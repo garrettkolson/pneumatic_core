@@ -1,6 +1,6 @@
 pub mod encoding;
 pub mod node;
-mod conns;
+pub mod conns;
 
 // pub fn add(left: usize, right: usize) -> usize {
 //     left + right
