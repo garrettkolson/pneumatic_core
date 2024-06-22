@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
-    Register(Vec<NodeRegistryType>),
-    Request(NodeRegistryType)
+    Register,
+    Request
 }
 
 #[derive(Eq)]
@@ -25,7 +25,9 @@ pub enum NodeRegistryType {
 pub struct NodeRequest {
     pub requester_key: Vec<u8>,
     pub requester_ip: Ipv6Addr,
-    pub request_type: NodeRequestType
+    pub request_type: NodeRequestType,
+    pub requester_types: Vec<NodeRegistryType>,
+    pub requested_type: NodeRegistryType
 }
 
 #[derive(Serialize, Deserialize)]
