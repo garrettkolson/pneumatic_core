@@ -1,12 +1,13 @@
 use std::io::Write;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddrV4, SocketAddrV6, TcpStream};
 
 pub trait IsConnection : Send {
 
 }
 
 pub trait FireAndForgetSender {
-    fn send(&self, addr: impl ToSocketAddrs, data: &[u8]);
+    fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]);
+    fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]);
 }
 
 pub struct TcpFafSender {
@@ -14,7 +15,12 @@ pub struct TcpFafSender {
 }
 
 impl FireAndForgetSender for TcpFafSender {
-    fn send(&self, addr: impl ToSocketAddrs, data: &[u8]) {
+    fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]) {
+        if let Ok(mut stream) = TcpStream::connect(addr) {
+            let _ = stream.write_all(data);
+        }    }
+
+    fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]) {
         if let Ok(mut stream) = TcpStream::connect(addr) {
             let _ = stream.write_all(data);
         }
@@ -22,7 +28,7 @@ impl FireAndForgetSender for TcpFafSender {
 }
 
 pub trait ConnFactory {
-    fn get_faf_sender(&self) -> impl FireAndForgetSender;
+    fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
 }
 
 pub struct TcpConnFactory {
@@ -36,8 +42,8 @@ impl TcpConnFactory {
 }
 
 impl ConnFactory for TcpConnFactory {
-    fn get_faf_sender(&self) -> TcpFafSender {
-        TcpFafSender {}
+    fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender> {
+        Box::new(TcpFafSender {})
     }
 }
 
