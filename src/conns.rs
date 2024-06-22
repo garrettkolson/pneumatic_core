@@ -29,6 +29,12 @@ pub struct TcpConnFactory {
 
 }
 
+impl TcpConnFactory {
+    pub fn new() -> TcpConnFactory {
+        TcpConnFactory {}
+    }
+}
+
 impl ConnFactory for TcpConnFactory {
     fn get_faf_sender(&self) -> TcpFafSender {
         TcpFafSender {}
