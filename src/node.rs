@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
     Register(Vec<NodeRegistryType>),
-    Request(NodeRequestType)
+    Request(NodeRegistryType)
 }
 
 #[derive(Eq)]
