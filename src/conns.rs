@@ -27,7 +27,7 @@ impl FireAndForgetSender for TcpFafSender {
     }
 }
 
-pub trait ConnFactory {
+pub trait ConnFactory : Send + Sync {
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
 }
 
