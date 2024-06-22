@@ -6,7 +6,7 @@ pub trait IsConnection : Send {
 }
 
 pub trait FireAndForgetSender {
-    fn send(&self, addr: impl ToSocketAddrs, data: Vec<u8>);
+    fn send(&self, addr: impl ToSocketAddrs, data: &[u8]);
 }
 
 pub struct TcpFafSender {
@@ -14,9 +14,9 @@ pub struct TcpFafSender {
 }
 
 impl FireAndForgetSender for TcpFafSender {
-    fn send(&self, addr: impl ToSocketAddrs, data: Vec<u8>) {
+    fn send(&self, addr: impl ToSocketAddrs, data: &[u8]) {
         if let Ok(mut stream) = TcpStream::connect(addr) {
-            let _ = stream.write_all(&*data);
+            let _ = stream.write_all(data);
         }
     }
 }
