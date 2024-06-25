@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
     Register,
-    Request
+    Request,
+    Heartbeat
 }
 
 #[derive(Eq)]
