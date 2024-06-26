@@ -1,59 +1,34 @@
 use std::io::{Read, Write};
-use std::net::{SocketAddrV4, SocketAddrV6, TcpStream};
-use crate::encoding;
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 pub trait IsConnection : Send {
 
 }
 
 pub trait FireAndForgetSender : Send + Sync {
-    fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]);
-    fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]);
+    fn send(&self, addr: SocketAddr, data: &[u8]);
 }
 
 pub struct TcpFafSender { }
 
 impl FireAndForgetSender for TcpFafSender {
-    fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]) {
-        if let Ok(mut stream) = TcpStream::connect(addr) {
-            let _ = stream.write_all(data);
-        }
-    }
-
-    fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]) {
-        if let Ok(mut stream) = TcpStream::connect(addr) {
+    fn send(&self, addr: SocketAddr, data: &[u8]) {
+        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(CONN_TIMEOUT_IN_SECS)) {
             let _ = stream.write_all(data);
         }
     }
 }
 
 pub trait Sender: Send + Sync {
-    fn get_response_from_v4(&self, addr: SocketAddrV4, data: &[u8]) -> Result<Vec<u8>, ConnError>;
-    fn get_response_from_v6(&self, addr: SocketAddrV6, data: &[u8]) -> Result<Vec<u8>, ConnError>;
+    fn get_response(&self, addr: SocketAddr, data: &[u8]) -> Result<Vec<u8>, ConnError>;
 }
 
 pub struct TcpSender { }
 
 impl Sender for TcpSender {
-    fn get_response_from_v4(&self, addr: SocketAddrV4, data: &[u8]) -> Result<Vec<u8>, ConnError> {
-        let mut stream = match TcpStream::connect(addr) {
-            Ok(stream) => stream,
-            Err(err) => return Err(ConnError::IO(err.to_string()))
-        };
-
-        if let Err(err) = stream.write_all(data) {
-            return Err(ConnError::IO(err.to_string()))
-        }
-
-        let mut buffer = Vec::new();
-        match stream.read_to_end(&mut buffer) {
-            Err(err) => Err(ConnError::IO(err.to_string())),
-            Ok(_) => Ok(buffer)
-        }
-    }
-
-    fn get_response_from_v6(&self, addr: SocketAddrV6, data: &[u8]) -> Result<Vec<u8>, ConnError> {
-        let mut stream = match TcpStream::connect(addr) {
+    fn get_response(&self, addr: SocketAddr, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(CONN_TIMEOUT_IN_SECS)) {
             Ok(stream) => stream,
             Err(err) => return Err(ConnError::IO(err.to_string()))
         };
@@ -97,6 +72,8 @@ pub enum ConnError {
     IO(String),
     MalformedData(String)
 }
+
+const CONN_TIMEOUT_IN_SECS: u64 = 60;
 
 pub const HEARTBEAT_PORT: u16 = 44000;
 pub const COMMITTER_PORT: u16 = 45000;
