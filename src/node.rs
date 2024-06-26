@@ -1,4 +1,4 @@
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ pub enum NodeRegistryType {
 #[derive(Serialize, Deserialize)]
 pub struct NodeRequest {
     pub requester_key: Vec<u8>,
-    pub requester_ip: Ipv6Addr,
+    pub requester_ip: IpAddr,
     pub request_type: NodeRequestType,
     pub requester_types: Vec<NodeRegistryType>,
     pub requested_type: NodeRegistryType
