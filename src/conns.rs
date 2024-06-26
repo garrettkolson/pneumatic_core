@@ -6,7 +6,7 @@ pub trait IsConnection : Send {
 
 }
 
-pub trait FireAndForgetSender {
+pub trait FireAndForgetSender : Send + Sync {
     fn send_to_v4(&self, addr: SocketAddrV4, data: &[u8]);
     fn send_to_v6(&self, addr: SocketAddrV6, data: &[u8]);
 }
@@ -27,7 +27,7 @@ impl FireAndForgetSender for TcpFafSender {
     }
 }
 
-pub trait Sender {
+pub trait Sender: Send + Sync {
     fn get_response_from_v4(&self, addr: SocketAddrV4, data: &[u8]) -> Result<Vec<u8>, ConnError>;
     fn get_response_from_v6(&self, addr: SocketAddrV6, data: &[u8]) -> Result<Vec<u8>, ConnError>;
 }
