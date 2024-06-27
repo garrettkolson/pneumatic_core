@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
@@ -14,6 +16,7 @@ pub enum NodeRequestType {
 #[derive(Hash)]
 #[derive(Clone)]
 #[derive(Serialize, Deserialize)]
+#[derive(Debug, EnumIter)]
 pub enum NodeRegistryType {
     Committer,
     Sentinel,
