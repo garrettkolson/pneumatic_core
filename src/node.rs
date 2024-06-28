@@ -36,7 +36,7 @@ pub struct InternalRegistration {
 }
 
 impl InternalRegistration {
-    fn for_add(key: Vec<u8>, addr: IpAddr, types: Vec<NodeRegistryType>) -> Self {
+    pub fn for_add(key: Vec<u8>, addr: IpAddr, types: Vec<NodeRegistryType>) -> Self {
         InternalRegistration {
             node_key: key,
             ip_addr: Some(addr),
@@ -44,7 +44,7 @@ impl InternalRegistration {
         }
     }
 
-    fn for_removal(key: Vec<u8>, types: Vec<NodeRegistryType>) -> Self {
+    pub fn for_removal(key: Vec<u8>, types: Vec<NodeRegistryType>) -> Self {
         InternalRegistration {
             node_key: key,
             ip_addr: None,
