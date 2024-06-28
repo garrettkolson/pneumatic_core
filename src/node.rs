@@ -23,21 +23,34 @@ pub enum NodeRequestType {
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum InternalRegistrationType {
-    Add(InternalRegistrationBatch),
-    Remove(InternalRegistrationBatch)
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct InternalRegistrationBatch {
-    pub nodes: Vec<InternalRegistration>
+pub enum InternalRegistrationBatch {
+    Add(Vec<InternalRegistration>),
+    Remove(Vec<InternalRegistration>)
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct InternalRegistration {
     pub node_key: Vec<u8>,
-    pub ip_addr: IpAddr,
+    pub ip_addr: Option<IpAddr>,
     pub node_types: Vec<NodeRegistryType>
+}
+
+impl InternalRegistration {
+    fn for_add(key: Vec<u8>, addr: IpAddr, types: Vec<NodeRegistryType>) -> Self {
+        InternalRegistration {
+            node_key: key,
+            ip_addr: Some(addr),
+            node_types: types
+        }
+    }
+
+    fn for_removal(key: Vec<u8>, types: Vec<NodeRegistryType>) -> Self {
+        InternalRegistration {
+            node_key: key,
+            ip_addr: None,
+            node_types: types
+        }
+    }
 }
 
 #[derive(Eq)]
