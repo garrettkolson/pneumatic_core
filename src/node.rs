@@ -99,7 +99,7 @@ impl NodeRegistryEntry {
 }
 
 pub struct NodeBootstrapError {
-    message: String
+    pub message: String
 }
 
 impl NodeBootstrapError {
