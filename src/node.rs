@@ -10,9 +10,9 @@ pub enum NodeType {
 }
 
 pub struct NodeTypeConfig {
-    min: usize,
-    max: usize,
-    min_stake: u64
+    pub min: usize,
+    pub max: usize,
+    pub min_stake: u64
 }
 
 #[derive(Serialize, Deserialize)]
