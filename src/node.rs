@@ -22,6 +22,24 @@ pub enum NodeRequestType {
     Heartbeat
 }
 
+#[derive(Serialize, Deserialize)]
+pub enum InternalRegistrationType {
+    Add(InternalRegistrationBatch),
+    Remove(InternalRegistrationBatch)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct InternalRegistrationBatch {
+    pub nodes: Vec<InternalRegistration>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct InternalRegistration {
+    pub node_key: Vec<u8>,
+    pub ip_addr: IpAddr,
+    pub node_types: Vec<NodeRegistryType>
+}
+
 #[derive(Eq)]
 #[derive(PartialEq)]
 #[derive(Hash)]
