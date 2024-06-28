@@ -3,6 +3,9 @@ pub mod node;
 pub mod conns;
 pub mod server;
 pub mod config;
+pub mod environment;
+pub mod data;
+pub mod crypto;
 
 // pub fn add(left: usize, right: usize) -> usize {
 //     left + right

@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
+pub enum NodeType {
+    Full,
+    Light
+}
+
+pub struct NodeTypeConfig {
+    min: usize,
+    max: usize,
+    min_stake: u64
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
     Register,
@@ -83,6 +94,18 @@ impl NodeRegistryEntry {
             environment_ids,
             connection: None,
             accepted: false
+        }
+    }
+}
+
+pub struct NodeBootstrapError {
+    message: String
+}
+
+impl NodeBootstrapError {
+    pub fn from_io_error(error: std::io::Error) -> NodeBootstrapError {
+        NodeBootstrapError {
+            message: error.to_string(),
         }
     }
 }
