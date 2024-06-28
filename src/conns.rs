@@ -80,3 +80,4 @@ pub const COMMITTER_PORT: u16 = 45000;
 pub const SENTINEL_PORT: u16 = 46000;
 pub const EXECUTOR_PORT: u16 = 47000;
 pub const FINALIZER_PORT: u16 = 48000;
+pub const BROADCAST_PORT: u16 = 49000;
