@@ -1,6 +1,17 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+use crate::node::NodeRegistryType;
+
+pub fn get_internal_port(node_type: NodeRegistryType) -> u16 {
+    match node_type {
+        NodeRegistryType::Committer => COMMITTER_PORT_INTERNAL,
+        NodeRegistryType::Archiver => COMMITTER_PORT_INTERNAL,
+        NodeRegistryType::Sentinel => SENTINEL_PORT_INTERNAL,
+        NodeRegistryType::Executor => EXECUTOR_PORT_INTERNAL,
+        NodeRegistryType::Finalizer => FINALIZER_PORT_INTERNAL
+    }
+}
 
 pub trait IsConnection : Send {
 
@@ -82,7 +93,7 @@ pub const EXECUTOR_PORT: u16 = 42003;
 pub const FINALIZER_PORT: u16 = 42004;
 pub const BEACON_PORT: u16 = 42005;
 
-pub const COMMITTER_PORT_INTERNAL: u16 = 50000;
-pub const SENTINEL_PORT_INTERNAL: u16 = 50001;
-pub const EXECUTOR_PORT_INTERNAL: u16 = 50002;
-pub const FINALIZER_PORT_INTERNAL: u16 = 50003;
+const COMMITTER_PORT_INTERNAL: u16 = 50000;
+const SENTINEL_PORT_INTERNAL: u16 = 50001;
+const EXECUTOR_PORT_INTERNAL: u16 = 50002;
+const FINALIZER_PORT_INTERNAL: u16 = 50003;
