@@ -129,6 +129,7 @@ impl NodeRegistryEntry {
     }
 }
 
+#[derive(Debug)]
 pub struct NodeBootstrapError {
     pub message: String
 }
