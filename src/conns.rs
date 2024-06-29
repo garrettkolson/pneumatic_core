@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 use crate::node::NodeRegistryType;
 
-pub fn get_internal_port(node_type: NodeRegistryType) -> u16 {
+pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
     match node_type {
         NodeRegistryType::Committer => COMMITTER_PORT_INTERNAL,
         NodeRegistryType::Archiver => COMMITTER_PORT_INTERNAL,
