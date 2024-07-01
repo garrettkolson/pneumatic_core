@@ -1,5 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use crate::node::NodeRegistryType;
 
@@ -11,6 +14,19 @@ pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
         NodeRegistryType::Executor => EXECUTOR_PORT_INTERNAL,
         NodeRegistryType::Finalizer => FINALIZER_PORT_INTERNAL
     }
+}
+
+pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, addr: SocketAddr)
+                      -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        match cloned_data.read() {
+            Err(_) => vec![],
+            Ok(read_data) => {
+                conn.get_response(addr, &read_data)
+                    .unwrap_or_else(|_| vec![])
+            }
+        }
+    })
 }
 
 pub trait IsConnection : Send {
