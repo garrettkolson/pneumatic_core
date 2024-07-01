@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use crate::config;
 use crate::environment::EnvironmentMetadataSpec;
 
 pub struct DataProvider {
@@ -9,6 +10,15 @@ pub struct DataProvider {
 }
 
 impl DataProvider {
+    pub fn from_config(config: &config::Config) -> Self {
+        let stores: Arc<DashMap<String, Box<dyn DataStore>>> = Arc::new(DashMap::new());
+        stores.insert(config.main_environment_id.clone(), Box::new(RocksDbDataStore::new()));
+        DataProvider {
+            cache: Arc::new(DashMap::new()),
+            stores
+        }
+    }
+
     pub fn from_environment_spec(spec: &EnvironmentMetadataSpec) -> DataProvider {
         let stores = Arc::new(DashMap::new());
         for partition in spec.partitions.iter() {
