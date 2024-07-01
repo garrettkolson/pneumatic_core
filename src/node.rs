@@ -77,6 +77,14 @@ pub struct NodeRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct NodeRegistryResponse {
+    pub responder_key: Vec<u8>,
+    pub responder_ip: IpAddr,
+    pub registry_type: NodeRegistryType,
+    pub entries: Vec<NodeRegistryEntry>
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct NodeRegistryRequest {
     pub requester_key: Vec<u8>,
     pub requester_ip: Ipv6Addr,
@@ -100,34 +108,40 @@ impl NodeRegistryRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeRegistryEntry {
-    pub node_public_key: Vec<u8>,
-    pub public_ip_addr: Ipv6Addr,
-    pub environment_ids: Vec<String>,
-    pub requested_type: NodeRegistryType,
-    pub available_types: Vec<NodeRegistryType>,
-    pub accepted: bool,
-
-    #[serde(skip_serializing, skip_deserializing)]
-    pub connection: Option<Arc<Mutex<Box<dyn crate::conns::IsConnection>>>>
+    pub node_key: Vec<u8>,
+    pub node_ip: IpAddr
 }
 
-impl NodeRegistryEntry {
-    pub fn new(node_public_key: Vec<u8>,
-               public_ip_addr: Ipv6Addr,
-               requested_type: NodeRegistryType,
-               available_types: Vec<NodeRegistryType>,
-               environment_ids: Vec<String>) -> NodeRegistryEntry {
-        NodeRegistryEntry {
-            node_public_key,
-            public_ip_addr,
-            requested_type,
-            available_types,
-            environment_ids,
-            connection: None,
-            accepted: false
-        }
-    }
-}
+// #[derive(Serialize, Deserialize)]
+// pub struct NodeRegistryEntry {
+//     pub node_public_key: Vec<u8>,
+//     pub public_ip_addr: Ipv6Addr,
+//     pub environment_ids: Vec<String>,
+//     pub requested_type: NodeRegistryType,
+//     pub available_types: Vec<NodeRegistryType>,
+//     pub accepted: bool,
+//
+//     #[serde(skip_serializing, skip_deserializing)]
+//     pub connection: Option<Arc<Mutex<Box<dyn crate::conns::IsConnection>>>>
+// }
+//
+// impl NodeRegistryEntry {
+//     pub fn new(node_public_key: Vec<u8>,
+//                public_ip_addr: Ipv6Addr,
+//                requested_type: NodeRegistryType,
+//                available_types: Vec<NodeRegistryType>,
+//                environment_ids: Vec<String>) -> NodeRegistryEntry {
+//         NodeRegistryEntry {
+//             node_public_key,
+//             public_ip_addr,
+//             requested_type,
+//             available_types,
+//             environment_ids,
+//             connection: None,
+//             accepted: false
+//         }
+//     }
+// }
 
 #[derive(Debug)]
 pub struct NodeBootstrapError {
