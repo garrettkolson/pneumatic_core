@@ -1,14 +1,16 @@
 use moka::sync::Cache;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 use dashmap::DashMap;
 //use rocksdb::{DB};
 use serde::{Deserialize, Serialize};
 use crate::config;
+use crate::encoding::deserialize_rmp_to;
 use crate::environment::EnvironmentMetadataSpec;
+use crate::tokens::Token;
 
 pub struct DataProvider {
-    cache: Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>>,
+    cache: Cache<Vec<u8>, Arc<RwLock<Token>>>,
     stores: Arc<DashMap<String, Box<dyn DataStore>>>
 }
 
@@ -38,8 +40,8 @@ impl DataProvider {
         }
     }
 
-    pub fn get_data(&self, token_key: &Vec<u8>, partition_id: &str)
-        -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
+    pub fn get_token(&self, token_key: &Vec<u8>, partition_id: &str)
+        -> Result<Arc<RwLock<Token>>, DataError> {
         if let Some(token_entry) = self.cache.get(token_key) {
             return Ok(Arc::clone(&token_entry))
         }
@@ -50,7 +52,10 @@ impl DataProvider {
         let Some(data) = store.value().get_data(token_key)
             else { return Err(DataError::DataNotFound) };
 
-        self.cache.insert(token_key.clone(), Arc::new(RwLock::new(data)));
+        let Ok(token) = deserialize_rmp_to::<Token>(&data)
+            else { return Err(DataError::DeserializationError) };
+
+        self.cache.insert(token_key.clone(), Arc::new(RwLock::new(token)));
         match self.cache.get(token_key) {
             Some(cached_token) => Ok(Arc::clone(&cached_token)),
             None => Err(DataError::CacheError)
@@ -59,13 +64,13 @@ impl DataProvider {
 
     pub fn save_data(&self, key: Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
 
-        self.cache.insert(key, Arc::new(RwLock::new(data)));
+        //self.cache.insert(key, Arc::new(RwLock::new(data)));
 
         Ok(())
     }
 }
 
-fn get_cache() -> Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>> {
+fn get_cache() -> Cache<Vec<u8>, Arc<RwLock<Token>>> {
     Cache::builder()
         .time_to_idle(Duration::from_secs(30))
         .build()
@@ -105,5 +110,6 @@ pub enum DataError {
     DeserializationError,
     DataNotFound,
     StoreNotFound,
-    CacheError
+    CacheError,
+    Poisoned
 }
