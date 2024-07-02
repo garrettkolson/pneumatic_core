@@ -6,6 +6,7 @@ pub mod config;
 pub mod environment;
 pub mod data;
 pub mod crypto;
+pub mod user;
 
 // pub fn add(left: usize, right: usize) -> usize {
 //     left + right
