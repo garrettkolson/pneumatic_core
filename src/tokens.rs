@@ -16,7 +16,7 @@ impl Token {
         }
     }
 
-    pub fn from_asset<T>(asset: T) -> Result<Token, std::io::Error>
+    pub fn from_asset<T>(asset: &T) -> Result<Token, std::io::Error>
         where T : Serialize
     {
         match encoding::serialize_to_bytes_rmp(asset) {
@@ -35,14 +35,14 @@ impl Token {
         //self.metadata.insert(key, value);
     }
 
-    pub fn get_asset<T>(&self) -> Option<&T>
+    pub fn get_asset<T>(&self) -> Option<T>
         where T : for<'a> Deserialize<'a>
     {
-        // let Some(asset) = self.asset_data else { return None };
-        // match encoding::deserialize_rmp_to::<T>(asset) {
-        //
-        // }
-        todo!()
+        let Some(asset) = &self.asset_data else { return None };
+        match encoding::deserialize_rmp_to::<T>(asset) {
+            Ok(a) => Some(a),
+            Err(_) => None
+        }
     }
 
     pub fn get_asset_mut<T>(&self) -> Option<T>
