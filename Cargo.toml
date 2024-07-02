@@ -12,3 +12,5 @@ serde = { version = "1.0.193", features = ["derive"] }
 dashmap = "5.5.3"
 strum = "0.26.3"
 strum_macros = "0.26.4"
+moka = { version = "0.12.7", features = ["sync"] }
+rocksdb = "0.22.0"
