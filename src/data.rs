@@ -8,7 +8,7 @@ use crate::config;
 use crate::environment::EnvironmentMetadataSpec;
 
 pub struct DataProvider {
-    cache: Cache<Vec<u8>, Arc<Vec<u8>>>,
+    cache: Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>>,
     stores: Arc<DashMap<String, Box<dyn DataStore>>>
 }
 
@@ -39,19 +39,33 @@ impl DataProvider {
     }
 
     pub fn get_data(&self, token_key: &Vec<u8>, partition_id: &str)
-        -> Result<Arc<Vec<u8>>, DataError> {
-        todo!()
+        -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
+        if let Some(token_entry) = self.cache.get(token_key) {
+            return Ok(Arc::clone(&token_entry))
+        }
+
+        let Some(store) = self.stores.get(partition_id)
+            else { return Err(DataError::StoreNotFound) };
+
+        let Some(data) = store.value().get_data(token_key)
+            else { return Err(DataError::DataNotFound) };
+
+        self.cache.insert(token_key.clone(), Arc::new(RwLock::new(data)));
+        match self.cache.get(token_key) {
+            Some(cached_token) => Ok(Arc::clone(&cached_token)),
+            None => Err(DataError::CacheError)
+        }
     }
 
     pub fn save_data(&self, key: Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
 
-        self.cache.insert(key, Arc::new(data));
+        self.cache.insert(key, Arc::new(RwLock::new(data)));
 
         Ok(())
     }
 }
 
-fn get_cache() -> Cache<Vec<u8>, Arc<Vec<u8>>> {
+fn get_cache() -> Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>> {
     Cache::builder()
         .time_to_idle(Duration::from_secs(30))
         .build()
