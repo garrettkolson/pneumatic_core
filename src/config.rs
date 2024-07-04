@@ -4,7 +4,6 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use crate::data::DataProviderType;
 use crate::encoding;
 use crate::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
 use crate::node::{NodeBootstrapError, NodeRegistryType, NodeType, NodeTypeConfig};
@@ -19,7 +18,6 @@ pub struct Config {
     pub rest_api_version: usize,
     pub node_type: NodeType,
     pub node_registry_types: Vec<NodeRegistryType>,
-    pub main_data_provider_type: DataProviderType,
     pub main_environment_id: String,
     pub environment_metadata: Arc<DashMap<String, EnvironmentMetadata>>,
     pub type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>
@@ -52,7 +50,6 @@ impl Config {
             rest_api_version: spec.rest_api_version,
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
             node_registry_types: vec![],
-            main_data_provider_type: DataProviderType::RocksDb,
             environment_metadata,
             main_environment_id: String::from(""),
             type_configs: Arc::new(DashMap::new())

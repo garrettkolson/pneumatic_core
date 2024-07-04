@@ -1,112 +1,143 @@
+use std::ops::Deref;
 use moka::sync::Cache;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
-use dashmap::DashMap;
-//use rocksdb::{DB};
-use serde::{Deserialize, Serialize};
-use crate::config;
-use crate::encoding::deserialize_rmp_to;
-use crate::environment::EnvironmentMetadataSpec;
+use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
+use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::tokens::Token;
 
-pub struct DataProvider {
-    cache: Cache<Vec<u8>, Arc<RwLock<Token>>>,
-    stores: Arc<DashMap<String, Box<dyn DataStore>>>
-}
+pub struct DataProvider { }
 
 impl DataProvider {
-    pub fn from_config(config: &config::Config) -> Self {
-        let stores: Arc<DashMap<String, Box<dyn DataStore>>> = Arc::new(DashMap::new());
-        stores.insert(config.main_environment_id.clone(), Box::new(RocksDbDataStore::new()));
-        DataProvider {
-            cache: get_cache(),
-            stores
-        }
+    pub fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
+        let cache = Self::get_cache();
+        if let Some(token_entry) = cache.get(key) { return Ok(token_entry.clone()); }
+
+        let token = Self::get_token_from_db(key, partition_id)?;
+        Self::put_in_cache(key, Arc::new(RwLock::new(token)));
+        cache.get(key).ok_or(DataError::CacheError)
     }
 
-    pub fn from_environment_spec(spec: &EnvironmentMetadataSpec) -> DataProvider {
-        let stores = Arc::new(DashMap::new());
-        for partition in spec.partitions.iter() {
-            let store: Box<dyn DataStore> = match &partition.data_provider {
-                DataProviderType::RocksDb => Box::new(RocksDbDataStore::new()),
-                _ => panic!("Data provider of type \"{:?}\" is not supported", &partition.data_provider)
-            };
-            stores.insert(partition.id.clone(), store);
-        }
-
-        DataProvider {
-            cache: get_cache(),
-            stores
-        }
-    }
-
-    pub fn get_token(&self, token_key: &Vec<u8>, partition_id: &str)
-        -> Result<Arc<RwLock<Token>>, DataError> {
-        if let Some(token_entry) = self.cache.get(token_key) {
-            return Ok(Arc::clone(&token_entry))
-        }
-
-        let Some(store) = self.stores.get(partition_id)
-            else { return Err(DataError::StoreNotFound) };
-
-        let Some(data) = store.value().get_data(token_key)
-            else { return Err(DataError::DataNotFound) };
-
-        let Ok(token) = deserialize_rmp_to::<Token>(&data)
-            else { return Err(DataError::DeserializationError) };
-
-        self.cache.insert(token_key.clone(), Arc::new(RwLock::new(token)));
-        match self.cache.get(token_key) {
-            Some(cached_token) => Ok(Arc::clone(&cached_token)),
-            None => Err(DataError::CacheError)
-        }
-    }
-
-    pub fn save_data(&self, key: Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
-
-        //self.cache.insert(key, Arc::new(RwLock::new(data)));
-
+    pub fn save_token(key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
+                      -> Result<(), DataError> {
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        let _ = db.save_token(key, &token_ref)?;
+        Self::put_in_cache(key, token_ref);
         Ok(())
+    }
+
+    fn get_token_from_db(key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        db.get_token(key)
+    }
+
+    fn put_in_cache(key: &Vec<u8>, token: Arc<RwLock<Token>>) {
+        Self::get_cache().insert(key.clone(), token)
+    }
+
+    fn get_cache() -> &'static TokenCache {
+        CACHE.get_or_init(|| get_cache())
+    }
+
+    fn get_db_factory() -> &'static Box<dyn DbFactory> {
+        DB_FACTORY.get_or_init(|| get_db_factory())
     }
 }
 
-fn get_cache() -> Cache<Vec<u8>, Arc<RwLock<Token>>> {
+//////////////////// Globals ///////////////////////
+
+static CACHE: OnceLock<TokenCache> = OnceLock::new();
+static DB_FACTORY: OnceLock<Box<dyn DbFactory>> = OnceLock::new();
+
+fn get_cache() -> TokenCache {
+    // TODO: replace this with config.json call or something
     Cache::builder()
         .time_to_idle(Duration::from_secs(30))
         .build()
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum DataProviderType {
-    RocksDb
+fn get_db_factory() -> Box<dyn DbFactory> {
+    // TODO: replace this with config.json call or something (per partition_id?)
+    Box::new(RocksDbFactory { })
 }
 
-trait DataStore : Send + Sync {
-    fn get_data(&self, key: &Vec<u8>) -> Option<Vec<u8>>;
-    fn save_data(&self, key: Vec<u8>, data: Vec<u8>) -> Result<(), DataError>;
+////////////// Data Factories/Stores ////////////////
+
+trait Db {
+    fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError>;
+    fn save_token(&self, key: &Vec<u8>, token: &Arc<RwLock<Token>>) -> Result<(), DataError>;
 }
 
-pub struct RocksDbDataStore {
-    // TODO: have to wrap the actual store calls in mutexes
+trait DbFactory : Send + Sync {
+    fn get_db(&self, partition_id: &str) -> Result<Box<dyn Db>, DataError>;
 }
 
-impl RocksDbDataStore {
-    pub fn new() -> Self {
-        RocksDbDataStore {}
+struct RocksDbFactory { }
+
+impl DbFactory for RocksDbFactory {
+    fn get_db(&self, partition_id: &str) -> Result<Box<dyn Db>, DataError> {
+        let db = RocksDb::new(partition_id)?;
+        Ok(Box::new(db))
     }
 }
 
-impl DataStore for RocksDbDataStore {
-    fn get_data(&self, key: &Vec<u8>) -> Option<Vec<u8>> {
-        todo!()
+struct RocksDb {
+    store: DBWithThreadMode<MultiThreaded>
+}
+
+impl RocksDb {
+    fn new(partition_id: &str) -> Result<Self, DataError> {
+        match DBWithThreadMode::open(&Self::with_options(), partition_id) {
+            Err(err) => Err(DataError::FromStore(err.into_string())),
+            Ok(db) => {
+                let rocks_db = RocksDb { store: db };
+                Ok(rocks_db)
+            }
+        }
     }
 
-    fn save_data(&self, key: Vec<u8>, data: Vec<u8>) -> Result<(), DataError> {
-        todo!()
+    fn with_options() -> Options {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        opts
     }
 }
 
+impl Db for RocksDb {
+    fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError> {
+        match self.store.get(key) {
+            Err(e) => Err(DataError::FromStore(e.into_string())),
+            Ok(None) => Err(DataError::DataNotFound),
+            Ok(Some(data)) => {
+                match deserialize_rmp_to::<Token>(&data) {
+                    Err(_) => Err(DataError::DeserializationError),
+                    Ok(token) => Ok(token)
+                }
+            }
+        }
+    }
+
+    fn save_token(&self, key: &Vec<u8>, token_ref: &Arc<RwLock<Token>>) -> Result<(), DataError> {
+        let Ok(token) = token_ref.write()
+            else { return Err(DataError::Poisoned) };
+
+        let Ok(data) = serialize_to_bytes_rmp(token.deref())
+            else { return Err(DataError::SerializationError) };
+
+        match self.store.put(key, data) {
+            Err(err) => Err(DataError::FromStore(err.into_string())),
+            Ok(_) => Ok(())
+        }
+    }
+}
+
+type TokenCache = Cache<Vec<u8>, Arc<RwLock<Token>>>;
+
+#[derive(Debug)]
 pub enum DataError {
+    FromStore(String),
+    SerializationError,
     DeserializationError,
     DataNotFound,
     StoreNotFound,

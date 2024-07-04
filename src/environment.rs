@@ -1,9 +1,6 @@
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use crate::crypto::AsymCryptoProviderType;
-use crate::data::{DataProvider, DataProviderType};
 
-//#[derive(Serialize, Deserialize)]
 pub struct EnvironmentMetadata {
     pub environment_id: String,
     pub environment_name: String,
@@ -13,15 +10,12 @@ pub struct EnvironmentMetadata {
     pub partitions: Vec<EnvironmentPartition>,
     pub quorum_percentage: f32,
     pub override_quorum_percentage: f32,
-    pub data_provider: Arc<DataProvider>,
     pub asym_crypto_provider_type: AsymCryptoProviderType
     // TODO: have to finish this
 }
 
 impl EnvironmentMetadata {
     pub fn load_from_spec(spec: EnvironmentMetadataSpec) -> EnvironmentMetadata {
-        let data_provider = Arc::new(DataProvider::from_environment_spec(&spec));
-
         let mut token_option = None;
         let mut contract_partition = None;
         let mut proxy_partition = None;
@@ -47,7 +41,6 @@ impl EnvironmentMetadata {
             partitions: spec.partitions,
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
-            data_provider,
             asym_crypto_provider_type: spec.asym_crypto_provider
         }
     }
@@ -80,5 +73,4 @@ pub enum EnvironmentPartitionType {
 pub struct EnvironmentPartition {
     pub id: String,
     pub partition_type: EnvironmentPartitionType,
-    pub data_provider: DataProviderType
 }
