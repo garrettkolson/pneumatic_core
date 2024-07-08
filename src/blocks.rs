@@ -61,8 +61,22 @@ pub struct BlockFactory {
 
 impl BlockFactory {
     pub fn create_hash(block: &Block) -> Vec<u8> {
-        // todo: implement
-        vec![]
+        let mut hash = block.previous_hash.clone();
+
+        let mut time_bytes = crate::encoding::serialize_to_bytes_rmp(&block.timestamp)
+            .expect("");
+        hash.append(&mut time_bytes);
+
+        let mut trans_bytes = crate::encoding::serialize_to_bytes_rmp(&block.signed_trans)
+            .expect("");
+        hash.append(&mut trans_bytes);
+
+        let mut metadata_bytes = crate::encoding::serialize_to_bytes_rmp(&block.token_metadata)
+            .expect("");
+        hash.append(&mut metadata_bytes);
+
+        // TODO: actually hash these bytes via the crypto module
+        hash
     }
 }
 
@@ -98,7 +112,8 @@ impl Blockchain {
         }
 
         let mut prev_block = &self.chain[0];
-        let mut valid = prev_block.current_hash == BlockFactory::create_hash(&prev_block);
+        let prev_hash = BlockFactory::create_hash(&prev_block);
+        let mut valid = prev_block.current_hash == prev_hash;
 
         for (i, _) in self.chain.iter().enumerate() {
             let next_index = i + 1;
