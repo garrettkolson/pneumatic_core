@@ -1,4 +1,7 @@
+use std::error::Error;
 use std::net::{IpAddr, Ipv6Addr};
+use std::sync::Arc;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -51,6 +54,47 @@ impl Registration {
         }
     }
 }
+
+pub struct NodeRegistry {
+    committers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
+    executors: Arc<DashMap<Vec<u8>, IpAddr>>,
+    finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
+}
+
+impl NodeRegistry {
+    pub fn init() -> Self {
+        NodeRegistry {
+            committers: Arc::new(DashMap::new()),
+            sentinels: Arc::new(DashMap::new()),
+            executors: Arc::new(DashMap::new()),
+            finalizers: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn get_nodes(&self, node_type: &NodeRegistryType) -> Option<Nodes> {
+        match node_type {
+            NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
+            NodeRegistryType::Sentinel => Some(Arc::clone(&self.sentinels)),
+            NodeRegistryType::Executor => Some(Arc::clone(&self.executors)),
+            NodeRegistryType::Finalizer => Some(Arc::clone(&self.finalizers)),
+            _ => None
+        }
+    }
+
+    fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> bool {
+        match self.get_nodes(node_type) {
+            Some(nodes) => nodes.contains_key(key),
+            None => false
+        }
+    }
+
+    pub fn process_registration(registration: Registration) -> Result<(), NodeRegistrationError> {
+        Ok(())
+    }
+}
+
+pub type Nodes = Arc<DashMap<Vec<u8>, IpAddr>>;
 
 #[derive(Eq)]
 #[derive(PartialEq)]
@@ -111,36 +155,7 @@ pub struct NodeRegistryEntry {
     pub node_ip: IpAddr
 }
 
-// #[derive(Serialize, Deserialize)]
-// pub struct NodeRegistryEntry {
-//     pub node_public_key: Vec<u8>,
-//     pub public_ip_addr: Ipv6Addr,
-//     pub environment_ids: Vec<String>,
-//     pub requested_type: NodeRegistryType,
-//     pub available_types: Vec<NodeRegistryType>,
-//     pub accepted: bool,
-//
-//     #[serde(skip_serializing, skip_deserializing)]
-//     pub connection: Option<Arc<Mutex<Box<dyn crate::conns::IsConnection>>>>
-// }
-//
-// impl NodeRegistryEntry {
-//     pub fn new(node_public_key: Vec<u8>,
-//                public_ip_addr: Ipv6Addr,
-//                requested_type: NodeRegistryType,
-//                available_types: Vec<NodeRegistryType>,
-//                environment_ids: Vec<String>) -> NodeRegistryEntry {
-//         NodeRegistryEntry {
-//             node_public_key,
-//             public_ip_addr,
-//             requested_type,
-//             available_types,
-//             environment_ids,
-//             connection: None,
-//             accepted: false
-//         }
-//     }
-// }
+/////////////////// Errors //////////////////////
 
 #[derive(Debug)]
 pub struct NodeBootstrapError {
@@ -153,4 +168,10 @@ impl NodeBootstrapError {
             message: error.to_string(),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum NodeRegistrationError {
+    FromUnderlying(String),
+    Unknown
 }
