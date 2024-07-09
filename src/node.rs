@@ -82,7 +82,7 @@ impl NodeRegistry {
         }
     }
 
-    fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> bool {
+    pub fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> bool {
         match self.get_nodes(node_type) {
             Some(nodes) => nodes.contains_key(key),
             None => false
