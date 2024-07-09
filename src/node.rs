@@ -1,10 +1,15 @@
-use std::error::Error;
-use std::net::{IpAddr, Ipv6Addr};
+use std::fmt::format;
+use std::io::{BufReader, Write};
+use std::mem::forget;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+use crate::{conns, server};
+use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+use crate::node::RegistrationBatchResult::Success;
 
 pub enum NodeType {
     Full,
@@ -55,6 +60,12 @@ impl Registration {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub enum RegistrationBatchResult {
+    Success,
+    Failure(NodeRegistrationError)
+}
+
 pub struct NodeRegistry {
     committers: Arc<DashMap<Vec<u8>, IpAddr>>,
     sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
@@ -89,8 +100,37 @@ impl NodeRegistry {
         }
     }
 
-    pub fn process_registration(registration: Registration) -> Result<(), NodeRegistrationError> {
-        Ok(())
+    pub fn listen_for_updates(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
+        let port_num = conns::get_internal_port(this_func_type);
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
+
+        let listener = TcpListener::bind(addr)
+            .expect("Couldn't set up internal listener for node registry updates");
+        let thread_pool = server::ThreadPool::build(4)
+            .expect("Couldn't establish thread pool for node registry updates");
+
+        for stream in listener.incoming() {
+            let _ = match stream {
+                Err(_) => continue,
+                Ok(mut stream) => {
+                    let cloned_registry = registry.clone();
+                    let _ = thread_pool.execute(move || {
+                        let buf_reader = BufReader::new(&mut stream);
+                        let raw_data = buf_reader.buffer().to_vec();
+                        let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&raw_data)
+                            else { return };
+
+                        let result = cloned_registry.process_registration(reg);
+                        let response = serialize_to_bytes_rmp(&result).unwrap_or_else(|_| vec![]);
+                        stream.write_all(&response).unwrap()
+                    });
+                }
+            };
+        }
+    }
+
+    fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {
+        Success
     }
 }
 
@@ -171,6 +211,7 @@ impl NodeBootstrapError {
 }
 
 #[derive(Debug)]
+#[derive(Serialize, Deserialize)]
 pub enum NodeRegistrationError {
     FromUnderlying(String),
     Unknown

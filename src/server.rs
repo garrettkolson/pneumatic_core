@@ -89,10 +89,12 @@ impl Worker {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Debug)]
 pub struct PoolCreationError {
     pub message: String
 }
 
+#[derive(Debug)]
 pub enum WorkerError {
     ReceiverPoisoned(String),
     WhileReceiving(String)
