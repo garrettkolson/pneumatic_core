@@ -16,6 +16,16 @@ pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
     }
 }
 
+pub fn get_external_port(node_type: &NodeRegistryType) -> u16 {
+    match node_type {
+        NodeRegistryType::Committer => COMMITTER_PORT,
+        NodeRegistryType::Archiver => COMMITTER_PORT,
+        NodeRegistryType::Sentinel => SENTINEL_PORT,
+        NodeRegistryType::Executor => EXECUTOR_PORT,
+        NodeRegistryType::Finalizer => FINALIZER_PORT
+    }
+}
+
 pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, addr: SocketAddr)
                       -> JoinHandle<Vec<u8>> {
     thread::spawn(move || {

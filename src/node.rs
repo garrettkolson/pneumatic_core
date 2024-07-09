@@ -1,7 +1,5 @@
-use std::fmt::format;
 use std::io::{BufReader, Write};
-use std::mem::forget;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -74,6 +72,8 @@ pub struct NodeRegistry {
 }
 
 impl NodeRegistry {
+    const LISTENER_THREAD_COUNT: usize = 4;
+
     pub fn init() -> Self {
         NodeRegistry {
             committers: Arc::new(DashMap::new()),
@@ -106,7 +106,7 @@ impl NodeRegistry {
 
         let listener = TcpListener::bind(addr)
             .expect("Couldn't set up internal listener for node registry updates");
-        let thread_pool = server::ThreadPool::build(4)
+        let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for node registry updates");
 
         for stream in listener.incoming() {
