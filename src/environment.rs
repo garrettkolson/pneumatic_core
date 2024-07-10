@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use crate::crypto::AsymCryptoProviderType;
+use crate::crypto;
+use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 
 pub struct EnvironmentMetadata {
     pub environment_id: String,
@@ -10,7 +11,7 @@ pub struct EnvironmentMetadata {
     pub partitions: Vec<EnvironmentPartition>,
     pub quorum_percentage: f32,
     pub override_quorum_percentage: f32,
-    pub asym_crypto_provider_type: AsymCryptoProviderType
+    pub asym_crypto_provider: Box<dyn AsymCryptoProvider>
     // TODO: have to finish this
 }
 
@@ -32,6 +33,8 @@ impl EnvironmentMetadata {
             .expect(&format!("Environment with name \"{0}\" should have a token partition",
                              spec.environment_name));
 
+        let asym_provider = crypto::get_asym_provider(&spec.asym_crypto_provider);
+
         EnvironmentMetadata {
             environment_id: spec.environment_id,
             environment_name: spec.environment_name,
@@ -41,7 +44,7 @@ impl EnvironmentMetadata {
             partitions: spec.partitions,
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
-            asym_crypto_provider_type: spec.asym_crypto_provider
+            asym_crypto_provider: asym_provider
         }
     }
 }
