@@ -76,6 +76,10 @@ impl Token {
     }
 
     pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) {
+        let trans_id = info.trans_data.trans_id.clone();
+        let Ok(_) = DataProvider::save_data(&trans_id, &info.trans_data, &info.env_slush_partition)
+            else { return };    // TODO: replace this with error logging
+
         {
             let mut write_token = match token.write() {
                 Ok(t) => t,
@@ -86,12 +90,11 @@ impl Token {
                 write_token.blockchain.remove_block();
             }
 
-            write_token.blockchain.add_block(info.block);
+            let block = info.trans_data.proposed_block;
+            write_token.blockchain.add_block(block);
         }
 
         let Ok(_) = DataProvider::save_token(&info.token_id, token, &info.env_id)
-            else { return };    // TODO: replace this with error logging
-        let Ok(_) = DataProvider::save_data(&info.trans_data.trans_id, &info.trans_data, &info.env_slush_partition)
             else { return };    // TODO: replace this with error logging
     }
 
@@ -102,7 +105,6 @@ impl Token {
 
 pub struct BlockCommitInfo {
     pub is_archiver: bool,
-    pub block: Block,
     pub token_id: Vec<u8>,
     pub env_id: String,
     pub env_slush_partition: String,
