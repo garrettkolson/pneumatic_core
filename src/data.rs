@@ -26,13 +26,45 @@ impl DataProvider {
         Ok(())
     }
 
+    pub fn get_data(key: &Vec<u8>, partition_id: &str)
+        -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
+        // TODO: implement caching for this
+
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        let data = db.get_data(key)?;
+        Ok(Arc::new(RwLock::new(data)))
+    }
+
+    pub fn save_data<T: serde::Serialize>(key: &Vec<u8>, data: &T, partition_id: &str) -> Result<(), DataError> {
+        // TODO: implement caching for this
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        let Ok(serialized) = serialize_to_bytes_rmp(data)
+            else { return Err(DataError::SerializationError) };
+
+        let _ = db.save_data(key, serialized)?;
+        Ok(())
+    }
+
+    pub fn save_locked_data<T: serde::Serialize>(key: &Vec<u8>, data: Arc<RwLock<T>>, partition_id: &str)
+                    -> Result<(), DataError> {
+        // TODO: implement caching for this
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        let Ok(write_data) = data.write()
+            else { return Err(DataError::Poisoned) };
+        let Ok(serialized) = serialize_to_bytes_rmp(write_data.deref())
+            else { return Err(DataError::SerializationError) };
+
+        let _ = db.save_data(key, serialized)?;
+        Ok(())
+    }
+
     fn get_token_from_db(key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
         let db = Self::get_db_factory().get_db(partition_id)?;
         db.get_token(key)
     }
 
-    fn put_in_cache(key: &Vec<u8>, token: Arc<RwLock<Token>>) {
-        Self::get_cache().insert(key.clone(), token)
+    fn put_in_cache(key: &Vec<u8>, data: Arc<RwLock<Token>>) {
+        Self::get_cache().insert(key.clone(), data)
     }
 
     fn get_cache() -> &'static TokenCache {
@@ -66,6 +98,8 @@ fn get_db_factory() -> Box<dyn DbFactory> {
 trait Db {
     fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError>;
     fn save_token(&self, key: &Vec<u8>, token: &Arc<RwLock<Token>>) -> Result<(), DataError>;
+    fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError>;
+    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>) -> Result<(), DataError>;
 }
 
 trait DbFactory : Send + Sync {
@@ -125,6 +159,21 @@ impl Db for RocksDb {
         let Ok(data) = serialize_to_bytes_rmp(token.deref())
             else { return Err(DataError::SerializationError) };
 
+        match self.store.put(key, data) {
+            Err(err) => Err(DataError::FromStore(err.into_string())),
+            Ok(_) => Ok(())
+        }
+    }
+
+    fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError> {
+        match self.store.get(key) {
+            Err(e) => Err(DataError::FromStore(e.into_string())),
+            Ok(None) => Err(DataError::DataNotFound),
+            Ok(Some(data)) => Ok(data)
+        }
+    }
+
+    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>) -> Result<(), DataError> {
         match self.store.put(key, data) {
             Err(err) => Err(DataError::FromStore(err.into_string())),
             Ok(_) => Ok(())

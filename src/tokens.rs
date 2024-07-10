@@ -1,25 +1,35 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use rocksdb::statistics::Ticker::BlockCacheCompressionDictAdd;
 use serde::{Deserialize, Serialize};
-use crate::blocks::Block;
+use crate::blocks::{Block, Blockchain};
+use crate::data::DataProvider;
 use crate::encoding;
 use crate::environment::EnvironmentMetadata;
+use crate::transactions::TransactionCommit;
 
 #[derive(Serialize, Deserialize)]
 pub struct Token {
     pub metadata: HashMap<String, String>,
+    pub blockchain: Blockchain,
     asset_data: Option<Vec<u8>>,
-    pub asset_hash: Vec<u8>
+    pub asset_hash: Vec<u8>,
+    security_level: usize,
     // TODO: have asset data as optional in the case of non-executables
     // TODO: and verify with MD5 hash on non-Archiver nodes.
     // TODO: Archivers should store the full assets
 }
 
 impl Token {
+    const DEFAULT_SECURITY_LEVEL: usize = 5;
+
     pub fn new() -> Token {
         Token {
             metadata: HashMap::new(),
+            blockchain: Blockchain::new(),
             asset_data: None,
-            asset_hash: vec![]
+            asset_hash: vec![],
+            security_level: Self::DEFAULT_SECURITY_LEVEL
         }
     }
 
@@ -30,8 +40,10 @@ impl Token {
             Ok(data) => {
                 Ok(Token {
                     metadata: HashMap::new(),
+                    blockchain: Blockchain::new(),
                     asset_data: Some(data),
-                    asset_hash: vec![] // TODO: actually hash the data
+                    asset_hash: vec![], // TODO: actually hash the data,
+                    security_level: Self::DEFAULT_SECURITY_LEVEL
                 })
             },
             Err(error) => Err(error)
@@ -62,6 +74,39 @@ impl Token {
     pub fn validate_block(&self, block: &Block, env_data: &EnvironmentMetadata) -> BlockValidationResult {
         BlockValidationResult::Ok
     }
+
+    pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) {
+        {
+            let mut write_token = match token.write() {
+                Ok(t) => t,
+                Err(err) => { panic!() }    // TODO: replace this with error logging
+            };
+
+            if write_token.has_reached_max_chain_length() && !info.is_archiver {
+                write_token.blockchain.remove_block();
+            }
+
+            write_token.blockchain.add_block(info.block);
+        }
+
+        let Ok(_) = DataProvider::save_token(&info.token_id, token, &info.env_id)
+            else { return };    // TODO: replace this with error logging
+        let Ok(_) = DataProvider::save_data(&info.trans_data.trans_id, &info.trans_data, &info.env_slush_partition)
+            else { return };    // TODO: replace this with error logging
+    }
+
+    fn has_reached_max_chain_length(&self) -> bool {
+        self.security_level == self.blockchain.get_count()
+    }
+}
+
+pub struct BlockCommitInfo {
+    pub is_archiver: bool,
+    pub block: Block,
+    pub token_id: Vec<u8>,
+    pub env_id: String,
+    pub env_slush_partition: String,
+    pub trans_data: TransactionCommit
 }
 
 pub enum BlockValidationResult {

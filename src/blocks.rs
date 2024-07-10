@@ -9,7 +9,6 @@ use crate::tokens::Token;
 pub struct Block {
     //pub transaction_id : String,
     pub signed_trans : SignedTransaction,
-    pub token_metadata : HashMap<String, String>,
     pub previous_hash : Vec<u8>,
     pub current_hash : Vec<u8>,
     pub timestamp : i64,
@@ -28,7 +27,6 @@ impl Block {
         Block {
             //transaction_id: signed.transaction_id,
             signed_trans: signed,
-            token_metadata: blockchain.token_metadata,
             previous_hash: prev_hash,
             timestamp: Utc::now().timestamp(),
             // executor_sigs: signed.executor_sigs,
@@ -42,7 +40,6 @@ impl Block {
         let mut block = Block {
             //transaction_id: test_transaction.transaction_id,
             signed_trans: test_transaction,
-            token_metadata: HashMap::new(),
             previous_hash: prev_hash,
             current_hash: vec![],
             timestamp: Utc::now().timestamp(),
@@ -71,10 +68,6 @@ impl BlockFactory {
             .expect("");
         hash.append(&mut trans_bytes);
 
-        let mut metadata_bytes = crate::encoding::serialize_to_bytes_rmp(&block.token_metadata)
-            .expect("");
-        hash.append(&mut metadata_bytes);
-
         // TODO: actually hash these bytes via the crypto module
         hash
     }
@@ -83,14 +76,12 @@ impl BlockFactory {
 #[derive(Serialize, Deserialize)]
 pub struct Blockchain {
     pub chain: VecDeque<Block>,
-    pub token_metadata: HashMap<String, String>
 }
 
 impl Blockchain {
-    pub fn new(token: Token) -> Self {
+    pub fn new() -> Self {
         Blockchain {
             chain: VecDeque::new(),
-            token_metadata: token.metadata
         }
     }
 
@@ -178,7 +169,7 @@ pub mod tests {
 
     #[test]
     fn get_current_chain_state_with_empty_chain() {
-        let blockchain = Blockchain::new(Token::new());
+        let blockchain = Blockchain::new();
 
         let state = blockchain.get_current_chain_state();
 
@@ -188,7 +179,7 @@ pub mod tests {
 
     #[test]
     fn get_current_chain_state_with_valid_chain() {
-        let mut blockchain = Blockchain::new(Token::new());
+        let mut blockchain = Blockchain::new();
 
         // Add some valid blocks to the chain
         let valid_next_block = Block::test_block(vec![ 23, 42, 43 ]);
@@ -202,7 +193,7 @@ pub mod tests {
 
     #[test]
     fn get_current_chain_state_with_invalid_chain() {
-        let mut blockchain = Blockchain::new(Token::new());
+        let mut blockchain = Blockchain::new();
 
         // Add some invalid blocks to the chain
         let valid_next_block = Block::test_block(vec![ 23, 42, 43 ]);
@@ -218,7 +209,7 @@ pub mod tests {
 
     #[test]
     fn validate_next_block_with_valid_block() {
-        let mut blockchain = Blockchain::new(Token::new());
+        let mut blockchain = Blockchain::new();
 
         // Add some valid blocks
         let valid_next_block = Block::test_block(vec![ 23, 42, 43 ]);
@@ -233,7 +224,7 @@ pub mod tests {
 
     #[test]
     fn validate_next_block_with_invalid_previous_hash() {
-        let mut blockchain = Blockchain::new(Token::new());
+        let mut blockchain = Blockchain::new();
 
         // Add some valid blocks
         let valid_next_block = Block::test_block(vec![ 23, 42, 43 ]);
@@ -246,7 +237,7 @@ pub mod tests {
 
     #[test]
     fn validate_next_block_with_invalid_block_hash() {
-        let mut blockchain = Blockchain::new(Token::new());
+        let mut blockchain = Blockchain::new();
 
         // Add some valid blocks
         let valid_next_block = Block::test_block(vec![ 23, 42, 43 ]);

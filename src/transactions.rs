@@ -45,6 +45,7 @@ impl SignedTransaction {
 
 #[derive (Serialize, Deserialize)]
 pub struct TransactionCommit {
+    pub trans_id: Vec<u8>,
     pub token_id: Vec<u8>,
     pub env_id: String,
     pub proposed_block: Block
