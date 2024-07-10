@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use crate::blocks::Block;
 use crate::encoding;
+use crate::environment::EnvironmentMetadata;
 
 #[derive(Serialize, Deserialize)]
 pub struct Token {
@@ -56,6 +58,19 @@ impl Token {
     {
         todo!()
     }
+
+    pub fn validate_block(&self, block: Block, env_data: EnvironmentMetadata) -> BlockValidationResult {
+        BlockValidationResult::Ok
+    }
+}
+
+pub enum BlockValidationResult {
+    Ok,
+    Err(BlockValidationError)
+}
+
+pub enum BlockValidationError {
+    InvalidFinalizerSignature
 }
 
 // private async Task checkAndCommitTransactionResults(object sender, DataEventArgs<Message> args)
