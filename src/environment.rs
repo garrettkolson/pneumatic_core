@@ -33,7 +33,7 @@ impl EnvironmentMetadata {
             .expect(&format!("Environment with name \"{0}\" should have a token partition",
                              spec.environment_name));
 
-        let asym_provider = crypto::get_asym_provider(&spec.asym_crypto_provider);
+        let asym_provider = Box::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
 
         EnvironmentMetadata {
             environment_id: spec.environment_id,
