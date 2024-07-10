@@ -59,7 +59,7 @@ impl Token {
         todo!()
     }
 
-    pub fn validate_block(&self, block: Block, env_data: EnvironmentMetadata) -> BlockValidationResult {
+    pub fn validate_block(&self, block: &Block, env_data: &EnvironmentMetadata) -> BlockValidationResult {
         BlockValidationResult::Ok
     }
 }
