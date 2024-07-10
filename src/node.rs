@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use crate::{conns, server};
+use crate::{conns, messages, server};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::node::RegistrationBatchResult::Success;
 
@@ -120,9 +120,8 @@ impl NodeRegistry {
                         let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&raw_data)
                             else { return };
 
-                        let result = cloned_registry.process_registration(reg);
-                        let response = serialize_to_bytes_rmp(&result).unwrap_or_else(|_| vec![]);
-                        stream.write_all(&response).unwrap()
+                        let _ = cloned_registry.process_registration(reg);
+                        stream.write_all(&messages::acknowledge()).unwrap()
                     });
                 }
             };
