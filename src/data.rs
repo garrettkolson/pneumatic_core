@@ -27,6 +27,8 @@ pub trait DataProvider {
 
 pub struct DefaultDataProvider { }
 
+impl DataProvider for DefaultDataProvider {}
+
 impl DefaultDataProvider {
     pub fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
         let cache = Self::get_cache();
