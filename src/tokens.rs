@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use rocksdb::statistics::Ticker::BlockCacheCompressionDictAdd;
 use serde::{Deserialize, Serialize};
 use crate::blocks::{Block, Blockchain};
-use crate::data::DataProvider;
+use crate::data::{DataError, DataProvider};
 use crate::encoding;
 use crate::environment::EnvironmentMetadata;
 use crate::transactions::TransactionCommit;
@@ -75,15 +75,17 @@ impl Token {
         BlockValidationResult::Ok
     }
 
-    pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) {
+    pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) -> Result<(), BlockCommitError> {
         let trans_id = info.trans_data.trans_id.clone();
-        let Ok(_) = DataProvider::save_data(&trans_id, &info.trans_data, &info.env_slush_partition)
-            else { return };    // TODO: replace this with error logging
+        let _ = match DataProvider::save_data(&trans_id, &info.trans_data, &info.env_slush_partition) {
+            Err(err) => return Err(BlockCommitError::FromDataError(err)),
+            Ok(_) => ()
+        };
 
         {
             let mut write_token = match token.write() {
-                Ok(t) => t,
-                Err(err) => { panic!() }    // TODO: replace this with error logging
+                Err(_) => return Err(BlockCommitError::TokenWriteLockPoisoned),
+                Ok(t) => t
             };
 
             if write_token.has_reached_max_chain_length() && !info.is_archiver {
@@ -94,8 +96,8 @@ impl Token {
             write_token.blockchain.add_block(block);
         }
 
-        let Ok(_) = DataProvider::save_token(&info.token_id, token, &info.env_id)
-            else { return };    // TODO: replace this with error logging
+        DataProvider::save_token(&info.token_id, token, &info.env_id)
+            .or_else(|err| Err(BlockCommitError::FromDataError(err)))
     }
 
     fn has_reached_max_chain_length(&self) -> bool {
@@ -118,6 +120,11 @@ pub enum BlockValidationResult {
 
 pub enum BlockValidationError {
     InvalidFinalizerSignature
+}
+
+pub enum BlockCommitError {
+    TokenWriteLockPoisoned,
+    FromDataError(DataError)
 }
 
 // private async Task checkAndCommitTransactionResults(object sender, DataEventArgs<Message> args)
