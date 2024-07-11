@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use rocksdb::statistics::Ticker::BlockCacheCompressionDictAdd;
 use serde::{Deserialize, Serialize};
 use crate::blocks::{Block, Blockchain};
-use crate::data::{DataError, DataProvider};
+use crate::data::{DataError, DefaultDataProvider};
 use crate::encoding;
 use crate::environment::EnvironmentMetadata;
 use crate::transactions::TransactionCommit;
@@ -77,7 +77,7 @@ impl Token {
 
     pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) -> Result<(), BlockCommitError> {
         let trans_id = info.trans_data.trans_id.clone();
-        let _ = match DataProvider::save_data(&trans_id, &info.trans_data, &info.env_slush_partition) {
+        let _ = match DefaultDataProvider::save_typed_data(&trans_id, &info.trans_data, &info.env_slush_partition) {
             Err(err) => return Err(BlockCommitError::FromDataError(err)),
             Ok(_) => ()
         };
@@ -96,7 +96,7 @@ impl Token {
             write_token.blockchain.add_block(block);
         }
 
-        DataProvider::save_token(&info.token_id, token, &info.env_id)
+        DefaultDataProvider::save_token(&info.token_id, token, &info.env_id)
             .or_else(|err| Err(BlockCommitError::FromDataError(err)))
     }
 
@@ -141,7 +141,7 @@ pub enum BlockCommitError {
     // // TODO: figure out how to get the underlying asset for a new token
     // // TODO: (probably have to pass it in with the ADD transaction)
     // // TODO: AND ADD IT TO THE REPOSITORY NODES (PER PARTITION)
-    // var token = await metadata.DataProvider.GetTokenAsync(result.TokenId) ??
+    // var token = await metadata.DefaultDataProvider.GetTokenAsync(result.TokenId) ??
     // await TokenFactory.MintToken(metadata, new object());
     // var validationResult = await token.ValidateBlock(proposedBlock, metadata);
     //

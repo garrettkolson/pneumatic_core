@@ -6,9 +6,28 @@ use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::tokens::Token;
 
-pub struct DataProvider { }
+pub trait DataProvider {
+    fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
+        DefaultDataProvider::get_token(key, partition_id)
+    }
 
-impl DataProvider {
+    fn save_token(key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
+                  -> Result<(), DataError> {
+        DefaultDataProvider::save_token(key, token_ref, partition_id)
+    }
+
+    fn get_data(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
+        DefaultDataProvider::get_data(key, partition_id)
+    }
+
+    fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
+        DefaultDataProvider::save_data(key, data, partition_id)
+    }
+}
+
+pub struct DefaultDataProvider { }
+
+impl DefaultDataProvider {
     pub fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
         let cache = Self::get_cache();
         if let Some(token_entry) = cache.get(key) { return Ok(token_entry.clone()); }
@@ -35,7 +54,14 @@ impl DataProvider {
         Ok(Arc::new(RwLock::new(data)))
     }
 
-    pub fn save_data<T: serde::Serialize>(key: &Vec<u8>, data: &T, partition_id: &str) -> Result<(), DataError> {
+    pub fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
+        // TODO: implement caching for this
+        let db = Self::get_db_factory().get_db(partition_id)?;
+        let _ = db.save_data(key, data)?;
+        Ok(())
+    }
+
+    pub fn save_typed_data<T: serde::Serialize>(key: &Vec<u8>, data: &T, partition_id: &str) -> Result<(), DataError> {
         // TODO: implement caching for this
         let db = Self::get_db_factory().get_db(partition_id)?;
         let Ok(serialized) = serialize_to_bytes_rmp(data)
