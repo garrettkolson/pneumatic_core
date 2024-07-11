@@ -12,9 +12,9 @@ pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> impl AsymCry
 }
 
 pub trait AsymCryptoProvider {
-    fn encrypt(&self, data: Vec<u8>);
-    fn decrypt(&self, data: Vec<u8>);
-    fn check_signature(&self, signature: Vec<u8>, data: Vec<u8>, public_key: Vec<u8>);
+    fn encrypt(&self, data: Vec<u8>) -> Vec<u8>;
+    fn decrypt(&self, data: Vec<u8>) -> Vec<u8>;
+    fn check_signature(&self, signature: Vec<u8>, data: Vec<u8>, public_key: Vec<u8>) -> bool;
 }
 
 pub struct RsaCryptoProvider {
@@ -28,15 +28,15 @@ impl RsaCryptoProvider {
 }
 
 impl AsymCryptoProvider for RsaCryptoProvider {
-    fn encrypt(&self, data: Vec<u8>) {
+    fn encrypt(&self, data: Vec<u8>) -> Vec<u8> {
         todo!()
     }
 
-    fn decrypt(&self, data: Vec<u8>) {
+    fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
         todo!()
     }
 
-    fn check_signature(&self, signature: Vec<u8>, data: Vec<u8>, public_key: Vec<u8>) {
+    fn check_signature(&self, signature: Vec<u8>, data: Vec<u8>, public_key: Vec<u8>) -> bool {
         todo!()
     }
 }
