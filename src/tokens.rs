@@ -75,32 +75,7 @@ impl Token {
         BlockValidationResult::Ok
     }
 
-    pub fn commit_block(token: Arc<RwLock<Token>>, info: BlockCommitInfo) -> Result<(), BlockCommitError> {
-        let trans_id = info.trans_data.trans_id.clone();
-        let _ = match DefaultDataProvider::save_typed_data(&trans_id, &info.trans_data, &info.env_slush_partition) {
-            Err(err) => return Err(BlockCommitError::FromDataError(err)),
-            Ok(_) => ()
-        };
-
-        {
-            let mut write_token = match token.write() {
-                Err(_) => return Err(BlockCommitError::TokenWriteLockPoisoned),
-                Ok(t) => t
-            };
-
-            if write_token.has_reached_max_chain_length() && !info.is_archiver {
-                write_token.blockchain.remove_block();
-            }
-
-            let block = info.trans_data.proposed_block;
-            write_token.blockchain.add_block(block);
-        }
-
-        DefaultDataProvider::save_token(&info.token_id, token, &info.env_id)
-            .or_else(|err| Err(BlockCommitError::FromDataError(err)))
-    }
-
-    fn has_reached_max_chain_length(&self) -> bool {
+    pub fn has_reached_max_chain_length(&self) -> bool {
         self.security_level == self.blockchain.get_count()
     }
 }
