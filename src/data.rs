@@ -6,21 +6,21 @@ use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::tokens::Token;
 
-pub trait DataProvider {
-    fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
+pub trait DataProvider : Send + Sync {
+    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
         DefaultDataProvider::get_token(key, partition_id)
     }
 
-    fn save_token(key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
+    fn save_token(&self, key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
                   -> Result<(), DataError> {
         DefaultDataProvider::save_token(key, token_ref, partition_id)
     }
 
-    fn get_data(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
+    fn get_data(&self, key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
         DefaultDataProvider::get_data(key, partition_id)
     }
 
-    fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
+    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
         DefaultDataProvider::save_data(key, data, partition_id)
     }
 }
