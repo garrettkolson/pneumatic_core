@@ -109,6 +109,7 @@ impl NodeRegistry {
         let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for node registry updates");
 
+        // TODO: wrap listener in trait
         for stream in listener.incoming() {
             let _ = match stream {
                 Err(_) => continue,
@@ -127,6 +128,8 @@ impl NodeRegistry {
             };
         }
     }
+
+    // TODO: make method to send message to all nodes of type on threads
 
     fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {
         Success

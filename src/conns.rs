@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::str::from_boxed_utf8_unchecked;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -39,9 +40,7 @@ pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, 
     })
 }
 
-pub trait IsConnection : Send {
-
-}
+///////////////////// Senders ////////////////////////
 
 pub trait FireAndForgetSender : Send + Sync {
     fn send(&self, addr: SocketAddr, data: &[u8]);
@@ -82,9 +81,68 @@ impl Sender for TcpSender {
     }
 }
 
+///////////////////// Listeners ////////////////////////
+
+pub trait Listener {
+    fn accept(&self) -> Result<(Box<dyn Stream>, SocketAddr), std::io::Error>;
+}
+
+pub struct CoreTcpListener {
+    inner_listener: TcpListener
+}
+
+impl CoreTcpListener {
+    fn new(addr: SocketAddr) -> Self {
+        CoreTcpListener {
+            inner_listener: TcpListener::bind(addr)
+                .expect(&format!("Couldn't set up external TCP listener on socket {0}", addr))
+        }
+    }
+}
+
+impl Listener for CoreTcpListener {
+    fn accept(&self) -> Result<(Box<dyn Stream>, SocketAddr), std::io::Error> {
+        let (stream, addr) = self.inner_listener.accept()?;
+        let core_stream = Box::new(CoreTcpStream::from_stream(stream));
+        Ok((core_stream, addr))
+    }
+}
+
+///////////////////// Streams ///////////////////////
+
+pub trait Stream {
+    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error>;
+    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), std::io::Error>;
+}
+
+pub struct CoreTcpStream {
+    inner_stream: TcpStream
+}
+
+impl CoreTcpStream {
+    fn from_stream(stream: TcpStream) -> Self {
+        CoreTcpStream {
+            inner_stream: stream
+        }
+    }
+}
+
+impl Stream for CoreTcpStream {
+    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+        self.inner_stream.read_to_end(buffer)
+    }
+
+    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), std::io::Error> {
+        self.inner_stream.write_all(data)
+    }
+}
+
+////////////////////// Factories ////////////////////////
+
 pub trait ConnFactory : Send + Sync {
     fn get_sender(&self) -> Box<dyn Sender>;
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
+    fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener>;
 }
 
 pub struct TcpConnFactory { }
@@ -102,6 +160,10 @@ impl ConnFactory for TcpConnFactory {
 
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender> {
         Box::new(TcpFafSender {})
+    }
+
+    fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener> {
+        Box::new(CoreTcpListener::new(addr))
     }
 }
 

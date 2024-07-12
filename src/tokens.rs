@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
+use std::ops::Deref;
 use serde::{Deserialize, Serialize};
 use crate::blocks::{Block, Blockchain};
 use crate::data::{DataError};
@@ -75,31 +76,26 @@ impl Token {
             return BlockValidationResult::Err(BlockValidationError::InvalidFinalizerSignature)
         }
 
-        let transaction = &block.signed_trans.transaction;
-        let Ok(_) = serialize_to_bytes_rmp(transaction)
-            .and_then(|data| {
-                env_data.asym_crypto_provider.lock()
-                    .and_then(|provider| {
-                        Ok(provider.check_signature(&block.signed_trans.finalizer_sig.signature, &data))
-                    })
-                    .map_err(|err| Error::other(err))
-            })
-            else {
-                return BlockValidationResult::Err(BlockValidationError::FinalizedTransactionDataWasModified);
-            };
+        // let transaction = &block.signed_trans.transaction;
+        // let Ok(_) = serialize_to_bytes_rmp(transaction)
+        //     .and_then(|data| {
+        //         env_data.asym_crypto_provider.lock()
+        //             .and_then(|provider| {
+        //                 Ok(provider.check_signature(&block.signed_trans.finalizer_sig.signature, &data))
+        //             })
+        //     })
+        //     else {
+        //         return BlockValidationResult::Err(BlockValidationError::FinalizedTransactionDataWasModified);
+        //     };
 
-        let default_validator: Box<dyn BlockValidator> = Box::new(DefaultBlockValidator {});
-        let validator = match self.metadata.get("validator_name") {
-            None => &default_validator,
-            Some(name) => {
-                match env_data.block_validators.get(name) {
-                    Some(v) => v.value(),
-                    None => &default_validator
-                }
-            }
-        };
+        let default_name = String::new();
+        let validator_name = self.metadata.get("validator_name")
+            .unwrap_or_else(|| &default_name);
 
-        validator.validate(block, &self)
+        match env_data.block_validators.get(validator_name) {
+            None => DefaultBlockValidator{}.validate(block, &self),
+            Some(v) => v.validate(block, &self)
+        }
     }
 
     pub fn has_reached_max_chain_length(&self) -> bool {
@@ -136,12 +132,13 @@ pub enum BlockValidationResult {
 
 #[derive(Debug)]
 pub enum BlockValidationError {
-    TokenNotFount,
+    TokenNotFound,
     ImproperBlockFormatting,
     IncorrectExecutorTransactionHash,
     IncorrectExecutorTransactionSignature,
     FinalizedTransactionDataWasModified,
-    InvalidFinalizerSignature
+    InvalidFinalizerSignature,
+    
 }
 
 pub enum BlockCommitError {
