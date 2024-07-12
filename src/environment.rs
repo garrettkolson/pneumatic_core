@@ -1,7 +1,9 @@
 use std::sync::Mutex;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
+use crate::tokens::BlockValidator;
 
 pub struct EnvironmentMetadata {
     pub environment_id: String,
@@ -13,7 +15,8 @@ pub struct EnvironmentMetadata {
     pub partitions: Vec<EnvironmentPartition>,
     pub quorum_percentage: f32,
     pub override_quorum_percentage: f32,
-    pub asym_crypto_provider: Mutex<Box<dyn AsymCryptoProvider>>
+    pub asym_crypto_provider: Mutex<Box<dyn AsymCryptoProvider>>,
+    pub block_validators: DashMap<String, Box<dyn BlockValidator>>
     // TODO: have to finish this
 }
 
@@ -53,7 +56,8 @@ impl EnvironmentMetadata {
             partitions: spec.partitions,
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
-            asym_crypto_provider: Mutex::new(asym_provider)
+            asym_crypto_provider: Mutex::new(asym_provider),
+            block_validators: DashMap::new()    // TODO: have to finish this
         }
     }
 }

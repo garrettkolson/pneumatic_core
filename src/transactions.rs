@@ -9,7 +9,11 @@ pub struct Transaction {
 
 #[derive(Serialize, Deserialize)]
 pub struct TransactionSignature {
-
+    pub transaction_id: Vec<u8>,
+    pub env_id: Vec<u8>,
+    pub transaction_hash: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub current_stake: u64
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,7 +41,13 @@ impl SignedTransaction {
             leader_stake: 24,
             leader_hash: vec![],
             finalizer_addr: vec![],
-            finalizer_sig: TransactionSignature {},
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0
+            },
             executor_sigs: HashMap::new()
         }
     }

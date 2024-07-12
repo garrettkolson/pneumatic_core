@@ -1,19 +1,16 @@
-use std::collections::{HashMap,VecDeque};
+use std::collections::{VecDeque};
+use std::hash::Hash;
 use std::vec;
 use chrono::{Utc, prelude::*};
 use serde::{Deserialize, Serialize};
 use crate::transactions::{SignedTransaction};
-use crate::tokens::Token;
 
 #[derive(Serialize, Deserialize)]
 pub struct Block {
-    //pub transaction_id : String,
     pub signed_trans : SignedTransaction,
     pub previous_hash : Vec<u8>,
     pub current_hash : Vec<u8>,
-    pub timestamp : i64,
-    // pub executor_sigs : DashMap<Vec<u8>, TransactionSignature>,
-    // pub finalizer_sig : KeyValuePair<Vec<u8>, TransactionSignature>
+    pub timestamp : i64
 }
 
 impl Block {
@@ -25,12 +22,9 @@ impl Block {
         };
 
         Block {
-            //transaction_id: signed.transaction_id,
             signed_trans: signed,
             previous_hash: prev_hash,
             timestamp: Utc::now().timestamp(),
-            // executor_sigs: signed.executor_sigs,
-            // finalizer_sig: signed.finalizer_sig,
             current_hash: vec![]
         }
     }
@@ -38,13 +32,10 @@ impl Block {
     fn test_block(prev_hash: Vec<u8>) -> Self {
         let test_transaction = SignedTransaction::test_transaction();
         let mut block = Block {
-            //transaction_id: test_transaction.transaction_id,
             signed_trans: test_transaction,
             previous_hash: prev_hash,
             current_hash: vec![],
-            timestamp: Utc::now().timestamp(),
-            // executor_sigs: test_transaction.executor_sigs,
-            // finalizer_sig: test_transaction.finalizer_sig
+            timestamp: Utc::now().timestamp()
         };
 
         block.current_hash = BlockFactory::create_hash(&block);
@@ -68,6 +59,7 @@ impl BlockFactory {
             .expect("");
         hash.append(&mut trans_bytes);
 
+        // TODO: need to find a way to include token metadata here, so that can't be modified maliciously
         // TODO: actually hash these bytes via the crypto module
         hash
     }
@@ -122,14 +114,14 @@ impl Blockchain {
         ChainState::invalid()
     }
 
-    pub fn validate_next_block(&self, next_block: Block) -> bool {
+    pub fn validate_next_block(&self, next_block: &Block) -> bool {
         let current_state = self.get_current_chain_state();
         if !current_state.is_valid { return false; }
 
         match current_state.last_hash_in.len() {
             0 => false,
             _ => current_state.last_hash_in == next_block.previous_hash &&
-                BlockFactory::create_hash(&next_block) == next_block.current_hash
+                BlockFactory::create_hash(next_block) == next_block.current_hash
         }
     }
 }
@@ -219,7 +211,7 @@ pub mod tests {
 
         let valid_next_block = Block::test_block(last_block_hash);
 
-        assert!(blockchain.validate_next_block(valid_next_block));
+        assert!(blockchain.validate_next_block(&valid_next_block));
     }
 
     #[test]
@@ -232,7 +224,7 @@ pub mod tests {
 
         let invalid_next_block = Block::test_block(vec![ 1, 2, 3 ]);
 
-        assert!(!blockchain.validate_next_block(invalid_next_block));
+        assert!(!blockchain.validate_next_block(&invalid_next_block));
     }
 
     #[test]
@@ -248,6 +240,6 @@ pub mod tests {
 
         invalid_next_block.current_hash = vec![ 1, 2, 3 ];
 
-        assert!(!blockchain.validate_next_block(invalid_next_block));
+        assert!(!blockchain.validate_next_block(&invalid_next_block));
     }
 }

@@ -40,3 +40,7 @@ impl AsymCryptoProvider for RsaCryptoProvider {
         todo!()
     }
 }
+
+pub trait HashProvider : Send + Sync {
+    fn hash(&self, data: &Vec<u8>) -> Vec<u8>;
+}
