@@ -103,7 +103,7 @@ impl Token {
     }
 }
 
-pub trait BlockValidator {
+pub trait BlockValidator : Send + Sync {
     fn validate(&self, block: &Block, token: &Token) -> BlockValidationResult;
 }
 

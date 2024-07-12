@@ -110,7 +110,7 @@ impl Listener for CoreTcpListener {
 
 ///////////////////// Streams ///////////////////////
 
-pub trait Stream {
+pub trait Stream : Send + Sync {
     fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error>;
     fn write_all(&mut self, data: &Vec<u8>) -> Result<(), std::io::Error>;
 }
