@@ -1,11 +1,14 @@
 use std::io::{BufReader, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::thread::JoinHandle;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use crate::{conns, messages, server};
+use crate::conns::{ConnError, ConnFactory};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::node::RegistrationBatchResult::Success;
 
@@ -69,17 +72,19 @@ pub struct NodeRegistry {
     sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
     executors: Arc<DashMap<Vec<u8>, IpAddr>>,
     finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    conn_factory: Arc<Box<dyn ConnFactory>>
 }
 
 impl NodeRegistry {
     const LISTENER_THREAD_COUNT: usize = 4;
 
-    pub fn init() -> Self {
+    pub fn init(conn_factory: Box<dyn ConnFactory>) -> Self {
         NodeRegistry {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
+            conn_factory: Arc::new(conn_factory)
         }
     }
 
@@ -104,32 +109,47 @@ impl NodeRegistry {
         let port_num = conns::get_internal_port(this_func_type);
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
 
-        let listener = TcpListener::bind(addr)
-            .expect("Couldn't set up internal listener for node registry updates");
+        let listener = &registry.conn_factory.get_listener(addr);
         let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for node registry updates");
 
-        // TODO: wrap listener in trait
-        for stream in listener.incoming() {
-            let _ = match stream {
+        loop {
+            match listener.accept() {
                 Err(_) => continue,
-                Ok(mut stream) => {
+                Ok((mut stream, _)) => {
                     let cloned_registry = registry.clone();
                     let _ = thread_pool.execute(move || {
-                        let buf_reader = BufReader::new(&mut stream);
-                        let raw_data = buf_reader.buffer().to_vec();
-                        let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&raw_data)
+                        let mut data: Vec<u8> = vec![];
+                        let _ = stream.read_to_end(&mut data);
+                        let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&data)
                             else { return };
 
                         let _ = cloned_registry.process_registration(reg);
                         stream.write_all(&messages::acknowledge()).unwrap()
                     });
                 }
-            };
+            }
         }
     }
 
-    // TODO: make method to send message to all nodes of type on threads
+    pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
+        let shared_data = Arc::new(RwLock::new(data));
+        let Some(nodes) = self.get_nodes(node_type) else { return };
+
+        let threads: Vec<JoinHandle<Vec<u8>>> = nodes.iter().map(|node| -> JoinHandle<Vec<u8>> {
+            let data_clone = shared_data.clone();
+            let sender = self.conn_factory.get_sender();
+            let addr = SocketAddr::new(node.value().clone(), conns::get_external_port(node_type));
+            thread::spawn(move ||{
+                let Ok(read_data) = data_clone.read() else { return vec![] };
+                sender.get_response(addr, read_data.as_slice()).unwrap_or_else(|_| vec![])
+            })
+        }).collect();
+
+        for thread in threads {
+            let _ = thread.join();
+        }
+    }
 
     fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {
         Success
