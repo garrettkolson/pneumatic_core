@@ -11,3 +11,4 @@ pub mod tokens;
 pub mod blocks;
 pub mod transactions;
 pub mod messages;
+pub mod logging;

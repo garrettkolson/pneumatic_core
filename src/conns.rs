@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::str::from_boxed_utf8_unchecked;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
