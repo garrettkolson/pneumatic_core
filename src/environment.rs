@@ -47,7 +47,7 @@ impl EnvironmentMetadata {
                 spec.environment_name));
 
         let asym_provider = Box::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
-        let logger = Arc::new(Box::new(FileLogger::new(spec.log_file.clone())));
+        let logger: Arc<Box<dyn Logger>> = Arc::new(Box::new(FileLogger::new(spec.log_file.clone())));
 
         EnvironmentMetadata {
             environment_id: spec.environment_id,
