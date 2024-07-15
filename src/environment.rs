@@ -1,8 +1,9 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
+use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
 
 pub struct EnvironmentMetadata {
@@ -16,7 +17,8 @@ pub struct EnvironmentMetadata {
     pub quorum_percentage: f32,
     pub override_quorum_percentage: f32,
     pub asym_crypto_provider: Mutex<Box<dyn AsymCryptoProvider>>,
-    pub block_validators: DashMap<String, Box<dyn BlockValidator>>
+    pub block_validators: DashMap<String, Box<dyn BlockValidator>>,
+    pub logger: Arc<Box<dyn Logger>>
     // TODO: have to finish this
 }
 
@@ -45,6 +47,7 @@ impl EnvironmentMetadata {
                 spec.environment_name));
 
         let asym_provider = Box::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
+        let logger = Arc::new(Box::new(FileLogger::new(spec.log_file.clone())));
 
         EnvironmentMetadata {
             environment_id: spec.environment_id,
@@ -57,7 +60,9 @@ impl EnvironmentMetadata {
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
             asym_crypto_provider: Mutex::new(asym_provider),
-            block_validators: DashMap::new()    // TODO: have to finish this
+            block_validators: DashMap::new(),
+            logger
+            // TODO: have to finish this
         }
     }
 }
@@ -74,7 +79,8 @@ pub struct EnvironmentMetadataSpec {
     override_quorum_percentage: f32,
     allowed_token_types: Vec<String>,
     trans_validation_specs: Vec<String>,
-    block_validation_specs: Vec<String>
+    block_validation_specs: Vec<String>,
+    log_file: String
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
