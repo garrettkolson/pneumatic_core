@@ -19,6 +19,7 @@ pub struct Config {
     pub node_type: NodeType,
     pub node_registry_types: Vec<NodeRegistryType>,
     pub main_environment_id: String,
+    pub reconciliation_partition_id: String,
     pub environment_metadata: Arc<DashMap<String, EnvironmentMetadata>>,
     pub type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>
 }
@@ -51,7 +52,8 @@ impl Config {
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
             node_registry_types: vec![],
             environment_metadata,
-            main_environment_id: String::from(""),
+            main_environment_id: spec.main_env_id,
+            reconciliation_partition_id: spec.reconciliation_partition_id,
             type_configs: Arc::new(DashMap::new())
         })
     }
@@ -104,5 +106,7 @@ pub struct ConfigSpec {
     is_full_node: bool,
     rest_api_version: usize,
     balance: u64,
-    environments: Vec<String>
+    environments: Vec<String>,
+    main_env_id: String,
+    reconciliation_partition_id: String
 }
