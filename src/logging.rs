@@ -1,7 +1,7 @@
 use std::io::Write;
 use file_lock::{FileLock, FileOptions};
 
-pub trait Logger {
+pub trait Logger : Send + Sync {
     fn log(&self, message: String);
 }
 
