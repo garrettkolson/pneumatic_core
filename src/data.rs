@@ -187,10 +187,7 @@ impl Db for RocksDb {
         let Ok(data) = serialize_to_bytes_rmp(token.deref())
             else { return Err(DataError::SerializationError) };
 
-        match self.store.put(key, data) {
-            Err(err) => Err(DataError::FromStore(err.into_string())),
-            Ok(_) => Ok(())
-        }
+        self.save_data(key, data)
     }
 
     fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError> {
