@@ -1,13 +1,15 @@
-use std::collections::{VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::vec;
 use chrono::{Utc, prelude::*};
 use serde::{Deserialize, Serialize};
+use crate::tokens::Token;
 use crate::transactions::{SignedTransaction};
 
 #[derive(Serialize, Deserialize)]
 pub struct Block {
     pub signed_trans : SignedTransaction,
+    pub token_metadata: HashMap<String, String>,
     pub previous_hash : Vec<u8>,
     pub current_hash : Vec<u8>,
     pub timestamp : i64
@@ -15,7 +17,8 @@ pub struct Block {
 
 impl Block {
     pub fn from_transaction(signed: SignedTransaction,
-                                  blockchain: Blockchain) -> Self {
+                            blockchain: Blockchain,
+                            token: &Token) -> Self {
         let prev_hash = match blockchain.get_count() {
             0 => signed.leader_hash.clone(),
             _ => blockchain.get_current_chain_state().last_hash_in
@@ -23,6 +26,7 @@ impl Block {
 
         Block {
             signed_trans: signed,
+            token_metadata: token.metadata.clone(),
             previous_hash: prev_hash,
             timestamp: Utc::now().timestamp(),
             current_hash: vec![]
@@ -33,6 +37,7 @@ impl Block {
         let test_transaction = SignedTransaction::test_transaction();
         let mut block = Block {
             signed_trans: test_transaction,
+            token_metadata: HashMap::new(),
             previous_hash: prev_hash,
             current_hash: vec![],
             timestamp: Utc::now().timestamp()
@@ -43,25 +48,27 @@ impl Block {
     }
 }
 
-pub struct BlockFactory {
-
-}
+pub struct BlockFactory {}
 
 impl BlockFactory {
     pub fn create_hash(block: &Block) -> Vec<u8> {
-        let mut hash = block.previous_hash.clone();
+        let mut input = block.previous_hash.clone();
 
         let mut time_bytes = crate::encoding::serialize_to_bytes_rmp(&block.timestamp)
-            .expect("");
-        hash.append(&mut time_bytes);
+            .expect("Block timestamp couldn't be serialized.");
+        input.append(&mut time_bytes);
 
         let mut trans_bytes = crate::encoding::serialize_to_bytes_rmp(&block.signed_trans)
-            .expect("");
-        hash.append(&mut trans_bytes);
+            .expect("Block signed transaction couldn't be serialized.");
+        input.append(&mut trans_bytes);
 
         // TODO: need to find a way to include token metadata here, so that can't be modified maliciously
+        let mut metadata_bytes = crate::encoding::serialize_to_bytes_rmp(&block.token_metadata)
+            .expect("Block token metadata couldn't be serialized.");
+        input.append(&mut metadata_bytes);
+
         // TODO: actually hash these bytes via the crypto module
-        hash
+        input
     }
 }
 

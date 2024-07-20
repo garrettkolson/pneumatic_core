@@ -1,9 +1,10 @@
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use crate::messages::acknowledge;
 use crate::node::NodeRegistryType;
 
 pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
@@ -136,12 +137,79 @@ impl Stream for CoreTcpStream {
     }
 }
 
+///////////////////// Connections ///////////////////////
+
+pub trait Connection : Send + Sync {
+    fn send(&self, data: &Vec<u8>) -> Result<(), ConnError>;
+}
+
+pub struct TcpConnection {
+    stream: Arc<TcpStream>,
+    listening_thread: JoinHandle<()>
+}
+
+impl TcpConnection {
+    pub fn from_stream<F>(stream: TcpStream, mut on_received: F) -> Self
+        where F : FnMut(Vec<u8>) + Send + 'static {
+        let stream = Arc::new(stream);
+        let listening_stream = stream.clone();
+        let thread = thread::spawn(move || loop {
+            let mut reader = BufReader::new(listening_stream.as_ref());
+            let mut data: Vec<u8> = vec![];
+            let Ok(_) = reader.read_to_end(&mut data) else { return };
+            on_received(data)
+
+            // TODO: else case should break loop, retry original connection?, then initiate drop
+        });
+
+        TcpConnection {
+            stream,
+            listening_thread: thread,
+        }
+    }
+}
+
+impl Connection for TcpConnection {
+    fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
+        let mut sending_stream = self.stream.clone();
+        let mut writer = BufWriter::new(sending_stream.as_ref());
+        match writer.write_all(data) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // TODO: implement flag to drop connection from Registry here
+                Err(ConnError::IO(err.to_string()))
+            }
+        }
+    }
+}
+
+// impl Drop for TcpConnection {
+//     fn drop(&mut self) {
+//         self.listening_thread.join();
+//     }
+// }
+
+//impl Drop for ThreadPool {
+//     fn drop(&mut self) {
+//         drop(self.sender.take());
+//
+//         for worker in &mut self.workers {
+//             println!("Shutting down worker {}", worker.id);
+//             if let Some(thread) = worker.thread.take() {
+//                 thread.join().unwrap();
+//             }
+//         }
+//     }
+// }
+
 ////////////////////// Factories ////////////////////////
 
 pub trait ConnFactory : Send + Sync {
     fn get_sender(&self) -> Box<dyn Sender>;
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
     fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener>;
+    fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
+        -> Result<Box<dyn Connection>, ConnError>;
 }
 
 pub struct TcpConnFactory { }
@@ -164,11 +232,38 @@ impl ConnFactory for TcpConnFactory {
     fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener> {
         Box::new(CoreTcpListener::new(addr))
     }
+
+    fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
+        -> Result<Box<dyn Connection>, ConnError> {
+        let Ok(mut stream) = TcpStream::connect(addr)
+            else { return Err(ConnError::CouldNotEstablishStream) };
+
+        // TODO: pull function to get this node's registration into nodes module for access
+        let request = &vec![];
+        let Ok(_) = stream.write_all(request)
+            else { return Err(ConnError::WriteError(None)) };
+
+        let mut data: Vec<u8> = vec![];
+        let Ok(_) = stream.read_to_end(&mut data)
+            else { return Err(ConnError::ReadError(None)) };
+
+        match data == acknowledge() {
+            false => Err(ConnError::ConnectionRejectedByRemote),
+            true => {
+                let conn = TcpConnection::from_stream(stream, on_received);
+                Ok(Box::new(conn))
+            }
+        }
+    }
 }
 
 pub enum ConnError {
     IO(String),
-    MalformedData(String)
+    MalformedData(String),
+    CouldNotEstablishStream,
+    WriteError(Option<String>),
+    ReadError(Option<String>),
+    ConnectionRejectedByRemote
 }
 
 const CONN_TIMEOUT_IN_SECS: u64 = 60;

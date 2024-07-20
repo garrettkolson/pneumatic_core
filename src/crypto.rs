@@ -44,3 +44,11 @@ impl AsymCryptoProvider for RsaCryptoProvider {
 pub trait HashProvider : Send + Sync {
     fn hash(&self, data: &Vec<u8>) -> Vec<u8>;
 }
+
+pub struct BasicHashProvider {}
+
+impl HashProvider for BasicHashProvider {
+    fn hash(&self, data: &Vec<u8>) -> Vec<u8> {
+        todo!()
+    }
+}
