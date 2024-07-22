@@ -4,6 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use crate::messages::acknowledge;
 use crate::node::NodeRegistryType;
 
@@ -144,36 +146,34 @@ pub trait Connection : Send + Sync {
 }
 
 pub struct TcpConnection {
-    stream: Arc<tokio::net::TcpStream>,
+    writer: OwnedWriteHalf,
     listening_thread: JoinHandle<()>
 }
 
 impl TcpConnection {
     pub fn from_stream<F>(stream: tokio::net::TcpStream, mut on_received: F) -> Self
         where F : FnMut(Vec<u8>) + Send + 'static {
-        let stream = Arc::new(stream);
-        let listening_stream = stream.clone();
-        let thread = thread::spawn(move || loop {
-            let mut reader = BufReader::new(listening_stream.as_ref());
+        let (mut reader, mut writer) = stream.into_split();
+        let thread = thread::spawn(async move || loop {
             let mut data: Vec<u8> = vec![];
-            let Ok(_) = reader.read_to_end(&mut data) else { return };
+            let Ok(_) = reader.read_to_end(&mut data).await
+                else { return };
             on_received(data)
 
+            // TODO: implement a Frame enum and parser
             // TODO: else case should break loop, retry original connection?, then initiate drop
         });
 
         TcpConnection {
-            stream,
+            writer,
             listening_thread: thread,
         }
     }
 }
 
 impl Connection for TcpConnection {
-    fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
-        let mut sending_stream = self.stream.clone();
-        let mut writer = BufWriter::new(sending_stream.as_ref());
-        match writer.write_all(data) {
+    async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError> {
+        match self.writer.write_all(data).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 // TODO: implement flag to drop connection from Registry here
@@ -204,11 +204,12 @@ impl Connection for TcpConnection {
 
 ////////////////////// Factories ////////////////////////
 
+#[async-trait]
 pub trait ConnFactory : Send + Sync {
     fn get_sender(&self) -> Box<dyn Sender>;
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
     fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener>;
-    fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
+    async fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
         -> Result<Box<dyn Connection>, ConnError>;
 }
 
@@ -233,9 +234,9 @@ impl ConnFactory for TcpConnFactory {
         Box::new(CoreTcpListener::new(addr))
     }
 
-    fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
+    async fn request_connection(&self, addr: SocketAddr, on_received: Box<dyn FnMut(Vec<u8>) + Send + 'static>)
         -> Result<Box<dyn Connection>, ConnError> {
-        let Ok(mut stream) = TcpStream::connect(addr)
+        let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await
             else { return Err(ConnError::CouldNotEstablishStream) };
 
         // TODO: pull function to get this node's registration into nodes module for access
