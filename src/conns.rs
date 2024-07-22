@@ -144,12 +144,12 @@ pub trait Connection : Send + Sync {
 }
 
 pub struct TcpConnection {
-    stream: Arc<TcpStream>,
+    stream: Arc<tokio::net::TcpStream>,
     listening_thread: JoinHandle<()>
 }
 
 impl TcpConnection {
-    pub fn from_stream<F>(stream: TcpStream, mut on_received: F) -> Self
+    pub fn from_stream<F>(stream: tokio::net::TcpStream, mut on_received: F) -> Self
         where F : FnMut(Vec<u8>) + Send + 'static {
         let stream = Arc::new(stream);
         let listening_stream = stream.clone();
