@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use crate::messages::acknowledge;
@@ -141,24 +142,27 @@ impl Stream for CoreTcpStream {
 
 ///////////////////// Connections ///////////////////////
 
+#[async_trait]
 pub trait Connection : Send + Sync {
-    fn send(&self, data: &Vec<u8>) -> Result<(), ConnError>;
+    async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError>;
 }
 
 pub struct TcpConnection {
     writer: OwnedWriteHalf,
-    listening_thread: JoinHandle<()>
+    listening_thread: tokio::task::JoinHandle<()>
 }
 
 impl TcpConnection {
     pub fn from_stream<F>(stream: tokio::net::TcpStream, mut on_received: F) -> Self
         where F : FnMut(Vec<u8>) + Send + 'static {
         let (mut reader, mut writer) = stream.into_split();
-        let thread = thread::spawn(async move || loop {
-            let mut data: Vec<u8> = vec![];
-            let Ok(_) = reader.read_to_end(&mut data).await
-                else { return };
-            on_received(data)
+        let thread = tokio::spawn(async move {
+            loop {
+                let mut data: Vec<u8> = vec![];
+                let Ok(_) = reader.read_to_end(&mut data).await
+                    else { return };
+                on_received(data)
+            }
 
             // TODO: implement a Frame enum and parser
             // TODO: else case should break loop, retry original connection?, then initiate drop
@@ -171,6 +175,7 @@ impl TcpConnection {
     }
 }
 
+#[async_trait]
 impl Connection for TcpConnection {
     async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError> {
         match self.writer.write_all(data).await {
@@ -204,7 +209,7 @@ impl Connection for TcpConnection {
 
 ////////////////////// Factories ////////////////////////
 
-#[async-trait]
+#[async_trait]
 pub trait ConnFactory : Send + Sync {
     fn get_sender(&self) -> Box<dyn Sender>;
     fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
@@ -221,6 +226,7 @@ impl TcpConnFactory {
     }
 }
 
+#[async_trait]
 impl ConnFactory for TcpConnFactory {
     fn get_sender(&self) -> Box<dyn Sender> {
         Box::new(TcpSender {})
@@ -241,11 +247,11 @@ impl ConnFactory for TcpConnFactory {
 
         // TODO: pull function to get this node's registration into nodes module for access
         let request = &vec![];
-        let Ok(_) = stream.write_all(request)
+        let Ok(_) = stream.write_all(request).await
             else { return Err(ConnError::WriteError(None)) };
 
         let mut data: Vec<u8> = vec![];
-        let Ok(_) = stream.read_to_end(&mut data)
+        let Ok(_) = stream.read_to_end(&mut data).await
             else { return Err(ConnError::ReadError(None)) };
 
         match data == acknowledge() {

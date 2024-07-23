@@ -21,3 +21,4 @@ ring = "0.17.8"
 tokio = { version = "1.38.1", features = ["full"] }
 tokio-macros = "2.3.0"
 tokio-stream = "0.1.15"
+async-trait = "0.1.81"
