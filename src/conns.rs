@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use crate::messages::acknowledge;
 use crate::node::NodeRegistryType;
 
@@ -158,13 +158,13 @@ impl TcpConnection {
         let (mut reader, mut writer) = stream.into_split();
         let thread = tokio::spawn(async move {
             loop {
-                let mut data: Vec<u8> = vec![];
-                let Ok(_) = reader.read_to_end(&mut data).await
-                    else { return };
-                on_received(data)
+                match Self::get_data(&mut reader).await {
+                    Ok(data) => on_received(data),
+                    Err(ConnError::ReadError(_)) => continue,
+                    _ => break
+                }
             }
 
-            // TODO: implement a Frame enum and parser
             // TODO: else case should break loop, retry original connection?, then initiate drop
         });
 
@@ -173,11 +173,31 @@ impl TcpConnection {
             listening_thread: thread,
         }
     }
+
+    async fn get_data(reader: &mut OwnedReadHalf) -> Result<Vec<u8>, ConnError> {
+        let mut header: Vec<u8> = vec![0u8, 4];
+        if let Err(err) = reader.read_exact(&mut header).await {
+            return Err(ConnError::ReadError(Some(err.to_string())))
+        }
+
+        let data_length = usize::from_be_bytes(header.try_into().unwrap_or_default());
+        let mut data: Vec<u8> = vec![0u8; data_length];
+        match reader.read_exact(&mut data).await {
+            Ok(_) => Ok(data),
+            Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
+        }
+    }
 }
 
 #[async_trait]
 impl Connection for TcpConnection {
     async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError> {
+        let length_header = data.len().to_be_bytes();
+        let _ = match self.writer.write_all(&length_header).await {
+            Err(err) => Err(ConnError::WriteError(Some(err.to_string()))),
+            Ok(()) => Ok(())
+        };
+
         match self.writer.write_all(data).await {
             Ok(()) => Ok(()),
             Err(err) => {

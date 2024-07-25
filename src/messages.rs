@@ -9,6 +9,10 @@ pub struct Message {
     pub public_key: Vec<u8>
 }
 
+pub struct MessageBody {
+    // TODO: implement this
+}
+
 pub fn acknowledge() -> Vec<u8> {
     Vec::from(b"ack")
 }

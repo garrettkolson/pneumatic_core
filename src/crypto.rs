@@ -15,6 +15,7 @@ pub trait AsymCryptoProvider : Send + Sync {
     fn encrypt(&self, data: Vec<u8>) -> Vec<u8>;
     fn decrypt(&self, data: Vec<u8>) -> Vec<u8>;
     fn check_signature(&self, signature: &Vec<u8>, data: &Vec<u8>) -> bool;
+    fn sign_data(&self, data: &Vec<u8>) -> Vec<u8>;
 }
 
 pub struct RsaCryptoProvider {
@@ -37,6 +38,10 @@ impl AsymCryptoProvider for RsaCryptoProvider {
     }
 
     fn check_signature(&self, signature: &Vec<u8>, data: &Vec<u8>) -> bool {
+        todo!()
+    }
+
+    fn sign_data(&self, data: &Vec<u8>) -> Vec<u8> {
         todo!()
     }
 }
