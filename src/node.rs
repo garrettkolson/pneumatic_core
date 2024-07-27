@@ -1,5 +1,4 @@
-use std::io::{BufReader, Write};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -8,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use crate::{conns, messages, server};
-use crate::conns::{ConnError, ConnFactory};
-use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+use crate::conns::Connection;
+use crate::conns::factories::ConnFactory;
+use crate::encoding::{deserialize_rmp_to};
 use crate::node::RegistrationBatchResult::Success;
 
 pub enum NodeType {
@@ -68,10 +68,10 @@ pub enum RegistrationBatchResult {
 }
 
 pub struct NodeRegistry {
-    committers: Arc<DashMap<Vec<u8>, IpAddr>>,
-    sentinels: Arc<DashMap<Vec<u8>, IpAddr>>,
-    executors: Arc<DashMap<Vec<u8>, IpAddr>>,
-    finalizers: Arc<DashMap<Vec<u8>, IpAddr>>,
+    committers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
+    sentinels: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
+    executors: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
+    finalizers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     conn_factory: Arc<Box<dyn ConnFactory>>
 }
 
@@ -132,6 +132,10 @@ impl NodeRegistry {
         }
     }
 
+    // pub async fn listen_for_conn_requests(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
+    //
+    // }
+
     pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let shared_data = Arc::new(RwLock::new(data));
         let Some(nodes) = self.get_nodes(node_type) else { return };
@@ -139,7 +143,7 @@ impl NodeRegistry {
         let threads: Vec<JoinHandle<Vec<u8>>> = nodes.iter().map(|node| -> JoinHandle<Vec<u8>> {
             let data_clone = shared_data.clone();
             let sender = self.conn_factory.get_sender();
-            let addr = SocketAddr::new(node.value().clone(), conns::get_external_port(node_type));
+            let addr = SocketAddr::new(node.value().ip.clone(), conns::get_external_port(node_type));
             thread::spawn(move ||{
                 let Ok(read_data) = data_clone.read() else { return vec![] };
                 sender.get_response(addr, read_data.as_slice()).unwrap_or_else(|_| vec![])
@@ -156,7 +160,12 @@ impl NodeRegistry {
     }
 }
 
-pub type Nodes = Arc<DashMap<Vec<u8>, IpAddr>>;
+pub type Nodes = Arc<DashMap<Vec<u8>, NodeRegistryNode>>;
+
+pub struct NodeRegistryNode {
+    pub ip: IpAddr,
+    pub conn: Box<dyn Connection>
+}
 
 #[derive(Eq)]
 #[derive(PartialEq)]
