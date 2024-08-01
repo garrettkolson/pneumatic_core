@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -7,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use crate::{conns, messages, server};
-use crate::conns::Connection;
+use crate::conns::{Connection};
 use crate::conns::factories::ConnFactory;
+use crate::conns::streams::Stream;
 use crate::encoding::{deserialize_rmp_to};
 use crate::node::RegistrationBatchResult::Success;
 
@@ -72,19 +74,23 @@ pub struct NodeRegistry {
     sentinels: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     executors: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     finalizers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
-    conn_factory: Arc<Box<dyn ConnFactory>>
+    conn_factory: Arc<Box<dyn ConnFactory>>,
+    on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>
 }
 
 impl NodeRegistry {
     const LISTENER_THREAD_COUNT: usize = 4;
 
-    pub fn init(conn_factory: Box<dyn ConnFactory>) -> Self {
+    pub fn init(conn_factory: Box<dyn ConnFactory>,
+                on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
+        -> Self {
         NodeRegistry {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
-            conn_factory: Arc::new(conn_factory)
+            conn_factory: Arc::new(conn_factory),
+            on_received
         }
     }
 
@@ -105,36 +111,85 @@ impl NodeRegistry {
         }
     }
 
-    pub fn listen_for_updates(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
+    // pub fn listen_for_updates(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
+    //     let port_num = conns::get_internal_port(this_func_type);
+    //     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
+    //
+    //     let listener = &registry.conn_factory.get_listener(addr);
+    //     let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
+    //         .expect("Couldn't establish thread pool for node registry updates");
+    //
+    //     loop {
+    //         match listener.accept() {
+    //             Err(_) => continue,
+    //             Ok((mut stream, _)) => {
+    //                 let cloned_registry = registry.clone();
+    //                 let _ = thread_pool.execute(move || {
+    //                     let mut data: Vec<u8> = vec![];
+    //                     let _ = stream.read_to_end(&mut data);
+    //                     let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&data)
+    //                         else { return };
+    //
+    //                     let _ = cloned_registry.process_registration(reg);
+    //                     stream.write_all(&messages::acknowledge()).unwrap()
+    //                 });
+    //             }
+    //         }
+    //     }
+    // }
+
+    pub fn listen_for_conn_requests(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
         let port_num = conns::get_internal_port(this_func_type);
+        // TODO: replace this addr with the actual public addr of this node
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
 
-        let listener = &registry.conn_factory.get_listener(addr);
+        let listener = registry.conn_factory.get_listener(addr);
         let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
-            .expect("Couldn't establish thread pool for node registry updates");
+            .expect("Couldn't establish thread pool for listening for connection requests");
 
         loop {
             match listener.accept() {
                 Err(_) => continue,
                 Ok((mut stream, _)) => {
                     let cloned_registry = registry.clone();
-                    let _ = thread_pool.execute(move || {
-                        let mut data: Vec<u8> = vec![];
-                        let _ = stream.read_to_end(&mut data);
-                        let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&data)
-                            else { return };
-
-                        let _ = cloned_registry.process_registration(reg);
-                        stream.write_all(&messages::acknowledge()).unwrap()
-                    });
+                    let _ = thread_pool.execute_async(Box::pin(async move {
+                        let Ok(data) = conns::get_data(&mut stream) else { return };
+                        cloned_registry.process_conn_request(data, stream).await
+                    }));
                 }
             }
         }
     }
 
-    // pub async fn listen_for_conn_requests(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
-    //
-    // }
+    async fn process_conn_request(&self, data: Vec<u8>, mut stream: Box<dyn Stream>) {
+        let Ok(request) = deserialize_rmp_to::<NodeRegistryRequest>(&data) else {
+            let _ = stream.write_all(&messages::reject());
+            return
+        };
+
+        if !self.can_accept_this_connection(&request).await {
+            let _ = stream.write_all(&messages::reject());
+            return;
+        }
+
+        // TODO: select which type this node will be registered as
+        let node_type = NodeRegistryType::Committer;
+
+        let Some(mut conn) = self.conn_factory.create_connection(stream, self.on_received.clone())
+            else { return };
+
+        if conn.send(&messages::acknowledge()).await.is_err() { return; }
+        let node = NodeRegistryNode::new(request.requester_ip, conn);
+        match self.get_nodes(&node_type) {
+            None => return,
+            Some(nodes) => { nodes.insert(request.requester_key, node); }
+        }
+    }
+
+    async fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> bool {
+        // TODO: implement this - see pneumatic_beacon for impl logic
+        todo!()
+    }
 
     pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let shared_data = Arc::new(RwLock::new(data));
@@ -165,6 +220,15 @@ pub type Nodes = Arc<DashMap<Vec<u8>, NodeRegistryNode>>;
 pub struct NodeRegistryNode {
     pub ip: IpAddr,
     pub conn: Box<dyn Connection>
+}
+
+impl NodeRegistryNode {
+    fn new(ip: IpAddr, conn: Box<dyn Connection>) -> Self {
+        NodeRegistryNode {
+            ip,
+            conn
+        }
+    }
 }
 
 #[derive(Eq)]
@@ -201,14 +265,14 @@ pub struct NodeRegistryResponse {
 #[derive(Serialize, Deserialize)]
 pub struct NodeRegistryRequest {
     pub requester_key: Vec<u8>,
-    pub requester_ip: Ipv6Addr,
+    pub requester_ip: IpAddr,
     pub requester_types: Vec<NodeRegistryType>,
     pub requested_type: NodeRegistryType
 }
 
 impl NodeRegistryRequest {
     pub fn new(key: Vec<u8>,
-               addr: Ipv6Addr,
+               addr: IpAddr,
                requester_types: Vec<NodeRegistryType>,
                requested_type: NodeRegistryType) -> Self {
         NodeRegistryRequest {

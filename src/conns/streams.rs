@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{Error, Read, Write};
 use std::net::TcpStream;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6,8 +6,9 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use crate::conns::ConnError;
 
 pub trait Stream : Send + Sync {
-    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error>;
-    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), std::io::Error>;
+    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, Error>;
+    fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<(), Error>;
+    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), Error>;
     fn into_split(self: Box<Self>) -> Result<(Box<dyn StreamReader>, Box<dyn StreamWriter>), ConnError>;
 }
 
@@ -24,11 +25,15 @@ impl CoreTcpStream {
 }
 
 impl Stream for CoreTcpStream {
-    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, std::io::Error> {
+    fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, Error> {
         self.inner_stream.read_to_end(buffer)
     }
 
-    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), std::io::Error> {
+    fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<(), Error> {
+        self.inner_stream.read_exact(buffer)
+    }
+
+    fn write_all(&mut self, data: &Vec<u8>) -> Result<(), Error> {
         self.inner_stream.write_all(data)
     }
 

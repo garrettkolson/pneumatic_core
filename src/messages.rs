@@ -16,3 +16,7 @@ pub struct MessageBody {
 pub fn acknowledge() -> Vec<u8> {
     Vec::from(b"ack")
 }
+
+pub fn reject() -> Vec<u8> {
+    Vec::from(b"rej")
+}

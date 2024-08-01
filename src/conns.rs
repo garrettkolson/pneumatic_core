@@ -48,6 +48,34 @@ pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, 
     })
 }
 
+pub fn get_data(reader: &mut Box<dyn Stream>) -> Result<Vec<u8>, ConnError> {
+    let mut header: Vec<u8> = vec![0u8, 4];
+    if let Err(err) = reader.read_exact(&mut header) {
+        return Err(ConnError::ReadError(Some(err.to_string())))
+    }
+
+    let data_length = usize::from_be_bytes(header.try_into().unwrap_or_default());
+    let mut data: Vec<u8> = vec![0u8; data_length];
+    match reader.read_exact(&mut data) {
+        Ok(_) => Ok(data),
+        Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
+    }
+}
+
+pub async fn get_data_async(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8>, ConnError> {
+    let mut header: Vec<u8> = vec![0u8, 4];
+    if let Err(err) = reader.read_exact(&mut header).await {
+        return Err(ConnError::ReadError(Some(err.to_string())))
+    }
+
+    let data_length = usize::from_be_bytes(header.try_into().unwrap_or_default());
+    let mut data: Vec<u8> = vec![0u8; data_length];
+    match reader.read_exact(&mut data).await {
+        Ok(_) => Ok(data),
+        Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
+    }
+}
+
 #[async_trait]
 pub trait Connection : Send + Sync {
     async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError>;
@@ -59,39 +87,26 @@ struct TcpConnection {
 }
 
 impl TcpConnection {
-    pub fn from_stream<F>(stream: Box<dyn Stream>, mut on_received: F) -> Result<Self, ConnError>
-        where F : FnMut(Vec<u8>) + Send + 'static {
+    pub fn from_stream(stream: Box<dyn Stream>,
+                          on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
+        -> Result<Self, ConnError> {
         let (mut reader, mut writer) = stream.into_split()?;
         let thread = tokio::spawn(async move {
             loop {
-                match Self::get_data(&mut reader).await {
+                match get_data_async(&mut reader).await {
                     Ok(data) => on_received(data),
                     Err(ConnError::ReadError(_)) => continue,
                     _ => break
                 }
             }
 
-            // TODO: else case should break loop, then initiate drop
+            // TODO: initiate drop
         });
 
         Ok(TcpConnection {
             writer,
             listening_thread: thread,
         })
-    }
-
-    async fn get_data(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8>, ConnError> {
-        let mut header: Vec<u8> = vec![0u8, 4];
-        if let Err(err) = reader.read_exact(&mut header).await {
-            return Err(ConnError::ReadError(Some(err.to_string())))
-        }
-
-        let data_length = usize::from_be_bytes(header.try_into().unwrap_or_default());
-        let mut data: Vec<u8> = vec![0u8; data_length];
-        match reader.read_exact(&mut data).await {
-            Ok(_) => Ok(data),
-            Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
-        }
     }
 }
 
