@@ -136,6 +136,7 @@ fn get_data_cache() -> DataCache {
 
 fn get_db_factory() -> Box<dyn DbFactory> {
     // TODO: replace this with config.json call or something (per partition_id?)
+    // TODO: use a dashmap to map env_ids to DbFactory instances
     Box::new(RocksDbFactory { })
 }
 
