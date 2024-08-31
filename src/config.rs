@@ -98,6 +98,20 @@ impl Config {
 
         Ok(Arc::new(environment_metadata))
     }
+
+    pub fn get_max_node_number(&self, node_type: &NodeRegistryType) -> usize {
+        match self.type_configs.get(node_type) {
+            Some(node) => node.max,
+            None => 0
+        }
+    }
+
+    pub fn get_min_type_stake(&self, node_type: &NodeRegistryType) -> u64 {
+        match self.type_configs.get(node_type) {
+            Some(config) => config.min_stake,
+            None => u64::MAX
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

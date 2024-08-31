@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use crate::{conns, messages, server};
+use crate::config::Config;
 use crate::conns::{Connection};
 use crate::conns::factories::ConnFactory;
 use crate::conns::streams::Stream;
+use crate::data::{DataProvider, DefaultDataProvider};
 use crate::encoding::{deserialize_rmp_to};
 use crate::node::RegistrationBatchResult::Success;
+use crate::user::User;
 
 pub enum NodeType {
     Full,
@@ -74,6 +77,7 @@ pub struct NodeRegistry {
     sentinels: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     executors: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     finalizers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
+    config: Arc<Config>,
     conn_factory: Arc<Box<dyn ConnFactory>>,
     on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>
 }
@@ -81,7 +85,8 @@ pub struct NodeRegistry {
 impl NodeRegistry {
     const LISTENER_THREAD_COUNT: usize = 4;
 
-    pub fn init(conn_factory: Box<dyn ConnFactory>,
+    pub fn init(config: Arc<Config>,
+                conn_factory: Box<dyn ConnFactory>,
                 on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
         -> Self {
         NodeRegistry {
@@ -89,6 +94,7 @@ impl NodeRegistry {
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
+            config,
             conn_factory: Arc::new(conn_factory),
             on_received
         }
@@ -111,32 +117,12 @@ impl NodeRegistry {
         }
     }
 
-    // pub fn listen_for_updates(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
-    //     let port_num = conns::get_internal_port(this_func_type);
-    //     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
-    //
-    //     let listener = &registry.conn_factory.get_listener(addr);
-    //     let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
-    //         .expect("Couldn't establish thread pool for node registry updates");
-    //
-    //     loop {
-    //         match listener.accept() {
-    //             Err(_) => continue,
-    //             Ok((mut stream, _)) => {
-    //                 let cloned_registry = registry.clone();
-    //                 let _ = thread_pool.execute(move || {
-    //                     let mut data: Vec<u8> = vec![];
-    //                     let _ = stream.read_to_end(&mut data);
-    //                     let Ok(reg) = deserialize_rmp_to::<RegistrationBatch>(&data)
-    //                         else { return };
-    //
-    //                     let _ = cloned_registry.process_registration(reg);
-    //                     stream.write_all(&messages::acknowledge()).unwrap()
-    //                 });
-    //             }
-    //         }
-    //     }
-    // }
+    fn type_is_maxed_out(&self, node_type: &NodeRegistryType) -> bool {
+        match self.get_nodes(node_type) {
+            Some(nodes) => nodes.len() >= self.config.get_max_node_number(node_type),
+            None => true
+        }
+    }
 
     pub fn listen_for_conn_requests(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
         let port_num = conns::get_internal_port(this_func_type);
@@ -167,7 +153,7 @@ impl NodeRegistry {
             return
         };
 
-        if !self.can_accept_this_connection(&request).await {
+        if !self.can_accept_this_connection(&request) {
             let _ = stream.write_all(&messages::reject());
             return;
         }
@@ -186,9 +172,23 @@ impl NodeRegistry {
         }
     }
 
-    async fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> bool {
-        // TODO: implement this - see pneumatic_beacon for impl logic
-        todo!()
+    fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> bool {
+        if self.node_is_already_registered(&request.requester_key, &request.requested_type) ||
+            self.type_is_maxed_out(&request.requested_type){
+            return false;
+        }
+
+        Self::check_db_node_user(&request.requester_key,
+                                 &self.config.main_environment_id,
+                                 self.config.get_min_type_stake(&request.requested_type))
+    }
+
+    fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
+        let Ok(locked_token) = DefaultDataProvider::get_token(user_key, environment_id)
+            else { return false };
+        let Ok(token) = locked_token.read() else { return false };
+        let Some(user) = token.get_asset::<User>() else { return false };
+        user.fuel_balance > min_stake
     }
 
     pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
