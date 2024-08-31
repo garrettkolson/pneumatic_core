@@ -55,7 +55,7 @@ impl DefaultDataProvider {
         let db = Self::get_db_factory().get_db(partition_id)?;
         let data = db.get_data(key)?;
         Self::put_in_data_cache(key, Arc::new(RwLock::new(data)));
-        cache.get(key).or_or(DataError::CacheError)
+        cache.get(key).ok_or(DataError::CacheError)
     }
 
     pub fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
@@ -84,7 +84,7 @@ impl DefaultDataProvider {
             else { return Err(DataError::SerializationError) };
 
         let _ = db.save_data(key, &serialized)?;
-        Self::put_in_data_cache(key, data.clone());
+        Self::put_in_data_cache(key, Arc::new(RwLock::new(serialized)));
         Ok(())
     }
 
