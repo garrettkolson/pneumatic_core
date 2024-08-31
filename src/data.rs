@@ -31,11 +31,11 @@ impl DataProvider for DefaultDataProvider {}
 
 impl DefaultDataProvider {
     pub fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
-        let cache = Self::get_cache();
+        let cache = Self::get_token_cache();
         if let Some(token_entry) = cache.get(key) { return Ok(token_entry.clone()); }
 
         let token = Self::get_token_from_db(key, partition_id)?;
-        Self::put_in_cache(key, Arc::new(RwLock::new(token)));
+        Self::put_in_token_cache(key, Arc::new(RwLock::new(token)));
         cache.get(key).ok_or(DataError::CacheError)
     }
 
@@ -43,46 +43,48 @@ impl DefaultDataProvider {
                       -> Result<(), DataError> {
         let db = Self::get_db_factory().get_db(partition_id)?;
         let _ = db.save_token(key, &token_ref)?;
-        Self::put_in_cache(key, token_ref);
+        Self::put_in_token_cache(key, token_ref);
         Ok(())
     }
 
     pub fn get_data(key: &Vec<u8>, partition_id: &str)
         -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
-        // TODO: implement caching for this
+        let cache = Self::get_data_cache();
+        if let Some(data_entry) = cache.get(key) { return Ok(data_entry.clone()); }
 
         let db = Self::get_db_factory().get_db(partition_id)?;
         let data = db.get_data(key)?;
-        Ok(Arc::new(RwLock::new(data)))
+        Self::put_in_data_cache(key, Arc::new(RwLock::new(data)));
+        cache.get(key).or_or(DataError::CacheError)
     }
 
     pub fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
-        // TODO: implement caching for this
         let db = Self::get_db_factory().get_db(partition_id)?;
-        let _ = db.save_data(key, data)?;
+        let _ = db.save_data(key, &data)?;
+        Self::put_in_data_cache(key, Arc::new(RwLock::new(data)));
         Ok(())
     }
 
     pub fn save_typed_data<T: serde::Serialize>(key: &Vec<u8>, data: &T, partition_id: &str) -> Result<(), DataError> {
-        // TODO: implement caching for this
         let db = Self::get_db_factory().get_db(partition_id)?;
         let Ok(serialized) = serialize_to_bytes_rmp(data)
             else { return Err(DataError::SerializationError) };
 
-        let _ = db.save_data(key, serialized)?;
+        let _ = db.save_data(key, &serialized)?;
+        Self::put_in_data_cache(key, Arc::new(RwLock::new(serialized)));
         Ok(())
     }
 
     pub fn save_locked_data<T: serde::Serialize>(key: &Vec<u8>, data: Arc<RwLock<T>>, partition_id: &str)
                     -> Result<(), DataError> {
-        // TODO: implement caching for this
         let db = Self::get_db_factory().get_db(partition_id)?;
         let Ok(write_data) = data.write()
             else { return Err(DataError::Poisoned) };
         let Ok(serialized) = serialize_to_bytes_rmp(write_data.deref())
             else { return Err(DataError::SerializationError) };
 
-        let _ = db.save_data(key, serialized)?;
+        let _ = db.save_data(key, &serialized)?;
+        Self::put_in_data_cache(key, data.clone());
         Ok(())
     }
 
@@ -91,12 +93,20 @@ impl DefaultDataProvider {
         db.get_token(key)
     }
 
-    fn put_in_cache(key: &Vec<u8>, data: Arc<RwLock<Token>>) {
-        Self::get_cache().insert(key.clone(), data)
+    fn put_in_token_cache(key: &Vec<u8>, data: Arc<RwLock<Token>>) {
+        Self::get_token_cache().insert(key.clone(), data)
     }
 
-    fn get_cache() -> &'static TokenCache {
-        CACHE.get_or_init(|| get_cache())
+    fn put_in_data_cache(key: &Vec<u8>, data: Arc<RwLock<Vec<u8>>>) {
+        Self::get_data_cache().insert(key.clone(), data)
+    }
+
+    fn get_token_cache() -> &'static TokenCache {
+        TOKEN_CACHE.get_or_init(|| get_token_cache())
+    }
+
+    fn get_data_cache() -> &'static DataCache {
+        DATA_CACHE.get_or_init(|| get_data_cache())
     }
 
     fn get_db_factory() -> &'static Box<dyn DbFactory> {
@@ -106,10 +116,18 @@ impl DefaultDataProvider {
 
 //////////////////// Globals ///////////////////////
 
-static CACHE: OnceLock<TokenCache> = OnceLock::new();
+static TOKEN_CACHE: OnceLock<TokenCache> = OnceLock::new();
+static DATA_CACHE: OnceLock<DataCache> = OnceLock::new();
 static DB_FACTORY: OnceLock<Box<dyn DbFactory>> = OnceLock::new();
 
-fn get_cache() -> TokenCache {
+fn get_token_cache() -> TokenCache {
+    // TODO: replace this with config.json call or something
+    Cache::builder()
+        .time_to_idle(Duration::from_secs(30))
+        .build()
+}
+
+fn get_data_cache() -> DataCache {
     // TODO: replace this with config.json call or something
     Cache::builder()
         .time_to_idle(Duration::from_secs(30))
@@ -127,7 +145,7 @@ trait Db {
     fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError>;
     fn save_token(&self, key: &Vec<u8>, token: &Arc<RwLock<Token>>) -> Result<(), DataError>;
     fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError>;
-    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>) -> Result<(), DataError>;
+    fn save_data(&self, key: &Vec<u8>, data: &Vec<u8>) -> Result<(), DataError>;
 }
 
 trait DbFactory : Send + Sync {
@@ -187,7 +205,7 @@ impl Db for RocksDb {
         let Ok(data) = serialize_to_bytes_rmp(token.deref())
             else { return Err(DataError::SerializationError) };
 
-        self.save_data(key, data)
+        self.save_data(key, &data)
     }
 
     fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError> {
@@ -198,7 +216,7 @@ impl Db for RocksDb {
         }
     }
 
-    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>) -> Result<(), DataError> {
+    fn save_data(&self, key: &Vec<u8>, data: &Vec<u8>) -> Result<(), DataError> {
         match self.store.put(key, data) {
             Err(err) => Err(DataError::FromStore(err.into_string())),
             Ok(_) => Ok(())
@@ -207,6 +225,7 @@ impl Db for RocksDb {
 }
 
 type TokenCache = Cache<Vec<u8>, Arc<RwLock<Token>>>;
+type DataCache = Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>>;
 
 #[derive(Debug)]
 pub enum DataError {
