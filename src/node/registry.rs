@@ -9,12 +9,7 @@ use crate::conns::factories::ConnFactory;
 use crate::conns::streams::Stream;
 use crate::data::DefaultDataProvider;
 use crate::encoding::deserialize_rmp_to;
-use crate::node::{NodeRegistryNode,
-                  NodeRegistryRequest,
-                  NodeRegistryType,
-                  Nodes,
-                  RegistrationBatch,
-                  RegistrationBatchResult};
+use crate::node::*;
 use crate::node::RegistrationBatchResult::Success;
 use crate::user::User;
 
@@ -99,18 +94,20 @@ impl NodeRegistry {
             return
         };
 
-        if !self.can_accept_this_connection(&request) {
+        let Some(node_type) = self.can_accept_this_connection(&request) else {
             let _ = stream.write_all(&messages::reject());
             return;
-        }
-
-        // TODO: select which type this node will be registered as
-        let node_type = NodeRegistryType::Committer;
+        };
 
         let Some(mut conn) = self.conn_factory.create_connection(stream, self.on_received.clone())
             else { return };
 
         if conn.send(&messages::acknowledge()).await.is_err() { return; }
+        self.register_connection(conn, request, node_type)
+    }
+
+    fn register_connection(&self, conn: Box<dyn Connection>,
+                           request: NodeRegistryRequest, node_type: NodeRegistryType) {
         let node = NodeRegistryNode::new(request.requester_ip, conn);
         match self.get_nodes(&node_type) {
             None => return,
@@ -118,15 +115,17 @@ impl NodeRegistry {
         }
     }
 
-    fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> bool {
-        if self.node_is_already_registered(&request.requester_key, &request.requested_type) ||
-            self.type_is_maxed_out(&request.requested_type){
-            return false;
-        }
+    fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> Option<NodeRegistryType> {
+        let node_type = match self.select_registration_node_type(request) {
+            None => return None,
+            Some(t) => t
+        };
 
-        Self::check_db_node_user(&request.requester_key,
+        if !Self::check_db_node_user(&request.requester_key,
                                  &self.config.main_environment_id,
-                                 self.config.get_min_type_stake(&request.requested_type))
+                                 self.config.get_min_type_stake(&request.requested_type)) { return None; }
+
+        Some(node_type)
     }
 
     fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
@@ -137,7 +136,32 @@ impl NodeRegistry {
         user.fuel_balance > min_stake
     }
 
+    fn select_registration_node_type(&self, request: &NodeRegistryRequest) -> Option<NodeRegistryType> {
+        if self.can_select_this_type(request, NodeRegistryType::Finalizer) {
+            return Some(NodeRegistryType::Finalizer);
+        }
+
+        if self.can_select_this_type(request, NodeRegistryType::Executor) {
+            return Some(NodeRegistryType::Executor);
+        }
+
+        if self.can_select_this_type(request, NodeRegistryType::Sentinel) {
+            return Some(NodeRegistryType::Sentinel);
+        }
+
+        if self.can_select_this_type(request, NodeRegistryType::Committer) {
+            return Some(NodeRegistryType::Committer);
+        }
+
+        None
+    }
+
+    fn can_select_this_type(&self, request: &NodeRegistryRequest, node_type: NodeRegistryType) -> bool {
+        request.requester_types.contains(&node_type) && !self.type_is_maxed_out(&node_type)
+    }
+
     pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
+        // TODO: have to redo this to use registered conns instead of senders
         let shared_data = Arc::new(RwLock::new(data));
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
