@@ -171,26 +171,26 @@ mod tests {
     #[tokio::test]
     #[should_panic]
     async fn calling_thread_pool_new_with_zero_threads_panics() {
-        let pool = ThreadPool::new(0).await;
+        let pool = ThreadPool::new(0);
     }
 
     #[tokio::test]
     async fn calling_thread_pool_new_with_more_than_zero_returns_thread_pool_with_correct_number_of_workers() {
         let size = 300;
-        let pool = ThreadPool::new(size).await;
+        let pool = ThreadPool::new(size);
         assert_eq!(pool.workers.len(), size)
     }
 
     #[tokio::test]
     async fn calling_thread_pool_build_with_zero_threads_returns_pool_creation_error() {
-        let pool = ThreadPool::build(0).await;
+        let pool = ThreadPool::build(0);
         assert!(pool.is_err_and(|err| err.message == "The size of the thread pool cannot be 0"))
     }
 
     #[tokio::test]
     async fn calling_thread_pool_build_with_more_than_zero_threads_returns_ok() {
         let size = 54;
-        let pool = ThreadPool::build(size).await;
+        let pool = ThreadPool::build(size);
         assert!(pool.is_ok_and(|result| result.workers.len() == size));
     }
 
@@ -201,14 +201,14 @@ mod tests {
         let (async_sender, async_receiver) = mpsc::channel::<AsyncJob>();
         let receiver = Arc::new(Mutex::new(receiver));
         let async_receiver = Arc::new(tokio::sync::Mutex::new(async_receiver));
-        let worker = Worker::new(id, receiver, async_receiver).await;
+        let worker = Worker::new(id, receiver, async_receiver);
         assert_eq!(worker.id, id)
     }
 
     #[tokio::test]
     async fn calling_thread_pool_execute_should_run_the_closure() {
         let mut stuff: &'static str = "stuff";
-        let pool = ThreadPool::new(23).await;
+        let pool = ThreadPool::new(23);
         let _ = pool.execute(move || {
             stuff = "more stuff";
             assert_eq!(stuff, "more stuff");
@@ -231,7 +231,7 @@ mod tests {
         let async_mutex = Arc::new(tokio::sync::Mutex::new(async_receiver));
 
         let worker = Worker::new(id, mutex.clone(), async_mutex.clone());
-        let mut pool = ThreadPool::new(1).await;
+        let mut pool = ThreadPool::new(1);
         pool.workers[0] = worker;
 
         let _ = pool.execute(|| {
