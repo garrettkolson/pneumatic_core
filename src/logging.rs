@@ -29,20 +29,20 @@ impl Logger for FileLogger {
 
 #[cfg(test)]
 pub mod tests {
-    use std::error::Error;
     use std::io::Read;
     use super::*;
     use crate::logging::FileLogger;
 
     #[test]
     fn logger_should_log_message_to_file() {
-        let logger = FileLogger::new("log.txt".to_string());
+        let file_name = "test_log.txt";
+        let logger = FileLogger::new(file_name.to_string());
         let timestamp = chrono::Utc::now().to_string();
 
         let str = format!("this is a message {}", timestamp);
         logger.log(str.to_string());
 
-        let result: Result<FileLock, std::io::Error> = match FileLock::lock("log.txt", false, FileOptions::new().read(true)) {
+        let result: Result<FileLock, std::io::Error> = match FileLock::lock(file_name, false, FileOptions::new().read(true)) {
             Ok(file) => Ok(file),
             Err(err) => {
                 panic!("error: {0}", err.to_string());
