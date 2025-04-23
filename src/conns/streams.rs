@@ -167,7 +167,7 @@ impl UdsWriter {
 #[async_trait]
 impl StreamWriter for UdsWriter {
     async fn write_all(&mut self, data: &[u8]) -> Result<(), ConnError> {
-        match self.inner_writer.write_all(&data) {
+        match self.inner_writer.write_all(&data).await {
             Err(err) => Err(ConnError::WriteError(Some(err.to_string()))),
             Ok(()) => Ok(())
         }
