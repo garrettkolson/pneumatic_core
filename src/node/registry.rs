@@ -77,7 +77,7 @@ impl NodeRegistry {
         loop {
             match listener.accept() {
                 Err(_) => continue,
-                Ok((mut stream, _)) => {
+                Ok(mut stream) => {
                     let cloned_registry = registry.clone();
                     let _ = thread_pool.execute_async(Box::pin(async move {
                         let Ok(data) = conns::get_data(&mut stream) else { return };
