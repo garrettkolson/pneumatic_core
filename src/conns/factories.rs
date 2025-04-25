@@ -1,17 +1,20 @@
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::string::ToString;
 use std::sync::Arc;
 use async_trait::async_trait;
-use crate::conns::{Connection, ConnError, Sender, TcpConnection};
-use crate::conns::listeners::{CoreTcpListener, Listener};
-use crate::conns::senders::{FireAndForgetSender, TcpFafSender, TcpSender};
+use crate::conns::{Connection, ConnError, ConnTarget, LocalTarget, Sender, TcpConnection};
+use crate::conns::listeners::{CoreTcpListener, CoreUdsListener, Listener};
+use crate::conns::senders::{TcpSender, UdsSender};
 use crate::conns::streams::{CoreTcpStream, Stream};
 use crate::messages::acknowledge;
 
+const NOT_UNIX_MESSAGE: &str =
+    "This is not a Unix runtime environment. Use the TCP loopback address for internal communication.";
+
 #[async_trait]
-pub trait ConnFactory : Send + Sync {
-    fn get_sender(&self) -> Box<dyn Sender>;
-    fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender>;
-    fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener>;
+pub trait IsConnFactory: Send + Sync {
+    fn get_sender(&self, target: ConnTarget) -> Result<Box<dyn Sender>, ConnError>;
+    fn get_listener(&self, target: ConnTarget) -> Result<Box<dyn Listener>, ConnError>;
     fn create_connection(&self,
                          stream: Box<dyn Stream>,
                          on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
@@ -22,26 +25,48 @@ pub trait ConnFactory : Send + Sync {
                                 -> Result<Box<dyn Connection>, ConnError>;
 }
 
-pub struct TcpConnFactory { }
+pub struct ConnFactory {
 
-impl TcpConnFactory {
-    pub fn new() -> TcpConnFactory {
-        TcpConnFactory {}
+}
+
+impl ConnFactory {
+    pub fn new() -> ConnFactory {
+        ConnFactory {}
     }
 }
 
 #[async_trait]
-impl ConnFactory for TcpConnFactory {
-    fn get_sender(&self) -> Box<dyn Sender> {
-        Box::new(TcpSender {})
+impl IsConnFactory for ConnFactory {
+    fn get_sender(&self, target: ConnTarget) -> Result<Box<dyn Sender>, ConnError> {
+        match target {
+            ConnTarget::Remote(addr) => Ok(Box::new(TcpSender::new(addr))),
+            ConnTarget::Local(local) => match local {
+                LocalTarget::Tcp(addr) => Ok(Box::new(TcpSender::new(addr))),
+                LocalTarget::Unix(path) => {
+                    if !cfg!(unix) { return Err(ConnError::MalformedData(NOT_UNIX_MESSAGE.to_string())); }
+                    Ok(Box::new(UdsSender::new(path)))
+                }
+            }
+        }
     }
 
-    fn get_faf_sender(&self) -> Box<dyn FireAndForgetSender> {
-        Box::new(TcpFafSender {})
-    }
-
-    fn get_listener(&self, addr: SocketAddr) -> Box<dyn Listener> {
-        Box::new(CoreTcpListener::new(addr))
+    fn get_listener(&self, target: ConnTarget) -> Result<Box<dyn Listener>, ConnError> {
+        match target {
+            ConnTarget::Remote(addr) => Ok(Box::new(CoreTcpListener::new(addr))),
+            ConnTarget::Local(local) => match local {
+                LocalTarget::Tcp(addr) => Ok(Box::new(CoreTcpListener::new(addr))),
+                LocalTarget::Unix(location) => {
+                    if !cfg!(unix) { return Err(ConnError::MalformedData(NOT_UNIX_MESSAGE.to_string())); }
+                    let path = format!("/tmp/{}.sock", location);
+                    if let Ok(socket) = std::os::unix::net::SocketAddr::from_pathname(path) {
+                        Ok(Box::new(CoreUdsListener::new(socket)))
+                    }
+                    else {
+                        Err(ConnError::MalformedData("Bad Unix sockets location".to_string()))
+                    }
+                }
+            }
+        }
     }
 
     fn create_connection(&self,

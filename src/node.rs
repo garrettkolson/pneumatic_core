@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use crate::conns::{Connection};
-use crate::conns::factories::ConnFactory;
+use crate::conns::factories::IsConnFactory;
 use crate::conns::streams::Stream;
 use crate::data::{DataProvider};
 

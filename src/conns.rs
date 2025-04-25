@@ -3,7 +3,7 @@ pub mod factories;
 pub mod senders;
 pub mod listeners;
 
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -41,7 +41,7 @@ pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, 
         match cloned_data.read() {
             Err(_) => vec![],
             Ok(read_data) => {
-                conn.get_response(addr, &read_data)
+                conn.get_response(&read_data)
                     .unwrap_or_else(|_| vec![])
             }
         }
@@ -119,11 +119,15 @@ impl Connection for TcpConnection {
     }
 }
 
-// impl Drop for TcpConnection {
-//     fn drop(&mut self) {
-//         self.listening_thread.join();
-//     }
-// }
+pub enum ConnTarget {
+    Local(LocalTarget),
+    Remote(SocketAddr)
+}
+
+pub enum LocalTarget {
+    Unix(String),
+    Tcp(SocketAddr)
+}
 
 pub enum ConnError {
     IO(String),
@@ -132,6 +136,12 @@ pub enum ConnError {
     WriteError(Option<String>),
     ReadError(Option<String>),
     ConnectionRejectedByRemote
+}
+
+impl Debug for ConnError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
 }
 
 impl Display for ConnError {

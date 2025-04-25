@@ -1,33 +1,62 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::Duration;
-use crate::conns::ConnError;
+use crate::conns::{ConnError, ConnTarget};
 
 const CONN_TIMEOUT_IN_SECS: u64 = 60;
 
-pub trait FireAndForgetSender : Send + Sync {
-    fn send(&self, addr: SocketAddr, data: &[u8]);
+pub trait Sender: Send + Sync {
+    fn get_response(&self, data: &[u8]) -> Result<Vec<u8>, ConnError>;
 }
 
-pub struct TcpFafSender { }
+pub(crate) struct UdsSender {
+    path: String
+}
 
-impl FireAndForgetSender for TcpFafSender {
-    fn send(&self, addr: SocketAddr, data: &[u8]) {
-        if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(CONN_TIMEOUT_IN_SECS)) {
-            let _ = stream.write_all(data);
+impl UdsSender {
+    pub fn new(target: String) -> Self {
+        UdsSender {
+            path: target
         }
     }
 }
 
-pub trait Sender: Send + Sync {
-    fn get_response(&self, addr: SocketAddr, data: &[u8]) -> Result<Vec<u8>, ConnError>;
+impl Sender for UdsSender {
+    fn get_response(&self, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+        let mut stream = match UnixStream::connect(&self.path) {
+            Ok(str) => str,
+            Err(err) => return Err(ConnError::IO(err.to_string()))
+        };
+
+        if let Err(err) = stream.write_all(data) {
+            return Err(ConnError::IO(err.to_string()))
+        }
+
+        let mut buffer = Vec::new();
+        match stream.read_to_end(&mut buffer) {
+            Err(err) => Err(ConnError::IO(err.to_string())),
+            Ok(_) => Ok(buffer)
+        }
+    }
 }
 
-pub struct TcpSender { }
+pub(crate) struct TcpSender {
+    path: SocketAddr
+}
+
+impl TcpSender {
+    pub fn new(addr: SocketAddr) -> Self {
+        TcpSender {
+            path: addr
+        }
+    }
+}
 
 impl Sender for TcpSender {
-    fn get_response(&self, addr: SocketAddr, data: &[u8]) -> Result<Vec<u8>, ConnError> {
-        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(CONN_TIMEOUT_IN_SECS)) {
+    fn get_response(&self, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+        let mut stream = match TcpStream::connect_timeout(&self.path, Duration::from_secs(CONN_TIMEOUT_IN_SECS)) {
             Ok(stream) => stream,
             Err(err) => return Err(ConnError::IO(err.to_string()))
         };

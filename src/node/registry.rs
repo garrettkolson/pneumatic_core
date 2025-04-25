@@ -5,7 +5,8 @@ use std::thread::JoinHandle;
 use dashmap::DashMap;
 use crate::config::Config;
 use crate::{conns, messages, server};
-use crate::conns::factories::ConnFactory;
+use crate::conns::ConnTarget;
+use crate::conns::factories::IsConnFactory;
 use crate::conns::streams::Stream;
 use crate::data::DefaultDataProvider;
 use crate::encoding::deserialize_rmp_to;
@@ -19,7 +20,7 @@ pub struct NodeRegistry {
     executors: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     finalizers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     config: Arc<Config>,
-    conn_factory: Arc<Box<dyn ConnFactory>>,
+    conn_factory: Arc<Box<dyn IsConnFactory>>,
     on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>
 }
 
@@ -27,7 +28,7 @@ impl NodeRegistry {
     const LISTENER_THREAD_COUNT: usize = 4;
 
     pub fn init(config: Arc<Config>,
-                conn_factory: Box<dyn ConnFactory>,
+                conn_factory: Box<dyn IsConnFactory>,
                 on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
                 -> Self {
         NodeRegistry {
@@ -70,7 +71,8 @@ impl NodeRegistry {
         // TODO: replace this addr with the actual public addr of this node
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
 
-        let listener = registry.conn_factory.get_listener(addr);
+        let listener = registry.conn_factory.get_listener(ConnTarget::Remote(addr))
+            .expect("Couldn't create listener for incoming connection requests");
         let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for listening for connection requests");
 
@@ -167,11 +169,16 @@ impl NodeRegistry {
 
         let threads: Vec<JoinHandle<Vec<u8>>> = nodes.iter().map(|node| -> JoinHandle<Vec<u8>> {
             let data_clone = shared_data.clone();
-            let sender = self.conn_factory.get_sender();
             let addr = SocketAddr::new(node.value().ip.clone(), conns::get_external_port(node_type));
-            thread::spawn(move ||{
-                let Ok(read_data) = data_clone.read() else { return vec![] };
-                sender.get_response(addr, read_data.as_slice()).unwrap_or_else(|_| vec![])
+            let sender_result = self.conn_factory.get_sender(ConnTarget::Remote(addr));
+            thread::spawn(move || {
+                if let Ok(sender) = sender_result {
+                    let Ok(read_data) = data_clone.read() else { return vec![] };
+                    sender.get_response(read_data.as_slice()).unwrap_or_else(|_| vec![])
+                }
+                else {
+                    vec![]
+                }
             })
         }).collect();
 
