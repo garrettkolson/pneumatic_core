@@ -124,6 +124,20 @@ pub enum ConnTarget {
     Remote(SocketAddr)
 }
 
+impl Clone for ConnTarget {
+    fn clone(&self) -> Self {
+        match self {
+            ConnTarget::Remote(addr) => ConnTarget::Remote(addr.clone()),
+            ConnTarget::Local(addr_or_path) => {
+                match addr_or_path {
+                    LocalTarget::Unix(path) => ConnTarget::Local(LocalTarget::Unix(path.clone())),
+                    LocalTarget::Tcp(addr) => ConnTarget::Local(LocalTarget::Tcp(addr.clone()))
+                }
+            }
+        }
+    }
+}
+
 pub enum LocalTarget {
     Unix(String),
     Tcp(SocketAddr)

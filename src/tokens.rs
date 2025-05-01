@@ -9,7 +9,7 @@ use crate::encoding::serialize_to_bytes_rmp;
 use crate::environment::EnvironmentMetadata;
 use crate::transactions::TransactionCommit;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Token {
     pub metadata: HashMap<String, String>,
     pub blockchain: Blockchain,

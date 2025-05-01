@@ -131,9 +131,8 @@ impl NodeRegistry {
     }
 
     fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
-        let Ok(locked_token) = DefaultDataProvider::get_token(user_key, environment_id)
+        let Ok(token) = DefaultDataProvider::new().get_token(user_key, environment_id)
             else { return false };
-        let Ok(token) = locked_token.read() else { return false };
         let Some(user) = token.get_asset::<User>() else { return false };
         user.fuel_balance > min_stake
     }

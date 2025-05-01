@@ -135,7 +135,7 @@ impl Worker {
                         -> tokio::task::JoinHandle<Result<(), WorkerError>> {
         tokio::task::spawn(async move {
             loop {
-                let mut mutex = receiver.lock().await;
+                let mutex = receiver.lock().await;
                 return match mutex.recv() {
                     Err(err) => Err(WorkerError::WhileReceiving(err.to_string())),
                     Ok(job) => {
@@ -237,5 +237,39 @@ mod tests {
         let _ = pool.execute(|| {
             panic!("This should not actually panic");
         });
+    }
+
+    #[tokio::test]
+    async fn calling_thread_pool_execute_async_should_run_closure() {
+        let mut stuff: &'static str = "stuff";
+        let pool = ThreadPool::new(42);
+        let _ = pool.execute_async(Box::pin(async move {
+            stuff = "different stuff";
+            assert_eq!(stuff, "different stuff")
+        }));
+    }
+
+    #[tokio::test]
+    async fn calling_thread_pool_execute_async_with_poisoned_mutex_should_not_run_the_closure() {
+        let id = 23;
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let (async_sender, async_receiver) = mpsc::channel::<AsyncJob>();
+        let async_mutex = Arc::new(tokio::sync::Mutex::new(async_receiver));
+        let cloned_mutex = Arc::clone(&async_mutex);
+
+        let _ = thread::spawn(move || async move {
+            let data = cloned_mutex.lock().await;
+            panic!();
+        }).join();
+
+        let mutex = Arc::new(Mutex::new(receiver));
+
+        let worker = Worker::new(id, mutex.clone(), async_mutex.clone());
+        let mut pool = ThreadPool::new(1);
+        pool.workers[0] = worker;
+
+        let _ = pool.execute_async(Box::pin(async {
+            panic!("This should not actually panic");
+        }));
     }
 }

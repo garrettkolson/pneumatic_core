@@ -1,240 +1,172 @@
+use std::net::IpAddr::V4;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ops::Deref;
 use moka::sync::Cache;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
+use serde::{Deserialize, Serialize};
+use serde_json::error::Category::Data;
+use crate::conns::{ConnTarget, LocalTarget};
+use crate::conns::factories::{ConnFactory, IsConnFactory};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::tokens::Token;
 
+pub const DATA_TCP_PORT: u16 = 55555;
+pub const DATA_UNIX_PATH: &str = "data";
+
 pub trait DataProvider : Send + Sync {
-    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
-        DefaultDataProvider::get_token(key, partition_id)
+    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
+        DefaultDataProvider::new().get_token(key, partition_id)
     }
 
-    fn save_token(&self, key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
+    fn save_token(&self, key: &Vec<u8>, token: Token, partition_id: &str)
                   -> Result<(), DataError> {
-        DefaultDataProvider::save_token(key, token_ref, partition_id)
+        DefaultDataProvider::new().save_token(key, token, partition_id)
     }
 
-    fn get_data(&self, key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
-        DefaultDataProvider::get_data(key, partition_id)
+    fn get_data(&self, key: &Vec<u8>, partition_id: &str) -> Result<Vec<u8>, DataError> {
+        DefaultDataProvider::new().get_data(key, partition_id)
     }
 
     fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
-        DefaultDataProvider::save_data(key, data, partition_id)
+        DefaultDataProvider::new().save_data(key, data, partition_id)
     }
 }
 
-pub struct DefaultDataProvider { }
-
-impl DataProvider for DefaultDataProvider {}
+pub struct DefaultDataProvider {
+    conn_factory: ConnFactory
+}
 
 impl DefaultDataProvider {
-    pub fn get_token(key: &Vec<u8>, partition_id: &str) -> Result<Arc<RwLock<Token>>, DataError> {
-        let cache = Self::get_token_cache();
-        if let Some(token_entry) = cache.get(key) { return Ok(token_entry.clone()); }
-
-        let token = Self::get_token_from_db(key, partition_id)?;
-        Self::put_in_token_cache(key, Arc::new(RwLock::new(token)));
-        cache.get(key).ok_or(DataError::CacheError)
-    }
-
-    pub fn save_token(key: &Vec<u8>, token_ref: Arc<RwLock<Token>>, partition_id: &str)
-                      -> Result<(), DataError> {
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        let _ = db.save_token(key, &token_ref)?;
-        Self::put_in_token_cache(key, token_ref);
-        Ok(())
-    }
-
-    pub fn get_data(key: &Vec<u8>, partition_id: &str)
-        -> Result<Arc<RwLock<Vec<u8>>>, DataError> {
-        let cache = Self::get_data_cache();
-        if let Some(data_entry) = cache.get(key) { return Ok(data_entry.clone()); }
-
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        let data = db.get_data(key)?;
-        Self::put_in_data_cache(key, Arc::new(RwLock::new(data)));
-        cache.get(key).ok_or(DataError::CacheError)
-    }
-
-    pub fn save_data(key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        let _ = db.save_data(key, &data)?;
-        Self::put_in_data_cache(key, Arc::new(RwLock::new(data)));
-        Ok(())
-    }
-
-    pub fn save_typed_data<T: serde::Serialize>(key: &Vec<u8>, data: &T, partition_id: &str) -> Result<(), DataError> {
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        let Ok(serialized) = serialize_to_bytes_rmp(data)
-            else { return Err(DataError::SerializationError) };
-
-        let _ = db.save_data(key, &serialized)?;
-        Self::put_in_data_cache(key, Arc::new(RwLock::new(serialized)));
-        Ok(())
-    }
-
-    pub fn save_locked_data<T: serde::Serialize>(key: &Vec<u8>, data: Arc<RwLock<T>>, partition_id: &str)
-                    -> Result<(), DataError> {
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        let Ok(write_data) = data.write()
-            else { return Err(DataError::Poisoned) };
-        let Ok(serialized) = serialize_to_bytes_rmp(write_data.deref())
-            else { return Err(DataError::SerializationError) };
-
-        let _ = db.save_data(key, &serialized)?;
-        Self::put_in_data_cache(key, Arc::new(RwLock::new(serialized)));
-        Ok(())
-    }
-
-    fn get_token_from_db(key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
-        let db = Self::get_db_factory().get_db(partition_id)?;
-        db.get_token(key)
-    }
-
-    fn put_in_token_cache(key: &Vec<u8>, data: Arc<RwLock<Token>>) {
-        Self::get_token_cache().insert(key.clone(), data)
-    }
-
-    fn put_in_data_cache(key: &Vec<u8>, data: Arc<RwLock<Vec<u8>>>) {
-        Self::get_data_cache().insert(key.clone(), data)
-    }
-
-    fn get_token_cache() -> &'static TokenCache {
-        TOKEN_CACHE.get_or_init(|| get_token_cache())
-    }
-
-    fn get_data_cache() -> &'static DataCache {
-        DATA_CACHE.get_or_init(|| get_data_cache())
-    }
-
-    fn get_db_factory() -> &'static Box<dyn DbFactory> {
-        DB_FACTORY.get_or_init(|| get_db_factory())
+    pub fn new() -> Self {
+        DefaultDataProvider {
+            conn_factory: ConnFactory::new()
+        }
     }
 }
 
-//////////////////// Globals ///////////////////////
+impl DefaultDataProvider {
+    fn get_source(&self) -> ConnTarget {
+        let local_target = match cfg!(unix) {
+            true => LocalTarget::Unix(DATA_UNIX_PATH.to_string()),
+            _ => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
+        };
 
-static TOKEN_CACHE: OnceLock<TokenCache> = OnceLock::new();
-static DATA_CACHE: OnceLock<DataCache> = OnceLock::new();
-static DB_FACTORY: OnceLock<Box<dyn DbFactory>> = OnceLock::new();
-
-fn get_token_cache() -> TokenCache {
-    // TODO: replace this with config.json call or something
-    Cache::builder()
-        .time_to_idle(Duration::from_secs(30))
-        .build()
-}
-
-fn get_data_cache() -> DataCache {
-    // TODO: replace this with config.json call or something
-    Cache::builder()
-        .time_to_idle(Duration::from_secs(30))
-        .build()
-}
-
-fn get_db_factory() -> Box<dyn DbFactory> {
-    // TODO: replace this with config.json call or something (per partition_id?)
-    // TODO: use a dashmap to map env_ids to DbFactory instances
-    Box::new(RocksDbFactory { })
-}
-
-////////////// Data Factories/Stores ////////////////
-
-trait Db {
-    fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError>;
-    fn save_token(&self, key: &Vec<u8>, token: &Arc<RwLock<Token>>) -> Result<(), DataError>;
-    fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError>;
-    fn save_data(&self, key: &Vec<u8>, data: &Vec<u8>) -> Result<(), DataError>;
-}
-
-trait DbFactory : Send + Sync {
-    fn get_db(&self, partition_id: &str) -> Result<Box<dyn Db>, DataError>;
-}
-
-struct RocksDbFactory { }
-
-impl DbFactory for RocksDbFactory {
-    fn get_db(&self, partition_id: &str) -> Result<Box<dyn Db>, DataError> {
-        let db = RocksDb::new(partition_id)?;
-        Ok(Box::new(db))
+        ConnTarget::Local(local_target)
     }
-}
 
-struct RocksDb {
-    store: DBWithThreadMode<MultiThreaded>
-}
+    fn serialize_request(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
+        -> Result<Vec<u8>, DataError> {
+        let request = DataRequest::new(key, op, partition);
+        return match serialize_to_bytes_rmp(&request) {
+            Ok(d) => Ok(d),
+            Err(err) => Err(DataError::SerializationError(err))
+        }
+    }
 
-impl RocksDb {
-    fn new(partition_id: &str) -> Result<Self, DataError> {
-        match DBWithThreadMode::open(&Self::with_options(), partition_id) {
-            Err(err) => Err(DataError::FromStore(err.into_string())),
-            Ok(db) => {
-                let rocks_db = RocksDb { store: db };
-                Ok(rocks_db)
+    fn get_data_internal<T>(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
+        -> Result<T, DataError>
+        where T : Serialize + for<'a> Deserialize<'a>
+    {
+        if let DataOperation::Save(_) = op { return Err(DataError::InvalidOperation(op)) }
+        let source = self.get_source();
+        if let Ok(sender) = self.conn_factory.get_sender(source) {
+            let data = self.serialize_request(key, op, partition)?;
+            let response = match sender.get_response(&data) {
+                Ok(data) => data,
+                Err(err) => return Err(DataError::FromStore(err.to_string()))
+            };
+
+            return match deserialize_rmp_to::<T>(&response) {
+                Ok(token) => Ok(token),
+                Err(err) => Err(DataError::DeserializationError(err))
             }
         }
+
+        Err(DataError::StoreNotFound)
     }
 
-    fn with_options() -> Options {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts
+    fn save_data_internal<T>(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
+                            -> Result<(), DataError>
+        where T : Serialize + for<'a> Deserialize<'a>
+    {
+        if let DataOperation::Get(_) = op { return Err(DataError::InvalidOperation(op)) }
+        let source = self.get_source();
+        if let Ok(sender) = self.conn_factory.get_sender(source) {
+            let data = self.serialize_request(key, op, partition)?;
+            return match sender.get_response(&data) {
+                Ok(_) => Ok(()),
+                Err(err) => Err(DataError::FromStore(err.to_string()))
+            };
+        }
+
+        Err(DataError::StoreNotFound)
     }
 }
 
-impl Db for RocksDb {
-    fn get_token(&self, key: &Vec<u8>) -> Result<Token, DataError> {
-        match self.store.get(key) {
-            Err(e) => Err(DataError::FromStore(e.into_string())),
-            Ok(None) => Err(DataError::DataNotFound),
-            Ok(Some(data)) => {
-                match deserialize_rmp_to::<Token>(&data) {
-                    Err(_) => Err(DataError::DeserializationError),
-                    Ok(token) => Ok(token)
-                }
-            }
-        }
+impl DataProvider for DefaultDataProvider {
+    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
+        self.get_data_internal::<Token>(key, DataOperation::Get(GetOperation::Token), partition_id)
     }
 
-    fn save_token(&self, key: &Vec<u8>, token_ref: &Arc<RwLock<Token>>) -> Result<(), DataError> {
-        let Ok(token) = token_ref.write()
-            else { return Err(DataError::Poisoned) };
-
-        let Ok(data) = serialize_to_bytes_rmp(token.deref())
-            else { return Err(DataError::SerializationError) };
-
-        self.save_data(key, &data)
+    fn save_token(&self, key: &Vec<u8>, token: Token, partition_id: &str)
+                  -> Result<(), DataError> {
+        self.save_data_internal::<Token>(key, DataOperation::Save(SaveOperation::Token(token)), partition_id)
     }
 
-    fn get_data(&self, key: &Vec<u8>) -> Result<Vec<u8>, DataError> {
-        match self.store.get(key) {
-            Err(e) => Err(DataError::FromStore(e.into_string())),
-            Ok(None) => Err(DataError::DataNotFound),
-            Ok(Some(data)) => Ok(data)
-        }
+    fn get_data(&self, key: &Vec<u8>, partition_id: &str) -> Result<Vec<u8>, DataError> {
+        self.get_data_internal::<Vec<u8>>(key, DataOperation::Get(GetOperation::Data), partition_id)
     }
 
-    fn save_data(&self, key: &Vec<u8>, data: &Vec<u8>) -> Result<(), DataError> {
-        match self.store.put(key, data) {
-            Err(err) => Err(DataError::FromStore(err.into_string())),
-            Ok(_) => Ok(())
-        }
+    fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
+        self.save_data_internal::<Vec<u8>>(key, DataOperation::Save(SaveOperation::Data(data)), partition_id)
     }
 }
 
-type TokenCache = Cache<Vec<u8>, Arc<RwLock<Token>>>;
-type DataCache = Cache<Vec<u8>, Arc<RwLock<Vec<u8>>>>;
+#[derive(Serialize, Deserialize, Debug)]
+pub enum DataOperation {
+    Get(GetOperation),
+    Save(SaveOperation)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum GetOperation {
+    Token,
+    Data
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SaveOperation {
+    Token(Token),
+    Data(Vec<u8>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DataRequest {
+    key: Vec<u8>,
+    op: DataOperation,
+    partition_id: String
+}
+
+impl DataRequest {
+    pub fn new(key: &Vec<u8>, op: DataOperation, partition: &str) -> Self {
+        DataRequest {
+            key: key.clone(),
+            op,
+            partition_id: partition.to_string()
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum DataError {
     FromStore(String),
-    SerializationError,
-    DeserializationError,
+    SerializationError(std::io::Error),
+    DeserializationError(std::io::Error),
     DataNotFound,
     StoreNotFound,
     CacheError,
-    Poisoned
+    Poisoned,
+    InvalidOperation(DataOperation)
 }

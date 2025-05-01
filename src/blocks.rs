@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::tokens::Token;
 use crate::transactions::{SignedTransaction};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Block {
     pub signed_trans : SignedTransaction,
     pub token_metadata: HashMap<String, String>,
@@ -72,7 +72,7 @@ impl BlockFactory {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Blockchain {
     pub chain: VecDeque<Block>,
 }

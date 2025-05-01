@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use crate::blocks::Block;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Transaction {
 
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct TransactionSignature {
     pub transaction_id: Vec<u8>,
     pub env_id: Vec<u8>,
@@ -16,7 +16,7 @@ pub struct TransactionSignature {
     pub current_stake: u64
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SignedTransaction {
     pub transaction_id : String,
     pub transaction : Transaction,
