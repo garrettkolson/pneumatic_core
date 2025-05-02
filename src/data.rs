@@ -43,20 +43,18 @@ impl DefaultDataProvider {
             conn_factory: ConnFactory::new()
         }
     }
-}
 
-impl DefaultDataProvider {
     fn get_source(&self) -> ConnTarget {
         let local_target = match cfg!(unix) {
             true => LocalTarget::Unix(DATA_UNIX_PATH.to_string()),
-            _ => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
+            false => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
         };
 
         ConnTarget::Local(local_target)
     }
 
-    fn serialize_request(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
-        -> Result<Vec<u8>, DataError> {
+    fn serialize_request(&self, key: &Vec<u8>, op: DataOp, partition: &str)
+                         -> Result<Vec<u8>, DataError> {
         let request = DataRequest::new(key, op, partition);
         return match serialize_to_bytes_rmp(&request) {
             Ok(d) => Ok(d),
@@ -64,11 +62,11 @@ impl DefaultDataProvider {
         }
     }
 
-    fn get_data_internal<T>(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
-        -> Result<T, DataError>
+    fn get_data_internal<T>(&self, key: &Vec<u8>, op: DataOp, partition: &str)
+                            -> Result<T, DataError>
         where T : Serialize + for<'a> Deserialize<'a>
     {
-        if let DataOperation::Save(_) = op { return Err(DataError::InvalidOperation(op)) }
+        if let DataOp::Save(_) = op { return Err(DataError::InvalidOperation(op)) }
         let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
@@ -86,11 +84,11 @@ impl DefaultDataProvider {
         Err(DataError::StoreNotFound)
     }
 
-    fn save_data_internal<T>(&self, key: &Vec<u8>, op: DataOperation, partition: &str)
-                            -> Result<(), DataError>
+    fn save_data_internal<T>(&self, key: &Vec<u8>, op: DataOp, partition: &str)
+                             -> Result<(), DataError>
         where T : Serialize + for<'a> Deserialize<'a>
     {
-        if let DataOperation::Get(_) = op { return Err(DataError::InvalidOperation(op)) }
+        if let DataOp::Get(_) = op { return Err(DataError::InvalidOperation(op)) }
         let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
@@ -106,37 +104,37 @@ impl DefaultDataProvider {
 
 impl DataProvider for DefaultDataProvider {
     fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
-        self.get_data_internal::<Token>(key, DataOperation::Get(GetOperation::Token), partition_id)
+        self.get_data_internal::<Token>(key, DataOp::Get(GetOp::Token), partition_id)
     }
 
     fn save_token(&self, key: &Vec<u8>, token: Token, partition_id: &str)
                   -> Result<(), DataError> {
-        self.save_data_internal::<Token>(key, DataOperation::Save(SaveOperation::Token(token)), partition_id)
+        self.save_data_internal::<Token>(key, DataOp::Save(SaveOp::Token(token)), partition_id)
     }
 
     fn get_data(&self, key: &Vec<u8>, partition_id: &str) -> Result<Vec<u8>, DataError> {
-        self.get_data_internal::<Vec<u8>>(key, DataOperation::Get(GetOperation::Data), partition_id)
+        self.get_data_internal::<Vec<u8>>(key, DataOp::Get(GetOp::Data), partition_id)
     }
 
     fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
-        self.save_data_internal::<Vec<u8>>(key, DataOperation::Save(SaveOperation::Data(data)), partition_id)
+        self.save_data_internal::<Vec<u8>>(key, DataOp::Save(SaveOp::Data(data)), partition_id)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum DataOperation {
-    Get(GetOperation),
-    Save(SaveOperation)
+pub enum DataOp {
+    Get(GetOp),
+    Save(SaveOp)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum GetOperation {
+pub enum GetOp {
     Token,
     Data
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum SaveOperation {
+pub enum SaveOp {
     Token(Token),
     Data(Vec<u8>)
 }
@@ -144,12 +142,12 @@ pub enum SaveOperation {
 #[derive(Serialize, Deserialize)]
 pub struct DataRequest {
     key: Vec<u8>,
-    op: DataOperation,
+    op: DataOp,
     partition_id: String
 }
 
 impl DataRequest {
-    pub fn new(key: &Vec<u8>, op: DataOperation, partition: &str) -> Self {
+    pub fn new(key: &Vec<u8>, op: DataOp, partition: &str) -> Self {
         DataRequest {
             key: key.clone(),
             op,
@@ -167,5 +165,5 @@ pub enum DataError {
     StoreNotFound,
     CacheError,
     Poisoned,
-    InvalidOperation(DataOperation)
+    InvalidOperation(DataOp)
 }
