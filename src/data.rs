@@ -4,7 +4,6 @@ use std::ops::Deref;
 use moka::sync::Cache;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
-use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category::Data;
 use crate::conns::{ConnTarget, LocalTarget};
