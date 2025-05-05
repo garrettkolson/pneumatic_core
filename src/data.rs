@@ -67,7 +67,7 @@ impl DefaultDataProvider {
         where T : Serialize + for<'a> Deserialize<'a>
     {
         if let DataOp::Save(_) = op { return Err(DataError::InvalidOperation(op)) }
-        let source = self.get_source();
+        let source = Self::get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
             let response = match sender.get_response(&data) {
@@ -89,7 +89,7 @@ impl DefaultDataProvider {
         where T : Serialize + for<'a> Deserialize<'a>
     {
         if let DataOp::Get(_) = op { return Err(DataError::InvalidOperation(op)) }
-        let source = self.get_source();
+        let source = Self::get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
             return match sender.get_response(&data) {
