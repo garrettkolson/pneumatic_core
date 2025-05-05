@@ -44,7 +44,7 @@ impl DefaultDataProvider {
         }
     }
 
-    fn get_source(&self) -> ConnTarget {
+    pub fn get_source() -> ConnTarget {
         let local_target = match cfg!(unix) {
             true => LocalTarget::Unix(DATA_UNIX_PATH.to_string()),
             false => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
