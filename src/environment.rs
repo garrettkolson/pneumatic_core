@@ -1,10 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
+use crate::validation::ValidationSpecRegistry;
 
 pub struct EnvironmentMetadata {
     pub environment_id: String,
@@ -16,10 +17,15 @@ pub struct EnvironmentMetadata {
     pub partitions: Vec<EnvironmentPartition>,
     pub quorum_percentage: f32,
     pub override_quorum_percentage: f32,
-    pub asym_crypto_provider: Mutex<Box<dyn AsymCryptoProvider>>,
+    /// Maximum risk score (0.0–1.0) allowed for transactions.
+    /// Transactions exceeding this threshold are rejected by the Sentinel.
+    pub max_risk: f32,
+    pub asym_crypto_provider: RwLock<Box<dyn AsymCryptoProvider>>,
+    /// Block validators keyed by spec name (for per-token block validation).
     pub block_validators: DashMap<String, Box<dyn BlockValidator>>,
-    pub logger: Arc<Box<dyn Logger>>
-    // TODO: have to finish this
+    /// Transaction validation specs — action-based specs registered by name.
+    pub transaction_validation_specs: Arc<ValidationSpecRegistry>,
+    pub logger: Arc<Box<dyn Logger>>,
 }
 
 impl EnvironmentMetadata {
@@ -34,20 +40,27 @@ impl EnvironmentMetadata {
                 EnvironmentPartitionType::Contract => contract_partition = Some(partition.id.clone()),
                 EnvironmentPartitionType::ProxyAuth => proxy_partition = Some(partition.id.clone()),
                 EnvironmentPartitionType::Slush => slush_partition = Some(partition.id.clone()),
-                EnvironmentPartitionType::Other => ()
+                EnvironmentPartitionType::Other => (),
             }
         }
 
         let token_partition_id = token_option
-            .expect(&format!("Environment with name \"{0}\" should have a token partition",
-                 spec.environment_name));
+            .expect(&format!(
+                "Environment with name \"{0}\" should have a token partition",
+                spec.environment_name
+            ));
 
         let slush_partition_id = slush_partition
-            .expect(&format!("Environment with name \"{0}\" should have a slush partition",
-                spec.environment_name));
+            .expect(&format!(
+                "Environment with name \"{0}\" should have a slush partition",
+                spec.environment_name
+            ));
 
         let asym_provider = Box::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
         let logger: Arc<Box<dyn Logger>> = Arc::new(Box::new(FileLogger::new(spec.log_file.clone())));
+
+        let mut specs = ValidationSpecRegistry::new();
+        specs.register_defaults();
 
         EnvironmentMetadata {
             environment_id: spec.environment_id,
@@ -59,10 +72,11 @@ impl EnvironmentMetadata {
             partitions: spec.partitions,
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
-            asym_crypto_provider: Mutex::new(asym_provider),
+            max_risk: spec.max_risk,
+            asym_crypto_provider: RwLock::new(asym_provider),
             block_validators: DashMap::new(),
-            logger
-            // TODO: have to finish this
+            transaction_validation_specs: Arc::new(specs),
+            logger,
         }
     }
 }
@@ -77,10 +91,11 @@ pub struct EnvironmentMetadataSpec {
     serialization_provider: String,
     quorum_percentage: f32,
     override_quorum_percentage: f32,
+    max_risk: f32,
     allowed_token_types: Vec<String>,
     trans_validation_specs: Vec<String>,
     block_validation_specs: Vec<String>,
-    log_file: String
+    log_file: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
@@ -89,7 +104,7 @@ pub enum EnvironmentPartitionType {
     Contract,
     ProxyAuth,
     Slush,
-    Other
+    Other,
 }
 
 #[derive(Serialize, Deserialize)]

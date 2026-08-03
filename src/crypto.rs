@@ -1,8 +1,16 @@
+use std::sync::RwLock;
+use ring::digest;
+use ring::signature::Ed25519KeyPair;
+use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, PartialEq)]
+// ---------------------------------------------------------------------------
+// AsymCryptoProvider — RSA placeholder (todo!())
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub enum AsymCryptoProviderType {
-    RSA
+    RSA,
 }
 
 pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> impl AsymCryptoProvider {
@@ -11,16 +19,14 @@ pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> impl AsymCry
     }
 }
 
-pub trait AsymCryptoProvider : Send + Sync {
+pub trait AsymCryptoProvider: Send + Sync {
     fn encrypt(&self, data: Vec<u8>) -> Vec<u8>;
     fn decrypt(&self, data: Vec<u8>) -> Vec<u8>;
-    fn check_signature(&self, signature: &Vec<u8>, data: &Vec<u8>) -> bool;
-    fn sign_data(&self, data: &Vec<u8>) -> Vec<u8>;
+    fn check_signature(&self, signature: &[u8], data: &[u8]) -> bool;
+    fn sign_data(&self, data: &[u8]) -> Vec<u8>;
 }
 
-pub struct RsaCryptoProvider {
-
-}
+pub struct RsaCryptoProvider {}
 
 impl RsaCryptoProvider {
     fn init() -> Self {
@@ -30,30 +36,65 @@ impl RsaCryptoProvider {
 
 impl AsymCryptoProvider for RsaCryptoProvider {
     fn encrypt(&self, data: Vec<u8>) -> Vec<u8> {
-        todo!()
+        let _ = data;
+        todo!("RSA encrypt not implemented — placeholder")
     }
 
     fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
-        todo!()
+        let _ = data;
+        todo!("RSA decrypt not implemented — placeholder")
     }
 
-    fn check_signature(&self, signature: &Vec<u8>, data: &Vec<u8>) -> bool {
-        todo!()
+    fn check_signature(&self, signature: &[u8], data: &[u8]) -> bool {
+        let _ = (signature, data);
+        todo!("RSA signature check not implemented — placeholder")
     }
 
-    fn sign_data(&self, data: &Vec<u8>) -> Vec<u8> {
-        todo!()
+    fn sign_data(&self, data: &[u8]) -> Vec<u8> {
+        let _ = data;
+        todo!("RSA sign_data not implemented — placeholder")
     }
 }
 
-pub trait HashProvider : Send + Sync {
-    fn hash(&self, data: &Vec<u8>) -> Vec<u8>;
+// ---------------------------------------------------------------------------
+// HashProvider — SHA-256 via ring
+// ---------------------------------------------------------------------------
+
+/// Trait for computing cryptographic hashes. Implemented by BasicHashProvider.
+pub trait HashProvider: Send + Sync {
+    /// Hash the given data, returning the digest as bytes.
+    fn hash(&self, data: &[u8]) -> Vec<u8>;
 }
 
-pub struct BasicHashProvider {}
+pub struct BasicHashProvider {
+    /// RwLock instead of Mutex for reduced contention in read-heavy scenarios.
+    /// Currently unused but reserved for future key management.
+    _key: RwLock<Vec<u8>>,
+}
+
+impl BasicHashProvider {
+    pub fn new() -> Self {
+        BasicHashProvider {
+            _key: RwLock::new(vec![]),
+        }
+    }
+}
+
+impl Default for BasicHashProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl HashProvider for BasicHashProvider {
-    fn hash(&self, data: &Vec<u8>) -> Vec<u8> {
-        todo!()
+    /// Compute SHA-256 hash of the input data.
+    fn hash(&self, data: &[u8]) -> Vec<u8> {
+        let digest = digest::digest(&digest::SHA256, data);
+        digest.as_ref().to_vec()
     }
+}
+
+/// Compute a SHA-256 hash using the default provider.
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    BasicHashProvider::new().hash(data)
 }
