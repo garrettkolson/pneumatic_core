@@ -516,7 +516,9 @@ dependencies = [
 name = "pneumatic_sentinel"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "pneumatic_core",
+ "tokio",
 ]
 
 [[package]]

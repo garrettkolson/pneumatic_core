@@ -1,4 +1,4 @@
-mod registry;
+pub mod registry;
 
 use std::io::Read;
 use std::net::{IpAddr};

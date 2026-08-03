@@ -123,6 +123,12 @@ impl PendingTransactionRegistry {
         Ok(entry.release())
     }
 
+    /// Acquire a mutable entry for state transitions.
+    /// Returns `None` if the transaction doesn't exist.
+    pub fn get_transaction_mut(&self, id: &str) -> Option<dashmap::mapref::one::RefMut<String, PendingTransaction>> {
+        self.transactions.get_mut(id)
+    }
+
     /// Check if any transaction is awaiting finalizer assignment.
     pub fn transaction_is_awaiting_finalizer(&self, id: &str) -> bool {
         let entry = match self.transactions.get_mut(id) {
