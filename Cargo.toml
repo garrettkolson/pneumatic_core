@@ -4,6 +4,7 @@ members = [
     "sentinel",
     "executor",
     "finalizer",
+    "committer",
 ]
 resolver = "2"
 
