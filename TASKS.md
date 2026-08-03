@@ -211,3 +211,156 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [ ] T07 Migrate existing 28 tests from pneumatic_core — all test-bearing files
 - [ ] T08 End-to-end: verify self-validated token flow — integration test
 - [ ] T09 Verify backpressure: executor rejects when overloaded — integration test
+
+---
+
+## Stubbed Functionality Inventory
+
+This section lists all code that is currently a **stub, placeholder, or `todo!()`** — structural scaffolding that is built but has no real implementation. Each item includes the file, line numbers, and what needs to be filled in.
+
+### pneumatic_core — Priority 1 (Core runtime functions)
+
+#### Crypto provider — all 4 methods are `todo!()`
+**File:** `src/crypto.rs:37-56`
+```rust
+fn encrypt(&self, data: Vec<u8>) -> Vec<u8  // todo!()
+fn decrypt(&self, data: Vec<u8>) -> Vec<u8  // todo!()
+fn check_signature(&self, signature: &[u8], data: &[u8]) -> bool  // todo!()
+fn sign_data(&self, data: &[u8]) -> Vec<u8>  // todo!()
+```
+**Action:** Replace with actual RSA or Ed25519 implementation using `ring`. Remove unused `Ed25519KeyPair`/`SystemRandom` imports that trigger warnings.
+
+#### ActionRouter — all routing branches return placeholders
+**File:** `src/action_router.rs:62-98`
+Every action branch (`Process`, `Preload`, `Sign`, `Confirm`, `Reject`, `Register`, `Clear`, `DistributeToken`) returns an unimplemented placeholder (e.g., `UnknownAction`, empty vecs, stake=0).
+**Action:** Wire through `NodeRegistry.send_to_all()` for forwarding, implement stake checking, nonce tracking.
+
+#### Gossiper — handler not stored
+**File:** `src/gossiper.rs:38-44`
+`initialize(on_message_received)` accepts a closure but never stores or invokes it.
+**Action:** Store the handler closure as a field and invoke it in `handle_message` after dedup check.
+
+#### Gossiper — no crypto validation
+**File:** `src/gossiper.rs:64`
+Comment: `// TODO: validate crypto signature (pending crypto implementation)`
+**Action:** After deserialization, verify `AsymCryptoProvider.check_signature(message.signature, message.body)`.
+
+#### Gossiper — fan-out to handler delegates not implemented
+**File:** `src/gossiper.rs:67-68`
+Comment: `// TODO: copy payload to each handler delegate (C# TODO)`
+**Action:** Store multiple handler closures, clone payload and spawn a task per handler.
+
+#### EpochReconciler — always returns empty
+**File:** `src/epoch.rs:125-133`
+`StubEpochReconciler::reconcile()` returns `EpochReconciliation::default()` (all empty collections).
+**Action:** Implement chain analysis at epoch boundaries — detect misshapen tokens, finalization conflicts.
+
+#### StakingManager — no-op
+**File:** `src/epoch.rs:136-142`
+`StubStakingManager::apply_ops()` returns `Ok(())`.
+**Action:** Persist AddStaker/RemoveStaker/Slash/Reward ops to data store.
+
+#### LeaderSelector — returns empty
+**File:** `src/epoch.rs:145-153`
+`StubLeaderSelector::select()` returns `vec![]`.
+**Action:** Stake-weighted random selection from `StakeSet`.
+
+#### Registry — finalizer_public_key stored separately, not in validation result
+**File:** `src/registry.rs:99-100`
+Comment: `// validation.finalizer_public_key = finalizer_key;`
+**Action:** Update `TransactionValidationResult` in `Validated` state with the finalizer key.
+
+#### Token.get_asset_mut — returns immutable copy
+**File:** `src/tokens.rs:111-122`
+Returns `Option<T>` (same as `get_asset`) instead of a mutable reference.
+**Action:** Return `&mut Option<Vec<u8>>` or add a `set_asset` method.
+
+#### EnvironmentMetadataSpec — unused fields
+**File:** `src/environment.rs:84-99`
+`allowed_token_types`, `trans_validation_specs`, `block_validation_specs`, `sym_crypto_provider`, `serialization_provider` — none are processed in `load_from_spec`.
+**Action:** Wire each field to appropriate initialization logic.
+
+#### Config — node registry type selection
+**File:** `src/config.rs:37-46`
+Three `// todo` comments for determining node types, connection counts, and minimum stake.
+**Action:** Parse config spec for node type selection and stake requirements.
+
+#### Server worker — exits after one job
+**File:** `src/server.rs:116-129`
+The `return` inside `match mutex.recv()` exits the entire thread after processing one job instead of continuing the loop.
+**Action:** Remove `return` so the loop continues processing subsequent jobs.
+
+#### Server async poison test — hangs
+**File:** `src/server.rs:252-275`
+Comment: `// TODO: this test causes the test runner to hang as-is - have to fix`
+**Action:** Uncomment and fix — likely needs `catch_unwind` or separate tokio runtime.
+
+#### TcpConnection — cleanup on drop
+**File:** `src/conns.rs:103`
+Comment: `// TODO: initiate drop`
+**Action:** Add `Drop` impl to cancel `listening_thread` and join with timeout.
+
+#### NodeRegistry.send_to_all — creates senders on the fly
+**File:** `src/node/registry.rs:164-187`
+Comment: `// TODO: have to redo this to use registered conns instead of creating senders on the fly`
+**Action:** Use `NodeRegistryNode.conn.send()` instead of `ConnFactory.get_sender()`.
+
+#### NodeRegistry.process_registration — always succeeds
+**File:** `src/node/registry.rs:189`
+Returns `RegistrationBatchResult::Success` without processing the batch or validating entries.
+**Action:** Iterate Add/Remove, insert/remove from DashMap, validate entries.
+
+### pneumatic_sentinel — Priority 2 (Node-specific logic)
+
+#### Sentinel.initialize — gossiper handler wiring stubbed
+**File:** `sentinel/src/sentinel.rs:66-74`
+**Action:** Create closure calling `self.on_data_received(raw)` and pass to `self.gossiper.initialize(closure)`.
+
+#### Sentinel.send_to_executor_for_preload — empty stub
+**File:** `sentinel/src/sentinel.rs:166-171`
+**Action:** Call `self.transaction_notifier.send_to_executors_for_preload(tx, self.env_data)`.
+
+#### Sentinel.handle_confirmation — stub
+**File:** `sentinel/src/sentinel.rs:174-178`
+**Action:** Deserialize tx_id, acquire transaction, verify finalizer, transition to Committed, notify sentinels.
+
+#### Sentinel.handle_rejection — stub
+**File:** `sentinel/src/sentinel.rs:182-184`
+**Action:** Deserialize tx_id, check awaiting_finalizer state, pick new finalizer, reassign.
+
+#### Sentinel.handle_register_request — stub
+**File:** `sentinel/src/sentinel.rs:187-189`
+**Action:** Deserialize `NodeRegistryRequest`, validate stake, register node.
+
+#### TransactionValidator.validate_transaction — spec not actually invoked
+**File:** `sentinel/src/transaction_validator.rs:33-61`
+Looks up spec by action name but does NOT call `spec.validate()`. Only checks that a spec exists.
+**Action:** Inject `DataProvider` to load token, call `spec.validate(tx, token, &self.env_data)`.
+
+#### TransactionNotifier.send_to_nodes — full stub
+**File:** `sentinel/src/transaction_notifier.rs:107-112`
+**Action:** Inject `NodeRegistry`, look up nodes of target type, use their `Connection` to send payload.
+
+### pneumatic_executor — Priority 3 (Not yet started)
+
+#### Executor crate — empty lib.rs stub
+**File:** `executor/src/lib.rs`
+**Action:** Create full crate with `Executor` struct (config, backpressure, preload, execute).
+
+### pneumatic_finalizer — Priority 4 (Not yet started)
+
+#### Finalizer crate — empty lib.rs stub
+**File:** `finalizer/src/lib.rs`
+**Action:** Create full crate with `Finalizer`, `SignatureCollector`, `BlockBuilder`, `MessageDispatcher`.
+
+### pneumatic_committer — Priority 5 (Not yet started)
+
+#### Committer crate — empty lib.rs stub
+**File:** `pneumatic_committer/src/lib.rs`
+**Action:** Refactor with gossiper, block_services, token_distributor. Create epoch_manager sub-directory.
+
+### Tests — Priority 6 (Not yet added)
+
+#### No tests for any new Phase 1 or Phase 2 modules
+**Files:** All files with new structs/traits/registries
+**Action:** Add ~20 test modules covering: `TransactionState` transitions, `PendingTransactionRegistry` lifecycle, `SelfSignedBlockValidatorSpec`, `Gossiper` dedup cache, `ActionRouter` routing, sentinel message handling, risk calculation.
