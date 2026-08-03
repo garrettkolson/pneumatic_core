@@ -1,0 +1,7 @@
+[package]
+name = "pneumatic_sentinel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pneumatic_core = { path = ".." }

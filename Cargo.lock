@@ -499,6 +499,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pneumatic_executor"
+version = "0.1.0"
+dependencies = [
+ "pneumatic_core",
+]
+
+[[package]]
+name = "pneumatic_finalizer"
+version = "0.1.0"
+dependencies = [
+ "pneumatic_core",
+]
+
+[[package]]
+name = "pneumatic_sentinel"
+version = "0.1.0"
+dependencies = [
+ "pneumatic_core",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
