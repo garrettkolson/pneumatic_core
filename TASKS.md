@@ -8,100 +8,100 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 
 ## Phase 0: Workspace
 
-- [ ] W01 Create workspace Cargo.toml — `Cargo.toml`
+- [x] W01 Create workspace Cargo.toml — `Cargo.toml` — structural
 
 ## Phase 1: pneumatic_core Core Library
 
 ### 1.0 Error Types (Foundation)
 
-- [ ] P0_01 Add `PneumaticError` enum covering all failure paths — `errors.rs`
-- [ ] P0_02 Verify `ConnError`, `DataError` integrate into PneumaticError
+- [x] P0_01 Add `PneumaticError` enum covering all failure paths — `errors.rs` — 8 variants + From impls
+- [ ] P0_02 Add `From<ConnError>` impl to `PneumaticError` — `errors.rs` — DataError already has From impl
 
 ### 1.1 Transaction Lifecycle (Explicit State Machine)
 
-- [ ] P1_01 Add `TransactionState` enum (Pending → Preloaded → Validated → [Executing →] Finalizing → Committed/Failed) — `transactions.rs`
-- [ ] P1_02 Add `PendingTransaction` with state machine transitions — `transactions.rs`
-- [ ] P1_03 Implement `PendingTransaction::acquire()` / `release()` with lock count — `transactions.rs`
+- [x] P1_01 Add `TransactionState` enum (Pending → Preloaded → Validated → [Executing →] Finalizing → Committed/Failed) — `transactions.rs` — all 7 states present
+- [x] P1_02 Add `PendingTransaction` with state machine transitions — `transactions.rs` — transition methods for all states
+- [x] P1_03 Implement `PendingTransaction::acquire()` / `release()` with lock count — `transactions.rs`
 
 ### 1.2 Transaction & SignedTransaction Model
 
-- [ ] P1_04 Add `Transaction` struct with all fields — `transactions.rs` — refs: C# Transaction.cs
-- [ ] P1_05 Add `Bid` struct — `transactions.rs` — refs: C# Bid.cs
-- [ ] P1_06 Add `TransactionValidationResult` — `transactions.rs` — refs: C# TransactionValidationResult.cs
-- [ ] P1_07 Add `ValidationFailureReason` enum — `transactions.rs` — refs: C# TransactionValidationResult.cs
-- [ ] P1_08 Add concrete `TransactionRiskFactor` with metrics (affected_parties, amount, is_contract, is_multi_party) — `transactions.rs`
-- [ ] P1_09 Refactor `SignedTransaction` to C# signature model — `transactions.rs` — refs: C# SignedTransaction.cs
-- [ ] P1_10 Update `TransactionCommit` with serialized block data — `transactions.rs`
+- [x] P1_04 Add `Transaction` struct with all fields — `transactions.rs` — id, action, token_id, bid, sequence_number, sender, receiver, amount, timestamp, result_hash
+- [x] P1_05 Add `Bid` struct — `transactions.rs` — bid_expiry, bid_percentage
+- [x] P1_06 Add `TransactionValidationResult` — `transactions.rs` — is_valid, risk, failure_reasons, finalizer_public_key
+- [x] P1_07 Add `ValidationFailureReason` enum — `errors.rs` — 13 variants
+- [x] P1_08 Add concrete `TransactionRiskFactor` with metrics (affected_parties, amount, is_contract, is_multi_party) — `errors.rs`
+- [x] P1_09 Refactor `SignedTransaction` to C# signature model — `transactions.rs` — leader/finalizer/executor sigs
+- [x] P1_10 Update `TransactionCommit` with serialized block data — `transactions.rs` — proposed_block: Block
 
 ### 1.3 Token & Blockchain Refactoring
 
-- [ ] P1_11 Add fields to Token (id, sequence_number, is_self_verified, is_non_transferable, block_validation_spec_name, environment_id) — `tokens.rs` — refs: C# Token.cs
-- [ ] P1_12 Add `Token::create_block(metadata, signed_tx)` — `tokens.rs` — refs: C# Token.cs:40-48
-- [ ] P1_13 Convert `Token::validate_block` → spec lookup — `tokens.rs` — refs: C# Token.cs:51-59
-- [ ] P1_14 Implement `Token::commit_block` — `tokens.rs` — refs: C# Token.cs:61-76
-- [ ] P1_15 Add `Blockchain` metadata fields — `blocks.rs` — refs: C# Blockchain.cs
-- [ ] P1_16 Refactor `Blockchain::create_hash` → HashProvider — `blocks.rs` — refs: C# Blockchain.cs:71-75
+- [x] P1_11 Add fields to Token (id, sequence_number, is_self_verified, is_non_transferable, block_validation_spec_name, environment_id) — `tokens.rs` — all 10 fields present
+- [x] P1_12 Add `Token::create_block(metadata, signed_tx)` — `tokens.rs` — hash chains to previous or genesis
+- [x] P1_13 Convert `Token::validate_block` → spec lookup — `tokens.rs` — looks up spec by name from env
+- [x] P1_14 Implement `Token::commit_block` — `tokens.rs` — validates, trims, hashes, appends, increments sequence
+- [x] P1_15 Add `Blockchain` metadata fields — `blocks.rs` — metadata: HashMap<String, String>
+- [x] P1_16 Refactor `Blockchain::create_hash` → HashProvider — `blocks.rs` — BlockFactory calls BasicHashProvider
 
 ### 1.4 ValidationSpec System (CRITICAL)
 
-- [ ] P1_17 Create `validation.rs` with `TransactionValidationSpec` trait — `validation.rs` — refs: C# TransactionValidationSpec.cs
-- [ ] P1_18 Implement `SelfSignedBlockValidatorSpec` (checks owner signature, enables skip path) — `validation.rs` — refs: C# SelfSignedBlockValidatorSpec.cs
-- [ ] P1_19 Implement `ExecutedBlockValidatorSpec` — `validation.rs` — refs: C# ExecutedBlockValidatorSpec.cs
-- [ ] P1_20 Add `block_validator_specs` HashMap to EnvironmentMetadata — `environment.rs` — refs: C# EnvironmentMetadataSpec.cs
+- [x] P1_17 Create `validation.rs` with `TransactionValidationSpec` trait — `validation.rs` — validate(), calculate_risk(), name()
+- [x] P1_18 Implement `SelfSignedBlockValidatorSpec` (checks owner signature, enables skip path) — `validation.rs` — implements TransactionValidationSpec
+- [x] P1_19 Implement `ExecutedBlockValidatorSpec` — `validation.rs` — validates sender, nonce, gas, amount, risk
+- [x] P1_20 Add `transaction_validation_specs` to EnvironmentMetadata — `environment.rs` — registered via load_from_spec + register_defaults()
 
 ### 1.5 PendingTransactionRegistry
 
-- [ ] P1_21 Create `registry.rs` with `PendingTransactionRegistry` (DashMap-backed) — `registry.rs` — refs: C# PendingTransactionRegistry.cs
-- [ ] P1_22 All methods return `Result` (never `Option`) — `registry.rs`
+- [x] P1_21 Create `registry.rs` with `PendingTransactionRegistry` (DashMap-backed) — `registry.rs`
+- [ ] P1_22 All methods return `Result` (never `Option`) — `registry.rs` — get_validation_result() and get_transaction_mut() still return Option
 
 ### 1.6 TransactionSignatureRegistry
 
-- [ ] P1_23 Implement `TransactionSignatureRegistry` — `registry.rs` — refs: C# TransactionSignatureRegistry.cs
+- [x] P1_23 Implement `TransactionSignatureRegistry` — `registry.rs` — 7 methods, DashMap-backed
 
 ### 1.7 EpochManager Types (Concrete Structure)
 
-- [ ] P1_24 Add `Epoch` struct — `epoch.rs` — refs: C# Epoch.cs
-- [ ] P1_25 Add `StakingOp` enum — `epoch.rs`
-- [ ] P1_26 Add `EpochReconciliation` struct — `epoch.rs` — refs: C# IEpochReconciler.cs
-- [ ] P1_27 Create `IEpochReconciler` trait (returns reconciliation data) — `epoch.rs`
-- [ ] P1_28 Create `IStakingManager` trait (applies ops) — `epoch.rs` — refs: C# IStakingManager.cs
-- [ ] P1_29 Create `IEpochLeaderSelector` trait — `epoch.rs` — refs: C# IEpochLeaderSelector.cs
-- [ ] P1_30 Stub implementations that return empty structures — `epoch.rs`
+- [x] P1_24 Add `Epoch` struct — `epoch.rs` — start/end timestamp, epoch_number, leader_public_key
+- [x] P1_25 Add `StakingOp` enum — `epoch.rs` — AddStaker, RemoveStaker, Slash, Reward
+- [x] P1_26 Add `EpochReconciliation` struct — `epoch.rs` — misshapen_tokens, conflicts, slashing_ops, reward_ops
+- [x] P1_27 Create `IEpochReconciler` trait (returns reconciliation data) — `epoch.rs`
+- [x] P1_28 Create `IStakingManager` trait (applies ops) — `epoch.rs`
+- [x] P1_29 Create `IEpochLeaderSelector` trait — `epoch.rs`
+- [x] P1_30 Stub implementations that return empty structures — `epoch.rs` — StubEpochReconciler, StubStakingManager, StubLeaderSelector
 
 ### 1.8 TokenFactory + Token Types
 
-- [ ] P1_31 Implement `TokenFactory::mint_token` — `tokens.rs` — refs: C# TokenFactory.cs
-- [ ] P1_32 Add `SmartContract`, `ContractProxyAuthorization`, `User` structs — `tokens.rs`
-- [ ] P1_33 Add `ContractToken: Token` — `tokens.rs` — refs: C# ContractToken.cs
-- [ ] P1_34 Add `ProxyAuthToken: Token` — `tokens.rs` — refs: C# ProxyAuthToken.cs
-- [ ] P1_35 Add `UserToken: Token` — `tokens.rs` — refs: C# UserToken.cs
+- [x] P1_31 Implement `TokenFactory::mint_token` — `tokens.rs` — generic dispatch on asset type, helpers: mint_user_token, mint_contract_token, mint_proxy_auth_token
+- [x] P1_32 Add `SmartContract`, `ContractProxyAuthorization`, `User` structs — `tokens.rs`
+- [x] P1_33 Add `ContractToken: Token` — `tokens.rs` — DESIGN DECISION: unified `Token` struct with `asset_data`/`asset_hash` instead of subtype hierarchy
+- [x] P1_34 Add `ProxyAuthToken: Token` — `tokens.rs` — same unified approach
+- [x] P1_35 Add `UserToken: Token` — `tokens.rs` — same unified approach
 
 ### 1.9 Message & BlockValidatorSpec
 
-- [ ] P1_36 Add `MessageBody<T>` — `messages.rs` — refs: C# MessageBody.cs
-- [ ] P1_37 Rename `Message.env_id` → `chain_id` — `messages.rs` — refs: C# Message.cs
-- [ ] P1_38 Create `BlockValidatorSpec` trait — `validation.rs` — refs: C# BlockValidatorSpec.cs
-- [ ] P1_39 Add `SelfSignedBlockValidatorSpec` for blocks — `validation.rs` — refs: C# SelfSignedBlockValidatorSpec.cs
-- [ ] P1_40 Add `ExecutedBlockValidatorSpec` for blocks — `validation.rs` — refs: C# ExecutedBlockValidatorSpec.cs
+- [x] P1_36 Add `MessageBody<T>` — `messages.rs` — action: String, body: T
+- [x] P1_37 Rename `Message.env_id` → `chain_id` — `messages.rs`
+- [x] P1_38 Create `BlockValidatorSpec` trait — `validation.rs` — validate(block, token, env_data)
+- [ ] P1_39 Add `SelfSignedBlockValidatorSpec` for blocks — `validation.rs` — EXISTS but implements TransactionValidationSpec, not BlockValidatorSpec
+- [ ] P1_40 Add `ExecutedBlockValidatorSpec` for blocks — `validation.rs` — EXISTS but implements TransactionValidationSpec, not BlockValidatorSpec
 
 ### 1.10 Gossiper
 
-- [ ] P1_41 Implement `Gossiper` struct with config TTL cache — `gossiper.rs` — refs: C# Gossiper.cs
-- [ ] P1_42 Copy payload to each handler delegate (C# TODO) — `gossiper.rs`
+- [x] P1_41 Implement `Gossiper` struct with config TTL cache — `gossiper.rs` — moka cache with TTL
+- [ ] P1_42 Copy payload to each handler delegate (C# TODO) — `gossiper.rs` — initialize() accepts closure but never stores/inokes it; TODO comment at line 67
 
 ### 1.11 IActionRouter
 
-- [ ] P1_43 Create `IActionRouter` trait — `action_router.rs` — refs: C# IActionRouter.cs
-- [ ] P1_44 Implement `ActionRouter` with utility token coordination (nonce, gas, stake) — `action_router.rs`
-- [ ] P1_45 Create `ActionRouterResult` type — `action_router.rs`
+- [x] P1_43 Create `IActionRouter` trait — `action_router.rs` — async route(Message) -> Result<ActionRouterResult>
+- [ ] P1_44 Implement `ActionRouter` with utility token coordination (nonce, gas, stake) — `action_router.rs` — struct/routing exist, does NOT implement IActionRouter (has handle() instead of route()), utility token coordination is stubbed
+- [x] P1_45 Create `ActionRouterResult` type — `action_router.rs` — 6 variants
 
 ### 1.12 Remove Validator
 
-- [ ] P1_46 Remove `Validator` from `NodeRegistryType` enum — `node.rs` — dead code in C#
+- [x] P1_46 Remove `Validator` from `NodeRegistryType` enum — `node.rs` — enum has Committer, Sentinel, Executor, Finalizer, Archiver
 
 ### 1.13 HashProvider
 
-- [ ] P1_47 Create `IHashProvider` trait — `crypto.rs` — refs: C# IHashProvider.cs
+- [x] P1_47 Create `HashProvider` trait — `crypto.rs` — named `HashProvider` (no `I` prefix), fully implemented with SHA-256 via ring
 
 ## Phase 2: pneumatic_sentinel Crate
 
