@@ -132,13 +132,13 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 
 ### 3.1 Executor
 
-- [ ] P3_01 Create executor crate — `executor/Cargo.toml` — structural
-- [ ] P3_02 Implement `Executor` struct with `max_in_flight` (backpressure) — `executor/src/executor.rs` — refs: C# Executor.cs
-- [ ] P3_03 Implement `initialize`, `on_data_received` — `executor/src/executor.rs` — refs: C# Executor.cs:27-30, 71-97
-- [ ] P3_04 Implement `preload_for_transaction` — `executor/src/executor.rs` — refs: C# Executor.cs:33-43
-- [ ] P3_05 Implement `process_transaction` — `executor/src/executor.rs` — refs: C# Executor.cs:45-67
-- [ ] P3_06 Implement backpressure check (reject if overloaded) — `executor/src/executor.rs`
-- [ ] P3_07 Implement preload task cleanup — `executor/src/executor.rs`
+- [x] P3_01 Create executor crate — `executor/Cargo.toml` — structural
+- [x] P3_02 Implement `Executor` struct with `max_in_flight` (backpressure) — `executor/src/executor.rs` — refs: C# Executor.cs
+- [x] P3_03 Implement `initialize`, `on_data_received` — `executor/src/executor.rs` — refs: C# Executor.cs:27-30, 71-97
+- [x] P3_04 Implement `preload_for_transaction` — `executor/src/executor.rs` — refs: C# Executor.cs:33-43
+- [x] P3_05 Implement `process_transaction` — `executor/src/executor.rs` — refs: C# Executor.cs:45-67
+- [x] P3_06 Implement backpressure check (reject if overloaded) — `executor/src/executor.rs`
+- [x] P3_07 Implement preload task cleanup — `executor/src/executor.rs`
 
 ## Phase 4: pneumatic_finalizer Crate (Split from C# Monolithic Design)
 
@@ -341,11 +341,27 @@ Looks up spec by action name but does NOT call `spec.validate()`. Only checks th
 **File:** `sentinel/src/transaction_notifier.rs:107-112`
 **Action:** Inject `NodeRegistry`, look up nodes of target type, use their `Connection` to send payload.
 
-### pneumatic_executor — Priority 3 (Not yet started)
+### pneumatic_executor — Priority 3 (Started — Phase 3 complete, ~560 lines, 6 tests)
 
-#### Executor crate — empty lib.rs stub
-**File:** `executor/src/lib.rs`
-**Action:** Create full crate with `Executor` struct (config, backpressure, preload, execute).
+#### Executor — stub contract execution
+**File:** `executor/src/executor.rs:298-304`
+`execute_contract()` serializes the transaction as "execution output" instead of invoking contract bytecode.
+**Action:** Replace stub with actual contract execution logic.
+
+#### Executor — stub finalizer networking
+**File:** `executor/src/executor.rs:141-162`
+`send_to_finalizer()` broadcasts `Message(action="Execute")` with serialized body, but doesn't build proper execution result or compute result hash.
+**Action:** Build proper execution result, hash with `hash_provider`, include in message.
+
+#### Executor — `validate_execution_result` never called
+**File:** `executor/src/executor.rs:184-193`
+Checks `result_hash` non-empty but never invoked in the pipeline (execution task calls `preload_cleanup` directly).
+**Action:** Call after `execute_contract`, use result to transition to Finalizing state.
+
+#### Executor — `get_finalizer_key` never called
+**File:** `executor/src/executor.rs:203-208`
+Returns finalizer key from registry but never used.
+**Action:** Use to send execution result to the correct finalizer.
 
 ### pneumatic_finalizer — Priority 4 (Not yet started)
 
