@@ -154,13 +154,31 @@ pub enum ConnError {
 
 impl Debug for ConnError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        match self {
+            ConnError::IO(msg) => f.debug_tuple("IO").field(msg).finish(),
+            ConnError::MalformedData(msg) => f.debug_tuple("MalformedData").field(msg).finish(),
+            ConnError::CouldNotEstablishStream => f.write_str("CouldNotEstablishStream"),
+            ConnError::WriteError(msg) => f.debug_tuple("WriteError").field(msg).finish(),
+            ConnError::ReadError(msg) => f.debug_tuple("ReadError").field(msg).finish(),
+            ConnError::ConnectionRejectedByRemote => {
+                f.write_str("ConnectionRejectedByRemote")
+            }
+        }
     }
 }
 
 impl Display for ConnError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        match self {
+            ConnError::IO(msg) => write!(f, "IO({})", msg),
+            ConnError::MalformedData(msg) => write!(f, "MalformedData({})", msg),
+            ConnError::CouldNotEstablishStream => f.write_str("CouldNotEstablishStream"),
+            ConnError::WriteError(msg) => write!(f, "WriteError({:?})", msg),
+            ConnError::ReadError(msg) => write!(f, "ReadError({:?})", msg),
+            ConnError::ConnectionRejectedByRemote => {
+                f.write_str("ConnectionRejectedByRemote")
+            }
+        }
     }
 }
 

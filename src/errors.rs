@@ -42,6 +42,12 @@ impl From<BlockValidationError> for PneumaticError {
     }
 }
 
+impl From<crate::conns::ConnError> for PneumaticError {
+    fn from(e: crate::conns::ConnError) -> Self {
+        PneumaticError::Network(e.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation failure reasons (mirrors C# ValidationFailureReason minus dead ones)
 // ---------------------------------------------------------------------------
@@ -190,6 +196,16 @@ mod tests {
         match err {
             PneumaticError::Block(_) => {}
             _ => panic!("expected Block variant, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_conn_error_becomes_network() {
+        let conn_err = crate::conns::ConnError::IO("connection lost".to_string());
+        let err: PneumaticError = conn_err.into();
+        match err {
+            PneumaticError::Network(msg) => assert_eq!(msg, "IO(connection lost)"),
+            _ => panic!("expected Network variant, got {:?}", err),
         }
     }
 

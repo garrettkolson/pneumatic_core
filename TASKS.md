@@ -15,7 +15,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 ### 1.0 Error Types (Foundation)
 
 - [x] P0_01 Add `PneumaticError` enum covering all failure paths — `errors.rs` — 8 variants + From impls
-- [ ] P0_02 Add `From<ConnError>` impl to `PneumaticError` — `errors.rs` — DataError already has From impl
+- [x] P0_02 Add `From<ConnError>` impl to `PneumaticError` — `errors.rs` — maps to `Network(String)` variant; also fixed `ConnError` Display/Debug infinite recursion (self-referential `write!(f, "{}", self)`)
 
 ### 1.1 Transaction Lifecycle (Explicit State Machine)
 
