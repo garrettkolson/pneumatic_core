@@ -201,12 +201,15 @@ impl Executor {
 
     /// Get the finalizer public key from the transaction's validation result.
     fn get_finalizer_key(&self, tx_id: &str) -> Vec<u8> {
-        if let Some(entry) = self.pending_registry.get_transaction_mut(tx_id) {
-            if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
-                &entry.state
-            {
-                return validation.finalizer_public_key.clone();
+        match self.pending_registry.get_transaction_mut(tx_id) {
+            Ok(entry) => {
+                if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
+                    &entry.state
+                {
+                    return validation.finalizer_public_key.clone();
+                }
             }
+            Err(_) => {}
         }
         vec![]
     }
@@ -258,35 +261,36 @@ impl ExecutorHandle {
     /// Run the full execution pipeline for a single transaction.
     async fn run_execution(&self, tx_id: &str) -> Result<ExecutionResult, ExecutorError> {
         // Step 1: Load the pending transaction from the registry
-        let transaction = match self.pending_registry.get_transaction_mut(tx_id) {
-            Some(mut entry) => {
-                match &entry.state {
-                    pneumatic_core::transactions::TransactionState::Preloaded { transaction } => {
-                        transaction.clone()
-                    }
-                    pneumatic_core::transactions::TransactionState::Validated { transaction, .. } => {
-                        transaction.clone()
-                    }
-                    pneumatic_core::transactions::TransactionState::Executing { transaction } => {
-                        transaction.clone()
-                    }
-                    _ => {
-                        return Err(ExecutorError::InvalidState(format!(
-                            "Transaction {} in terminal state", tx_id
-                        )))
-                    }
+        let entry = self.pending_registry.get_transaction_mut(tx_id)
+            .map_err(|e| match e {
+                pneumatic_core::errors::PneumaticError::Registry(msg) => {
+                    ExecutorError::Registry(msg)
                 }
+                other => {
+                    ExecutorError::Registry(format!("{:?}", other))
+                }
+            })?;
+        let transaction = match &entry.state {
+            pneumatic_core::transactions::TransactionState::Preloaded { transaction } => {
+                transaction.clone()
             }
-            None => {
-                return Err(ExecutorError::Registry(format!(
-                    "Transaction {} not in registry", tx_id
+            pneumatic_core::transactions::TransactionState::Validated { transaction, .. } => {
+                transaction.clone()
+            }
+            pneumatic_core::transactions::TransactionState::Executing { transaction } => {
+                transaction.clone()
+            }
+            _ => {
+                return Err(ExecutorError::InvalidState(format!(
+                    "Transaction {} in terminal state", tx_id
                 )))
             }
         };
+        drop(entry);
 
         // Step 2: Transition to Executing state
         {
-            if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
                 entry.transition_to_executing(transaction.clone());
             }
         }
@@ -317,7 +321,7 @@ impl ExecutorHandle {
         let validation_result = self.validate_execution_result(&transaction, &final_result);
         if let Err(reasons) = validation_result {
             // Transition to Failed state
-            if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
                 entry.transition_to_failed(transaction, reasons.clone());
             }
             return Err(ExecutorError::Validation(reasons));
@@ -331,7 +335,7 @@ impl ExecutorHandle {
 
         // Step 10: Transition to Finalizing state
         {
-            if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
                 entry.transition_to_finalizing(transaction.clone(), finalizer_key.clone());
             }
         }
@@ -342,7 +346,7 @@ impl ExecutorHandle {
             .await
         {
             // Transition to Failed state on send failure
-            if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
                 entry.transition_to_failed(
                     transaction.clone(),
                     vec![ValidationFailureReason::ContractNotFound],
@@ -378,12 +382,15 @@ impl ExecutorHandle {
 
     /// Get the finalizer public key from the transaction's validation result.
     fn get_finalizer_key(&self, tx_id: &str) -> Vec<u8> {
-        if let Some(entry) = self.pending_registry.get_transaction_mut(tx_id) {
-            if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
-                &entry.state
-            {
-                return validation.finalizer_public_key.clone();
+        match self.pending_registry.get_transaction_mut(tx_id) {
+            Ok(entry) => {
+                if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
+                    &entry.state
+                {
+                    return validation.finalizer_public_key.clone();
+                }
             }
+            Err(_) => {}
         }
         vec![]
     }

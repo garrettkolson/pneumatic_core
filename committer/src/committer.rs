@@ -187,8 +187,7 @@ impl Committer {
         let transaction = {
             let entry = self
                 .pending_registry
-                .get_transaction_mut(&tx_id)
-                .ok_or_else(|| CommitterError::TransactionNotFound(tx_id.clone()))?;
+                .get_transaction_mut(&tx_id)?;
 
             match &entry.state {
                 TransactionState::Finalizing { transaction, .. } => transaction.clone(),
@@ -202,7 +201,7 @@ impl Committer {
         let result = self.block_services.commit_block(commit)?;
 
         // Step 4: Transition to Committed state
-        if let Some(mut entry) = self.pending_registry.get_transaction_mut(&tx_id) {
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx_id) {
             entry.transition_to_committed(transaction, result.token_id);
         }
 

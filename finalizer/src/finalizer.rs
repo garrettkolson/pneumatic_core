@@ -201,59 +201,46 @@ impl Finalizer {
         let reconciled = self.signature_collector.reconcile_signatures(tx_id)?;
 
         // Step 2: Load the transaction from pending registry
-        let transaction = match self.pending_registry.get_transaction_mut(tx_id) {
-            Some(mut entry) => {
-                // Get the transaction from the current state
-                match entry.state {
-                    TransactionState::Preloaded { ref transaction }
-                    | TransactionState::Validated { ref transaction, .. }
-                    | TransactionState::Executing { ref transaction } => {
-                        transaction.clone()
-                    }
-                    _ => {
-                        return Err(PneumaticError::Registry(format!(
-                            "Transaction {} not in executable state for finalization",
-                            tx_id
-                        )));
-                    }
-                }
+        let entry = self.pending_registry.get_transaction_mut(tx_id)?;
+        let transaction = match entry.state {
+            TransactionState::Preloaded { ref transaction }
+            | TransactionState::Validated { ref transaction, .. }
+            | TransactionState::Executing { ref transaction } => {
+                transaction.clone()
             }
-            None => {
+            _ => {
                 return Err(PneumaticError::Registry(format!(
-                    "Transaction {} not found for finalization",
+                    "Transaction {} not in executable state for finalization",
                     tx_id
                 )));
             }
         };
+        drop(entry);
 
         // Step 3: Get the finalizer key from the transaction state
         let finalizer_key = match self.pending_registry.get_transaction_mut(tx_id) {
-            Some(entry) => {
-                match &entry.state {
-                    TransactionState::Validated { validation, .. } => {
-                        validation.finalizer_public_key.clone()
-                    }
-                    TransactionState::Finalizing { finalizer_key, .. } => {
-                        finalizer_key.clone()
-                    }
-                    _ => vec![],
+            Ok(entry) => match &entry.state {
+                TransactionState::Validated { validation, .. } => {
+                    validation.finalizer_public_key.clone()
                 }
-            }
-            None => vec![],
+                TransactionState::Finalizing { finalizer_key, .. } => {
+                    finalizer_key.clone()
+                }
+                _ => vec![],
+            },
+            Err(_) => vec![],
         };
 
         // Step 4: Build SignedTransaction from reconciled data
         let (total_stake, total_voters) = match self.pending_registry.get_transaction_mut(tx_id) {
-            Some(entry) => {
-                match &entry.state {
-                    TransactionState::Validated { .. } => {
-                        // In production, get from environment metadata
-                        (0, 0)
-                    }
-                    _ => (0, 0),
+            Ok(entry) => match &entry.state {
+                TransactionState::Validated { .. } => {
+                    // In production, get from environment metadata
+                    (0, 0)
                 }
-            }
-            None => (0, 0),
+                _ => (0, 0),
+            },
+            Err(_) => (0, 0),
         };
 
         let mut signed_tx = self.block_builder.build_signed_transaction(
@@ -269,7 +256,7 @@ impl Finalizer {
         signed_tx.finalizer_sig = finalizer_sig;
 
         // Step 6: Transition to Finalizing state
-        if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
             entry.transition_to_finalizing(transaction.clone(), finalizer_key);
         }
 
@@ -292,7 +279,7 @@ impl Finalizer {
         self.message_dispatcher.send_clear_to_sentinels(tx_id)?;
 
         // Step 10: Transition to Committed state
-        if let Some(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
             entry.transition_to_committed(transaction, block_hash);
         }
 

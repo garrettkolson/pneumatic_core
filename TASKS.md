@@ -52,7 +52,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 ### 1.5 PendingTransactionRegistry
 
 - [x] P1_21 Create `registry.rs` with `PendingTransactionRegistry` (DashMap-backed) — `registry.rs`
-- [ ] P1_22 All methods return `Result` (never `Option`) — `registry.rs` — get_validation_result() and get_transaction_mut() still return Option
+- [x] P1_22 All methods return `Result` (never `Option`) — `registry.rs` — get_validation_result() and get_transaction_mut() now return Result<T, PneumaticError>; all callers updated across 6 files (registry.rs, sentinel.rs, finalizer.rs, executor.rs, committer.rs, validation.rs); test names updated to reflect new semantics (e.g. `get_validation_result_from_pending_returns_none` → `get_validation_result_from_pending_returns_error`)
 
 ### 1.6 TransactionSignatureRegistry
 

@@ -497,9 +497,8 @@ mod tests {
         // Confirm registry holds validated state
         let registry = PendingTransactionRegistry::new();
         registry.add_transaction(pt_id.clone(), pt).unwrap();
-        let result = registry.get_validation_result(&pt_id);
-        assert!(result.is_some());
-        assert!(result.unwrap().is_valid);
+        let result = registry.get_validation_result(&pt_id).unwrap();
+        assert!(result.is_valid);
     }
 
     // --- Nonce tests ---

@@ -67,11 +67,17 @@ impl PendingTransactionRegistry {
     }
 
     /// Get the validation result for a validated transaction.
-    pub fn get_validation_result(&self, id: &str) -> Option<TransactionValidationResult> {
-        let entry = self.transactions.get(id)?;
+    /// Returns `Err` if the transaction doesn't exist or isn't in Validated state.
+    pub fn get_validation_result(&self, id: &str) -> Result<TransactionValidationResult, PneumaticError> {
+        let entry = self.transactions.get(id)
+            .ok_or_else(|| PneumaticError::Registry(format!(
+                "Transaction {} not found in registry", id
+            )))?;
         match &entry.state {
-            TransactionState::Validated { validation, .. } => Some(validation.clone()),
-            _ => None,
+            TransactionState::Validated { validation, .. } => Ok(validation.clone()),
+            _ => Err(PneumaticError::Registry(format!(
+                "Transaction {} is not in Validated state", id
+            ))),
         }
     }
 
@@ -125,9 +131,12 @@ impl PendingTransactionRegistry {
     }
 
     /// Acquire a mutable entry for state transitions.
-    /// Returns `None` if the transaction doesn't exist.
-    pub fn get_transaction_mut(&self, id: &str) -> Option<dashmap::mapref::one::RefMut<String, PendingTransaction>> {
+    /// Returns `Err` if the transaction doesn't exist.
+    pub fn get_transaction_mut(&self, id: &str) -> Result<dashmap::mapref::one::RefMut<String, PendingTransaction>, PneumaticError> {
         self.transactions.get_mut(id)
+            .ok_or_else(|| PneumaticError::Registry(format!(
+                "Transaction {} not found in registry", id
+            )))
     }
 
     /// Check if any transaction is awaiting finalizer assignment.
@@ -306,7 +315,7 @@ mod tests {
         registry.register_pending("tx1".into()).unwrap();
         registry.acquire_transaction("tx1").unwrap();
         // Transition to Failed
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_failed(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),
@@ -326,7 +335,7 @@ mod tests {
         registry.register_pending("tx1".into()).unwrap();
         registry.acquire_transaction("tx1").unwrap();
         // Transition to Validated
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_validated(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),
@@ -343,16 +352,15 @@ mod tests {
                 ),
             );
         }
-        let result = registry.get_validation_result("tx1");
-        assert!(result.is_some());
-        assert!(result.unwrap().is_valid);
+        let result = registry.get_validation_result("tx1").unwrap();
+        assert!(result.is_valid);
     }
 
     #[test]
-    fn get_validation_result_from_pending_returns_none() {
+    fn get_validation_result_from_pending_returns_error() {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
-        assert!(registry.get_validation_result("tx1").is_none());
+        assert!(registry.get_validation_result("tx1").is_err());
     }
 
     #[test]
@@ -369,7 +377,7 @@ mod tests {
     fn release_failed_transaction_returns_true() {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_failed(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),
@@ -391,7 +399,7 @@ mod tests {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
         // Transition to Validated first
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_validated(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),
@@ -416,7 +424,7 @@ mod tests {
     fn is_requested_finalizer_matches() {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_validated(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),
@@ -435,7 +443,7 @@ mod tests {
     fn is_requested_finalizer_mismatch() {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
-        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+        if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
             entry.transition_to_validated(
                 Transaction {
                     id: "tx1".into(), action: "Transfer".into(),

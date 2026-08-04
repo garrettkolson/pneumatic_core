@@ -147,7 +147,7 @@ impl Sentinel {
         // Transition to Validated state with self-signed result
         {
             let risk = self.transaction_validator.calculate_risk(&tx);
-            if let Some(mut entry) = self.registry.get_transaction_mut(&tx_id) {
+            if let Ok(mut entry) = self.registry.get_transaction_mut(&tx_id) {
                 entry.transition_to_validated(tx.clone(),
                     pneumatic_core::transactions::TransactionValidationResult {
                     is_valid: true,
@@ -214,12 +214,12 @@ impl Sentinel {
     fn transition_to_failed(&self, tx_id: &str, tx: Transaction, error: PneumaticError) {
         match error {
             PneumaticError::Validation(reasons) => {
-                if let Some(mut entry) = self.registry.get_transaction_mut(tx_id) {
+                if let Ok(mut entry) = self.registry.get_transaction_mut(tx_id) {
                     entry.transition_to_failed(tx, reasons);
                 }
             }
             _ => {
-                if let Some(mut entry) = self.registry.get_transaction_mut(tx_id) {
+                if let Ok(mut entry) = self.registry.get_transaction_mut(tx_id) {
                     entry.transition_to_failed(tx, vec![]);
                 }
             }
@@ -532,8 +532,7 @@ mod tests {
         registry.add_transaction(tx_id.clone(), pt).unwrap();
 
         // Verify the sentinel sees the transaction as validated
-        let validation = registry.get_validation_result(&tx_id);
-        assert!(validation.is_some());
-        assert!(validation.unwrap().is_valid);
+        let validation = registry.get_validation_result(&tx_id).unwrap();
+        assert!(validation.is_valid);
     }
 }
