@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
@@ -21,7 +21,7 @@ pub struct EnvironmentMetadata {
     /// Maximum risk score (0.0–1.0) allowed for transactions.
     /// Transactions exceeding this threshold are rejected by the Sentinel.
     pub max_risk: f32,
-    pub asym_crypto_provider: Arc<dyn AsymCryptoProvider>,
+    pub asym_crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
     /// Block validators keyed by spec name (for per-token block validation).
     pub block_validators: Arc<DashMap<String, Box<dyn BlockValidator>>>,
     /// Transaction validation specs — action-based specs registered by name.
@@ -57,7 +57,7 @@ impl EnvironmentMetadata {
                 spec.environment_name
             ));
 
-        let asym_crypto_provider: Arc<dyn AsymCryptoProvider> = Arc::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
+        let asym_crypto_provider = crypto::get_asym_provider(&spec.asym_crypto_provider);
         let logger: Arc<dyn Logger> = Arc::new(FileLogger::new(spec.log_file.clone()));
 
         let mut specs = ValidationSpecRegistry::new();
