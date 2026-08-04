@@ -104,7 +104,17 @@ impl Committer {
     where
         F: Fn(Message) + Send + Sync + 'static,
     {
-        self.gossiper.initialize(on_message_received);
+        // Wrap the caller's Fn(Message) to deserialize from raw bytes.
+        // The gossiper stores a Fn(Vec<u8>) and calls this wrapper
+        // after deserialization and dedup checks pass.
+        let wrapped = move |raw: Vec<u8>| {
+            if let Ok(msg) = deserialize_rmp_to(&raw) {
+                on_message_received(msg);
+            }
+            // Silently drop malformed messages — the gossiper already
+            // recorded them in the dedup cache.
+        };
+        self.gossiper.initialize(wrapped);
     }
 
     /// Set the shutdown flag.

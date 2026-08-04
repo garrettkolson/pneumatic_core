@@ -63,14 +63,19 @@ impl Sentinel {
     /// Initialize the sentinel — set up message handlers and start listening.
     /// The gossiper handles incoming raw data and dispatches to the appropriate
     /// handler based on the Message.action field.
-    pub fn initialize(&self) {
-        // Wire up the gossiper to route messages to on_data_received.
-        // In production:
-        //   self.gossiper.initialize(move |raw| {
-        //       if let Err(e) = self.on_data_received(raw) {
-        //           // log error
-        //       }
-        //   });
+    ///
+    /// The closure should be created by the caller using an `Arc<Sentinel>`:
+    /// ```ignore
+    /// let sentinel = Arc::new(Sentinel::new(...));
+    /// let arc = sentinel.clone();
+    /// sentinel.initialize(move |raw| {
+    ///     if let Err(e) = arc.on_data_received(raw) {
+    ///         // log error
+    ///     }
+    /// });
+    /// ```
+    pub fn initialize(&self, gossiper_handle: impl Fn(Vec<u8>) + Send + Sync + 'static) {
+        self.gossiper.initialize(gossiper_handle);
     }
 
     /// Handle an incoming raw data frame — the primary entry point.

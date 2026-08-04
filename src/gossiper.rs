@@ -17,6 +17,10 @@ pub struct Gossiper {
     conn_factory: ConnFactory,
     /// Signature-based dedup cache with configurable TTL
     cache: Cache<Vec<u8>, ()>,
+    /// Callback invoked for each valid, non-duplicate message.
+    /// Set via `initialize()`. Stored behind a `Mutex` because
+    /// `initialize()` and `handle_message()` both borrow `&self`.
+    handler: std::sync::Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>,
 }
 
 impl Gossiper {
@@ -30,17 +34,18 @@ impl Gossiper {
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(ttl_seconds))
                 .build(),
+            handler: std::sync::Mutex::new(None),
         }
     }
 
     /// Initialize the gossiper, setting up the message received handler.
     /// The handler closure is called for each valid, non-duplicate message.
-    pub fn initialize<F>(&self, _on_message_received: F)
+    /// The closure receives the raw message bytes (before deserialization).
+    pub fn initialize<F>(&self, on_message_received: F)
     where
-        F: Fn(Message) + Send + Sync + 'static,
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
     {
-        // The handler closure would be stored and invoked in handle_message.
-        // Currently, the handler is passed in for future implementation.
+        *self.handler.lock().unwrap() = Some(Box::new(on_message_received));
     }
 
     /// Handle an incoming message: deserialize, check cache, validate crypto,
@@ -64,8 +69,11 @@ impl Gossiper {
         // TODO: validate crypto signature (pending crypto implementation)
         // Let the message through for now — real validation in Phase 6
 
-        // TODO: copy payload to each handler delegate (C# TODO)
-        // Fan out to registered handlers here
+        // Invoke the handler registered during initialize().
+        // The handler owns the dispatch logic (routing by action, etc.).
+        if let Some(ref handler) = *self.handler.lock().unwrap() {
+            handler(raw_data);
+        }
 
         Ok(())
     }
@@ -113,7 +121,6 @@ mod tests {
             signature: vec![1, 2, 3],
             public_key: vec![4, 5, 6],
         };
-        let raw = serde_json::to_vec(&msg).unwrap(); // won't work for msgpack, need encoding
         // Actually, handle_message uses deserialize_rmp_to, so we need msgpack
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
         assert!(gossiper.handle_message(raw).is_ok());

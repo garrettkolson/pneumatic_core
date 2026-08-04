@@ -134,13 +134,8 @@ impl Finalizer {
     {
         // In production: subscribe to "Preload" and "Sign" actions
         // via the Gossiper message router.
-        // self.gossiper.initialize(move |message| {
-        //     match message.action.as_str() {
-        //         "Preload" => self.handle_preload(message),
-        //         "Sign" => self.handle_signature(message),
-        //         _ => {}
-        //     }
-        // });
+        // This requires injecting a Gossiper into the Finalizer struct.
+        // For now, the closure is accepted but not wired.
         let _ = _on_message_received;
     }
 

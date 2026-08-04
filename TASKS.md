@@ -199,19 +199,25 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_03 EnvironmentMetadata crypto provider uses `RwLock` — `environment.rs`
 - [ ] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + RSA key transport) — `crypto.rs`
 
-## Phase 7: Tests
+## Phase 7: Tests (~166 passing — ~39 → ~166)
 
-- [ ] T01 Add tests for TransactionState transitions — `transactions.rs` tests
-- [ ] P1_Add tests for PendingTransactionRegistry — `registry.rs` tests
-- [ ] P1_Add tests for PendingTransaction acquire/release — `registry.rs` tests
-- [ ] P0_Add tests for PneumaticError variants
-- [ ] P1_Add tests for Gossiper dedup — `gossiper.rs` tests
-- [ ] P1_Add tests for ValidationSpec — `validation.rs` tests
-- [ ] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` tests
-- [ ] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` tests
-- [ ] T07 Migrate existing 28 tests from pneumatic_core — all test-bearing files
-- [ ] T08 End-to-end: verify self-validated token flow — integration test
-- [ ] T09 Verify backpressure: executor rejects when overloaded — integration test
+All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
+Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
+
+- [x] T01 Add tests for TransactionState transitions — `transactions.rs` — 14 tests: lifecycle, acquire/release, state predicates
+- [x] P1_Add tests for PneumaticError variants — `errors.rs` — 10 tests: From impls, risk scoring, validation error matching
+- [x] P1_Add tests for PendingTransactionRegistry — `registry.rs` — 22 unit tests (CRUD, state transitions, validation result lookup) + 11 concurrent tests (atomic ops, race safety, stress)
+- [x] P1_Add tests for PendingTransaction acquire/release — `registry.rs` — included in registry tests above
+- [x] P1_Add tests for Gossiper dedup — `gossiper.rs` — 4 tests: accept first, ignore duplicate, accept different, capacity verification
+- [x] P1_Add tests for ValidationSpec — `validation.rs` — 17 tests: SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec, ValidationSpecRegistry, nonce validation
+- [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 9 tests: From impls, creation, spec name routing, action dispatch, self-signed flow
+- [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
+- [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
+- [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
+- [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
+- [x] T07 Migrate existing tests — all test-bearing files — total 166 tests across 4 crate targets
+- [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
+- [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
 ---
 
@@ -234,18 +240,18 @@ fn decrypt(&self, data: Vec<u8>) -> Vec<u8>  // todo!() — same
 Every action branch (`Process`, `Preload`, `Sign`, `Confirm`, `Reject`, `Register`, `Clear`, `DistributeToken`) returns an unimplemented placeholder (e.g., `UnknownAction`, empty vecs, stake=0).
 **Action:** Wire through `NodeRegistry.send_to_all()` for forwarding, implement stake checking, nonce tracking.
 
-#### Gossiper — handler not stored
-**File:** `src/gossiper.rs:38-44`
-`initialize(on_message_received)` accepts a closure but never stores or invokes it.
-**Action:** Store the handler closure as a field and invoke it in `handle_message` after dedup check.
+#### Gossiper — handler stored and wired ✓ (DONE)
+**File:** `src/gossiper.rs:23`
+Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `initialize()` method stores the closure and `handle_message()` invokes it after dedup check.
+**Wiring:** Sentinel: `sentinel.initialize(move |raw| { if let Err(e) = arc.on_data_received(raw) { ... } })`. Committer: wraps caller's `Fn(Message)` with deserialization. Finalizer: stub (no Gossiper field yet).
 
 #### Gossiper — no crypto validation
-**File:** `src/gossiper.rs:64`
+**File:** `src/gossiper.rs:69`
 Comment: `// TODO: validate crypto signature (pending crypto implementation)`
 **Action:** After deserialization, verify `AsymCryptoProvider.check_signature(message.signature, message.body)`.
 
 #### Gossiper — fan-out to handler delegates not implemented
-**File:** `src/gossiper.rs:67-68`
+**File:** `src/gossiper.rs:72`
 Comment: `// TODO: copy payload to each handler delegate (C# TODO)`
 **Action:** Store multiple handler closures, clone payload and spawn a task per handler.
 
@@ -376,8 +382,24 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` sub-directory with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`.
 
-### Tests — Priority 6 (Not yet added)
+### Tests — Priority 6 (~166 passing across 4 crates)
 
-#### No tests for any new Phase 1 or Phase 2 modules
-**Files:** All files with new structs/traits/registries
-**Action:** Add ~20 test modules covering: `TransactionState` transitions, `PendingTransactionRegistry` lifecycle, `SelfSignedBlockValidatorSpec`, `Gossiper` dedup cache, `ActionRouter` routing, sentinel message handling, risk calculation.
+#### Tests added to pneumatic_core — 126 tests
+**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33), `gossiper.rs` (4), `validation.rs` (17), plus all pre-existing test-bearing files
+**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransaction acquire/release, PendingTransactionRegistry CRUD + concurrent ops, Gossiper dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration.
+
+#### Tests added to pneumatic_finalizer — 22 tests
+**Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing
+**Covered:** Signature add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior.
+
+#### Tests added to pneumatic_sentinel — 9 tests
+**Files:** `sentinel/src/sentinel.rs`
+**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow.
+
+#### Tests added to pneumatic_executor — 9 tests
+**Files:** `executor/src/executor.rs`
+**Covered:** Execution result validation, capacity checks, full backpressure cycle.
+
+#### Remaining test gaps
+**Files:** `crypto.rs`, `blocks.rs`, `config.rs`, `data.rs`, `tokens.rs`, `server.rs`, `epoch.rs`
+**Action:** Tests for HashProvider (BasicHashProvider has partial coverage via block tests), DataProvider trait, Token creation/comparison, ThreadPool (sync worker exits early — see Server worker stub), epoch reconciliation (stubbed).
