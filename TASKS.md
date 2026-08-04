@@ -174,23 +174,23 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 
 ### 5.1 Committer
 
-- [ ] P5_01 Update `pneumatic_committer/Cargo.toml` — `pneumatic_committer/Cargo.toml` — structural
-- [ ] P5_02 Refactor `Committer` struct with gossiper, block_services, token_distributor — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:32-54
-- [ ] P5_03 Implement `check_and_commit_transaction_results` — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:66-94
-- [ ] P5_04 Simplify `validate_transaction_message` — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:97-103
-- [ ] P5_05 Use Result throughout (no silent logger.log failures) — `pneumatic_committer/src/lib.rs`
+- [x] P5_01 Update `pneumatic_committer/Cargo.toml` — `pneumatic_committer/Cargo.toml` — structural
+- [x] P5_02 Refactor `Committer` struct with gossiper, block_services, token_distributor — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:32-54
+- [x] P5_03 Implement `check_and_commit_transaction_results` — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:66-94
+- [x] P5_04 Simplify `validate_transaction_message` — `pneumatic_committer/src/lib.rs` — refs: C# Committer.cs:97-103
+- [x] P5_05 Use Result throughout (no silent logger.log failures) — `pneumatic_committer/src/lib.rs`
 
 ### 5.2 EpochManager
 
-- [ ] P5_06 Create `epoch_manager/` directory — `pneumatic_committer/src/epoch_manager/mod.rs` — structural
-- [ ] P5_07 Implement `CommitterBlockServices` — `pneumatic_committer/src/epoch_manager/committer_block_services.rs` — refs: C# CommitterBlockServices.cs
-- [ ] P5_08 Implement `StakingManager` with concrete types — `pneumatic_committer/src/epoch_manager/staking_manager.rs` — refs: C# StakingManager.cs
-- [ ] P5_09 Implement `EpochReconciler` — `pneumatic_committer/src/epoch_manager/epoch_reconciler.rs` — refs: C# EpochReconciler.cs
-- [ ] P5_10 Implement `LeaderSelector` (stubbed) — `pneumatic_committer/src/epoch_manager/leader_selector.rs`
+- [x] P5_06 Create `epoch_manager/` directory — `pneumatic_committer/src/epoch_manager/mod.rs` — structural
+- [x] P5_07 Implement `CommitterBlockServices` — `pneumatic_committer/src/epoch_manager/committer_block_services.rs` — refs: C# CommitterBlockServices.cs
+- [x] P5_08 Implement `StakingManager` with concrete types — `pneumatic_committer/src/epoch_manager/staking_manager.rs` — refs: C# StakingManager.cs
+- [x] P5_09 Implement `EpochReconciler` — `pneumatic_committer/src/epoch_manager/epoch_reconciler.rs` — refs: C# EpochReconciler.cs
+- [x] P5_10 Implement `LeaderSelector` (stubbed) — `pneumatic_committer/src/epoch_manager/leader_selector.rs`
 
 ### 5.3 Main
 
-- [ ] P5_11 Update `main.rs` — `pneumatic_committer/src/main.rs` — structural
+- [x] P5_11 Update `main.rs` — `pneumatic_committer/src/main.rs` — structural
 
 ## Phase 6: Crypto Implementation
 

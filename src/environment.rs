@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
@@ -7,6 +7,7 @@ use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
 use crate::validation::ValidationSpecRegistry;
 
+#[derive(Clone)]
 pub struct EnvironmentMetadata {
     pub environment_id: String,
     pub environment_name: String,
@@ -20,12 +21,12 @@ pub struct EnvironmentMetadata {
     /// Maximum risk score (0.0–1.0) allowed for transactions.
     /// Transactions exceeding this threshold are rejected by the Sentinel.
     pub max_risk: f32,
-    pub asym_crypto_provider: RwLock<Box<dyn AsymCryptoProvider>>,
+    pub asym_crypto_provider: Arc<dyn AsymCryptoProvider>,
     /// Block validators keyed by spec name (for per-token block validation).
-    pub block_validators: DashMap<String, Box<dyn BlockValidator>>,
+    pub block_validators: Arc<DashMap<String, Box<dyn BlockValidator>>>,
     /// Transaction validation specs — action-based specs registered by name.
     pub transaction_validation_specs: Arc<ValidationSpecRegistry>,
-    pub logger: Arc<Box<dyn Logger>>,
+    pub logger: Arc<dyn Logger>,
 }
 
 impl EnvironmentMetadata {
@@ -56,8 +57,8 @@ impl EnvironmentMetadata {
                 spec.environment_name
             ));
 
-        let asym_provider = Box::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
-        let logger: Arc<Box<dyn Logger>> = Arc::new(Box::new(FileLogger::new(spec.log_file.clone())));
+        let asym_crypto_provider: Arc<dyn AsymCryptoProvider> = Arc::new(crypto::get_asym_provider(&spec.asym_crypto_provider));
+        let logger: Arc<dyn Logger> = Arc::new(FileLogger::new(spec.log_file.clone()));
 
         let mut specs = ValidationSpecRegistry::new();
         specs.register_defaults();
@@ -73,8 +74,8 @@ impl EnvironmentMetadata {
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
             max_risk: spec.max_risk,
-            asym_crypto_provider: RwLock::new(asym_provider),
-            block_validators: DashMap::new(),
+            asym_crypto_provider,
+            block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(specs),
             logger,
         }
@@ -98,7 +99,7 @@ pub struct EnvironmentMetadataSpec {
     log_file: String,
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq, Clone)]
 pub enum EnvironmentPartitionType {
     Token,
     Contract,
@@ -107,7 +108,7 @@ pub enum EnvironmentPartitionType {
     Other,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct EnvironmentPartition {
     pub id: String,
     pub partition_type: EnvironmentPartitionType,

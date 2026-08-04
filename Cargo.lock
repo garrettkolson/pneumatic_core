@@ -614,6 +614,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pneumatic_committer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "ed25519-dalek",
+ "pneumatic_core",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pneumatic_core"
 version = "0.1.0"
 dependencies = [

@@ -7,7 +7,7 @@ use crate::crypto::{BasicHashProvider, HashProvider};
 use crate::tokens::Token;
 use crate::transactions::SignedTransaction;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Block {
     pub signed_trans: SignedTransaction,
     pub token_metadata: HashMap<String, String>,
@@ -75,7 +75,7 @@ impl BlockFactory {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Blockchain {
     pub chain: VecDeque<Block>,
     /// Metadata about the blockchain (e.g., genesis hash, chain name)

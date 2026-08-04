@@ -11,6 +11,7 @@ use crate::transactions::{SignedTransaction, TransactionCommit};
 
 /// A token IS its own blockchain — independent parallel ledgers.
 #[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone)]
 pub struct Token {
     /// Unique token identifier
     pub id: Vec<u8>,
@@ -387,6 +388,7 @@ pub enum BlockValidationError {
     InvalidFinalizerSignature,
 }
 
+#[derive(Debug)]
 pub enum BlockCommitError {
     TokenWriteLockPoisoned,
     FromDataError(DataError),
