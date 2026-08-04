@@ -260,3 +260,275 @@ impl From<DataError> for SentinelError {
         SentinelError::Data(e)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use dashmap::DashMap;
+    use pneumatic_core::config::Config;
+    use pneumatic_core::node::{NodeRegistryType, NodeType, NodeTypeConfig};
+    use pneumatic_core::conns::factories::ConnFactory;
+    use pneumatic_core::conns::ConnError;
+    use pneumatic_core::data::DataError;
+    use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+    use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+    use pneumatic_core::gossiper::Gossiper;
+    use pneumatic_core::messages::Message;
+    use pneumatic_core::registry::PendingTransactionRegistry;
+    use pneumatic_core::tokens::Token;
+    use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState};
+    use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
+
+    use super::*;
+
+    // --- helpers ---
+
+    fn make_test_config() -> Config {
+        Config {
+            public_key: vec![1],
+            ip_address: "127.0.0.1".parse().unwrap(),
+            rest_api_version: 1,
+            node_type: NodeType::Full,
+            node_registry_types: vec![NodeRegistryType::Committer],
+            main_environment_id: "test".to_string(),
+            reconciliation_partition_id: "recon".to_string(),
+            environment_metadata: Arc::new(DashMap::new()),
+            type_configs: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn make_test_node_registry() -> Arc<NodeRegistry> {
+        use pneumatic_core::conns::factories::IsConnFactory;
+        Arc::new(NodeRegistry::init(
+            Arc::new(make_test_config()),
+            Box::new(ConnFactory::new()),
+            Arc::new(|_| {}),
+        ))
+    }
+
+    fn make_test_env_data() -> EnvironmentMetadata {
+        let json = r#"{"environment_id":"test","environment_name":"test",
+            "partitions":[{"id":"token","partition_type":"Token"},
+            {"id":"slush","partition_type":"Slush"}],
+            "asym_crypto_provider":{"RSA":null},"sym_crypto_provider":"sym",
+            "serialization_provider":"rmp","quorum_percentage":67.0,
+            "override_quorum_percentage":0.0,"max_risk":1.0,
+            "allowed_token_types":[],"trans_validation_specs":[],
+            "block_validation_specs":[],"log_file":"test.log"}"#;
+        let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
+        EnvironmentMetadata::load_from_spec(spec)
+    }
+
+    fn make_sentinel_fixture() -> (Sentinel, Arc<PendingTransactionRegistry>) {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        let node_registry = make_test_node_registry();
+        let env_data = Arc::new(make_test_env_data());
+        let gossiper = Arc::new(Gossiper::new(
+            NodeRegistryType::Sentinel,
+            make_test_config(),
+            300,
+        ));
+        let sentinel = Sentinel::new(
+            make_test_config(),
+            env_data,
+            node_registry,
+            registry.clone(),
+            gossiper,
+        );
+        (sentinel, registry)
+    }
+
+    // --- SentinelError From impls ---
+
+    #[test]
+    fn sentinel_error_from_io_error_wraps_as_encoding() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test io");
+        let err: SentinelError = io_err.into();
+        match err {
+            SentinelError::Encoding(_) => {}
+            _ => panic!("expected Encoding"),
+        }
+    }
+
+    #[test]
+    fn sentinel_error_from_data_error_wraps_as_data() {
+        let data_err = DataError::DeserializationError(std::io::Error::new(
+            std::io::ErrorKind::Other, "test data",
+        ));
+        let err: SentinelError = data_err.into();
+        match err {
+            SentinelError::Data(_) => {}
+            _ => panic!("expected Data"),
+        }
+    }
+
+    // --- Sentinel creation and behavior ---
+
+    #[test]
+    fn sentinel_creation_succeeds() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        // Just verify it was constructed without panic
+        let _ = sentinel;
+    }
+
+    #[test]
+    fn get_validation_spec_name_empty_defaults_to_executed() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let tx = Transaction {
+            id: "test".into(),
+            action: "".into(),
+            token_id: vec![],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let name = sentinel.get_validation_spec_name(&tx);
+        assert_eq!(name, "Executed");
+    }
+
+    #[test]
+    fn get_validation_spec_name_nonempty_returns_action() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let tx = Transaction {
+            id: "test".into(),
+            action: "Transfer".into(),
+            token_id: vec![],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let name = sentinel.get_validation_spec_name(&tx);
+        assert_eq!(name, "Transfer");
+    }
+
+    // --- on_data_received routing ---
+
+    #[test]
+    fn on_data_received_unknown_action_returns_error() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Zzzz".into(),
+            body: vec![],
+            signature: vec![],
+            public_key: vec![],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::UnknownAction(action) => assert_eq!(action, "Zzzz"),
+            _ => panic!("expected UnknownAction"),
+        }
+    }
+
+    #[test]
+    fn on_data_received_process_with_valid_body_no_encoding_error() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: serialize_to_bytes_rmp(&Transaction {
+                id: "test_tx".into(),
+                action: "Transfer".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: vec![1],
+                receiver: vec![2],
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            }).unwrap(),
+            signature: vec![1, 2, 3],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        // Should not return Encoding error (may fail on other paths, but that's OK)
+        match result {
+            Err(SentinelError::Encoding(_)) => panic!("should not be Encoding error"),
+            _ => {} // any other error is fine (validation, registry, etc.)
+        }
+    }
+
+    #[test]
+    fn on_data_received_clear_removes_from_registry() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        // Register a transaction first
+        registry.register_pending("tx_clear".into()).unwrap();
+        assert!(registry.contains("tx_clear"));
+
+        // Send a "Clear" message with serialized tx_id
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Clear".into(),
+            body: serialize_to_bytes_rmp(&"tx_clear".to_string()).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_ok());
+        assert!(!registry.contains("tx_clear"));
+    }
+
+    // --- T08 integration: self-signed token flow through sentinel ---
+
+    #[test]
+    fn sentinel_self_signed_token_flow_end_to_end() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let (token, node_registry) = (
+            {
+                let mut token = Token::new();
+                token.set_metadata("owner".to_string(), "alice".to_string());
+                token
+            },
+            make_test_node_registry(),
+        );
+
+        // Create a self-signed transaction (sender == owner)
+        let tx = Transaction {
+            id: "tx_self_signed".into(),
+            action: "Transfer".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: b"alice".to_vec(),
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+
+        // Validate with SelfSigned spec directly
+        let spec = SelfSignedBlockValidatorSpec::new();
+        let env = make_test_env_data();
+        let validation_result = spec.validate(&tx, &token, &env).unwrap();
+        assert!(validation_result.is_valid);
+
+        // Create PendingTransaction and transition to Validated
+        let tx_id = tx.id.clone();
+        let mut pt = PendingTransaction::new(tx_id.clone(), TransactionState::Pending);
+        pt.transition_to_validated(tx.clone(), validation_result);
+        registry.add_transaction(tx_id.clone(), pt).unwrap();
+
+        // Verify the sentinel sees the transaction as validated
+        let validation = registry.get_validation_result(&tx_id);
+        assert!(validation.is_some());
+        assert!(validation.unwrap().is_valid);
+    }
+}

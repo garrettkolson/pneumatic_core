@@ -150,3 +150,122 @@ pub struct ExecutorSignature {
 // Alias for token block validation error (reuse existing enum)
 // ---------------------------------------------------------------------------
 pub use crate::tokens::BlockValidationError;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- From implementations ---
+
+    #[test]
+    fn from_io_error_becomes_encoding() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "test io error");
+        let err: PneumaticError = io_err.into();
+        match err {
+            PneumaticError::Encoding(msg) => assert_eq!(msg, "test io error"),
+            _ => panic!("expected Encoding variant, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_data_error_becomes_data() {
+        let data_err = DataError::DeserializationError(std::io::Error::new(
+            std::io::ErrorKind::Other, "test data error",
+        ));
+        let err: PneumaticError = data_err.into();
+        match err {
+            PneumaticError::Data(_) => {}
+            _ => panic!("expected Data variant, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn from_block_validation_error_becomes_block() {
+        let block_err = BlockValidationError::ImproperBlockFormatting;
+        let err: PneumaticError = block_err.into();
+        match err {
+            PneumaticError::Block(_) => {}
+            _ => panic!("expected Block variant, got {:?}", err),
+        }
+    }
+
+    // --- TransactionRiskFactor scoring ---
+
+    #[test]
+    fn risk_score_low_amount_one_party_no_complexity() {
+        let risk = TransactionRiskFactor {
+            affected_parties: 1,
+            amount: 0,
+            is_contract: false,
+            is_multi_party: false,
+        };
+        // amount_risk=0.0, party_risk=0.0, complexity_risk=0.5
+        // score = (0.0 * 0.4) + (0.0 * 0.3) + (0.5 * 0.3) = 0.15
+        assert_eq!(risk.score(), 0.15);
+    }
+
+    #[test]
+    fn risk_score_medium_amount_two_parties() {
+        let risk = TransactionRiskFactor {
+            affected_parties: 2,
+            amount: 500_000,
+            is_contract: false,
+            is_multi_party: false,
+        };
+        // amount_risk=0.0 (<=1M), party_risk=0.5, complexity_risk=0.5
+        // score = (0.0 * 0.4) + (0.5 * 0.3) + (0.5 * 0.3) = 0.30
+        assert_eq!(risk.score(), 0.30);
+    }
+
+    #[test]
+    fn risk_score_high_amount_three_plus_complex() {
+        let risk = TransactionRiskFactor {
+            affected_parties: 3,
+            amount: 2_000_000_000,
+            is_contract: true,
+            is_multi_party: false,
+        };
+        // amount_risk=1.0, party_risk=1.0, complexity_risk=1.0 (is_contract)
+        // score = (1.0 * 0.4) + (1.0 * 0.3) + (1.0 * 0.3) = 1.0
+        assert_eq!(risk.score(), 1.0);
+    }
+
+    #[test]
+    fn amount_risk_small_medium_large() {
+        assert_eq!(TransactionRiskFactor { affected_parties: 0, amount: 100, is_contract: false, is_multi_party: false }.amount_risk(), 0.0);
+        assert_eq!(TransactionRiskFactor { affected_parties: 0, amount: 1_000_001, is_contract: false, is_multi_party: false }.amount_risk(), 0.5);
+        assert_eq!(TransactionRiskFactor { affected_parties: 0, amount: 2_000_000_000, is_contract: false, is_multi_party: false }.amount_risk(), 1.0);
+    }
+
+    #[test]
+    fn party_risk_one_two_three_plus() {
+        assert_eq!(TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }.party_risk(), 0.0);
+        assert_eq!(TransactionRiskFactor { affected_parties: 2, amount: 0, is_contract: false, is_multi_party: false }.party_risk(), 0.5);
+        assert_eq!(TransactionRiskFactor { affected_parties: 5, amount: 0, is_contract: false, is_multi_party: false }.party_risk(), 1.0);
+    }
+
+    // --- ValidationFailureReason ---
+
+    #[test]
+    fn validation_error_from_failure_reasons() {
+        let err = PneumaticError::Validation(vec![ValidationFailureReason::InsufficientFunds]);
+        match err {
+            PneumaticError::Validation(ref reasons) => {
+                assert_eq!(reasons.len(), 1);
+                assert!(matches!(reasons[0], ValidationFailureReason::InsufficientFunds));
+            }
+            _ => panic!("expected Validation variant"),
+        }
+    }
+
+    #[test]
+    fn pneumatic_error_debug_fmt_no_panic() {
+        let err = PneumaticError::Crypto("key expired".to_string());
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("Crypto"));
+    }
+}

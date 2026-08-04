@@ -1,4 +1,6 @@
-// Stub for workspace resolution — Phase 5 (committer refactor) not yet implemented.
+//! Terminal node in the pneumatic pipeline — commits blocks to token blockchains,
+//! distributes blocks to archivers, and manages epoch transitions (staking,
+//! reconciliation, leader selection).
 
 pub mod block_services;
 pub mod committer;

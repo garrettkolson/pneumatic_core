@@ -318,3 +318,227 @@ pub struct TransactionCommit {
     pub env_id: String,
     pub proposed_block: Block,
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- helpers ---
+
+    fn make_test_tx() -> Transaction {
+        Transaction {
+            id: "tx_test".into(),
+            action: "Transfer".into(),
+            token_id: vec![1, 2],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![10],
+            receiver: vec![20],
+            amount: Some(100),
+            timestamp: 1000,
+            result_hash: vec![],
+        }
+    }
+
+    fn make_validated_result() -> TransactionValidationResult {
+        TransactionValidationResult::valid(
+            vec![1, 2, 3],
+            TransactionRiskFactor {
+                affected_parties: 2,
+                amount: 100,
+                is_contract: false,
+                is_multi_party: false,
+            },
+        )
+    }
+
+    // --- TransactionState lifecycle ---
+
+    #[test]
+    fn state_is_pending_new_pending() {
+        let state = TransactionState::Pending;
+        assert!(state.is_pending());
+    }
+
+    #[test]
+    fn state_is_pending_validated_is_false() {
+        let state = TransactionState::Validated {
+            transaction: make_test_tx(),
+            validation: make_validated_result(),
+        };
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn state_is_pending_committed_is_false() {
+        let state = TransactionState::Committed {
+            transaction: make_test_tx(),
+            block_hash: vec![1],
+        };
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn state_is_finalizing_sets_and_clears() {
+        let mut state = TransactionState::Pending;
+        assert!(!state.is_finalizing());
+        state = TransactionState::Finalizing {
+            transaction: make_test_tx(),
+            finalizer_key: vec![5],
+        };
+        assert!(state.is_finalizing());
+        state = TransactionState::Committed {
+            transaction: make_test_tx(),
+            block_hash: vec![1],
+        };
+        assert!(!state.is_finalizing());
+    }
+
+    #[test]
+    fn state_transaction_returns_none_when_pending() {
+        let state = TransactionState::Pending;
+        assert!(state.transaction().is_none());
+    }
+
+    #[test]
+    fn state_transaction_returns_payload_when_validated() {
+        let tx = make_test_tx();
+        let state = TransactionState::Validated {
+            transaction: tx.clone(),
+            validation: make_validated_result(),
+        };
+        let retrieved = state.transaction().expect("should have transaction");
+        assert_eq!(retrieved.id, "tx_test");
+    }
+
+    #[test]
+    fn state_transaction_returns_payload_when_committed() {
+        let tx = make_test_tx();
+        let state = TransactionState::Committed {
+            transaction: tx.clone(),
+            block_hash: vec![1],
+        };
+        let retrieved = state.transaction().expect("should have transaction");
+        assert_eq!(retrieved.id, "tx_test");
+    }
+
+    #[test]
+    fn state_transaction_in_failed_returns_transaction() {
+        let tx = make_test_tx();
+        let state = TransactionState::Failed {
+            transaction: tx.clone(),
+            reasons: vec![ValidationFailureReason::InsufficientFunds],
+        };
+        let retrieved = state.transaction().expect("should have transaction");
+        assert_eq!(retrieved.id, "tx_test");
+    }
+
+    // --- PendingTransaction acquire ---
+
+    #[test]
+    fn acquire_pending_succeeds() {
+        let mut pt = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        assert!(pt.acquire().is_ok());
+        // Acquire again from Pending — should also succeed
+        assert!(pt.acquire().is_ok());
+    }
+
+    #[test]
+    fn acquire_preloaded_succeeds() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Preloaded { transaction: make_test_tx() },
+        );
+        assert!(pt.acquire().is_ok());
+    }
+
+    #[test]
+    fn acquire_executing_succeeds() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Executing { transaction: make_test_tx() },
+        );
+        assert!(pt.acquire().is_ok());
+    }
+
+    #[test]
+    fn acquire_failed_returns_err() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Failed {
+                transaction: make_test_tx(),
+                reasons: vec![],
+            },
+        );
+        assert!(pt.acquire().is_err());
+    }
+
+    #[test]
+    fn acquire_committed_returns_err() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Committed {
+                transaction: make_test_tx(),
+                block_hash: vec![1],
+            },
+        );
+        assert!(pt.acquire().is_err());
+    }
+
+    // --- PendingTransaction release ---
+
+    #[test]
+    fn release_zero_count_pending_does_not_remove() {
+        let mut pt = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        // lock_count=0, state=Pending → release returns false (not terminal)
+        assert!(!pt.release());
+    }
+
+    #[test]
+    fn release_nonzero_pending_decrements_to_zero() {
+        let mut pt = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        pt.acquire().unwrap(); // lock_count = 1
+        assert!(!pt.release()); // lock_count → 0, not terminal → false
+        assert!(!pt.release()); // lock_count = 0, not terminal → false
+    }
+
+    #[test]
+    fn release_failed_zero_count_removes() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Failed {
+                transaction: make_test_tx(),
+                reasons: vec![],
+            },
+        );
+        assert!(pt.release()); // lock_count=0, Failed → true
+    }
+
+    #[test]
+    fn release_failed_one_count_removes_after_decrement() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Pending,
+        );
+        pt.acquire().unwrap(); // lock_count = 1
+        // Transition to Failed (acquire was done before transition)
+        pt.transition_to_failed(make_test_tx(), vec![]);
+        assert!(pt.release()); // lock_count → 0, Failed → true
+    }
+
+    #[test]
+    fn release_committed_zero_count_removes() {
+        let mut pt = PendingTransaction::new(
+            "tx1".into(),
+            TransactionState::Committed {
+                transaction: make_test_tx(),
+                block_hash: vec![1],
+            },
+        );
+        assert!(pt.release()); // lock_count=0, Committed → true
+    }
+}

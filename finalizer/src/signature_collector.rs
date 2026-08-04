@@ -19,6 +19,7 @@ use pneumatic_core::transactions::{TransactionSignature, TransactionValidationRe
 /// 2. Verify each signature's voter identity
 /// 3. Check if quorum is reached
 /// 4. Reconcile conflicting signatures if needed
+#[derive(Clone)]
 pub struct SignatureCollector {
     /// Registry of collected signatures keyed by tx_id then executor key
     signature_registry: Arc<TransactionSignatureRegistry>,
@@ -276,5 +277,87 @@ mod tests {
         // Add 5th — quorum met
         collector.add_signature("tx_1", b"executor_4".to_vec(), make_sample_signature("tx_1", b"executor_4", 10)).unwrap();
         assert!(collector.check_quorum("tx_1").unwrap());
+    }
+
+    // --- Concurrent signature collection ---
+
+    #[test]
+    fn concurrent_add_signature_same_tx() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        let mut handles = vec![];
+
+        for i in 0..4 {
+            let col = collector.clone();
+            let key = format!("executor_{}", i);
+            handles.push(std::thread::spawn(move || {
+                col.add_signature(
+                    "tx_concurrent",
+                    key.as_bytes().to_vec(),
+                    make_sample_signature("tx_concurrent", key.as_bytes(), 10),
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for r in &results {
+            assert!(r.is_ok());
+        }
+        assert_eq!(collector.signature_count("tx_concurrent"), 4);
+    }
+
+    #[test]
+    fn concurrent_add_duplicate_signature() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let col = collector.clone();
+            let sig = make_sample_signature("tx_dup", b"executor_1", 10);
+            handles.push(std::thread::spawn(move || {
+                col.add_signature(
+                    "tx_dup",
+                    b"executor_1".to_vec(),
+                    sig,
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let successes: usize = results.iter().filter(|r| r.is_ok()).count();
+        let failures: usize = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1);
+        assert_eq!(failures, 3);
+    }
+
+    #[test]
+    fn concurrent_check_quorum_while_adding() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        let mut handles = vec![];
+
+        // Spawn signature adders
+        for i in 0..3 {
+            let col = collector.clone();
+            let key = format!("executor_{}", i);
+            handles.push(std::thread::spawn(move || {
+                col.add_signature(
+                    "tx_quorum",
+                    key.as_bytes().to_vec(),
+                    make_sample_signature("tx_quorum", key.as_bytes(), 10),
+                )
+            }));
+        }
+
+        // Wait for all adds to complete
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+
+        // Check quorum (should not panic — verifies concurrent read safety)
+        let quorum = collector.check_quorum("tx_quorum").unwrap();
+        // All 3 added, total_voters=3, 67% quorum: 3/3 = 100% >= 67% → true
+        assert!(quorum);
     }
 }

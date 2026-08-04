@@ -521,7 +521,7 @@ mod tests {
     }
 
     fn make_test_env_data() -> Arc<DashMap<String, EnvironmentMetadata>> {
-        let mut env_map = DashMap::new();
+        let env_map = DashMap::new();
         let spec_json = r#"{
             "environment_id": "test_env",
             "main_token_partition_id": "token",
@@ -792,5 +792,153 @@ mod tests {
         executor.preload_cleanup("cleanup_test").await;
 
         assert_eq!(executor.in_flight_count().await, 0);
+    }
+
+    // --- ExecutionResult validation ---
+
+    #[test]
+    fn validate_execution_result_empty_hash_fails() {
+        let node_registry = make_test_node_registry();
+        let data_provider = make_test_data_provider();
+        let pending_registry = make_test_pending_registry();
+        let hash_provider = make_test_hash_provider();
+
+        let executor = Executor::new(
+            "test_env".to_string(),
+            vec![1, 2, 3, 4],
+            node_registry,
+            data_provider,
+            pending_registry,
+            hash_provider,
+            10,
+        );
+
+        let tx = Transaction {
+            id: "test_tx_001".into(),
+            action: "Transfer".into(),
+            token_id: vec![0, 1, 2],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![10, 20, 30],
+            receiver: vec![40, 50, 60],
+            amount: Some(100),
+            timestamp: 1000,
+            result_hash: vec![],
+        };
+        let result = ExecutionResult {
+            transaction_id: "test_tx_001".to_string(),
+            result_data: vec![1, 2, 3],
+            result_hash: vec![], // empty hash should fail validation
+        };
+        let validation = executor.validate_execution_result(&tx, &result);
+        assert!(validation.is_err());
+        let reasons = validation.unwrap_err();
+        // Verify ContractNotFound is among the reasons by matching display
+        let reason_str = format!("{:?}", reasons);
+        assert!(reason_str.contains("ContractNotFound"));
+    }
+
+    #[test]
+    fn validate_execution_result_nonempty_hash_succeeds() {
+        let node_registry = make_test_node_registry();
+        let data_provider = make_test_data_provider();
+        let pending_registry = make_test_pending_registry();
+        let hash_provider = make_test_hash_provider();
+
+        let executor = Executor::new(
+            "test_env".to_string(),
+            vec![1, 2, 3, 4],
+            node_registry,
+            data_provider,
+            pending_registry,
+            hash_provider,
+            10,
+        );
+
+        let tx = Transaction {
+            id: "test_tx_001".into(),
+            action: "Transfer".into(),
+            token_id: vec![0, 1, 2],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![10, 20, 30],
+            receiver: vec![40, 50, 60],
+            amount: Some(100),
+            timestamp: 1000,
+            result_hash: vec![],
+        };
+        let result = ExecutionResult {
+            transaction_id: "test_tx_001".to_string(),
+            result_data: vec![1, 2, 3],
+            result_hash: vec![9, 8, 7, 6], // non-empty hash
+        };
+        let validation = executor.validate_execution_result(&tx, &result);
+        assert!(validation.is_ok());
+    }
+
+    // --- Full backpressure cycle ---
+
+    #[tokio::test]
+    async fn full_backpressure_cycle() {
+        let node_registry = make_test_node_registry();
+        let data_provider = make_test_data_provider();
+        let pending_registry = Arc::new(PendingTransactionRegistry::new());
+        let hash_provider = make_test_hash_provider();
+
+        // Add two transactions to the registry
+        for tx_id in ["bp_tx_a", "bp_tx_b"] {
+            let tx = Transaction {
+                id: tx_id.to_string(),
+                action: "Transfer".to_string(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: vec![],
+                receiver: vec![],
+                amount: Some(0),
+                timestamp: 0,
+                result_hash: vec![],
+            };
+            let pending = PendingTransaction::new(
+                tx_id.to_string(),
+                TransactionState::Preloaded { transaction: tx },
+            );
+            let _ = pending_registry.add_transaction(tx_id.to_string(), pending);
+        }
+
+        let executor = Executor::new(
+            "test_env".to_string(),
+            vec![1, 2, 3, 4],
+            node_registry,
+            data_provider,
+            pending_registry,
+            hash_provider,
+            1, // capacity of 1
+        );
+
+        // First preload should succeed (slot available)
+        let result_a = executor.preload_for_transaction("bp_tx_a").await;
+        assert!(result_a.is_ok());
+        assert_eq!(executor.in_flight_count().await, 1);
+        assert!(executor.is_at_capacity().await);
+
+        // Second preload should fail due to backpressure
+        let result_b = executor.preload_for_transaction("bp_tx_b").await;
+        assert!(result_b.is_err());
+        if let Err(ExecutorError::AtCapacity { max_in_flight, .. }) = result_b {
+            assert_eq!(max_in_flight, 1);
+        } else {
+            panic!("Expected AtCapacity error, got {:?}", result_b);
+        }
+
+        // Cleanup the first task frees a slot
+        executor.preload_cleanup("bp_tx_a").await;
+        assert_eq!(executor.in_flight_count().await, 0);
+        assert!(!executor.is_at_capacity().await);
+
+        // Now the second preload should succeed
+        let result_b = executor.preload_for_transaction("bp_tx_b").await;
+        assert!(result_b.is_ok());
+        assert_eq!(executor.in_flight_count().await, 1);
     }
 }

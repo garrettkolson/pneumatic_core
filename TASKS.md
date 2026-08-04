@@ -194,9 +194,10 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 
 ## Phase 6: Crypto Implementation
 
-- [ ] P6_01 Implement `RsaCryptoProvider` (encrypt/decrypt/sign/check) using ring — `crypto.rs` — refs: C# IAsymmetricalEncryptionProvider.cs
-- [ ] P6_02 Implement `BasicHashProvider::hash` using ring/SHA-256 — `crypto.rs` — refs: C# IHashProvider.cs
-- [ ] P6_03 Switch EnvironmentMetadata crypto provider from `Mutex` → `RwLock` — `environment.rs`
+- [x] P6_01 Implement `Ed25519Provider` (sign/verify/public_key) via `ed25519-dalek` — `crypto.rs` — refs: C# IAsymmetricalEncryptionProvider.cs, RFC 8032
+- [x] P6_02 Implement `BasicHashProvider::hash` using ring/SHA-256 — `crypto.rs` — refs: C# IHashProvider.cs
+- [x] P6_03 EnvironmentMetadata crypto provider uses `RwLock` — `environment.rs`
+- [ ] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + RSA key transport) — `crypto.rs`
 
 ## Phase 7: Tests
 
@@ -220,15 +221,13 @@ This section lists all code that is currently a **stub, placeholder, or `todo!()
 
 ### pneumatic_core — Priority 1 (Core runtime functions)
 
-#### Crypto provider — all 4 methods are `todo!()`
-**File:** `src/crypto.rs:37-56`
+#### Crypto provider — `encrypt`/`decrypt` are `todo!()` (sign/verify via ed25519-dalek)
+**File:** `src/crypto.rs:37-42`
 ```rust
-fn encrypt(&self, data: Vec<u8>) -> Vec<u8  // todo!()
-fn decrypt(&self, data: Vec<u8>) -> Vec<u8  // todo!()
-fn check_signature(&self, signature: &[u8], data: &[u8]) -> bool  // todo!()
-fn sign_data(&self, data: &[u8]) -> Vec<u8>  // todo!()
+fn encrypt(&self, data: Vec<u8>) -> Vec<u8>  // todo!() — hybrid AES-GCM + RSA key transport
+fn decrypt(&self, data: Vec<u8>) -> Vec<u8>  // todo!() — same
 ```
-**Action:** Replace with actual RSA or Ed25519 implementation using `ring`. Remove unused `Ed25519KeyPair`/`SystemRandom` imports that trigger warnings.
+**Action:** Implement hybrid encryption: generate random AES-GCM key, encrypt data, RSA-encrypt key, transmit both. Currently sign/verify/public_key are fully implemented via `ed25519-dalek`.
 
 #### ActionRouter — all routing branches return placeholders
 **File:** `src/action_router.rs:62-98`
@@ -371,11 +370,11 @@ Stubbed within implemented methods:
 - `Finalizer.try_finalize` — Steps 5, 7 use placeholder data (total_stake=0, total_voters=0, previous_hash=[])
 - `MessageDispatcher.send_to_all` — Uses NodeRegistry stub, not registered connections (see node/registry.rs:165)
 
-### pneumatic_committer — Priority 5 (Not yet started)
+### pneumatic_committer — Priority 5 (Complete: compiles, Phase 5 tasks done)
 
-#### Committer crate — empty lib.rs stub
+#### Committer crate — stub comment removed
 **File:** `pneumatic_committer/src/lib.rs`
-**Action:** Refactor with gossiper, block_services, token_distributor. Create epoch_manager sub-directory.
+**Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` sub-directory with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`.
 
 ### Tests — Priority 6 (Not yet added)
 

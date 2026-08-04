@@ -687,7 +687,10 @@ name = "pneumatic_sentinel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "pneumatic_core",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

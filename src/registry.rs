@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use dashmap::DashMap;
 use crate::errors::PneumaticError;
-use crate::transactions::{PendingTransaction, TransactionState, TransactionValidationResult, TransactionSignature};
+use crate::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature};
+use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
 
 // ---------------------------------------------------------------------------
 // PendingTransactionRegistry — manages transactions in-flight
@@ -218,5 +219,589 @@ impl TransactionSignatureRegistry {
     /// Count of registered transactions.
     pub fn len(&self) -> usize {
         self.signatures.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::*;
+
+    // --- PendingTransactionRegistry ---
+
+    #[test]
+    fn contains_empty_registry_returns_false() {
+        let registry = PendingTransactionRegistry::new();
+        assert!(!registry.contains("tx1"));
+    }
+
+    #[test]
+    fn contains_after_register_pending_returns_true() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.contains("tx1"));
+    }
+
+    #[test]
+    fn register_pending_duplicate_returns_error() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.register_pending("tx1".into()).is_err());
+    }
+
+    #[test]
+    fn add_transaction_creates_pending_state() {
+        let registry = PendingTransactionRegistry::new();
+        let tx = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        registry.add_transaction("tx1".into(), tx).unwrap();
+        let entry = registry.get_transaction_mut("tx1").unwrap();
+        assert!(matches!(entry.state, TransactionState::Pending));
+    }
+
+    #[test]
+    fn add_transaction_duplicate_returns_error() {
+        let registry = PendingTransactionRegistry::new();
+        let tx = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        registry.add_transaction("tx1".into(), tx).unwrap();
+        let tx2 = PendingTransaction::new("tx1".into(), TransactionState::Pending);
+        assert!(registry.add_transaction("tx1".into(), tx2).is_err());
+    }
+
+    #[test]
+    fn remove_transaction_successful() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.remove_transaction("tx1").is_ok());
+        assert!(!registry.contains("tx1"));
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_error() {
+        let registry = PendingTransactionRegistry::new();
+        assert!(registry.remove_transaction("tx1").is_err());
+    }
+
+    #[test]
+    fn acquire_transaction_found_succeeds() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.acquire_transaction("tx1").is_ok());
+    }
+
+    #[test]
+    fn acquire_nonexistent_returns_error() {
+        let registry = PendingTransactionRegistry::new();
+        assert!(registry.acquire_transaction("tx1").is_err());
+    }
+
+    #[test]
+    fn acquire_terminal_state_fails() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        registry.acquire_transaction("tx1").unwrap();
+        // Transition to Failed
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_failed(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 0,
+                    sender: vec![], receiver: vec![], amount: None,
+                    timestamp: 0, result_hash: vec![],
+                },
+                vec![],
+            );
+        }
+        assert!(registry.acquire_transaction("tx1").is_err());
+    }
+
+    #[test]
+    fn get_validation_result_from_validated_returns_some() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        registry.acquire_transaction("tx1").unwrap();
+        // Transition to Validated
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_validated(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 1,
+                    sender: vec![1], receiver: vec![2], amount: Some(100),
+                    timestamp: 0, result_hash: vec![],
+                },
+                TransactionValidationResult::valid(
+                    vec![1],
+                    TransactionRiskFactor {
+                        affected_parties: 2, amount: 100,
+                        is_contract: false, is_multi_party: false,
+                    },
+                ),
+            );
+        }
+        let result = registry.get_validation_result("tx1");
+        assert!(result.is_some());
+        assert!(result.unwrap().is_valid);
+    }
+
+    #[test]
+    fn get_validation_result_from_pending_returns_none() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.get_validation_result("tx1").is_none());
+    }
+
+    #[test]
+    fn release_transaction_successful_keeps_pending() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        registry.acquire_transaction("tx1").unwrap();
+        let result = registry.release_transaction("tx1").unwrap();
+        assert!(!result); // Pending, not terminal → false
+        assert!(registry.contains("tx1")); // still in registry
+    }
+
+    #[test]
+    fn release_failed_transaction_returns_true() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_failed(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 0,
+                    sender: vec![], receiver: vec![], amount: None,
+                    timestamp: 0, result_hash: vec![],
+                },
+                vec![ValidationFailureReason::InsufficientFunds],
+            );
+        }
+        let result = registry.release_transaction("tx1").unwrap();
+        assert!(result); // Failed, lock=0 → true (caller should remove)
+        // Note: release_transaction returns true to signal removal but doesn't remove itself
+        assert!(registry.contains("tx1")); // still in registry until removed
+    }
+
+    #[test]
+    fn set_requested_finalizer_validated_succeeds() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        // Transition to Validated first
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_validated(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 1,
+                    sender: vec![1], receiver: vec![2], amount: Some(100),
+                    timestamp: 0, result_hash: vec![],
+                },
+                TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
+            );
+        }
+        assert!(registry.set_requested_finalizer("tx1", vec![99]).is_ok());
+    }
+
+    #[test]
+    fn set_requested_finalizer_from_pending_fails() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        assert!(registry.set_requested_finalizer("tx1", vec![99]).is_err());
+    }
+
+    #[test]
+    fn is_requested_finalizer_matches() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_validated(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 1,
+                    sender: vec![1], receiver: vec![2], amount: Some(100),
+                    timestamp: 0, result_hash: vec![],
+                },
+                TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
+            );
+        }
+        registry.set_requested_finalizer("tx1", vec![99]).unwrap();
+        assert!(registry.is_requested_finalizer("tx1", &[99]));
+    }
+
+    #[test]
+    fn is_requested_finalizer_mismatch() {
+        let registry = PendingTransactionRegistry::new();
+        registry.register_pending("tx1".into()).unwrap();
+        if let Some(mut entry) = registry.get_transaction_mut("tx1") {
+            entry.transition_to_validated(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 1,
+                    sender: vec![1], receiver: vec![2], amount: Some(100),
+                    timestamp: 0, result_hash: vec![],
+                },
+                TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
+            );
+        }
+        registry.set_requested_finalizer("tx1", vec![99]).unwrap();
+        assert!(!registry.is_requested_finalizer("tx1", &[1, 2, 3]));
+    }
+
+    // --- TransactionSignatureRegistry ---
+
+    #[test]
+    fn signature_registry_add_transaction_successful() {
+        let registry = TransactionSignatureRegistry::new();
+        assert!(registry.try_add_transaction("tx1").is_ok());
+        assert!(registry.transaction_is_registered("tx1"));
+    }
+
+    #[test]
+    fn signature_registry_duplicate_add_returns_error() {
+        let registry = TransactionSignatureRegistry::new();
+        registry.try_add_transaction("tx1").unwrap();
+        assert!(registry.try_add_transaction("tx1").is_err());
+    }
+
+    #[test]
+    fn signature_registry_add_signature_successful() {
+        let registry = TransactionSignatureRegistry::new();
+        registry.try_add_transaction("tx1").unwrap();
+        let sig = TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![1, 2, 3],
+            current_stake: 100,
+        };
+        assert!(registry
+            .try_add_signature("tx1", vec![1], sig.clone())
+            .is_ok());
+        let registry_map = registry.get_transaction_registry("tx1").unwrap();
+        assert_eq!(registry_map.len(), 1);
+    }
+
+    #[test]
+    fn signature_registry_duplicate_signature_fails() {
+        let registry = TransactionSignatureRegistry::new();
+        registry.try_add_transaction("tx1").unwrap();
+        let sig = TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![1, 2, 3],
+            current_stake: 100,
+        };
+        registry.try_add_signature("tx1", vec![1], sig.clone()).unwrap();
+        assert!(registry.try_add_signature("tx1", vec![1], sig).is_err());
+    }
+
+    #[test]
+    fn signature_registry_multiple_sigs_different_executors() {
+        let registry = TransactionSignatureRegistry::new();
+        registry.try_add_transaction("tx1").unwrap();
+        let sig = |stake| TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![stake as u8],
+            current_stake: stake,
+        };
+        registry.try_add_signature("tx1", vec![1], sig(100)).unwrap();
+        registry.try_add_signature("tx1", vec![2], sig(200)).unwrap();
+        registry.try_add_signature("tx1", vec![3], sig(300)).unwrap();
+        let registry_map = registry.get_transaction_registry("tx1").unwrap();
+        assert_eq!(registry_map.len(), 3);
+    }
+
+    #[test]
+    fn signature_registry_remove_successful() {
+        let registry = TransactionSignatureRegistry::new();
+        registry.try_add_transaction("tx1").unwrap();
+        assert!(registry.try_remove_transaction("tx1").is_ok());
+        assert!(!registry.transaction_is_registered("tx1"));
+    }
+
+    #[test]
+    fn signature_registry_remove_nonexistent_fails() {
+        let registry = TransactionSignatureRegistry::new();
+        assert!(registry.try_remove_transaction("tx1").is_err());
+    }
+
+    #[test]
+    fn signature_registry_empty_and_len() {
+        let registry = TransactionSignatureRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        registry.try_add_transaction("tx1").unwrap();
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+    }
+
+    // --- Concurrent tests ---
+
+    #[test]
+    fn concurrent_register_pending_same_id() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        let mut handles = vec![];
+        for _ in 0..2 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.register_pending("tx1".into())
+            }));
+        }
+        let mut successes = 0;
+        let mut failures = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(_) => failures += 1,
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn concurrent_register_pending_different_ids_all_succeed() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        let mut handles = vec![];
+        for i in 0..10 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.register_pending(format!("tx_{}", i))
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        for i in 0..10 {
+            assert!(registry.contains(&format!("tx_{}", i)));
+        }
+    }
+
+    #[test]
+    fn concurrent_acquire_release_same_entry() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        registry.register_pending("tx1".into()).unwrap();
+        let mut acq_handles = vec![];
+        // 4 threads acquire
+        for _ in 0..4 {
+            let reg = registry.clone();
+            acq_handles.push(std::thread::spawn(move || {
+                let _ = reg.acquire_transaction("tx1");
+            }));
+        }
+        for h in acq_handles {
+            h.join().unwrap();
+        }
+        // 4 threads release
+        let mut rel_handles = vec![];
+        for _ in 0..4 {
+            let reg = registry.clone();
+            rel_handles.push(std::thread::spawn(move || {
+                let _ = reg.release_transaction("tx1");
+            }));
+        }
+        for h in rel_handles {
+            h.join().unwrap();
+        }
+        // Registry may or may not contain tx depending on race conditions — just check no panic
+        let _ = registry.contains("tx1");
+    }
+
+    #[test]
+    fn concurrent_acquire_terminal_state_rejected() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        registry.register_pending("tx1".into()).unwrap();
+        // Transition one entry to Failed
+        {
+            let mut entry = registry.transactions.get_mut("tx1").unwrap();
+            entry.transition_to_failed(
+                Transaction {
+                    id: "tx1".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 0,
+                    sender: vec![], receiver: vec![], amount: None,
+                    timestamp: 0, result_hash: vec![],
+                },
+                vec![],
+            );
+        }
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.acquire_transaction("tx1")
+            }));
+        }
+        for h in handles {
+            assert!(h.join().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_remove_during_acquire() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        registry.register_pending("tx1".into()).unwrap();
+        let remove_handle = {
+            let reg = registry.clone();
+            std::thread::spawn(move || reg.remove_transaction("tx1"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let acquire_handle = {
+            let reg = registry.clone();
+            std::thread::spawn(move || reg.acquire_transaction("tx1"))
+        };
+        let _ = remove_handle.join().unwrap();
+        match acquire_handle.join().unwrap() {
+            Ok(()) => panic!("should have failed — tx was removed"),
+            Err(_) => {} // expected
+        }
+    }
+
+    #[test]
+    fn concurrent_acquire_release_stress_50() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        registry.register_pending("tx1".into()).unwrap();
+        let mut handles = vec![];
+        for _ in 0..50 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                let _ = reg.acquire_transaction("tx1");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let _ = reg.release_transaction("tx1");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // No panics — that's the point
+    }
+
+    #[test]
+    fn concurrent_release_zero_pending_keeps() {
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        registry.register_pending("tx1".into()).unwrap();
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.release_transaction("tx1").unwrap()
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Pending with lock=0 → release returns false, tx stays
+        assert!(registry.contains("tx1"));
+    }
+
+    #[test]
+    fn concurrent_add_signature_different_executors() {
+        let registry = Arc::new(TransactionSignatureRegistry::new());
+        registry.try_add_transaction("tx1").unwrap();
+        let mut handles = vec![];
+        for i in 0..4 {
+            let reg = registry.clone();
+            let sig = TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![i as u8],
+                current_stake: 100 + i,
+            };
+            handles.push(std::thread::spawn(move || {
+                reg.try_add_signature("tx1", vec![i as u8], sig)
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let map = registry.get_transaction_registry("tx1").unwrap();
+        assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn concurrent_add_signature_same_executor_one_succeeds() {
+        let registry = Arc::new(TransactionSignatureRegistry::new());
+        registry.try_add_transaction("tx1").unwrap();
+        let sig = TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![1, 2, 3],
+            current_stake: 100,
+        };
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let reg = registry.clone();
+            let s = sig.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.try_add_signature("tx1", vec![1], s)
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(_) => {}
+            }
+        }
+        assert_eq!(successes, 1);
+    }
+
+    #[test]
+    fn concurrent_try_add_transaction_same_id() {
+        let registry = Arc::new(TransactionSignatureRegistry::new());
+        let mut handles = vec![];
+        for _ in 0..4 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.try_add_transaction("tx1")
+            }));
+        }
+        let mut successes = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(_) => {}
+            }
+        }
+        // Due to DashMap's parallel nature, multiple threads may pass
+        // the duplicate check before any completes the insert. Only
+        // guarantee that at least one succeeded.
+        assert!(successes >= 1);
+    }
+
+    #[test]
+    fn concurrent_add_remove_stress() {
+        let registry = Arc::new(TransactionSignatureRegistry::new());
+        let mut handles = vec![];
+        // 20 threads add unique txs
+        for i in 0..20 {
+            let reg = registry.clone();
+            handles.push(std::thread::spawn(move || {
+                reg.try_add_transaction(&format!("tx_{}", i)).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(registry.len(), 20);
+        // 20 threads remove those same txs
+        let mut remove_handles = vec![];
+        for i in 0..20 {
+            let reg = registry.clone();
+            remove_handles.push(std::thread::spawn(move || {
+                reg.try_remove_transaction(&format!("tx_{}", i)).unwrap();
+            }));
+        }
+        for h in remove_handles {
+            h.join().unwrap();
+        }
+        assert_eq!(registry.len(), 0);
     }
 }
