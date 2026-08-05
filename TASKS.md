@@ -87,7 +87,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 ### 1.10 Gossiper
 
 - [x] P1_41 Implement `Gossiper` struct with config TTL cache — `gossiper.rs` — moka cache with TTL
-- [ ] P1_42 Copy payload to each handler delegate (C# TODO) — `gossiper.rs` — initialize() accepts closure but never stores/inokes it; TODO comment at line 67
+- [x] P1_42 Fan-out: multiple handler delegates — `gossiper.rs` — `handler: Mutex<Option<...>>` → `handlers: Mutex<Vec<...>>`; `add_handler()` registers extra handlers; `handle_message()` clones raw_data and invokes each handler sequentially; 5 new tests (invokes-all, receives-copy, dedup-skips-all, three-handlers, concurrent-invocation)
 
 ### 1.11 IActionRouter
 
@@ -208,14 +208,14 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P1_Add tests for PneumaticError variants — `errors.rs` — 10 tests: From impls, risk scoring, validation error matching
 - [x] P1_Add tests for PendingTransactionRegistry — `registry.rs` — 22 unit tests (CRUD, state transitions, validation result lookup) + 11 concurrent tests (atomic ops, race safety, stress)
 - [x] P1_Add tests for PendingTransaction acquire/release — `registry.rs` — included in registry tests above
-- [x] P1_Add tests for Gossiper dedup — `gossiper.rs` — 4 tests: accept first, ignore duplicate, accept different, capacity verification
+- [x] P1_Add tests for Gossiper — `gossiper.rs` — 9 tests: accept first, ignore duplicate, accept different, capacity, fan-out invokes-all, fan-out receives-copy, fan-out dedup-skips-all, fan-out three-handlers, fan-out concurrent-invocation
 - [x] P1_Add tests for ValidationSpec — `validation.rs` — 17 tests: SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec, ValidationSpecRegistry, nonce validation
 - [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 9 tests: From impls, creation, spec name routing, action dispatch, self-signed flow
 - [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 166 tests across 4 crate targets
+- [x] T07 Migrate existing tests — all test-bearing files — total 180 tests across 4 crate targets
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -250,10 +250,9 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 Comment: `// TODO: validate crypto signature (pending crypto implementation)`
 **Action:** After deserialization, verify `AsymCryptoProvider.check_signature(message.signature, message.body)`.
 
-#### Gossiper — fan-out to handler delegates not implemented
-**File:** `src/gossiper.rs:72`
-Comment: `// TODO: copy payload to each handler delegate (C# TODO)`
-**Action:** Store multiple handler closures, clone payload and spawn a task per handler.
+#### Gossiper — fan-out to handler delegates done (P1_42)
+**File:** `src/gossiper.rs:87-92`
+Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_handler()` registers extras; `handle_message()` clones raw_data and invokes each sequentially.
 
 #### EpochReconciler — always returns empty
 **File:** `src/epoch.rs:125-133`
@@ -384,9 +383,9 @@ Stubbed within implemented methods:
 
 ### Tests — Priority 6 (~166 passing across 4 crates)
 
-#### Tests added to pneumatic_core — 126 tests
-**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33), `gossiper.rs` (4), `validation.rs` (17), plus all pre-existing test-bearing files
-**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransaction acquire/release, PendingTransactionRegistry CRUD + concurrent ops, Gossiper dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration.
+#### Tests added to pneumatic_core — 131 tests
+**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33), `gossiper.rs` (9), `validation.rs` (17), plus all pre-existing test-bearing files
+**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransaction acquire/release, PendingTransactionRegistry CRUD + concurrent ops, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration.
 
 #### Tests added to pneumatic_finalizer — 22 tests
 **Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing

@@ -17,10 +17,11 @@ pub struct Gossiper {
     conn_factory: ConnFactory,
     /// Signature-based dedup cache with configurable TTL
     cache: Cache<Vec<u8>, ()>,
-    /// Callback invoked for each valid, non-duplicate message.
-    /// Set via `initialize()`. Stored behind a `Mutex` because
-    /// `initialize()` and `handle_message()` both borrow `&self`.
-    handler: std::sync::Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>,
+    /// Registered handlers — invoked sequentially for each valid, non-duplicate
+    /// message. Set via `initialize()` (first handler) and `add_handler()` (extra
+    /// handlers). Stored behind a `Mutex` because `initialize()`, `add_handler()`,
+    /// and `handle_message()` all borrow `&self`.
+    handlers: std::sync::Mutex<Vec<Box<dyn Fn(Vec<u8>) + Send + Sync>>>,
 }
 
 impl Gossiper {
@@ -34,18 +35,32 @@ impl Gossiper {
                 .max_capacity(10_000)
                 .time_to_live(std::time::Duration::from_secs(ttl_seconds))
                 .build(),
-            handler: std::sync::Mutex::new(None),
+            handlers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Initialize the gossiper, setting up the message received handler.
+    /// Initialize the gossiper by registering the first message handler.
     /// The handler closure is called for each valid, non-duplicate message.
     /// The closure receives the raw message bytes (before deserialization).
+    ///
+    /// To register additional handlers, call `add_handler()`.
     pub fn initialize<F>(&self, on_message_received: F)
     where
         F: Fn(Vec<u8>) + Send + Sync + 'static,
     {
-        *self.handler.lock().unwrap() = Some(Box::new(on_message_received));
+        self.handlers.lock().unwrap().push(Box::new(on_message_received));
+    }
+
+    /// Register an additional handler for valid, non-duplicate messages.
+    ///
+    /// Use this when one gossiper instance needs to dispatch messages to
+    /// multiple internal delegates (fan-out). Each handler receives a copy
+    /// of the raw message bytes.
+    pub fn add_handler<F>(&self, handler: F)
+    where
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
+    {
+        self.handlers.lock().unwrap().push(Box::new(handler));
     }
 
     /// Handle an incoming message: deserialize, check cache, validate crypto,
@@ -69,10 +84,11 @@ impl Gossiper {
         // TODO: validate crypto signature (pending crypto implementation)
         // Let the message through for now — real validation in Phase 6
 
-        // Invoke the handler registered during initialize().
-        // The handler owns the dispatch logic (routing by action, etc.).
-        if let Some(ref handler) = *self.handler.lock().unwrap() {
-            handler(raw_data);
+        // Fan-out: invoke every registered handler with a copy of the raw data.
+        // Each handler owns the dispatch logic (routing by action, etc.).
+        let handlers = self.handlers.lock().unwrap();
+        for handler in handlers.iter() {
+            handler(raw_data.clone());
         }
 
         Ok(())
@@ -85,6 +101,7 @@ impl Gossiper {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use super::*;
@@ -179,5 +196,199 @@ mod tests {
         // If it constructs without panic, the cache is set up.
         // The capacity constant is 10_000 per the source code.
         drop(gossiper);
+    }
+
+    // --- Fan-out tests ---
+
+    #[test]
+    fn fan_out_invokes_all_handlers() {
+        let gossiper = make_gossiper();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: vec![1, 2, 3],
+            signature: vec![9, 8, 7],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        let handler1_count = Arc::new(AtomicUsize::new(0));
+        let handler2_count = Arc::new(AtomicUsize::new(0));
+
+        let c1 = handler1_count.clone();
+        gossiper.initialize(move |_data| {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let c2 = handler2_count.clone();
+        gossiper.add_handler(move |_data| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+
+        gossiper.handle_message(raw).unwrap();
+
+        assert_eq!(
+            handler1_count.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            handler2_count.load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn fan_out_handlers_receive_copy_of_data() {
+        let gossiper = make_gossiper();
+        let msg = Message {
+            chain_id: "broadcast".into(),
+            action: "Process".into(),
+            body: vec![42],
+            signature: vec![1, 2, 3],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        let expected_len = raw.len();
+
+        let received1 = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let received2 = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let r1 = received1.clone();
+        gossiper.initialize(move |data| {
+            r1.lock().unwrap().extend_from_slice(&data);
+        });
+
+        let r2 = received2.clone();
+        gossiper.add_handler(move |data| {
+            r2.lock().unwrap().extend_from_slice(&data);
+        });
+
+        gossiper.handle_message(raw).unwrap();
+
+        assert_eq!(
+            *received1.lock().unwrap(),
+            crate::encoding::serialize_to_bytes_rmp(&msg).unwrap()
+        );
+        assert_eq!(
+            *received2.lock().unwrap(),
+            crate::encoding::serialize_to_bytes_rmp(&msg).unwrap()
+        );
+        assert_eq!(*received1.lock().unwrap(), *received2.lock().unwrap());
+    }
+
+    #[test]
+    fn fan_out_dedup_skips_all_handlers() {
+        let gossiper = make_gossiper();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: vec![1],
+            signature: vec![5, 5, 5],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c1 = count.clone();
+        let c2 = count.clone();
+
+        gossiper.initialize(move |_| {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+        gossiper.add_handler(move |_| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // First call — both handlers invoked
+        gossiper.handle_message(raw.clone()).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // Duplicate — neither handler invoked
+        gossiper.handle_message(raw).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fan_out_three_handlers_all_called() {
+        let gossiper = make_gossiper();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: vec![1, 2],
+            signature: vec![1, 2, 3],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c1 = count.clone();
+        let c2 = count.clone();
+        let c3 = count.clone();
+
+        gossiper.initialize(move |_| {
+            c1.fetch_add(1, Ordering::SeqCst);
+        });
+        gossiper.add_handler(move |_| {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        gossiper.add_handler(move |_| {
+            c3.fetch_add(1, Ordering::SeqCst);
+        });
+
+        gossiper.handle_message(raw).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn fan_out_concurrent_handler_invocation() {
+        let gossiper = Arc::new(make_gossiper());
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: vec![1, 2, 3],
+            signature: vec![1, 2, 3],
+            public_key: vec![4, 5, 6],
+        };
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        let counts: Vec<Arc<AtomicUsize>> = (0..5)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+
+        for i in 0..5 {
+            let c = counts[i].clone();
+            if i == 0 {
+                gossiper.initialize(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                });
+            } else {
+                gossiper.add_handler(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        }
+
+        // Send 100 messages concurrently
+        let mut handles = vec![];
+        for _ in 0..100 {
+            let g = gossiper.clone();
+            let r = raw.clone();
+            handles.push(std::thread::spawn(move || {
+                g.handle_message(r).unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Due to the moka cache's concurrent nature, multiple threads
+        // may pass the duplicate check before any completes the insert.
+        // Each handler should have been called the same number of times (≥ 1).
+        let expected = counts[0].load(Ordering::SeqCst);
+        assert!(expected >= 1);
+        for c in &counts[1..] {
+            assert_eq!(c.load(Ordering::SeqCst), expected);
+        }
     }
 }
