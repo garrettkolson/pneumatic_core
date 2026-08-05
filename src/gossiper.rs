@@ -81,8 +81,8 @@ impl Gossiper {
         // Add to cache (will expire after TTL)
         self.cache.insert(signature_key, ());
 
-        // TODO: validate crypto signature (pending crypto implementation)
-        // Let the message through for now — real validation in Phase 6
+        // TODO: validate crypto signature via AsymCryptoProvider.check_signature()
+        // (encrypt/decrypt now implemented with hybrid AES-GCM + X25519 key exchange)
 
         // Fan-out: invoke every registered handler with a copy of the raw data.
         // Each handler owns the dispatch logic (routing by action, etc.).

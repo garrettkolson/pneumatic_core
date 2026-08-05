@@ -197,7 +197,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_01 Implement `Ed25519Provider` (sign/verify/public_key) via `ed25519-dalek` — `crypto.rs` — refs: C# IAsymmetricalEncryptionProvider.cs, RFC 8032
 - [x] P6_02 Implement `BasicHashProvider::hash` using ring/SHA-256 — `crypto.rs` — refs: C# IHashProvider.cs
 - [x] P6_03 EnvironmentMetadata crypto provider uses `RwLock` — `environment.rs`
-- [ ] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + RSA key transport) — `crypto.rs`
+- [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 
 ## Phase 7: Tests (~166 passing — ~39 → ~166)
 
@@ -227,13 +227,10 @@ This section lists all code that is currently a **stub, placeholder, or `todo!()
 
 ### pneumatic_core — Priority 1 (Core runtime functions)
 
-#### Crypto provider — `encrypt`/`decrypt` are `todo!()` (sign/verify via ed25519-dalek)
-**File:** `src/crypto.rs:37-42`
-```rust
-fn encrypt(&self, data: Vec<u8>) -> Vec<u8>  // todo!() — hybrid AES-GCM + RSA key transport
-fn decrypt(&self, data: Vec<u8>) -> Vec<u8>  // todo!() — same
-```
-**Action:** Implement hybrid encryption: generate random AES-GCM key, encrypt data, RSA-encrypt key, transmit both. Currently sign/verify/public_key are fully implemented via `ed25519-dalek`.
+#### Crypto provider — `encrypt`/`decrypt` now implemented (P6_04) (sign/verify via ed25519-dalek)
+**File:** `src/crypto.rs:74-123`
+Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh ephemeral keypair, derives shared secret via DH, encrypts payload. Wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`.
+**Dependencies:** `aes-gcm` 0.11.0, `x25519-dalek` 3.0.0 (with `static_secrets` + `getrandom` features).
 
 #### ActionRouter — routing branches now wired (P1_44), coordination stubbed
 **File:** `src/action_router.rs`
@@ -248,7 +245,8 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 
 #### Gossiper — no crypto validation
 **File:** `src/gossiper.rs:69`
-Comment: `// TODO: validate crypto signature (pending crypto implementation)`
+Comment: `// TODO: validate crypto signature via AsymCryptoProvider.check_signature()`
+**Note:** `encrypt`/`decrypt` are now implemented (P6_04). The remaining gap is signature validation in the deserialization path.
 **Action:** After deserialization, verify `AsymCryptoProvider.check_signature(message.signature, message.body)`.
 
 #### Gossiper — fan-out to handler delegates done (P1_42)

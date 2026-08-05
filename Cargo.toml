@@ -32,6 +32,8 @@ tokio-macros = "2.5.0"
 tokio-stream = "0.1.17"
 async-trait = "0.1.88"
 hex = "0.4"
+aes-gcm = "0.11.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 
 [dev-dependencies]
 tempfile = "3.20.0"

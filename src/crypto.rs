@@ -1,7 +1,9 @@
 use std::sync::{Arc, RwLock};
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{SigningKey, Signer, Verifier, VerifyingKey};
 use ring::digest;
 use serde::{Deserialize, Serialize};
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 // ---------------------------------------------------------------------------
 // AsymCryptoProvider — Ed25519 for blockchain signing/verification
@@ -37,23 +39,29 @@ pub trait AsymCryptoProvider: Send + Sync {
 /// - No padding oracle vulnerabilities
 /// - Better performance per security level
 ///
-/// RSA encryption/decryption (encrypt/decrypt methods) is stubbed
-/// because the current blockchain use case only requires signing.
+/// Hybrid encryption uses AES-256-GCM with ephemeral X25519 key exchange:
+/// each `encrypt()` call generates a new ephemeral keypair, derives a shared
+/// secret via Diffie-Hellman, and encrypts the payload. Output format:
+/// `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 pub struct Ed25519Provider {
     signing_key: RwLock<SigningKey>,
     verifying_key: RwLock<VerifyingKey>,
+    x25519_static_key: RwLock<StaticSecret>,
 }
 
 impl Ed25519Provider {
-    /// Generate a fresh Ed25519 keypair with a random 32-byte seed.
+    /// Generate a fresh Ed25519 keypair with a random 32-byte seed,
+    /// plus a separate X25519 static secret for key exchange.
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("Failed to generate random seed");
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
+        let x25519_static_key = StaticSecret::random();
         Ed25519Provider {
             signing_key: RwLock::new(signing_key),
             verifying_key: RwLock::new(verifying_key),
+            x25519_static_key: RwLock::new(x25519_static_key),
         }
     }
 }
@@ -63,12 +71,55 @@ impl Default for Ed25519Provider {
 }
 
 impl AsymCryptoProvider for Ed25519Provider {
-    fn encrypt(&self, _data: Vec<u8>) -> Vec<u8> {
-        todo!("RSA encrypt not implemented — placeholder. Use hybrid AES-GCM + RSA key transport when needed.")
+    fn encrypt(&self, data: Vec<u8>) -> Vec<u8> {
+        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+
+        // Fresh ephemeral secret per encryption (guarantees unique shared secret).
+        let ephemeral = EphemeralSecret::random();
+        let ephemeral_pub = PublicKey::from(&ephemeral);
+        let ephemeral_pub_bytes = ephemeral_pub.to_bytes();
+
+        // Derive shared secret via Diffie-Hellman.
+        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
+
+        // AES-256-GCM cipher with key derived from shared secret.
+        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
+            .expect("AES-256 key derivation failed (wrong secret size)");
+        let nonce = Nonce::default(); // safe: unique shared secret per call
+
+        let ciphertext = cipher
+            .encrypt(&nonce, data.as_ref())
+            .expect("AES-GCM encryption failed");
+
+        // Wire format: [32-byte ephemeral PK][ciphertext + 16-byte GCM tag]
+        let mut result = Vec::with_capacity(32 + ciphertext.len());
+        result.extend_from_slice(&ephemeral_pub_bytes);
+        result.extend_from_slice(&ciphertext);
+        result
     }
 
-    fn decrypt(&self, _data: Vec<u8>) -> Vec<u8> {
-        todo!("RSA decrypt not implemented — placeholder. Use RSA key transport + AES-GCM when needed.")
+    fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
+        if data.len() < 32 {
+            panic!("Decrypt input too short to contain X25519 public key");
+        }
+
+        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+        let ephemeral_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| {
+            panic!("Decrypt input too short to contain X25519 public key");
+        })
+        .expect("Invalid ephemeral public key");
+        let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
+
+        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
+
+        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
+            .expect("AES-256 key derivation failed (wrong secret size)");
+        let nonce = Nonce::default();
+
+        let plaintext = cipher
+            .decrypt(&nonce, &data[32..])
+            .expect("AES-GCM decryption failed (wrong key or tampered)");
+        plaintext.to_vec()
     }
 
     fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> bool {
@@ -190,15 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_decrypt_stubbed() {
+    fn test_encrypt_decrypt_roundtrip() {
         let provider = Ed25519Provider::generate();
         let data = vec![1u8, 2, 3, 4];
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            provider.encrypt(data.clone())
-        })).is_err());
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            provider.decrypt(data.clone())
-        })).is_err());
+        let encrypted = provider.encrypt(data.clone());
+        let decrypted = provider.decrypt(encrypted);
+        assert_eq!(data, decrypted);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_empty_data() {
+        let provider = Ed25519Provider::generate();
+        let data = vec![];
+        let encrypted = provider.encrypt(data);
+        assert_eq!(encrypted.len(), 48); // 32-byte PK + 16-byte GCM tag only
+        let decrypted = provider.decrypt(encrypted);
+        assert_eq!(decrypted, Vec::<u8>::new());
     }
 
     #[test]

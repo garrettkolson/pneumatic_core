@@ -34,7 +34,7 @@ The library is flat — 13 modules declared in `src/lib.rs`:
 | `config` | `Config` — loads `config.json` and per-environment specs from `/env/`, builds node configuration |
 | `environment` | `EnvironmentMetadata` — environment-level config with partition definitions, crypto provider, quorum settings, block validators, logger |
 | `data` | `DataProvider` trait — abstracts external data store; `DefaultDataProvider` communicates via TCP/UDS to a local data service using MsgPack |
-| `crypto` | `AsymCryptoProvider` trait (RSA placeholder) and `HashProvider` trait — both currently `todo!()` stubs |
+| `crypto` | `AsymCryptoProvider` trait — `Ed25519Provider` (sign/verify/public_key via ed25519-dalek, encrypt/decrypt via AES-256-GCM + X25519), `HashProvider` trait with `BasicHashProvider` (SHA-256 via ring) |
 | `encoding` | JSON and MsgPack (rmp-serde) serialization/deserialization helpers |
 | `tokens` | `Token` — contains metadata, blockchain, optional asset data; `BlockValidator` trait for per-token block validation |
 | `blocks` | `Block` and `Blockchain` — append-only chain with hash chaining; `BlockFactory` for hash computation |
@@ -57,7 +57,7 @@ Data frames consist of a 4-byte big-endian length header followed by the MsgPack
 
 ## Important notes
 
-- Several modules contain `todo!()` stubs: `crypto.rs` (RSA encrypt/decrypt/sign/check_signature), `tokens.rs` (`get_asset_mut`), `blocks.rs` (`BlockFactory::create_hash` should actually hash), `messages.rs` (`MessageBody` struct empty)
+- Several modules contain `todo!()` stubs: `tokens.rs` (`get_asset_mut`), `blocks.rs` (`BlockFactory::create_hash` should actually hash), `messages.rs` (`MessageBody` struct empty)
 - The `server.rs` ThreadPool has a commented-out async poison test (`#[should_panic]` test at line 252-275) that hangs and needs fixing
 - The ThreadPool's sync worker processes one job then exits (not a proper loop) — see `Worker::get_sync_thread` line 118
 - `config.rs` line 37-47 has `// todo` comments for node registry type selection, connection count calculation, and minimum stake
