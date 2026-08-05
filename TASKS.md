@@ -198,6 +198,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_02 Implement `BasicHashProvider::hash` using ring/SHA-256 — `crypto.rs` — refs: C# IHashProvider.cs
 - [x] P6_03 EnvironmentMetadata crypto provider uses `RwLock` — `environment.rs`
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
+- [ ] P6_05 Implement `encrypt_to`/`encrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with method that accepts a recipient's X25519 public key; DH uses recipient's key + local ephemeral secret
 
 ## Phase 7: Tests (~166 passing — ~39 → ~166)
 
@@ -231,6 +232,7 @@ This section lists all code that is currently a **stub, placeholder, or `todo!()
 **File:** `src/crypto.rs:74-123`
 Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh ephemeral keypair, derives shared secret via DH, encrypts payload. Wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`.
 **Dependencies:** `aes-gcm` 0.11.0, `x25519-dalek` 3.0.0 (with `static_secrets` + `getrandom` features).
+**Gap:** Current `encrypt`/`decrypt` only support self-encryption (same provider's key for both). P6_05 will add `encrypt_to`/`encrypt_from` for cross-recipient encryption (encrypt to a peer's X25519 public key).
 
 #### ActionRouter — routing branches now wired (P1_44), coordination stubbed
 **File:** `src/action_router.rs`
