@@ -26,6 +26,13 @@ pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> Arc<RwLock<d
 pub trait AsymCryptoProvider: Send + Sync {
     fn encrypt(&self, data: Vec<u8>) -> Vec<u8>;
     fn decrypt(&self, data: Vec<u8>) -> Vec<u8>;
+    /// Encrypt `data` to an arbitrary recipient identified by their 32-byte
+    /// X25519 public key.  Anyone with the recipient's public key can encrypt;
+    /// only the recipient (holding the matching static secret) can decrypt.
+    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Vec<u8>;
+    /// Decrypt data that was encrypted to this provider via `encrypt_to`.
+    /// The sender's ephemeral public key is embedded in the ciphertext.
+    fn decrypt_from(&self, data: Vec<u8>) -> Vec<u8>;
     fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> bool;
     fn sign_data(&self, data: &[u8]) -> Vec<u8>;
     fn public_key(&self) -> Vec<u8>;
@@ -64,6 +71,53 @@ impl Ed25519Provider {
             x25519_static_key: RwLock::new(x25519_static_key),
         }
     }
+
+    /// Encrypt using a static secret (self or recipient) + ephemeral secret.
+    /// Returns `[32-byte ephemeral PK][ciphertext + GCM tag]`.
+    fn dh_encrypt(
+        static_secret: &StaticSecret,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let ephemeral = EphemeralSecret::random();
+        let ephemeral_pub = PublicKey::from(&ephemeral);
+        let ephemeral_pub_bytes = ephemeral_pub.to_bytes();
+
+        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
+        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
+            .expect("AES-256 key derivation failed (wrong secret size)");
+        let nonce = Nonce::default(); // safe: unique ephemeral -> unique shared secret
+
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
+            .expect("AES-GCM encryption failed");
+
+        let mut result = Vec::with_capacity(32 + ciphertext.len());
+        result.extend_from_slice(&ephemeral_pub_bytes);
+        result.extend_from_slice(&ciphertext);
+        result
+    }
+
+    /// Decrypt using a static secret + ephemeral public key from ciphertext.
+    fn dh_decrypt(static_secret: &StaticSecret, data: &[u8]) -> Vec<u8> {
+        if data.len() < 32 {
+            panic!("Decrypt input too short to contain X25519 public key");
+        }
+        let ephemeral_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| {
+            panic!("Decrypt input too short to contain X25519 public key");
+        })
+        .expect("Invalid ephemeral public key");
+        let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
+
+        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
+        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
+            .expect("AES-256 key derivation failed (wrong secret size)");
+        let nonce = Nonce::default();
+
+        let plaintext = cipher
+            .decrypt(&nonce, &data[32..])
+            .expect("AES-GCM decryption failed (wrong key or tampered)");
+        plaintext.to_vec()
+    }
 }
 
 impl Default for Ed25519Provider {
@@ -73,53 +127,43 @@ impl Default for Ed25519Provider {
 impl AsymCryptoProvider for Ed25519Provider {
     fn encrypt(&self, data: Vec<u8>) -> Vec<u8> {
         let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+        Self::dh_encrypt(&static_secret, &data)
+    }
 
-        // Fresh ephemeral secret per encryption (guarantees unique shared secret).
+    fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
+        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+        Self::dh_decrypt(&static_secret, &data)
+    }
+
+    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Vec<u8> {
+        let recipient_key = PublicKey::from(*recipient_public_key);
+
+        // Generate fresh ephemeral keypair for this encryption.
         let ephemeral = EphemeralSecret::random();
         let ephemeral_pub = PublicKey::from(&ephemeral);
         let ephemeral_pub_bytes = ephemeral_pub.to_bytes();
 
-        // Derive shared secret via Diffie-Hellman.
-        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
+        // DH: ephemeral secret * recipient's static public key = shared secret.
+        // Anyone who knows the recipient's public key can encrypt to them.
+        let shared_secret = ephemeral.diffie_hellman(&recipient_key);
 
-        // AES-256-GCM cipher with key derived from shared secret.
         let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
             .expect("AES-256 key derivation failed (wrong secret size)");
-        let nonce = Nonce::default(); // safe: unique shared secret per call
+        let nonce = Nonce::default(); // safe: unique ephemeral -> unique shared secret
 
         let ciphertext = cipher
             .encrypt(&nonce, data.as_ref())
             .expect("AES-GCM encryption failed");
 
-        // Wire format: [32-byte ephemeral PK][ciphertext + 16-byte GCM tag]
         let mut result = Vec::with_capacity(32 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub_bytes);
         result.extend_from_slice(&ciphertext);
         result
     }
 
-    fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
-        if data.len() < 32 {
-            panic!("Decrypt input too short to contain X25519 public key");
-        }
-
+    fn decrypt_from(&self, data: Vec<u8>) -> Vec<u8> {
         let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
-        let ephemeral_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| {
-            panic!("Decrypt input too short to contain X25519 public key");
-        })
-        .expect("Invalid ephemeral public key");
-        let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
-
-        let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
-
-        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
-            .expect("AES-256 key derivation failed (wrong secret size)");
-        let nonce = Nonce::default();
-
-        let plaintext = cipher
-            .decrypt(&nonce, &data[32..])
-            .expect("AES-GCM decryption failed (wrong key or tampered)");
-        plaintext.to_vec()
+        Self::dh_decrypt(&static_secret, &data)
     }
 
     fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> bool {
@@ -147,6 +191,16 @@ impl AsymCryptoProvider for Ed25519Provider {
     fn public_key(&self) -> Vec<u8> {
         let pk = *self.verifying_key.read().expect("RwLock poisoned");
         pk.to_bytes().to_vec()
+    }
+}
+
+impl Ed25519Provider {
+    /// Return the 32-byte X25519 public key (for use with encrypt_to).
+    /// This is different from `public_key()` which returns the Ed25519
+    /// verifying key (for signature verification).
+    pub fn x25519_public_key(&self) -> [u8; 32] {
+        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+        PublicKey::from(&*static_secret).to_bytes()
     }
 }
 
@@ -257,6 +311,59 @@ mod tests {
         assert_eq!(encrypted.len(), 48); // 32-byte PK + 16-byte GCM tag only
         let decrypted = provider.decrypt(encrypted);
         assert_eq!(decrypted, Vec::<u8>::new());
+    }
+
+    // --- Cross-recipient encryption tests (P6_05) ---
+    // Note: uses x25519_public_key(), NOT public_key() (which returns Ed25519 verifying key)
+
+    #[test]
+    fn test_encrypt_to_decrypt_from_roundtrip() {
+        let sender = Ed25519Provider::generate();
+        let recipient = Ed25519Provider::generate();
+        let recipient_pk = recipient.x25519_public_key();
+        let data = b"cross-recipient message";
+
+        let encrypted = sender.encrypt_to(&recipient_pk, data.to_vec());
+        let decrypted = recipient.decrypt_from(encrypted);
+        assert_eq!(data.to_vec(), decrypted);
+    }
+
+    #[test]
+    fn test_encrypt_to_wrong_recipient_panics() {
+        let sender = Ed25519Provider::generate();
+        let recipient = Ed25519Provider::generate();
+        let wrong_receiver = Ed25519Provider::generate();
+        let recipient_pk = recipient.x25519_public_key();
+
+        let encrypted = sender.encrypt_to(&recipient_pk, b"secret".to_vec());
+        // Decrypting with a different provider's key should panic (AES-GCM tag mismatch).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            wrong_receiver.decrypt_from(encrypted);
+        }));
+        assert!(result.is_err(), "decrypt_from should panic with wrong key");
+    }
+
+    #[test]
+    fn test_encrypt_to_empty_data() {
+        let sender = Ed25519Provider::generate();
+        let recipient = Ed25519Provider::generate();
+        let recipient_pk = recipient.x25519_public_key();
+
+        let encrypted = sender.encrypt_to(&recipient_pk, vec![]);
+        assert_eq!(encrypted.len(), 48); // 32-byte PK + 16-byte GCM tag only
+        let decrypted = recipient.decrypt_from(encrypted);
+        assert_eq!(decrypted, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_encrypt_to_self() {
+        let provider = Ed25519Provider::generate();
+        let pk = provider.x25519_public_key();
+        let data = b"self-encrypted";
+
+        let encrypted = provider.encrypt_to(&pk, data.to_vec());
+        let decrypted = provider.decrypt_from(encrypted);
+        assert_eq!(data.to_vec(), decrypted);
     }
 
     #[test]

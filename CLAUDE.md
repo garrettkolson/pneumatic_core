@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo check              # Quick compilation check
 cargo build              # Build the library
-cargo test               # Run all 28 tests
+cargo test               # Run all 158 tests
 cargo test <filter>      # Run a single test, e.g. cargo test blocks::tests::get_current_chain_state_with_empty_chain
 ```
 
@@ -34,7 +34,7 @@ The library is flat — 13 modules declared in `src/lib.rs`:
 | `config` | `Config` — loads `config.json` and per-environment specs from `/env/`, builds node configuration |
 | `environment` | `EnvironmentMetadata` — environment-level config with partition definitions, crypto provider, quorum settings, block validators, logger |
 | `data` | `DataProvider` trait — abstracts external data store; `DefaultDataProvider` communicates via TCP/UDS to a local data service using MsgPack |
-| `crypto` | `AsymCryptoProvider` trait — `Ed25519Provider` (sign/verify/public_key via ed25519-dalek, encrypt/decrypt via AES-256-GCM + X25519), `HashProvider` trait with `BasicHashProvider` (SHA-256 via ring) |
+| `crypto` | `AsymCryptoProvider` trait — `Ed25519Provider` (sign/verify/public_key via ed25519-dalek, encrypt/decrypt for self-encryption, encrypt_to/decrypt_from for cross-recipient encryption via AES-256-GCM + X25519 DH; `x25519_public_key()` accessor), `HashProvider` trait with `BasicHashProvider` (SHA-256 via ring) |
 | `encoding` | JSON and MsgPack (rmp-serde) serialization/deserialization helpers |
 | `tokens` | `Token` — contains metadata, blockchain, optional asset data; `BlockValidator` trait for per-token block validation |
 | `blocks` | `Block` and `Blockchain` — append-only chain with hash chaining; `BlockFactory` for hash computation |
