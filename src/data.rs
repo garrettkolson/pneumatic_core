@@ -165,5 +165,6 @@ pub enum DataError {
     StoreNotFound,
     CacheError,
     Poisoned,
-    InvalidOperation(DataOp)
+    InvalidOperation(DataOp),
+    InvalidSignature,
 }

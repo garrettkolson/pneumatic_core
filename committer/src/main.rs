@@ -54,6 +54,7 @@ fn main() {
             std::process::exit(1);
         }),
         60, // 60s TTL
+        env_data.asym_crypto_provider.clone(),
     ));
 
     // 4. Create shared env_data Arc (clone for shared ownership)

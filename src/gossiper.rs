@@ -1,10 +1,12 @@
 use moka::sync::Cache;
 use crate::config::Config;
 use crate::conns::factories::ConnFactory;
+use crate::crypto::AsymCryptoProvider;
 use crate::data::DataError;
 use crate::encoding::deserialize_rmp_to;
 use crate::messages::Message;
 use crate::node::NodeRegistryType;
+use std::sync::{Arc, RwLock};
 
 /// Gossiper handles message deduplication and fan-out.
 /// Maintains a signature cache to prevent processing duplicate messages.
@@ -22,11 +24,18 @@ pub struct Gossiper {
     /// handlers). Stored behind a `Mutex` because `initialize()`, `add_handler()`,
     /// and `handle_message()` all borrow `&self`.
     handlers: std::sync::Mutex<Vec<Box<dyn Fn(Vec<u8>) + Send + Sync>>>,
+    /// Cryptographic provider for signature verification of incoming messages.
+    crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
 }
 
 impl Gossiper {
-    /// Create a new Gossiper with configurable dedup TTL.
-    pub fn new(node_type: NodeRegistryType, config: Config, ttl_seconds: u64) -> Self {
+    /// Create a new Gossiper with configurable dedup TTL and crypto provider.
+    pub fn new(
+        node_type: NodeRegistryType,
+        config: Config,
+        ttl_seconds: u64,
+        crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
+    ) -> Self {
         Gossiper {
             node_type,
             config,
@@ -36,6 +45,7 @@ impl Gossiper {
                 .time_to_live(std::time::Duration::from_secs(ttl_seconds))
                 .build(),
             handlers: std::sync::Mutex::new(Vec::new()),
+            crypto_provider,
         }
     }
 
@@ -81,8 +91,15 @@ impl Gossiper {
         // Add to cache (will expire after TTL)
         self.cache.insert(signature_key, ());
 
-        // TODO: validate crypto signature via AsymCryptoProvider.check_signature()
-        // (encrypt/decrypt now implemented with hybrid AES-GCM + X25519 key exchange)
+        // Validate sender's cryptographic signature over the message body.
+        if !self
+            .crypto_provider
+            .read()
+            .expect("RwLock poisoned")
+            .check_signature(&message.signature, &message.public_key, &message.body)
+        {
+            return Err(DataError::InvalidSignature);
+        }
 
         // Fan-out: invoke every registered handler with a copy of the raw data.
         // Each handler owns the dispatch logic (routing by action, etc.).
@@ -102,10 +119,11 @@ impl Gossiper {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLockReadGuard};
 
     use super::*;
     use crate::config::Config;
+    use crate::crypto::Ed25519Provider;
     use crate::node::{NodeRegistryType, NodeType};
     use dashmap::DashMap;
 
@@ -123,37 +141,54 @@ mod tests {
         }
     }
 
-    fn make_gossiper() -> Gossiper {
+    /// Create a Gossiper with a crypto provider returned for message signing.
+    fn make_gossiper_with_provider() -> (Gossiper, Arc<RwLock<Ed25519Provider>>) {
         let config = make_test_config();
-        Gossiper::new(NodeRegistryType::Sentinel, config, 300)
+        let crypto_provider = Arc::new(RwLock::new(Ed25519Provider::generate()));
+        let gossiper = Gossiper::new(
+            NodeRegistryType::Sentinel,
+            config,
+            300,
+            crypto_provider.clone(),
+        );
+        (gossiper, crypto_provider)
+    }
+
+    /// Create a properly signed test message using the given provider.
+    fn make_signed_message(
+        provider: &RwLockReadGuard<Ed25519Provider>,
+        chain_id: &str,
+        action: &str,
+        body: Vec<u8>,
+    ) -> Message {
+        let pk = provider.public_key();
+        let sig = provider.sign_data(&body);
+        Message {
+            chain_id: chain_id.to_string(),
+            action: action.to_string(),
+            body,
+            signature: sig,
+            public_key: pk,
+        }
     }
 
     #[test]
     fn gossiper_accepts_first_message() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
-        // Actually, handle_message uses deserialize_rmp_to, so we need msgpack
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
         assert!(gossiper.handle_message(raw).is_ok());
     }
 
     #[test]
     fn gossiper_silently_ignores_duplicate() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
         // First call: Ok, added to cache
         assert!(gossiper.handle_message(raw.clone()).is_ok());
         // Second call with same signature: Ok, but silently skipped (dedup)
@@ -162,21 +197,10 @@ mod tests {
 
     #[test]
     fn gossiper_accepts_different_message() {
-        let gossiper = make_gossiper();
-        let msg_a = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
-        let msg_b = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![],
-            signature: vec![7, 8, 9],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg_a = make_signed_message(&sig_guard, "test", "Process", vec![]);
+        let msg_b = make_signed_message(&sig_guard, "test", "Process", vec![1]);
         let raw_a = crate::encoding::serialize_to_bytes_rmp(&msg_a).unwrap();
         let raw_b = crate::encoding::serialize_to_bytes_rmp(&msg_b).unwrap();
         assert!(gossiper.handle_message(raw_a).is_ok());
@@ -192,7 +216,8 @@ mod tests {
         // (oldest would have been evicted by TTL-free cache).
         // For a simple verification, we just check the gossiper constructs.
         let config = make_test_config();
-        let gossiper = Gossiper::new(NodeRegistryType::Sentinel, config, 300);
+        let crypto_provider = Arc::new(RwLock::new(Ed25519Provider::generate()));
+        let gossiper = Gossiper::new(NodeRegistryType::Sentinel, config, 300, crypto_provider);
         // If it constructs without panic, the cache is set up.
         // The capacity constant is 10_000 per the source code.
         drop(gossiper);
@@ -202,15 +227,11 @@ mod tests {
 
     #[test]
     fn fan_out_invokes_all_handlers() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![1, 2, 3],
-            signature: vec![9, 8, 7],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![1, 2, 3]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
 
         let handler1_count = Arc::new(AtomicUsize::new(0));
         let handler2_count = Arc::new(AtomicUsize::new(0));
@@ -227,28 +248,17 @@ mod tests {
 
         gossiper.handle_message(raw).unwrap();
 
-        assert_eq!(
-            handler1_count.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
-            handler2_count.load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(handler1_count.load(Ordering::SeqCst), 1);
+        assert_eq!(handler2_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn fan_out_handlers_receive_copy_of_data() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "broadcast".into(),
-            action: "Process".into(),
-            body: vec![42],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "broadcast", "Process", vec![42]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
-        let expected_len = raw.len();
+        drop(sig_guard);
 
         let received1 = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let received2 = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
@@ -263,30 +273,20 @@ mod tests {
             r2.lock().unwrap().extend_from_slice(&data);
         });
 
-        gossiper.handle_message(raw).unwrap();
+        gossiper.handle_message(raw.clone()).unwrap();
 
-        assert_eq!(
-            *received1.lock().unwrap(),
-            crate::encoding::serialize_to_bytes_rmp(&msg).unwrap()
-        );
-        assert_eq!(
-            *received2.lock().unwrap(),
-            crate::encoding::serialize_to_bytes_rmp(&msg).unwrap()
-        );
+        assert_eq!(*received1.lock().unwrap(), raw);
+        assert_eq!(*received2.lock().unwrap(), raw);
         assert_eq!(*received1.lock().unwrap(), *received2.lock().unwrap());
     }
 
     #[test]
     fn fan_out_dedup_skips_all_handlers() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![1],
-            signature: vec![5, 5, 5],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![1]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
 
         let count = Arc::new(AtomicUsize::new(0));
         let c1 = count.clone();
@@ -310,15 +310,11 @@ mod tests {
 
     #[test]
     fn fan_out_three_handlers_all_called() {
-        let gossiper = make_gossiper();
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![1, 2],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![1, 2]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
 
         let count = Arc::new(AtomicUsize::new(0));
         let c1 = count.clone();
@@ -341,15 +337,12 @@ mod tests {
 
     #[test]
     fn fan_out_concurrent_handler_invocation() {
-        let gossiper = Arc::new(make_gossiper());
-        let msg = Message {
-            chain_id: "test".into(),
-            action: "Process".into(),
-            body: vec![1, 2, 3],
-            signature: vec![1, 2, 3],
-            public_key: vec![4, 5, 6],
-        };
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+        let msg = make_signed_message(&sig_guard, "test", "Process", vec![1, 2, 3]);
         let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
+        let gossiper = Arc::new(gossiper);
 
         let counts: Vec<Arc<AtomicUsize>> = (0..5)
             .map(|_| Arc::new(AtomicUsize::new(0)))

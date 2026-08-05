@@ -245,11 +245,9 @@ All action branches now dispatch: Process→nonce+gas, Preload→gas+stake(Execu
 Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `initialize()` method stores the closure and `handle_message()` invokes it after dedup check.
 **Wiring:** Sentinel: `sentinel.initialize(move |raw| { if let Err(e) = arc.on_data_received(raw) { ... } })`. Committer: wraps caller's `Fn(Message)` with deserialization. Finalizer: stub (no Gossiper field yet).
 
-#### Gossiper — no crypto validation
-**File:** `src/gossiper.rs:69`
-Comment: `// TODO: validate crypto signature via AsymCryptoProvider.check_signature()`
-**Note:** `encrypt`/`decrypt` are now implemented (P6_04). The remaining gap is signature validation in the deserialization path.
-**Action:** After deserialization, verify `AsymCryptoProvider.check_signature(message.signature, message.body)`.
+#### Gossiper — no crypto validation — done (crypto_provider injected, check_signature called after dedup)
+**File:** `src/gossiper.rs:84-92`
+`handle_message()` now validates `AsymCryptoProvider.check_signature(message.signature, message.public_key, message.body)` after dedup and before fan-out. Invalid messages return `DataError::InvalidSignature`.
 
 #### Gossiper — fan-out to handler delegates done (P1_42)
 **File:** `src/gossiper.rs:87-92`

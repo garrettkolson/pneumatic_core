@@ -337,6 +337,7 @@ mod tests {
             NodeRegistryType::Sentinel,
             make_test_config(),
             300,
+            env_data.asym_crypto_provider.clone(),
         ));
         let sentinel = Sentinel::new(
             make_test_config(),
