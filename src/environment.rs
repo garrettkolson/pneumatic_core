@@ -5,7 +5,7 @@ use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
-use crate::validation::ValidationSpecRegistry;
+use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry};
 
 #[derive(Clone)]
 pub struct EnvironmentMetadata {
@@ -26,6 +26,8 @@ pub struct EnvironmentMetadata {
     pub block_validators: Arc<DashMap<String, Box<dyn BlockValidator>>>,
     /// Transaction validation specs — action-based specs registered by name.
     pub transaction_validation_specs: Arc<ValidationSpecRegistry>,
+    /// Block validator specs — used by Committers and Archivers.
+    pub block_validator_specs: Arc<BlockValidatorSpecRegistry>,
     pub logger: Arc<dyn Logger>,
 }
 
@@ -63,6 +65,9 @@ impl EnvironmentMetadata {
         let mut specs = ValidationSpecRegistry::new();
         specs.register_defaults();
 
+        let mut block_specs = BlockValidatorSpecRegistry::new();
+        block_specs.register_defaults();
+
         EnvironmentMetadata {
             environment_id: spec.environment_id,
             environment_name: spec.environment_name,
@@ -77,6 +82,7 @@ impl EnvironmentMetadata {
             asym_crypto_provider,
             block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(specs),
+            block_validator_specs: Arc::new(block_specs),
             logger,
         }
     }

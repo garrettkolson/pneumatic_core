@@ -81,8 +81,8 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P1_36 Add `MessageBody<T>` — `messages.rs` — action: String, body: T
 - [x] P1_37 Rename `Message.env_id` → `chain_id` — `messages.rs`
 - [x] P1_38 Create `BlockValidatorSpec` trait — `validation.rs` — validate(block, token, env_data)
-- [ ] P1_39 Add `SelfSignedBlockValidatorSpec` for blocks — `validation.rs` — EXISTS but implements TransactionValidationSpec, not BlockValidatorSpec
-- [ ] P1_40 Add `ExecutedBlockValidatorSpec` for blocks — `validation.rs` — EXISTS but implements TransactionValidationSpec, not BlockValidatorSpec
+- [x] P1_39 Add `SelfSignedBlockValidatorSpec` for blocks — `validation.rs` — Implements BlockValidatorSpec: chain integrity + is_self_verified check
+- [x] P1_40 Add `ExecutedBlockValidatorSpec` for blocks — `validation.rs` — Implements BlockValidatorSpec: result_hash, executor_sigs, finalizer_sig checks
 
 ### 1.10 Gossiper
 

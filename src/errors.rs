@@ -80,6 +80,14 @@ pub enum ValidationFailureReason {
     NotTokenOwner,
     /// Transaction action type is not supported for this token
     UnsupportedAction,
+    /// Token is not marked as self-verified (required for self-signed blocks)
+    NotSelfVerified,
+    /// Executed transaction is missing a result hash (executor did not run)
+    MissingResultHash,
+    /// Executed transaction has no executor signatures
+    MissingExecutorSignatures,
+    /// Executed transaction has no finalizer signature
+    MissingFinalizerSignature,
 }
 
 // ---------------------------------------------------------------------------

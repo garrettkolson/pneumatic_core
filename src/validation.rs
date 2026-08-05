@@ -96,6 +96,33 @@ impl TransactionValidationSpec for SelfSignedBlockValidatorSpec {
     }
 }
 
+// BlockValidatorSpec implementation for self-signed blocks
+
+impl BlockValidatorSpec for SelfSignedBlockValidatorSpec {
+    fn validate(
+        &self,
+        block: &crate::blocks::Block,
+        token: &Token,
+        _env_data: &EnvironmentMetadata,
+    ) -> Result<BlockValidationResult, PneumaticError> {
+        // Validate chain integrity (delegate to the token's blockchain)
+        if !token.blockchain.validate_next_block(&block) {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::NotSelfVerified,
+            ]));
+        }
+
+        // Self-signed tokens must be flagged as self-verified
+        if !token.is_self_verified {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::NotSelfVerified,
+            ]));
+        }
+
+        Ok(BlockValidationResult::Valid)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ExecutedBlockValidatorSpec — standard executed/processed blocks
 // ---------------------------------------------------------------------------
@@ -191,6 +218,40 @@ impl TransactionValidationSpec for ExecutedBlockValidatorSpec {
     }
 }
 
+// BlockValidatorSpec implementation for executed blocks
+
+impl BlockValidatorSpec for ExecutedBlockValidatorSpec {
+    fn validate(
+        &self,
+        block: &crate::blocks::Block,
+        _token: &Token,
+        _env_data: &EnvironmentMetadata,
+    ) -> Result<BlockValidationResult, PneumaticError> {
+        // Executed transactions must have a result hash (executor ran)
+        if block.signed_trans.transaction.result_hash.is_empty() {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::MissingResultHash,
+            ]));
+        }
+
+        // Executed transactions must have executor signatures
+        if block.signed_trans.executor_sigs.is_empty() {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::MissingExecutorSignatures,
+            ]));
+        }
+
+        // Executed transactions must have a finalizer signature
+        if block.signed_trans.finalizer_sig.signature.is_empty() {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::MissingFinalizerSignature,
+            ]));
+        }
+
+        Ok(BlockValidationResult::Valid)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BlockValidatorSpec — validates entire blocks (used by Committers/Archivers)
 // ---------------------------------------------------------------------------
@@ -271,6 +332,55 @@ impl TransactionValidationSpec for Box<dyn TransactionValidationSpec> {
 }
 
 // ---------------------------------------------------------------------------
+// BlockValidatorSpecRegistry — stores and looks up BlockValidatorSpec instances
+// ---------------------------------------------------------------------------
+
+/// Registry of BlockValidatorSpec instances, keyed by spec name.
+/// Used by Committers and Archivers to look up the correct block validation
+/// spec for each token's blocks.
+#[derive(Default)]
+pub struct BlockValidatorSpecRegistry {
+    specs: HashMap<String, Arc<dyn BlockValidatorSpec>>,
+}
+
+impl BlockValidatorSpecRegistry {
+    pub fn new() -> Self {
+        BlockValidatorSpecRegistry {
+            specs: HashMap::new(),
+        }
+    }
+
+    /// Register a block validator spec under a given name.
+    pub fn register(&mut self, name: &str, spec: Box<dyn BlockValidatorSpec>) {
+        let spec: Arc<dyn BlockValidatorSpec> = Arc::from(spec);
+        self.specs.insert(name.to_string(), spec);
+    }
+
+    /// Look up a spec by name.
+    pub fn get(&self, name: &str) -> Option<&Arc<dyn BlockValidatorSpec>> {
+        self.specs.get(name)
+    }
+
+    /// Register default specs (SelfSigned and Executed).
+    pub fn register_defaults(&mut self) {
+        self.register("SelfSigned", Box::new(SelfSignedBlockValidatorSpec::new()));
+        self.register("Executed", Box::new(ExecutedBlockValidatorSpec::new(0)));
+    }
+}
+
+// Blanket impl: Box<dyn BlockValidatorSpec> delegates to the inner trait object.
+impl BlockValidatorSpec for Box<dyn BlockValidatorSpec> {
+    fn validate(
+        &self,
+        block: &crate::blocks::Block,
+        token: &Token,
+        env_data: &EnvironmentMetadata,
+    ) -> Result<BlockValidationResult, PneumaticError> {
+        (**self).validate(block, token, env_data)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -325,7 +435,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[1, 2, 3], &[], None, 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_ok());
         assert!(result.unwrap().is_valid);
     }
@@ -336,7 +446,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], None, 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
         match result.unwrap_err() {
             PneumaticError::Validation(ref reasons) => {
@@ -353,7 +463,7 @@ mod tests {
         let token = Token::new(); // no owner metadata
         let tx = make_tx(&[1, 2, 3], &[], None, 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -381,7 +491,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[1, 2, 3], &[], Some(100), 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -391,7 +501,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[], &[], Some(100), 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -401,7 +511,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], Some(0), 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -411,7 +521,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], Some(100), 0);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -421,7 +531,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], Some(100), 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_ok());
         assert!(result.unwrap().is_valid);
     }
@@ -486,7 +596,7 @@ mod tests {
         // Validate with SelfSigned spec
         let spec = SelfSignedBlockValidatorSpec::new();
         let env = make_env_with_defaults();
-        let validation_result = spec.validate(&tx, &token, &env).unwrap();
+        let validation_result = TransactionValidationSpec::validate(&spec, &tx, &token, &env).unwrap();
         assert!(validation_result.is_valid);
 
         // Transition to Validated state in PendingTransaction
@@ -509,7 +619,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], Some(100), 0);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
     }
 
@@ -519,7 +629,7 @@ mod tests {
         let token = make_token_with_owner(&[1, 2, 3]);
         let tx = make_tx(&[9, 9, 9], &[], Some(100), 1);
         let env = make_env_with_defaults();
-        let result = spec.validate(&tx, &token, &env);
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_ok());
     }
 
@@ -531,10 +641,312 @@ mod tests {
 
         // seq=1 → valid
         let tx1 = make_tx(&[9, 9, 9], &[], Some(100), 1);
-        assert!(spec.validate(&tx1, &token, &env).is_ok());
+        assert!(TransactionValidationSpec::validate(&spec, &tx1, &token, &env).is_ok());
 
         // seq=2 → also valid
         let tx2 = make_tx(&[9, 9, 9], &[], Some(200), 2);
-        assert!(spec.validate(&tx2, &token, &env).is_ok());
+        assert!(TransactionValidationSpec::validate(&spec, &tx2, &token, &env).is_ok());
+    }
+
+    // --- Test helpers for block-level validators ---
+
+    use crate::blocks::{BlockFactory, Blockchain};
+    use crate::transactions::{SignedTransaction, TransactionSignature};
+    use crate::validation::BlockValidatorSpecRegistry;
+    use std::collections::HashMap;
+
+    fn make_signed_tx_with_fields(
+        result_hash: Vec<u8>,
+        executor_sigs: HashMap<Vec<u8>, TransactionSignature>,
+        finalizer_sig: TransactionSignature,
+    ) -> SignedTransaction {
+        SignedTransaction {
+            transaction_id: String::from("test_signed_tx"),
+            transaction: Transaction {
+                id: String::from("test_tx"),
+                action: String::from("Transfer"),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: vec![1, 2, 3],
+                receiver: vec![],
+                amount: Some(100),
+                timestamp: 0,
+                result_hash,
+            },
+            total_stake: 42,
+            total_voters: 3,
+            leader_address: vec![1],
+            leader_stake: 24,
+            leader_hash: vec![0u8; 32],
+            finalizer_addr: vec![2],
+            finalizer_sig,
+            executor_sigs,
+        }
+    }
+
+    fn make_valid_block(signed_tx: SignedTransaction, blockchain: &mut Blockchain) -> crate::blocks::Block {
+        // Pre-populate chain with a genesis block so validate_next_block works
+        // (validate_next_block returns false for empty chains)
+        if blockchain.get_count() == 0 {
+            let genesis = SignedTransaction {
+                transaction_id: String::from("genesis"),
+                transaction: Transaction {
+                    id: String::from("genesis"),
+                    action: String::from("Genesis"),
+                    token_id: vec![],
+                    bid: None,
+                    sequence_number: 0,
+                    sender: vec![],
+                    receiver: vec![],
+                    amount: None,
+                    timestamp: 0,
+                    result_hash: vec![],
+                },
+                total_stake: 42,
+                total_voters: 3,
+                leader_address: vec![1],
+                leader_stake: 24,
+                leader_hash: signed_tx.leader_hash.clone(),
+                finalizer_addr: vec![2],
+                finalizer_sig: TransactionSignature {
+                    transaction_id: vec![],
+                    env_id: vec![],
+                    transaction_hash: vec![],
+                    signature: vec![0u8; 64],
+                    current_stake: 10,
+                },
+                executor_sigs: HashMap::new(),
+            };
+            let mut gen_block = crate::blocks::Block {
+                signed_trans: genesis,
+                token_metadata: HashMap::new(),
+                previous_hash: signed_tx.leader_hash.clone(),
+                timestamp: 0,
+                current_hash: vec![],
+            };
+            gen_block.current_hash = BlockFactory::create_hash(&gen_block);
+            blockchain.add_block(gen_block);
+        }
+        let prev_hash = blockchain.get_current_chain_state().last_hash_in;
+        let mut block = crate::blocks::Block {
+            signed_trans: signed_tx,
+            token_metadata: HashMap::new(),
+            previous_hash: prev_hash,
+            timestamp: 0,
+            current_hash: vec![],
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+        block
+    }
+
+    fn make_self_signed_token(owner: &[u8]) -> Token {
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(owner.to_vec()).unwrap());
+        token.is_self_verified = true;
+        token.block_validation_spec_name = String::from("SelfSigned");
+        token
+    }
+
+    // --- SelfSignedBlockValidatorSpec (BlockValidatorSpec trait) ---
+
+    #[test]
+    fn self_signed_block_validates_chain_and_self_verified() {
+        let spec = SelfSignedBlockValidatorSpec::new();
+        let mut token = make_self_signed_token(&[1, 2, 3]);
+        let signed_tx = make_signed_tx_with_fields(vec![], HashMap::new(), TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![0u8; 64],
+            current_stake: 10,
+        });
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), BlockValidationResult::Valid));
+    }
+
+    #[test]
+    fn self_signed_block_rejects_non_self_verified_token() {
+        let spec = SelfSignedBlockValidatorSpec::new();
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.is_self_verified = false;
+        token.block_validation_spec_name = String::from("SelfSigned");
+        let signed_tx = make_signed_tx_with_fields(vec![], HashMap::new(), TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![0u8; 64],
+            current_stake: 10,
+        });
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PneumaticError::Validation(ref reasons) => {
+                let reason_str = format!("{:?}", reasons);
+                assert!(reason_str.contains("NotSelfVerified"));
+            }
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    // --- ExecutedBlockValidatorSpec (BlockValidatorSpec trait) ---
+
+    #[test]
+    fn executed_block_validates_all_requirements() {
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.is_self_verified = false;
+        token.block_validation_spec_name = String::from("Executed");
+
+        let mut executor_sigs = HashMap::new();
+        executor_sigs.insert(vec![10, 20], TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![0u8; 64],
+            current_stake: 10,
+        });
+
+        let signed_tx = make_signed_tx_with_fields(
+            vec![1, 2, 3, 4],
+            executor_sigs,
+            TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![0u8; 64],
+                current_stake: 10,
+            },
+        );
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), BlockValidationResult::Valid));
+    }
+
+    #[test]
+    fn executed_block_rejects_missing_result_hash() {
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.block_validation_spec_name = String::from("Executed");
+
+        let signed_tx = make_signed_tx_with_fields(
+            vec![],
+            HashMap::new(),
+            TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![0u8; 64],
+                current_stake: 10,
+            },
+        );
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PneumaticError::Validation(ref reasons) => {
+                let reason_str = format!("{:?}", reasons);
+                assert!(reason_str.contains("MissingResultHash"));
+            }
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn executed_block_rejects_missing_executor_sigs() {
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.block_validation_spec_name = String::from("Executed");
+
+        let signed_tx = make_signed_tx_with_fields(
+            vec![1, 2, 3, 4],
+            HashMap::new(), // empty executor_sigs
+            TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![0u8; 64],
+                current_stake: 10,
+            },
+        );
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PneumaticError::Validation(ref reasons) => {
+                let reason_str = format!("{:?}", reasons);
+                assert!(reason_str.contains("MissingExecutorSignatures"));
+            }
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    #[test]
+    fn executed_block_rejects_missing_finalizer_signature() {
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.block_validation_spec_name = String::from("Executed");
+
+        let mut executor_sigs = HashMap::new();
+        executor_sigs.insert(vec![10, 20], TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![0u8; 64],
+            current_stake: 10,
+        });
+
+        let signed_tx = make_signed_tx_with_fields(
+            vec![1, 2, 3, 4],
+            executor_sigs,
+            TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![], // empty finalizer signature
+                current_stake: 10,
+            },
+        );
+        let block = make_valid_block(signed_tx, &mut token.blockchain);
+        let env = make_env_with_defaults();
+        let result = BlockValidatorSpec::validate(&spec, &block, &token, &env);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PneumaticError::Validation(ref reasons) => {
+                let reason_str = format!("{:?}", reasons);
+                assert!(reason_str.contains("MissingFinalizerSignature"));
+            }
+            _ => panic!("expected Validation error"),
+        }
+    }
+
+    // --- BlockValidatorSpecRegistry ---
+
+    #[test]
+    fn block_validator_registry_registers_and_looks_up_defaults() {
+        let mut registry = BlockValidatorSpecRegistry::new();
+        registry.register_defaults();
+        assert!(registry.get("SelfSigned").is_some());
+        assert!(registry.get("Executed").is_some());
+    }
+
+    #[test]
+    fn block_validator_registry_get_nonexistent_returns_none() {
+        let registry = BlockValidatorSpecRegistry::new();
+        assert!(registry.get("Unknown").is_none());
     }
 }
