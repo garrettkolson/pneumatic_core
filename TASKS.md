@@ -335,10 +335,9 @@ Returns `RegistrationBatchResult::Success` without processing the batch or valid
 **File:** `sentinel/src/sentinel.rs:187-189`
 **Action:** Deserialize `NodeRegistryRequest`, validate stake, register node.
 
-#### TransactionValidator.validate_transaction — spec not actually invoked
-**File:** `sentinel/src/transaction_validator.rs:33-61`
-Looks up spec by action name but does NOT call `spec.validate()`. Only checks that a spec exists.
-**Action:** Inject `DataProvider` to load token, call `spec.validate(tx, token, &self.env_data)`.
+#### TransactionValidator.validate_transaction — spec now invoked — done
+**File:** `sentinel/src/transaction_validator.rs:33-70`
+`TransactionValidator` now receives `Arc<dyn DataProvider>`. `validate_transaction()` loads the token via `data_provider.get_token()` and delegates to `spec.validate(tx, token, env_data)`. Added `TokenNotFound` variant to `ValidationFailureReason`. `Sentinel::new()` creates `DefaultDataProvider` and passes it through.
 
 #### TransactionNotifier.send_to_nodes — full stub
 **File:** `sentinel/src/transaction_notifier.rs:107-112`

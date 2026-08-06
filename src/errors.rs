@@ -82,6 +82,8 @@ pub enum ValidationFailureReason {
     UnsupportedAction,
     /// Token is not marked as self-verified (required for self-signed blocks)
     NotSelfVerified,
+    /// Token data could not be loaded from the data store
+    TokenNotFound,
     /// Executed transaction is missing a result hash (executor did not run)
     MissingResultHash,
     /// Executed transaction has no executor signatures

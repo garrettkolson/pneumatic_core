@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pneumatic_core::config::Config;
 use pneumatic_core::conns::ConnError;
-use pneumatic_core::data::DataError;
+use pneumatic_core::data::{DataError, DefaultDataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::errors::PneumaticError;
@@ -48,7 +48,8 @@ impl Sentinel {
         let transaction_notifier = Arc::new(
             super::transaction_notifier::TransactionNotifier::new(config)
         );
-        let validator = super::transaction_validator::TransactionValidator::new(env_data.clone());
+        let data_provider = Arc::new(DefaultDataProvider::new());
+        let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), data_provider);
 
         Sentinel {
             node_registry,

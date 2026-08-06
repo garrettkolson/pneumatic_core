@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use pneumatic_core::data::DataProvider;
 use pneumatic_core::errors::{PneumaticError, TransactionRiskFactor, ValidationFailureReason};
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::messages::Message;
@@ -11,13 +12,15 @@ use pneumatic_core::transactions::Transaction;
 /// Used by the Sentinel's `handle_process_request`.
 pub struct TransactionValidator {
     env_data: Arc<EnvironmentMetadata>,
+    data_provider: Arc<dyn DataProvider>,
     node_registry: Option<Arc<NodeRegistry>>,
 }
 
 impl TransactionValidator {
-    pub fn new(env_data: Arc<EnvironmentMetadata>) -> Self {
+    pub fn new(env_data: Arc<EnvironmentMetadata>, data_provider: Arc<dyn DataProvider>) -> Self {
         TransactionValidator {
             env_data,
+            data_provider,
             node_registry: None,
         }
     }
@@ -45,7 +48,7 @@ impl TransactionValidator {
             ]));
         };
 
-        let _spec = match specs.get(&spec_name) {
+        let spec = match specs.get(&spec_name) {
             Some(s) => s,
             None => match specs.get("Executed") {
                 Some(s) => s,
@@ -55,8 +58,19 @@ impl TransactionValidator {
             },
         };
 
-        // Stub: full validation requires the token to be preloaded.
-        // The flow is: validate basic fields → preload data → full spec validation.
+        // Load the token from the data store to run full spec validation.
+        let token = match self.data_provider.get_token(&tx.token_id, &self.env_data.token_partition_id) {
+            Ok(t) => t,
+            Err(_) => return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::TokenNotFound
+            ])),
+        };
+
+        // Delegate to the action's validation spec.
+        let result = spec.validate(tx, &token, &self.env_data)?;
+        if !result.is_valid {
+            return Err(PneumaticError::Validation(result.failure_reasons));
+        }
         Ok(())
     }
 
