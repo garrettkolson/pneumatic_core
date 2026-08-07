@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use crate::errors::PneumaticError;
 use crate::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature, TransactionPool};
 use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
@@ -11,11 +12,27 @@ use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
 
 /// Backed by DashMap for concurrent access. Every method returns `Result`
 /// (never `Option`) to distinguish "not found" from "operation failed".
+/// Pending admin tax credit — records admin tax collected during token minting.
+/// Stored in the `PendingTransactionRegistry` until the admin collects or redeems it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingAdminCredit {
+    /// Unique credit identifier
+    pub id: String,
+    /// Admin public key who receives the tax
+    pub admin_public_key: Vec<u8>,
+    /// Tax amount owed to the admin
+    pub amount: u64,
+    /// Token ID that generated this credit
+    pub token_id: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct PendingTransactionRegistry {
     transactions: DashMap<String, PendingTransaction>,
     /// Ordered transaction pool for leader block proposal.
     pool: Mutex<TransactionPool>,
+    /// Admin tax credits collected during token minting, keyed by credit ID.
+    admin_credits: DashMap<String, PendingAdminCredit>,
 }
 
 impl PendingTransactionRegistry {
@@ -23,6 +40,7 @@ impl PendingTransactionRegistry {
         PendingTransactionRegistry {
             transactions: DashMap::new(),
             pool: Mutex::new(TransactionPool::new()),
+            admin_credits: DashMap::new(),
         }
     }
 
@@ -199,6 +217,23 @@ impl PendingTransactionRegistry {
             result.push(tx);
         }
         Ok(result)
+    }
+
+    /// Record an admin tax credit collected during token minting.
+    /// Returns the credit ID for later redemption.
+    pub fn record_admin_credit(&self, credit: PendingAdminCredit) {
+        self.admin_credits.insert(credit.id.clone(), credit);
+    }
+
+    /// Retrieve a pending admin credit by ID.
+    pub fn get_admin_credit(&self, credit_id: &str) -> Option<PendingAdminCredit> {
+        self.admin_credits.get(credit_id).map(|c| c.clone())
+    }
+
+    /// Take (remove and return) a pending admin credit — used for redemption.
+    pub fn take_admin_credit(&self, credit_id: &str) -> Option<PendingAdminCredit> {
+        let entry = self.admin_credits.remove(credit_id)?;
+        Some(entry.1)
     }
 
     /// Transition to Validated state and enqueue into the pool in one

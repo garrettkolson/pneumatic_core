@@ -220,7 +220,7 @@ pub enum DataError {
 #[cfg(test)]
 pub struct StubDataProvider {
     tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
-    users: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>,
+    users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
 }
 
 #[cfg(test)]
@@ -228,7 +228,7 @@ impl StubDataProvider {
     pub fn new() -> Self {
         StubDataProvider {
             tokens: std::collections::HashMap::new(),
-            users: std::collections::HashMap::new(),
+            users: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -238,7 +238,12 @@ impl StubDataProvider {
     }
 
     pub fn with_user(mut self, key: Vec<u8>, partition_id: String, user: User) -> Self {
-        self.users.entry(key).or_default().insert(partition_id, user);
+        self.users
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .insert(partition_id, user);
         self
     }
 }
@@ -274,13 +279,21 @@ impl DataProvider for StubDataProvider {
 
     fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
         self.users
+            .lock()
+            .unwrap()
             .get(key)
             .and_then(|partitions| partitions.get(partition_id))
             .cloned()
             .ok_or(DataError::DataNotFound)
     }
 
-    fn save_user(&self, _key: &Vec<u8>, _user: User, _partition_id: &str) -> Result<(), DataError> {
+    fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
+        self.users
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .insert(partition_id.to_string(), user);
         Ok(())
     }
 }

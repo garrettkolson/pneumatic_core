@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::ops::Deref;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use crate::blocks::{Block, Blockchain};
-use crate::data::DataError;
+use crate::data::{DataError, DataProvider};
 use crate::encoding;
 use crate::encoding::serialize_to_bytes_rmp;
-use crate::environment::EnvironmentMetadata;
+use crate::environment::{CostModel, EnvironmentMetadata};
 use crate::transactions::{SignedTransaction, TransactionCommit};
+use crate::registry::{PendingAdminCredit, PendingTransactionRegistry};
 
 /// A token IS its own blockchain — independent parallel ledgers.
 #[derive(Serialize, Deserialize, Debug)]
@@ -222,6 +224,33 @@ impl Default for Token {
 /// Factory for creating tokens from different asset types.
 pub struct TokenFactory;
 
+/// Arguments for token minting with fee deduction.
+/// When provided, `mint_token_full` deducts the minting fee from the
+/// owner's fuel balance and records admin tax as a pending credit.
+pub struct MintArgs {
+    /// Owner's public key (used to look up and deduct from their user record).
+    pub owner_key: Vec<u8>,
+    /// Initial fuel deposit given to the owner (fuel_balance set before fee deduction).
+    pub initial_fuel_deposit: u64,
+    /// Gas cost model for calculating the minting fee.
+    pub cost_model: CostModel,
+    /// Data provider for reading/writing the owner's user record.
+    pub data_provider: Arc<dyn DataProvider>,
+    /// Partition ID for data store lookups.
+    pub partition_id: String,
+    /// Registry for recording admin tax credits.
+    pub admin_credit_registry: Arc<PendingTransactionRegistry>,
+}
+
+/// Result of a token mint operation.
+#[derive(Debug)]
+pub struct MintResult {
+    /// The created token.
+    pub token: Token,
+    /// ID of the admin tax credit recorded (if fee deduction was performed).
+    pub admin_credit_id: Option<String>,
+}
+
 impl TokenFactory {
     /// Create a token by dispatching on the asset type.
     pub fn mint_token<T>(
@@ -249,6 +278,72 @@ impl TokenFactory {
         }
 
         Ok(token)
+    }
+
+    /// Create a token with fee deduction from the owner's fuel balance.
+    ///
+    /// Calculates the minting fee as `base_cost * 10` and deducts it from
+    /// the owner's fuel balance. Records `admin_tax = fee * admin_tax_percentage`
+    /// as a pending admin credit.
+    ///
+    /// If the owner's fuel balance is insufficient, returns an `InsufficientGas` error.
+    pub fn mint_token_full<T>(
+        asset: &T,
+        args: &MintArgs,
+        id: Vec<u8>,
+        metadata: &HashMap<String, String>,
+        environment_id: String,
+    ) -> Result<MintResult, Error>
+    where
+        T: Serialize,
+    {
+        // 1. Create the token
+        let token = TokenFactory::mint_token(asset, id.clone(), metadata, environment_id)?;
+
+        // 2. Calculate minting fee
+        let mint_multiplier: u64 = 10;
+        let minting_fee = args.cost_model.base_cost * mint_multiplier;
+
+        // 3. Load owner from data provider
+        let mut user = args.data_provider.get_user(&args.owner_key, &args.partition_id)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("{:?}", e)))?;
+
+        // 4. Set initial fuel deposit if provided
+        if args.initial_fuel_deposit > 0 {
+            user.fuel_balance = args.initial_fuel_deposit;
+        }
+
+        // 5. Check sufficient balance
+        if user.fuel_balance < minting_fee {
+            return Err(Error::new(ErrorKind::Other, "InsufficientGas"));
+        }
+
+        // 6. Deduct fee from fuel balance
+        user.fuel_balance -= minting_fee;
+        args.data_provider.save_user(&args.owner_key, user.clone(), &args.partition_id)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("{:?}", e)))?;
+
+        // 7. Record admin tax credit
+        let admin_tax = (minting_fee as f64) * args.cost_model.admin_tax_percentage;
+        if admin_tax > 0.0 {
+            let credit_id = format!("admin_credit_{}_{}", hex::encode(&id), args.owner_key.first().unwrap_or(&0));
+            let credit = PendingAdminCredit {
+                id: credit_id.clone(),
+                admin_public_key: args.cost_model.admin_public_key.clone(),
+                amount: admin_tax as u64,
+                token_id: id,
+            };
+            args.admin_credit_registry.record_admin_credit(credit);
+            Ok(MintResult {
+                token,
+                admin_credit_id: Some(credit_id),
+            })
+        } else {
+            Ok(MintResult {
+                token,
+                admin_credit_id: None,
+            })
+        }
     }
 
     /// Create a user token (simple value transfer).
@@ -317,6 +412,301 @@ pub struct ContractProxyAuthorization {
 
 pub use crate::user::User;
 pub use crate::user::Account;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::data::StubDataProvider;
+    use crate::registry::PendingTransactionRegistry;
+    use crate::environment::CostModel;
+    use crate::user::User;
+    use super::*;
+
+    // --- Helpers ---
+
+    fn make_cost_model() -> CostModel {
+        CostModel {
+            base_cost: 10,
+            global_min_stake: 100,
+            admin_public_key: vec![1, 2, 3],
+            admin_tax_percentage: 0.02, // 2%
+        }
+    }
+
+    fn make_mint_args(owner_key: Vec<u8>, initial_fuel: u64) -> MintArgs {
+        let data_provider = Arc::new(StubDataProvider::new());
+        let admin_registry = Arc::new(PendingTransactionRegistry::new());
+        MintArgs {
+            owner_key: owner_key.clone(),
+            initial_fuel_deposit: initial_fuel,
+            cost_model: make_cost_model(),
+            data_provider,
+            partition_id: String::from("token"),
+            admin_credit_registry: admin_registry,
+        }
+    }
+
+    fn make_test_user_key() -> Vec<u8> {
+        vec![0xCA, 0xFE]
+    }
+
+    // --- Basic mint_token (backward compatibility) ---
+
+    #[test]
+    fn mint_token_creates_user_token_successfully() {
+        let id = vec![1, 2, 3];
+        let token = TokenFactory::mint_user_token(
+            vec![0xAA],
+            id,
+            String::from("test-env"),
+        ).unwrap();
+
+        assert_eq!(token.id, vec![1, 2, 3]);
+        assert_eq!(token.environment_id, "test-env");
+        assert!(token.is_self_verified);
+        assert_eq!(token.metadata.get("token_type").unwrap(), "user");
+        let user: User = token.get_asset().unwrap();
+        assert_eq!(user.public_key, vec![0xAA]);
+    }
+
+    #[test]
+    fn mint_token_creates_contract_token() {
+        let contract = SmartContract {
+            name: String::from("MyContract"),
+            bytecode: vec![0x01, 0x02],
+            version: String::from("1.0"),
+        };
+        let id = vec![4, 5, 6];
+        let token = TokenFactory::mint_contract_token(
+            &contract,
+            id,
+            String::from("test-env"),
+        ).unwrap();
+
+        assert_eq!(token.id, vec![4, 5, 6]);
+        assert_eq!(token.metadata.get("contract_name").unwrap(), "MyContract");
+        let sc: SmartContract = token.get_asset().unwrap();
+        assert_eq!(sc.name, "MyContract");
+    }
+
+    // --- mint_token_full — fee deduction ---
+
+    #[test]
+    fn mint_token_full_deducts_fee_from_balance() {
+        let owner_key = make_test_user_key();
+        let base_cost = 10u64;
+        let initial_fuel = 100u64;
+        let expected_fee = base_cost * 10; // 100
+        let expected_remaining = initial_fuel - expected_fee; // 0
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.base_cost = base_cost;
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![1],
+            &metadata,
+            String::from("test"),
+        ).unwrap();
+
+        // Fee should have been deducted
+        let updated_user = args.data_provider.get_user(&owner_key, "token").unwrap();
+        assert_eq!(updated_user.fuel_balance, expected_remaining);
+        // Token should be created
+        assert!(!result.token.id.is_empty());
+    }
+
+    #[test]
+    fn mint_token_full_records_admin_tax_credit() {
+        let owner_key = make_test_user_key();
+        let base_cost = 10u64;
+        let initial_fuel = 200u64;
+        let admin_tax_pct = 0.02; // 2%
+        let expected_tax = (base_cost * 10) as f64 * admin_tax_pct; // 2.0 → 2
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.base_cost = base_cost;
+        args.cost_model.admin_tax_percentage = admin_tax_pct;
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![1],
+            &metadata,
+            String::from("test"),
+        ).unwrap();
+
+        // Admin tax credit should be recorded
+        assert!(result.admin_credit_id.is_some());
+        let credit_id = result.admin_credit_id.unwrap();
+        let credit = args.admin_credit_registry.get_admin_credit(&credit_id).unwrap();
+        assert_eq!(credit.amount, expected_tax as u64);
+        assert_eq!(credit.admin_public_key, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn mint_token_full_no_admin_tax_when_zero_percentage() {
+        let owner_key = make_test_user_key();
+        let initial_fuel = 200u64;
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.admin_tax_percentage = 0.0;
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![1],
+            &metadata,
+            String::from("test"),
+        ).unwrap();
+
+        // No admin credit when tax percentage is zero
+        assert!(result.admin_credit_id.is_none());
+    }
+
+    #[test]
+    fn mint_token_full_insufficient_gas_error() {
+        let owner_key = make_test_user_key();
+        let base_cost = 10u64;
+        let initial_fuel = 50u64; // fee = 100, balance = 50 → insufficient
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.base_cost = base_cost;
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![1],
+            &metadata,
+            String::from("test"),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mint_token_full_zero_base_cost_no_deduction() {
+        let owner_key = make_test_user_key();
+        let initial_fuel = 100u64;
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.base_cost = 0;
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![1],
+            &metadata,
+            String::from("test"),
+        ).unwrap();
+
+        // Zero fee → balance unchanged
+        assert_eq!(result.token.id, vec![1]);
+        let updated_user = args.data_provider.get_user(&owner_key, "token").unwrap();
+        assert_eq!(updated_user.fuel_balance, initial_fuel);
+        // No admin credit (tax of 0)
+        assert!(result.admin_credit_id.is_none());
+    }
+
+    #[test]
+    fn mint_token_full_admin_credit_taken() {
+        let owner_key = make_test_user_key();
+        let initial_fuel = 200u64;
+
+        let mut args = make_mint_args(owner_key.clone(), initial_fuel);
+        args.cost_model.admin_tax_percentage = 0.1; // 10%
+
+        let user = User::new(owner_key.clone());
+        args.data_provider = Arc::new(
+            StubDataProvider::new().with_user(owner_key.clone(), String::from("token"), user),
+        );
+
+        let asset = User::new(owner_key.clone());
+        let metadata = HashMap::from([
+            ("is_self_verified".to_string(), "true".to_string()),
+            ("token_type".to_string(), "user".to_string()),
+        ]);
+
+        let result = TokenFactory::mint_token_full(
+            &asset,
+            &args,
+            vec![42],
+            &metadata,
+            String::from("test"),
+        ).unwrap();
+
+        let credit_id = result.admin_credit_id.unwrap();
+
+        // Credit should exist and be retrievable
+        assert!(args.admin_credit_registry.get_admin_credit(&credit_id).is_some());
+
+        // Taking the credit should remove it
+        let taken = args.admin_credit_registry.take_admin_credit(&credit_id);
+        assert!(taken.is_some());
+        assert!(args.admin_credit_registry.get_admin_credit(&credit_id).is_none());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BlockValidator — trait for validating blocks
