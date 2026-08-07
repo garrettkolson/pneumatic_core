@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use dashmap::DashMap;
 use crate::errors::PneumaticError;
-use crate::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature};
+use crate::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature, TransactionPool};
 use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
 
 // ---------------------------------------------------------------------------
@@ -13,12 +14,15 @@ use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
 #[derive(Default)]
 pub struct PendingTransactionRegistry {
     transactions: DashMap<String, PendingTransaction>,
+    /// Ordered transaction pool for leader block proposal.
+    pool: Mutex<TransactionPool>,
 }
 
 impl PendingTransactionRegistry {
     pub fn new() -> Self {
         PendingTransactionRegistry {
             transactions: DashMap::new(),
+            pool: Mutex::new(TransactionPool::new()),
         }
     }
 
@@ -146,6 +150,83 @@ impl PendingTransactionRegistry {
             None => return false,
         };
         entry.is_awaiting_finalizer()
+    }
+
+    /// Enqueue a transaction into the pool. Called when a transaction
+    /// enters the Validated state.
+    pub fn enqueue_to_pool(&self, tx_id: &str, token_id: Vec<u8>,
+                           sequence_number: usize, timestamp: i64, sender: Vec<u8>) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.enqueue(tx_id.to_string(), token_id, sequence_number, timestamp, sender);
+    }
+
+    /// Dequeue the top n transaction IDs for a token. Returns IDs in
+    /// deterministic order for leader block proposal.
+    pub fn dequeue_for_leader(&self, token_id: &[u8], n: usize) -> Vec<String> {
+        let mut pool = self.pool.lock().unwrap();
+        pool.dequeue_for_leader(token_id, n)
+    }
+
+    /// Remove a transaction from the pool (called on commit or failure).
+    pub fn remove_from_pool(&self, tx_id: &str) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.remove(tx_id);
+    }
+
+    /// Get an immutable clone of a transaction from the Validated state.
+    pub fn get_transaction(&self, id: &str) -> Result<Transaction, PneumaticError> {
+        let entry = self.transactions.get(id)
+            .ok_or_else(|| PneumaticError::Registry(format!(
+                "Transaction {} not found in registry", id
+            )))?;
+        match &entry.state {
+            TransactionState::Validated { transaction, .. } => Ok(transaction.clone()),
+            _ => Err(PneumaticError::Registry(format!(
+                "Transaction {} is not in Validated state", id
+            ))),
+        }
+    }
+
+    /// Get ordered transactions for a token: dequeues from pool, fetches
+    /// each from the registry, returns Vec of Transactions in deterministic order.
+    pub fn get_ordered_transactions(&self, token_id: &[u8], limit: usize)
+        -> Result<Vec<Transaction>, PneumaticError>
+    {
+        let tx_ids = self.dequeue_for_leader(token_id, limit);
+        let mut result = Vec::with_capacity(tx_ids.len());
+        for tx_id in tx_ids {
+            let tx = self.get_transaction(&tx_id)?;
+            result.push(tx);
+        }
+        Ok(result)
+    }
+
+    /// Transition to Validated state and enqueue into the pool in one
+    /// atomic operation. The pool insertion uses the transaction's own
+    /// token_id, sequence_number, timestamp, and sender.
+    pub fn transition_to_validated_and_enqueue(
+        &self,
+        tx_id: &str,
+        transaction: Transaction,
+        validation: TransactionValidationResult,
+    ) -> Result<(), PneumaticError> {
+        // Transition the state
+        {
+            let mut entry = self.transactions.get_mut(tx_id)
+                .ok_or_else(|| PneumaticError::Registry(format!(
+                    "Transaction {} not found", tx_id
+                )))?;
+            entry.transition_to_validated(transaction.clone(), validation);
+        }
+        // Enqueue into the pool
+        self.enqueue_to_pool(
+            tx_id,
+            transaction.token_id.clone(),
+            transaction.sequence_number,
+            transaction.timestamp,
+            transaction.sender.clone(),
+        );
+        Ok(())
     }
 }
 

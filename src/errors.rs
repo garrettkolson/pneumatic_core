@@ -22,6 +22,19 @@ pub enum PneumaticError {
     Epoch(String),
     /// Block validation failures
     Block(BlockValidationError),
+    /// Block proposed by a stale (expired-epoch) leader
+    StaleBlock {
+        block_hash: Vec<u8>,
+        stale_leader: Vec<u8>,
+        current_leader: Vec<u8>,
+        epoch_number: u64,
+    },
+    /// Conflicting block proposals at the same height
+    BlockConflict {
+        height: u64,
+        block_a: Vec<u8>,
+        block_b: Vec<u8>,
+    },
 }
 
 impl From<std::io::Error> for PneumaticError {
@@ -94,6 +107,10 @@ pub enum ValidationFailureReason {
     MissingExecutorSignatures,
     /// Executed transaction has no finalizer signature
     MissingFinalizerSignature,
+    /// Block proposed during a stale epoch (leader epoch expired)
+    StaleEpochBlock,
+    /// Block conflicts with another proposal at the same height
+    BlockConflict,
 }
 
 // ---------------------------------------------------------------------------

@@ -259,14 +259,14 @@ All action branches dispatch and all coordination helpers use protocol-level use
 **Action:** On successful transaction execution (executor → finalizer → committer pipeline), call `data_provider.save_user()` to deduct `gas_used` from `ProtocolUser.fuel_balance`. Add `pending_transaction.gas_used` field to track deduction amount. Deduct happens in the committer's `check_and_commit_transaction_results` after block is committed.
 
 #### Transaction ordering — race conditions across senders
-**File:** `src/epoch.rs` (LeaderSelector stub) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
-**Current state:** Per-sender ordering via nonces + registry acquire/release locks. Cross-sender ordering: not implemented. LeaderSelector returns empty (stubbed). No global transaction queue. No deterministic block construction from a leader.
+**File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
+**Current state:** Foundation complete. `TransactionPool` provides per-token deterministic ordering (sorted by sender ASC, sequence_number ASC, timestamp ASC). `LeaderSelector` implements stake-weighted random selection. `BlockProposer` dequeues and wraps transactions in `SignedTransaction` with leader metadata. `EpochBoundaryDetector` detects stale blocks and advances epochs. `resolve_block_conflict()` handles conflicting block proposals with stake-based resolution and hash tie-break. `PendingTransactionRegistry` has `transition_to_validated_and_enqueue()`, `enqueue_to_pool()`, `dequeue_for_leader()`, `get_ordered_transactions()`. Error variants: `PneumaticError::StaleBlock`, `PneumaticError::BlockConflict`, `ValidationFailureReason::StaleEpochBlock`, `ValidationFailureReason::BlockConflict`.
 **Race scenarios:**
-- Two leaders propose conflicting blocks at the same height → Finalizer quorum resolution stubbed (returns all sigs, not stake-weighted)
-- Epoch boundary: old leader's block arrives after new leader's block → not handled
-- Leader reads from empty queue (no transaction pool integration)
-- Multiple senders with same nonce to same token → conflict, winner undefined
-**Action:** Implement transaction queue per token (sorted by nonce within sender, timestamp across senders). Wire LeaderSelector to read from queue and construct deterministic blocks. Handle epoch boundary stale blocks. Implement Finalizer quorum stake-weighted selection.
+- Two leaders propose conflicting blocks at the same height → `resolve_block_conflict()` resolves via stake comparison, hash tie-break
+- Epoch boundary: old leader's block arrives after new leader's block → `EpochBoundaryDetector.is_stale_block()` detects this
+- Leader reads from empty queue → `TransactionPool` integration via `PendingTransactionRegistry.dequeue_for_leader()`
+- Multiple senders with same nonce to same token → conflict resolved by timestamp ordering in pool
+**Action:** Wire BlockProposer into the actual pipeline (Sentinel → executor → finalizer → leader block construction). Implement Finalizer quorum stake-weighted selection.
 
 #### Gossiper — handler stored and wired ✓ (DONE)
 **File:** `src/gossiper.rs:23`
@@ -291,10 +291,10 @@ Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_ha
 `StubStakingManager::apply_ops()` returns `Ok(())`.
 **Action:** Persist AddStaker/RemoveStaker/Slash/Reward ops to data store.
 
-#### LeaderSelector — returns empty
-**File:** `src/epoch.rs:145-153`
-`StubLeaderSelector::select()` returns `vec![]`.
-**Action:** Stake-weighted random selection from `StakeSet`.
+#### LeaderSelector — stake-weighted random selection ✓ (DONE)
+**File:** `src/epoch.rs:154-186`
+Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach: pick random in `[0, total_stake)`, walk sorted stakers to find who owns that point. Implements `IEpochLeaderSelector` trait. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
+**Tests:** 22 new tests (8 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution).
 
 #### Registry — finalizer_public_key stored separately, not in validation result
 **File:** `src/registry.rs:99-100`

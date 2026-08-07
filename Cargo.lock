@@ -814,6 +814,7 @@ dependencies = [
  "hex",
  "moka",
  "once_cell",
+ "rand",
  "ring",
  "rmp-serde",
  "serde",

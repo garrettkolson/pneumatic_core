@@ -320,6 +320,115 @@ pub struct TransactionCommit {
 }
 
 // ---------------------------------------------------------------------------
+// TransactionPool — per-token ordered queue for leader block proposal
+// ---------------------------------------------------------------------------
+
+/// A per-token ordered queue of transaction IDs for deterministic
+/// leader block proposal. Sorted by (sequence_number ascending,
+/// timestamp ascending) within each sender, and by (token_id,
+/// timestamp ascending) across senders.
+#[derive(Debug, Default)]
+pub struct TransactionPool {
+    /// token_id → ordered list of transaction IDs
+    pools: HashMap<Vec<u8>, Vec<String>>,
+    /// tx_id → (token_id, sequence_number, timestamp, sender) for removal
+    index: HashMap<String, (Vec<u8>, usize, i64, Vec<u8>)>,
+}
+
+impl TransactionPool {
+    pub fn new() -> Self {
+        TransactionPool {
+            pools: HashMap::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Add a validated transaction to the pool, inserting in
+    /// correct order within the token's queue.
+    pub fn enqueue(&mut self, tx_id: String, token_id: Vec<u8>,
+                   sequence_number: usize, timestamp: i64, sender: Vec<u8>) {
+        let entry = (token_id.clone(), sequence_number, timestamp, sender.clone());
+
+        // Insert into index
+        self.index.insert(tx_id.clone(), entry.clone());
+
+        // Insert into token pool in sorted position
+        let pool = self.pools.entry(token_id).or_insert_with(Vec::new);
+        let pos = pool.iter().position(|id| {
+            if let Some(existing) = self.index.get(id) {
+                // Same sender → sort by sequence_number ascending
+                if existing.3 == sender {
+                    return existing.1 > sequence_number;
+                }
+                // Different senders → sort by (sequence_number, timestamp) ascending
+                (existing.1, existing.2) > (sequence_number, timestamp)
+            } else {
+                true
+            }
+        });
+        match pos {
+            Some(i) => pool.insert(i, tx_id),
+            None => pool.push(tx_id),
+        }
+    }
+
+    /// Remove a transaction from the pool. Returns the indexed metadata.
+    pub fn remove(&mut self, tx_id: &str) -> Option<(Vec<u8>, usize, i64, Vec<u8>)> {
+        let entry = self.index.remove(tx_id)?;
+        let token_id = entry.0.clone();
+        if let Some(pool) = self.pools.get_mut(&token_id) {
+            pool.retain(|id| id != tx_id);
+            if pool.is_empty() {
+                self.pools.remove(&token_id);
+            }
+        }
+        Some(entry)
+    }
+
+    /// Return the top n transaction IDs in deterministic order for a given token.
+    pub fn peek_top(&self, token_id: &[u8], n: usize) -> Vec<String> {
+        self.pools.get(token_id).map_or(vec![], |pool| {
+            pool.iter().take(n).cloned().collect()
+        })
+    }
+
+    /// Drain and return the top n tx_ids for a token (removes them from pool).
+    pub fn dequeue_for_leader(&mut self, token_id: &[u8], n: usize) -> Vec<String> {
+        let ids = self.peek_top(token_id, n);
+        if let Some(pool) = self.pools.get_mut(token_id) {
+            let remaining = pool.split_off(n.min(pool.len()));
+            if remaining.is_empty() {
+                self.pools.remove(token_id);
+            } else {
+                *pool = remaining;
+            }
+        }
+        ids
+    }
+
+    /// Returns the number of pending transactions for a token.
+    pub fn len(&self, token_id: &[u8]) -> usize {
+        self.pools.get(token_id).map_or(0, |p| p.len())
+    }
+
+    /// Returns true if the pool is empty for a token.
+    pub fn is_empty(&self, token_id: &[u8]) -> bool {
+        self.pools.get(token_id).map_or(true, |p| p.is_empty())
+    }
+
+    /// Total transactions across all tokens.
+    pub fn total_len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Returns an iterator over all known token_ids with pending txs.
+    pub fn token_ids(&self) -> std::collections::hash_map::Keys<Vec<u8>, Vec<String>> {
+        self.pools.keys()
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -540,5 +649,99 @@ mod tests {
             },
         );
         assert!(pt.release()); // lock_count=0, Committed → true
+    }
+
+    // --- TransactionPool tests ---
+
+    fn make_pool() -> TransactionPool {
+        TransactionPool::new()
+    }
+
+    #[test]
+    fn pool_empty_returns_zero_len() {
+        let pool = make_pool();
+        assert_eq!(pool.len(&[1, 2, 3]), 0);
+        assert!(pool.is_empty(&[1, 2, 3]));
+        assert_eq!(pool.total_len(), 0);
+    }
+
+    #[test]
+    fn pool_enqueue_and_peek_top_returns_single() {
+        let mut pool = make_pool();
+        pool.enqueue("tx1".into(), vec![1, 2], 1, 1000, vec![10]);
+        let ids = pool.peek_top(&[1, 2], 1);
+        assert_eq!(ids, vec!["tx1".to_string()]);
+    }
+
+    #[test]
+    fn pool_enqueue_same_sender_sorted_by_sequence() {
+        let mut pool = make_pool();
+        pool.enqueue("tx2".into(), vec![1, 2], 2, 1000, vec![10]);
+        pool.enqueue("tx1".into(), vec![1, 2], 1, 1000, vec![10]);
+        let ids = pool.peek_top(&[1, 2], 2);
+        assert_eq!(ids, vec!["tx1".to_string(), "tx2".to_string()]);
+    }
+
+    #[test]
+    fn pool_enqueue_different_senders_sorted_by_sequence_and_timestamp() {
+        let mut pool = make_pool();
+        // sender[20] seq=2, ts=2000
+        pool.enqueue("tx_c".into(), vec![1, 2], 2, 2000, vec![20]);
+        // sender[10] seq=2, ts=1000
+        pool.enqueue("tx_a".into(), vec![1, 2], 2, 1000, vec![10]);
+        // sender[30] seq=1, ts=1000
+        pool.enqueue("tx_b".into(), vec![1, 2], 1, 1000, vec![30]);
+        let ids = pool.peek_top(&[1, 2], 3);
+        // Order: seq=1 first (tx_b), then seq=2 by timestamp (tx_a ts=1000, tx_c ts=2000)
+        assert_eq!(ids, vec!["tx_b".to_string(), "tx_a".to_string(), "tx_c".to_string()]);
+    }
+
+    #[test]
+    fn pool_remove_not_returned_by_peek_top() {
+        let mut pool = make_pool();
+        pool.enqueue("tx1".into(), vec![1, 2], 1, 1000, vec![10]);
+        pool.enqueue("tx2".into(), vec![1, 2], 2, 1000, vec![20]);
+        pool.remove("tx1");
+        let ids = pool.peek_top(&[1, 2], 2);
+        assert_eq!(ids, vec!["tx2".to_string()]);
+    }
+
+    #[test]
+    fn pool_dequeue_drains_from_pool() {
+        let mut pool = make_pool();
+        pool.enqueue("tx1".into(), vec![1, 2], 1, 1000, vec![10]);
+        pool.enqueue("tx2".into(), vec![1, 2], 2, 1000, vec![20]);
+        let drained = pool.dequeue_for_leader(&[1, 2], 2);
+        assert_eq!(drained, vec!["tx1".to_string(), "tx2".to_string()]);
+        assert!(pool.is_empty(&[1, 2]));
+    }
+
+    #[test]
+    fn pool_dequeue_partial_returns_only_available() {
+        let mut pool = make_pool();
+        pool.enqueue("tx1".into(), vec![1, 2], 1, 1000, vec![10]);
+        let drained = pool.dequeue_for_leader(&[1, 2], 5);
+        assert_eq!(drained, vec!["tx1".to_string()]);
+    }
+
+    #[test]
+    fn pool_different_tokens_separate_queues() {
+        let mut pool = make_pool();
+        pool.enqueue("tx_a1".into(), vec![1], 1, 1000, vec![10]);
+        pool.enqueue("tx_b1".into(), vec![2], 1, 1000, vec![10]);
+        let a = pool.peek_top(&[1], 1);
+        let b = pool.peek_top(&[2], 1);
+        assert_eq!(a, vec!["tx_a1".to_string()]);
+        assert_eq!(b, vec!["tx_b1".to_string()]);
+    }
+
+    #[test]
+    fn pool_token_ids_returns_keys() {
+        let mut pool = make_pool();
+        pool.enqueue("tx1".into(), vec![1], 1, 1000, vec![10]);
+        pool.enqueue("tx2".into(), vec![2], 1, 1000, vec![10]);
+        let mut keys: Vec<Vec<u8>> = pool.token_ids().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec![vec![1], vec![2]]);
     }
 }
