@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,21 @@ pub struct CostModel {
     pub admin_public_key: Vec<u8>,
     /// Admin tax percentage (0.0–1.0, e.g. 0.02 = 2%)
     pub admin_tax_percentage: f64,
+    /// Per-action amount multiplier for gas calculation.
+    /// gas_used = base_cost + (transaction_amount × multiplier_for_action).
+    /// Default multipliers: {"Process": 1.0, "Preload": 2.0, "Sign": 1.5}.
+    #[serde(default = "CostModel::default_amount_multiplier")]
+    pub amount_multiplier: HashMap<String, f64>,
+}
+
+impl CostModel {
+    fn default_amount_multiplier() -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+        map.insert("Process".to_string(), 1.0);
+        map.insert("Preload".to_string(), 2.0);
+        map.insert("Sign".to_string(), 1.5);
+        map
+    }
 }
 
 impl Default for CostModel {
@@ -27,6 +43,7 @@ impl Default for CostModel {
             global_min_stake: 10,
             admin_public_key: vec![],
             admin_tax_percentage: 0.0,
+            amount_multiplier: Self::default_amount_multiplier(),
         }
     }
 }

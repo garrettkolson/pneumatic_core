@@ -143,16 +143,22 @@ impl ActionRouter {
     }
 
     /// Verify gas balance for a transaction.
-    /// Deducts `base_cost` from user's fuel balance and returns usage info.
-    async fn verify_gas(&self, sender: &[u8]) -> Result<ActionRouterResult, PneumaticError> {
+    /// Computes gas from action-specific multiplier:
+    ///   gas_used = base_cost + (transaction_amount × multiplier_for_action).
+    async fn verify_gas(&self, sender: &[u8], action: &str, amount: u64) -> Result<ActionRouterResult, PneumaticError> {
         let token_partition = &self.environment.token_partition_id;
 
         let user = self.data_provider.get_user(&sender.to_vec(), token_partition)?;
-        let gas_used = self.environment.cost_model.base_cost;
+        let base_cost = self.environment.cost_model.base_cost;
+        let multiplier = self.environment.cost_model.amount_multiplier
+            .get(action)
+            .copied()
+            .unwrap_or(1.0);
+        let gas_used = base_cost + (amount as f64 * multiplier) as u64;
 
-        if user.fuel_balance < gas_used {
+        if gas_used > user.fuel_balance {
             return Err(PneumaticError::Validation(vec![
-                ValidationFailureReason::InsufficientGas,
+                ValidationFailureReason::GasLimitExceeded,
             ]));
         }
 
@@ -202,7 +208,7 @@ impl IActionRouter for ActionRouter {
                 // Utility token coordination: check nonce + gas for the sender
                 let sender = message.public_key.clone();
                 let nonce_result = self.check_nonce(&sender, 0).await?;
-                let gas_result = self.verify_gas(&sender).await?;
+                let gas_result = self.verify_gas(&sender, "Process", 0).await?;
                 let _ = gas_result; // GasVerified result available to caller
                 match nonce_result {
                     ActionRouterResult::NonceUpdated { sender, new_nonce } => {
@@ -214,7 +220,7 @@ impl IActionRouter for ActionRouter {
             "Preload" => {
                 // Preload: verify gas balance, check stake, forward to executor
                 let sender = message.public_key.clone();
-                self.verify_gas(&sender).await?;
+                self.verify_gas(&sender, "Preload", 0).await?;
                 let stake = self.check_stake(&sender, NodeRegistryType::Executor).await?;
                 Ok(stake)
             }
@@ -266,7 +272,7 @@ impl IActionRouter for ActionRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+    use crate::environment::{CostModel, EnvironmentMetadata, EnvironmentMetadataSpec};
     use crate::messages::Message;
     use crate::user::User;
     use crate::tokens::Token;
@@ -284,7 +290,8 @@ mod tests {
             "asym_crypto_provider":{"RSA":null},"sym_crypto_provider":"sym",
             "serialization_provider":"rmp","quorum_percentage":67.0,
             "override_quorum_percentage":0.0,"max_risk":1.0,
-            "cost_model":{"base_cost":1,"global_min_stake":10,"admin_public_key":[],"admin_tax_percentage":0.0},
+            "cost_model":{"base_cost":1,"global_min_stake":10,"admin_public_key":[],"admin_tax_percentage":0.0,
+            "amount_multiplier":{"Process":1.0,"Preload":2.0,"Sign":1.5}},
             "allowed_token_types":[],"trans_validation_specs":[],
             "block_validation_specs":[],"log_file":"test.log"}"#;
         let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
@@ -524,7 +531,7 @@ mod tests {
         let env = make_test_env();
         let config = make_test_config(&env);
         let token_partition = env.token_partition_id.clone();
-        // User with fuel_balance == 0
+        // User with fuel_balance == 0 — base_cost=1 means gas_used=1 > fuel_balance
         let stub = StubDataProvider::new()
             .with_token(vec![1, 2, 3], token_partition.clone(), make_user_token(vec![1, 2, 3], 0, 0))
             .with_user(vec![1, 2, 3], token_partition.clone(), User { public_key: vec![1, 2, 3], fuel_balance: 0, stake: 0, nonce: 0 });
@@ -541,7 +548,8 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(PneumaticError::Validation(ref reasons)) => {
-                assert!(reasons.iter().any(|r| matches!(r, ValidationFailureReason::InsufficientGas)));
+                // With base_cost=1 and fuel_balance=0, gas_used=1 > 0 → GasLimitExceeded
+                assert!(reasons.iter().any(|r| matches!(r, ValidationFailureReason::GasLimitExceeded)));
             }
             _ => panic!("expected Validation error, got {:?}", result),
         }
@@ -644,5 +652,149 @@ mod tests {
             }
             _ => panic!("expected Validation error, got {:?}", result),
         }
+    }
+
+    // --- Per-action gas cost tests ---
+
+    /// Verify that gas_used accounts for the cost model's base_cost.
+    #[tokio::test]
+    async fn verify_gas_process_with_no_amount_returns_base_cost() {
+        let env = make_test_env();
+        let config = make_test_config(&env);
+        let token_partition = env.token_partition_id.clone();
+        let stub = StubDataProvider::new()
+            .with_user(vec![1], token_partition.clone(), User { public_key: vec![1], fuel_balance: 100, stake: 100, nonce: 0 });
+
+        let router = ActionRouter::new_with_config(
+            env,
+            Arc::new(RwLock::new(PendingTransactionRegistry::new())),
+            config,
+            Arc::new(stub),
+        );
+
+        let result = router.verify_gas(&vec![1], "Process", 0).await.unwrap();
+        match result {
+            ActionRouterResult::GasVerified { gas_used, gas_remaining } => {
+                assert_eq!(gas_used, 1); // base_cost = 1, amount=0, multiplier=1.0
+                assert_eq!(gas_remaining, 99);
+            }
+            other => panic!("expected GasVerified, got {:?}", other),
+        }
+    }
+
+    /// Verify that gas_used scales with amount for an action with multiplier > 1.0.
+    /// Preload has multiplier=2.0, so amount=100 → gas = 1 + (100 × 2.0) = 201.
+    #[tokio::test]
+    async fn verify_gas_preload_with_amount_applies_multiplier() {
+        let env = make_test_env();
+        let config = make_test_config(&env);
+        let token_partition = env.token_partition_id.clone();
+        let stub = StubDataProvider::new()
+            .with_user(vec![2], token_partition.clone(), User { public_key: vec![2], fuel_balance: 300, stake: 300, nonce: 0 });
+
+        let router = ActionRouter::new_with_config(
+            env,
+            Arc::new(RwLock::new(PendingTransactionRegistry::new())),
+            config,
+            Arc::new(stub),
+        );
+
+        let result = router.verify_gas(&vec![2], "Preload", 100).await.unwrap();
+        match result {
+            ActionRouterResult::GasVerified { gas_used, gas_remaining } => {
+                assert_eq!(gas_used, 201); // 1 + (100 × 2.0) = 201
+                assert_eq!(gas_remaining, 99);
+            }
+            other => panic!("expected GasVerified, got {:?}", other),
+        }
+    }
+
+    /// Verify that an action with unknown multiplier defaults to 1.0.
+    #[tokio::test]
+    async fn verify_gas_unknown_action_defaults_to_one() {
+        let env = make_test_env();
+        let config = make_test_config(&env);
+        let token_partition = env.token_partition_id.clone();
+        let stub = StubDataProvider::new()
+            .with_user(vec![3], token_partition.clone(), User { public_key: vec![3], fuel_balance: 100, stake: 100, nonce: 0 });
+
+        let router = ActionRouter::new_with_config(
+            env,
+            Arc::new(RwLock::new(PendingTransactionRegistry::new())),
+            config,
+            Arc::new(stub),
+        );
+
+        let result = router.verify_gas(&vec![3], "UnknownAction", 50).await.unwrap();
+        match result {
+            ActionRouterResult::GasVerified { gas_used, gas_remaining } => {
+                assert_eq!(gas_used, 51); // 1 + (50 × 1.0) = 51 (default multiplier)
+                assert_eq!(gas_remaining, 49);
+            }
+            other => panic!("expected GasVerified, got {:?}", other),
+        }
+    }
+
+    /// Verify GasLimitExceeded when amount × multiplier + base_cost > fuel_balance.
+    #[tokio::test]
+    async fn verify_gas_amount_exceeds_balance_returns_gas_limit_exceeded() {
+        let env = make_test_env();
+        let config = make_test_config(&env);
+        let token_partition = env.token_partition_id.clone();
+        let stub = StubDataProvider::new()
+            .with_user(vec![4], token_partition.clone(), User { public_key: vec![4], fuel_balance: 50, stake: 50, nonce: 0 });
+
+        let router = ActionRouter::new_with_config(
+            env,
+            Arc::new(RwLock::new(PendingTransactionRegistry::new())),
+            config,
+            Arc::new(stub),
+        );
+
+        // Preload: 1 + (100 × 2.0) = 201 > 50 fuel_balance → GasLimitExceeded
+        let result = router.verify_gas(&vec![4], "Preload", 100).await;
+        assert!(result.is_err());
+        match result {
+            Err(PneumaticError::Validation(ref reasons)) => {
+                assert!(reasons.iter().any(|r| matches!(r, ValidationFailureReason::GasLimitExceeded)));
+            }
+            _ => panic!("expected Validation error, got {:?}", result),
+        }
+    }
+
+    /// Verify CostModel amount_multiplier deserialization from JSON.
+    #[test]
+    fn cost_model_amount_multiplier_deserializes_from_json() {
+        let json = r#"{
+            "base_cost":5,
+            "global_min_stake":50,
+            "admin_public_key":[1,2,3],
+            "admin_tax_percentage":0.02,
+            "amount_multiplier":{"Process":1.0,"Preload":2.5,"Sign":1.5}
+        }"#;
+        let model: CostModel = serde_json::from_str(json).unwrap();
+        assert_eq!(model.base_cost, 5);
+        assert_eq!(model.global_min_stake, 50);
+        assert_eq!(model.admin_tax_percentage, 0.02);
+        assert_eq!(model.amount_multiplier.get("Process"), Some(&1.0));
+        assert_eq!(model.amount_multiplier.get("Preload"), Some(&2.5));
+        assert_eq!(model.amount_multiplier.get("Sign"), Some(&1.5));
+        // Unknown action should default to 1.0
+        assert_eq!(model.amount_multiplier.get("Unknown"), None);
+    }
+
+    /// Verify CostModel amount_multiplier defaults when omitted from JSON.
+    #[test]
+    fn cost_model_amount_multiplier_defaults_when_omitted() {
+        let json = r#"{
+            "base_cost":1,
+            "global_min_stake":10,
+            "admin_public_key":[],
+            "admin_tax_percentage":0.0
+        }"#;
+        let model: CostModel = serde_json::from_str(json).unwrap();
+        assert_eq!(model.amount_multiplier.get("Process"), Some(&1.0));
+        assert_eq!(model.amount_multiplier.get("Preload"), Some(&2.0));
+        assert_eq!(model.amount_multiplier.get("Sign"), Some(&1.5));
     }
 }

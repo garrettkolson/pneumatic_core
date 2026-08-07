@@ -419,6 +419,7 @@ pub use crate::user::Account;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::data::StubDataProvider;
@@ -435,6 +436,7 @@ mod tests {
             global_min_stake: 100,
             admin_public_key: vec![1, 2, 3],
             admin_tax_percentage: 0.02, // 2%
+            amount_multiplier: HashMap::new(),
         }
     }
 

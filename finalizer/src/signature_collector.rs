@@ -60,10 +60,9 @@ impl SignatureCollector {
         signature: TransactionSignature,
     ) -> Result<(), PneumaticError> {
         // Ensure the transaction entry exists in the signature registry
-        if !self.signature_registry.transaction_is_registered(tx_id) {
-            self.signature_registry
-                .try_add_transaction(tx_id)?;
-        }
+        // (atomic check-or-create — safe for concurrent callers)
+        self.signature_registry
+            .ensure_transaction_registered(tx_id);
 
         // Add the signature (returns Err on duplicate)
         self.signature_registry

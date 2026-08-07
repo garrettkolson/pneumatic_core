@@ -295,6 +295,14 @@ impl TransactionSignatureRegistry {
         Ok(())
     }
 
+    /// Ensure a transaction entry exists in the registry, creating it if absent.
+    /// This is the atomic (check-or-create) variant — safe for concurrent callers.
+    pub fn ensure_transaction_registered(&self, tx_id: &str) {
+        use dashmap::mapref::entry::Entry;
+        self.signatures.entry(tx_id.to_string())
+            .or_insert_with(HashMap::new);
+    }
+
     /// Check if a transaction is already registered for signatures.
     pub fn transaction_is_registered(&self, tx_id: &str) -> bool {
         self.signatures.contains_key(tx_id)
