@@ -10,6 +10,7 @@ use crate::conns::{ConnTarget, LocalTarget};
 use crate::conns::factories::{ConnFactory, IsConnFactory};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::tokens::Token;
+use crate::user::User;
 
 pub const DATA_TCP_PORT: u16 = 55555;
 pub const DATA_UNIX_PATH: &str = "data";
@@ -30,6 +31,14 @@ pub trait DataProvider : Send + Sync {
 
     fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
         DefaultDataProvider::new().save_data(key, data, partition_id)
+    }
+
+    fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
+        DefaultDataProvider::new().get_user(key, partition_id)
+    }
+
+    fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
+        DefaultDataProvider::new().save_user(key, user, partition_id)
     }
 }
 
@@ -100,6 +109,37 @@ impl DefaultDataProvider {
 
         Err(DataError::StoreNotFound)
     }
+
+    fn get_user(&self, key: &Vec<u8>, partition: &str) -> Result<User, DataError> {
+        let source = Self::get_source();
+        if let Ok(sender) = self.conn_factory.get_sender(source) {
+            let data = self.serialize_request(key, DataOp::Get(GetOp::User), partition)?;
+            let response = match sender.get_response(&data) {
+                Ok(data) => data,
+                Err(err) => return Err(DataError::FromStore(err.to_string()))
+            };
+
+            return match deserialize_rmp_to::<User>(&response) {
+                Ok(user) => Ok(user),
+                Err(err) => Err(DataError::DeserializationError(err))
+            }
+        }
+
+        Err(DataError::StoreNotFound)
+    }
+
+    fn save_user(&self, key: &Vec<u8>, user: User, partition: &str) -> Result<(), DataError> {
+        let source = Self::get_source();
+        if let Ok(sender) = self.conn_factory.get_sender(source) {
+            let data = self.serialize_request(key, DataOp::Save(SaveOp::User(user)), partition)?;
+            return match sender.get_response(&data) {
+                Ok(_) => Ok(()),
+                Err(err) => Err(DataError::FromStore(err.to_string()))
+            };
+        }
+
+        Err(DataError::StoreNotFound)
+    }
 }
 
 impl DataProvider for DefaultDataProvider {
@@ -130,13 +170,15 @@ pub enum DataOp {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum GetOp {
     Token,
-    Data
+    Data,
+    User,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SaveOp {
     Token(Token),
-    Data(Vec<u8>)
+    Data(Vec<u8>),
+    User(User),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -167,4 +209,78 @@ pub enum DataError {
     Poisoned,
     InvalidOperation(DataOp),
     InvalidSignature,
+}
+
+// ---------------------------------------------------------------------------
+// StubDataProvider — in-memory DataProvider for unit tests
+// ---------------------------------------------------------------------------
+
+/// Test helper that returns pre-loaded tokens instead of connecting to
+/// an external data service. Used exclusively by `#[cfg(test)]` code.
+#[cfg(test)]
+pub struct StubDataProvider {
+    tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
+    users: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>,
+}
+
+#[cfg(test)]
+impl StubDataProvider {
+    pub fn new() -> Self {
+        StubDataProvider {
+            tokens: std::collections::HashMap::new(),
+            users: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_token(mut self, key: Vec<u8>, partition_id: String, token: Token) -> Self {
+        self.tokens.entry(key).or_default().insert(partition_id, token);
+        self
+    }
+
+    pub fn with_user(mut self, key: Vec<u8>, partition_id: String, user: User) -> Self {
+        self.users.entry(key).or_default().insert(partition_id, user);
+        self
+    }
+}
+
+#[cfg(test)]
+impl Default for StubDataProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl DataProvider for StubDataProvider {
+    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
+        self.tokens
+            .get(key)
+            .and_then(|partitions| partitions.get(partition_id))
+            .cloned()
+            .ok_or(DataError::DataNotFound)
+    }
+
+    fn save_token(&self, _key: &Vec<u8>, _token: Token, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, DataError> {
+        Err(DataError::DataNotFound)
+    }
+
+    fn save_data(&self, _key: &Vec<u8>, _data: Vec<u8>, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
+        self.users
+            .get(key)
+            .and_then(|partitions| partitions.get(partition_id))
+            .cloned()
+            .ok_or(DataError::DataNotFound)
+    }
+
+    fn save_user(&self, _key: &Vec<u8>, _user: User, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
 }

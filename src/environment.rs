@@ -7,6 +7,30 @@ use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
 use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry};
 
+/// Gas cost model: pricing for actions and protocol-level policy.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CostModel {
+    /// Minimum gas cost per action
+    pub base_cost: u64,
+    /// Protocol-level minimum stake (must also meet Config::get_min_type_stake)
+    pub global_min_stake: u64,
+    /// Admin wallet public key for tax collection
+    pub admin_public_key: Vec<u8>,
+    /// Admin tax percentage (0.0–1.0, e.g. 0.02 = 2%)
+    pub admin_tax_percentage: f64,
+}
+
+impl Default for CostModel {
+    fn default() -> Self {
+        CostModel {
+            base_cost: 1,
+            global_min_stake: 10,
+            admin_public_key: vec![],
+            admin_tax_percentage: 0.0,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EnvironmentMetadata {
     pub environment_id: String,
@@ -21,6 +45,8 @@ pub struct EnvironmentMetadata {
     /// Maximum risk score (0.0–1.0) allowed for transactions.
     /// Transactions exceeding this threshold are rejected by the Sentinel.
     pub max_risk: f32,
+    /// Gas cost model for action pricing and protocol policy
+    pub cost_model: CostModel,
     pub asym_crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
     /// Block validators keyed by spec name (for per-token block validation).
     pub block_validators: Arc<DashMap<String, Box<dyn BlockValidator>>>,
@@ -79,6 +105,7 @@ impl EnvironmentMetadata {
             quorum_percentage: spec.quorum_percentage,
             override_quorum_percentage: spec.override_quorum_percentage,
             max_risk: spec.max_risk,
+            cost_model: spec.cost_model,
             asym_crypto_provider,
             block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(specs),
@@ -99,6 +126,8 @@ pub struct EnvironmentMetadataSpec {
     quorum_percentage: f32,
     override_quorum_percentage: f32,
     max_risk: f32,
+    #[serde(default)]
+    pub cost_model: CostModel,
     allowed_token_types: Vec<String>,
     trans_validation_specs: Vec<String>,
     block_validation_specs: Vec<String>,

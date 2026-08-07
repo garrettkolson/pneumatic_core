@@ -315,26 +315,8 @@ pub struct ContractProxyAuthorization {
     pub scope: Vec<String>,
 }
 
-/// A user account with fuel balance and identity.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct User {
-    /// User's public key
-    pub public_key: Vec<u8>,
-    /// Balance of fuel/gas for transaction execution
-    pub fuel_balance: u64,
-    /// Transaction nonce
-    pub nonce: usize,
-}
-
-impl User {
-    pub fn new(public_key: Vec<u8>) -> Self {
-        User {
-            public_key,
-            fuel_balance: 0,
-            nonce: 0,
-        }
-    }
-}
+pub use crate::user::User;
+pub use crate::user::Account;
 
 // ---------------------------------------------------------------------------
 // BlockValidator — trait for validating blocks

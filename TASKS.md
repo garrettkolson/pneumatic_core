@@ -92,7 +92,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 ### 1.11 IActionRouter
 
 - [x] P1_43 Create `IActionRouter` trait — `action_router.rs` — async route(Message) -> Result<ActionRouterResult>
-- [x] P1_44 Implement `ActionRouter` with utility token coordination — `action_router.rs` — implements IActionRouter trait; `handle()` delegates to `route()`; action branches: Process→nonce+gas, Preload→gas+stake(Executor), Sign→stake(Finalizer), Confirm→GasVerified, Reject→NonceUpdated(0), Register→stake(Sentinel), Clear→NonceUpdated(0), DistributeToken→TokenDispatched; utility coordination: `check_nonce()` registers sender in `PendingTransactionRegistry`, `verify_gas()` always passes (stub), `check_stake()` returns zero stake (stub); 2 builders (`new()`, `new_with_registry()`); 13 tests
+- [x] P1_44 Implement `ActionRouter` with utility token coordination — `action_router.rs` — implements IActionRouter trait; `handle()` delegates to `route()`; action branches: Process→nonce+gas, Preload→gas+stake(Executor), Sign→stake(Finalizer), Confirm→GasVerified, Reject→NonceUpdated(0), Register→stake(Sentinel), Clear→NonceUpdated(0), DistributeToken→TokenDispatched; utility coordination: `check_nonce()` validates user.nonce against data store, `verify_gas()` checks fuel_balance > 0, `check_stake()` compares fuel_balance against min_stake for node_type; 4 builders (new, new_with_registry, new_with_config); 18 tests
 - [x] P1_45 Create `ActionRouterResult` type — `action_router.rs` — 6 variants
 
 ### 1.12 Remove Validator
@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (~166 passing — ~39 → ~166)
+## Phase 7: Tests (~202 passing — 162 core + 22 finalizer + 9 executor + 9 sentinel)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -234,11 +234,39 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 **Dependencies:** `aes-gcm` 0.11.0, `x25519-dalek` 3.0.0 (with `static_secrets` + `getrandom` features).
 **Cross-recipient:** `encrypt_to`/`decrypt_from` (P6_05) extends encryption to arbitrary recipients via their X25519 public key.
 
-#### ActionRouter — routing branches now wired (P1_44), coordination stubbed
+#### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches now dispatch: Process→nonce+gas, Preload→gas+stake(Executor), Sign→stake(Finalizer), Confirm→GasVerified, Reject→NonceUpdated(0), Register→stake(Sentinel), Clear→NonceUpdated(0), DistributeToken→TokenDispatched. Implements `IActionRouter` trait; `handle()` delegates to `route()`.
-**Stubbed:** `verify_gas()` always passes, `check_stake()` returns zero, nonce check registers sender in `PendingTransactionRegistry` but doesn't validate against real token state.
-**Action:** Wire through `NodeRegistry.send_to_all()` for forwarding, implement real stake checking via staking manager, nonce validation against token sequence numbers.
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 202 tests across workspace (162 core + 22 finalizer + 9 executor + 9 sentinel).
+
+#### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
+**File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 202 tests passing.
+
+#### TokenFactory — minting fee deduction (charges ProtocolUser.fuel_balance)
+**File:** `src/tokens.rs`
+**Current state:** `TokenFactory::mint_token()` and `mint_user_token()` are free — no cost, no balance deduction.
+**Action:** `mint_token` accepts an optional `initial_fuel` deposit from a `ProtocolUser`. Calculates minting_fee = `cost_model.base_cost * mint_multiplier` (default: base_cost × 10). Deducts fee from `ProtocolUser.fuel_balance` via `data_provider`. Calculates `admin_tax = fee × cost_model.admin_tax_percentage` — records as pending admin credit in `PendingTransactionRegistry`. If `ProtocolUser.fuel_balance < fee` → returns `InsufficientGas` error.
+**Dependencies:** `DefaultDataProvider::get_user()` + `DefaultDataProvider::save_user()` already implemented. `CostModel` fields already on `EnvironmentMetadata`.
+
+#### ActionRouter — per-action gas cost from CostModel
+**File:** `src/action_router.rs`, `src/environment.rs`
+**Current state:** `verify_gas()` uses flat `cost_model.base_cost` for all actions. No differentiation between simple transfers and complex contract execution.
+**Action:** Add `amount_multiplier: HashMap<String, f64>` to `CostModel` (e.g., `{"Process": 1.0, "Preload": 2.0, "Sign": 1.5}`). `verify_gas()` computes `gas_used = base_cost + (transaction_amount × multiplier_for_action)`. Returns `GasUsed { gas_used, gas_remaining }` with the computed value. Adds `GasLimitExceeded` failure path to tests when `gas_used > user.fuel_balance`.
+
+#### Gas deduction after executor completes
+**File:** `src/action_router.rs` (or `executor/src/executor.rs`)
+**Current state:** `verify_gas()` checks balance but does NOT deduct gas. After successful execution, `fuel_balance` is unchanged — potential for double-spending (same gas consumed multiple times).
+**Action:** On successful transaction execution (executor → finalizer → committer pipeline), call `data_provider.save_user()` to deduct `gas_used` from `ProtocolUser.fuel_balance`. Add `pending_transaction.gas_used` field to track deduction amount. Deduct happens in the committer's `check_and_commit_transaction_results` after block is committed.
+
+#### Transaction ordering — race conditions across senders
+**File:** `src/epoch.rs` (LeaderSelector stub) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
+**Current state:** Per-sender ordering via nonces + registry acquire/release locks. Cross-sender ordering: not implemented. LeaderSelector returns empty (stubbed). No global transaction queue. No deterministic block construction from a leader.
+**Race scenarios:**
+- Two leaders propose conflicting blocks at the same height → Finalizer quorum resolution stubbed (returns all sigs, not stake-weighted)
+- Epoch boundary: old leader's block arrives after new leader's block → not handled
+- Leader reads from empty queue (no transaction pool integration)
+- Multiple senders with same nonce to same token → conflict, winner undefined
+**Action:** Implement transaction queue per token (sorted by nonce within sender, timestamp across senders). Wire LeaderSelector to read from queue and construct deterministic blocks. Handle epoch boundary stale blocks. Implement Finalizer quorum stake-weighted selection.
 
 #### Gossiper — handler stored and wired ✓ (DONE)
 **File:** `src/gossiper.rs:23`
@@ -365,7 +393,7 @@ Checks `result_hash` non-empty but never invoked in the pipeline (execution task
 Returns finalizer key from registry but never used.
 **Action:** Use to send execution result to the correct finalizer.
 
-### pneumatic_finalizer — Priority 4 (Complete: 19 tests pass)
+### pneumatic_finalizer — Priority 4 (Complete: 22 tests pass)
 
 Stubbed within implemented methods:
 - `SignatureCollector.reconcile_signatures` — Conflict resolution (supermajority/stake-weighted) stubbed; currently returns all signatures

@@ -131,10 +131,9 @@ impl NodeRegistry {
     }
 
     fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
-        let Ok(token) = DefaultDataProvider::new().get_token(user_key, environment_id)
+        let Ok(user) = DefaultDataProvider::new().get_user(user_key, environment_id)
             else { return false };
-        let Some(user) = token.get_asset::<User>() else { return false };
-        user.fuel_balance > min_stake
+        user.stake > min_stake
     }
 
     fn select_registration_node_type(&self, request: &NodeRegistryRequest) -> Option<NodeRegistryType> {

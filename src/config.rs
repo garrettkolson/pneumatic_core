@@ -112,6 +112,25 @@ impl Config {
             None => u64::MAX
         }
     }
+
+    /// Build a Config for unit tests without reading from disk.
+    pub fn new_for_testing(
+        main_environment_id: String,
+        environment_metadata: Arc<DashMap<String, EnvironmentMetadata>>,
+        type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>,
+    ) -> Self {
+        Config {
+            public_key: vec![],
+            ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            rest_api_version: 1,
+            node_type: NodeType::Full,
+            node_registry_types: vec![],
+            main_environment_id,
+            reconciliation_partition_id: String::from("default"),
+            environment_metadata,
+            type_configs,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

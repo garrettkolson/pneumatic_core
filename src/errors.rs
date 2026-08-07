@@ -62,6 +62,10 @@ pub enum ValidationFailureReason {
     InvalidNonce,
     /// Transaction gas balance is insufficient for the computation
     InsufficientGasBalance,
+    /// Sender has zero fuel balance (gas verification failed)
+    InsufficientGas,
+    /// Sender stake is below the minimum for the required node type
+    InsufficientStake,
     /// Transaction signature is invalid or unverifiable
     InvalidSignature,
     /// Transaction target contract does not exist
