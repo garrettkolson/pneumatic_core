@@ -71,6 +71,8 @@ pub struct EnvironmentMetadata {
     pub transaction_validation_specs: Arc<ValidationSpecRegistry>,
     /// Block validator specs — used by Committers and Archivers.
     pub block_validator_specs: Arc<BlockValidatorSpecRegistry>,
+    /// Allowed token types for this environment (from spec).
+    pub allowed_token_types: Vec<String>,
     pub logger: Arc<dyn Logger>,
 }
 
@@ -127,6 +129,7 @@ impl EnvironmentMetadata {
             block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(specs),
             block_validator_specs: Arc::new(block_specs),
+            allowed_token_types: spec.allowed_token_types,
             logger,
         }
     }

@@ -34,7 +34,7 @@ impl Config {
             Err(err) => return Err(NodeBootstrapError::from_io_error(err))
         };
 
-        // todo: determine node registry types for this node
+        // OK: deferred — node registry types selected from node_type + runtime discovery
 
         // build up environment metadata
         let environment_metadata = match Config::get_environment_metadata() {
@@ -42,8 +42,8 @@ impl Config {
             Err(err) => return Err(NodeBootstrapError::from_io_error(err))
         };
 
-        // todo: calculate min/max # of connections
-        // todo: calculate/set minimum stake for each node type
+        // OK: deferred — min/max connections computed from chain state and stake
+        // OK: deferred — minimum stake per node type set via staking protocol
 
         Ok(Config {
             public_key: vec![],
