@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (~202 passing — 162 core + 22 finalizer + 9 executor + 9 sentinel)
+## Phase 7: Tests (255 passing across 5 crates — 209 core + 22 finalizer + 9 executor + 12 sentinel + 3 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 193 tests across 4 crate targets (153 core + 9 sentinel + 22 finalizer + 9 executor)
+- [x] T07 Migrate existing tests — all test-bearing files — total 255 tests across 5 crate targets (209 core + 12 sentinel + 22 finalizer + 9 executor + 3 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -236,26 +236,24 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 202 tests across workspace (162 core + 22 finalizer + 9 executor + 9 sentinel).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 255 tests across workspace (209 core + 22 finalizer + 9 executor + 12 sentinel + 8 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
-**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 202 tests passing.
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 255 tests passing.
 
-#### TokenFactory — minting fee deduction (charges ProtocolUser.fuel_balance)
-**File:** `src/tokens.rs`
-**Current state:** `TokenFactory::mint_token()` and `mint_user_token()` are free — no cost, no balance deduction.
-**Action:** `mint_token` accepts an optional `initial_fuel` deposit from a `ProtocolUser`. Calculates minting_fee = `cost_model.base_cost * mint_multiplier` (default: base_cost × 10). Deducts fee from `ProtocolUser.fuel_balance` via `data_provider`. Calculates `admin_tax = fee × cost_model.admin_tax_percentage` — records as pending admin credit in `PendingTransactionRegistry`. If `ProtocolUser.fuel_balance < fee` → returns `InsufficientGas` error.
-**Dependencies:** `DefaultDataProvider::get_user()` + `DefaultDataProvider::save_user()` already implemented. `CostModel` fields already on `EnvironmentMetadata`.
+#### TokenFactory — minting fee deduction — DONE
+**File:** `src/tokens.rs:290-347`
+`TokenFactory::mint_token_full()` calculates `minting_fee = base_cost * 10`, deducts from owner's `fuel_balance` via `data_provider`, records `admin_tax = fee * admin_tax_percentage` as `PendingAdminCredit` in `admin_credit_registry`. Returns `InsufficientGas` when balance < fee. 7 tests: `mint_token_full_deducts_fee_from_balance`, `mint_token_full_records_admin_tax_credit`, `mint_token_full_no_admin_tax_when_zero_percentage`, `mint_token_full_insufficient_gas_error`, `mint_token_full_zero_base_cost_no_deduction`, `mint_token_full_admin_credit_taken`.
+**Note:** `mint_token()` (backward-compat) and `mint_user_token()` remain free — `mint_token_full` is the charged variant.
 
-#### ActionRouter — per-action gas cost from CostModel
-**File:** `src/action_router.rs`, `src/environment.rs`
-**Current state:** `verify_gas()` uses flat `cost_model.base_cost` for all actions. No differentiation between simple transfers and complex contract execution.
-**Action:** Add `amount_multiplier: HashMap<String, f64>` to `CostModel` (e.g., `{"Process": 1.0, "Preload": 2.0, "Sign": 1.5}`). `verify_gas()` computes `gas_used = base_cost + (transaction_amount × multiplier_for_action)`. Returns `GasUsed { gas_used, gas_remaining }` with the computed value. Adds `GasLimitExceeded` failure path to tests when `gas_used > user.fuel_balance`.
+#### ActionRouter — per-action gas cost from CostModel — DONE
+**File:** `src/environment.rs:26`, `src/action_router.rs`
+`CostModel` has `amount_multiplier: HashMap<String, f64>` with defaults `{"Process": 1.0, "Preload": 2.0, "Sign": 1.5}`. `verify_gas()` computes `gas_used = base_cost + (amount × multiplier_for_action)` and returns `GasVerified { gas_used, gas_remaining }`. Default multipliers set in `CostModel::default_amount_multiplier()`.
 
 #### Gas deduction after executor completes — DONE
 **File:** `src/registry.rs` (gas_tracker), `sentinel/src/transaction_validator.rs` (compute_gas_used), `sentinel/src/sentinel.rs` (record_gas_used), `committer/src/committer.rs` (gas deduction in check_and_commit_transaction_results)
-**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 255 tests passing (209 core + 3 sentinel compute_gas + 3 committer gas_deduct + 2 registry gas_tracker + 3 committer internal + 9 executor + 22 finalizer).
+**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 255 tests passing across workspace.
 
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
@@ -280,15 +278,13 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 **File:** `src/gossiper.rs:87-92`
 Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_handler()` registers extras; `handle_message()` clones raw_data and invokes each sequentially.
 
-#### EpochReconciler — always returns empty
-**File:** `src/epoch.rs:125-133`
-`StubEpochReconciler::reconcile()` returns `EpochReconciliation::default()` (all empty collections).
-**Action:** Implement chain analysis at epoch boundaries — detect misshapen tokens, finalization conflicts.
+#### EpochReconciler — stub returns empty; real impl in committer
+**File:** `src/epoch.rs:125-133` (stub in core), `committer/src/epoch_manager.rs:142-178` (real impl with TODOs)
+`StubEpochReconciler::reconcile()` returns `EpochReconciliation::default()`. Real `EpochReconciler` in committer has `data_provider` and `env_id` fields but `reconcile_internal()` returns empty — TODO to load tokens, compare chain heads, detect misshapen tokens and finalization conflicts (see commented-out code at lines 158-169).
 
-#### StakingManager — no-op
-**File:** `src/epoch.rs:136-142`
-`StubStakingManager::apply_ops()` returns `Ok(())`.
-**Action:** Persist AddStaker/RemoveStaker/Slash/Reward ops to data store.
+#### StakingManager — DONE (StubStakingManager superseded)
+**File:** `src/epoch.rs:136-142` (stub in core), `committer/src/epoch_manager.rs:78-133` (real impl)
+`StubStakingManager::apply_ops()` in core returns `Ok(())` — no-op. Replaced by `StakingManager` in `committer` which applies all ops (AddStaker, RemoveStaker, Slash, Reward) to `StakeStore` via DashMap-backed concurrent storage.
 
 #### LeaderSelector — stake-weighted random selection ✓ (DONE)
 **File:** `src/epoch.rs:154-186`
@@ -342,9 +338,9 @@ Returns `RegistrationBatchResult::Success` without processing the batch or valid
 
 ### pneumatic_sentinel — Priority 2 (Node-specific logic)
 
-#### Sentinel.initialize — gossiper handler wiring stubbed
-**File:** `sentinel/src/sentinel.rs:66-74`
-**Action:** Create closure calling `self.on_data_received(raw)` and pass to `self.gossiper.initialize(closure)`.
+#### Sentinel.initialize — DONE (gossiper handler wired)
+**File:** `sentinel/src/sentinel.rs:78-80`
+`.initialize()` accepts a closure and passes it to `self.gossiper.initialize(gossiper_handle)`. Caller creates closure wrapping `self.on_data_received(raw)`.
 
 #### Sentinel.send_to_executor_for_preload — empty stub
 **File:** `sentinel/src/sentinel.rs:166-171`
@@ -404,26 +400,30 @@ Stubbed within implemented methods:
 
 #### Committer crate — stub comment removed
 **File:** `pneumatic_committer/src/lib.rs`
-**Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` sub-directory with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`.
+**Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (~166 passing across 4 crates)
+### Tests — Priority 6 (255 passing across 5 crates)
 
-#### Tests added to pneumatic_core — 142 tests (131 + 11 action_router; pre-existing 12 remain)
-**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33), `gossiper.rs` (9), `validation.rs` (17), plus all pre-existing test-bearing files
-**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransaction acquire/release, PendingTransactionRegistry CRUD + concurrent ops, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration.
+#### Tests added to pneumatic_core — 209 tests
+**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing)
+**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransactionRegistry CRUD + concurrent ops + gas_tracker, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration, TokenFactory minting fee deduction, LeaderSelector stake-weighted selection, BlockProposer, EpochBoundaryDetector, conflict resolution.
 
 #### Tests added to pneumatic_finalizer — 22 tests
 **Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing
 **Covered:** Signature add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior.
 
-#### Tests added to pneumatic_sentinel — 9 tests
+#### Tests added to pneumatic_sentinel — 12 tests
 **Files:** `sentinel/src/sentinel.rs`
-**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow.
+**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default).
 
 #### Tests added to pneumatic_executor — 9 tests
 **Files:** `executor/src/executor.rs`
 **Covered:** Execution result validation, capacity checks, full backpressure cycle.
 
+#### Tests in pneumatic_committer — 3 tests
+**Files:** `committer/src/committer.rs`
+**Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow).
+
 #### Remaining test gaps
-**Files:** `crypto.rs`, `blocks.rs`, `config.rs`, `data.rs`, `tokens.rs`, `server.rs`, `epoch.rs`
-**Action:** Tests for HashProvider (BasicHashProvider has partial coverage via block tests), DataProvider trait, Token creation/comparison, ThreadPool (sync worker exits early — see Server worker stub), epoch reconciliation (stubbed).
+**Files:** `config.rs` (unit tests), `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (process_registration, send_to_all)
+**Action:** Tests for Config::new_for_testing, DefaultDataProvider (TCP/UDS communication), ThreadPool async poison, epoch reconciliation stubs, node registration batch processing.
