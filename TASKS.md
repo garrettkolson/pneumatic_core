@@ -253,10 +253,9 @@ All action branches dispatch and all coordination helpers use protocol-level use
 **Current state:** `verify_gas()` uses flat `cost_model.base_cost` for all actions. No differentiation between simple transfers and complex contract execution.
 **Action:** Add `amount_multiplier: HashMap<String, f64>` to `CostModel` (e.g., `{"Process": 1.0, "Preload": 2.0, "Sign": 1.5}`). `verify_gas()` computes `gas_used = base_cost + (transaction_amount × multiplier_for_action)`. Returns `GasUsed { gas_used, gas_remaining }` with the computed value. Adds `GasLimitExceeded` failure path to tests when `gas_used > user.fuel_balance`.
 
-#### Gas deduction after executor completes
-**File:** `src/action_router.rs` (or `executor/src/executor.rs`)
-**Current state:** `verify_gas()` checks balance but does NOT deduct gas. After successful execution, `fuel_balance` is unchanged — potential for double-spending (same gas consumed multiple times).
-**Action:** On successful transaction execution (executor → finalizer → committer pipeline), call `data_provider.save_user()` to deduct `gas_used` from `ProtocolUser.fuel_balance`. Add `pending_transaction.gas_used` field to track deduction amount. Deduct happens in the committer's `check_and_commit_transaction_results` after block is committed.
+#### Gas deduction after executor completes — DONE
+**File:** `src/registry.rs` (gas_tracker), `sentinel/src/transaction_validator.rs` (compute_gas_used), `sentinel/src/sentinel.rs` (record_gas_used), `committer/src/committer.rs` (gas deduction in check_and_commit_transaction_results)
+**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 255 tests passing (209 core + 3 sentinel compute_gas + 3 committer gas_deduct + 2 registry gas_tracker + 3 committer internal + 9 executor + 22 finalizer).
 
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight

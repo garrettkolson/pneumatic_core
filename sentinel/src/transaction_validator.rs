@@ -94,4 +94,15 @@ impl TransactionValidator {
             _ => 3,             // High risk → three finalizers
         }
     }
+
+    /// Compute gas used for a transaction from the cost model.
+    /// gas_used = base_cost + (transaction_amount × multiplier_for_action).
+    pub fn compute_gas_used(&self, tx: &Transaction) -> u64 {
+        let base = self.env_data.cost_model.base_cost;
+        let mult = self.env_data.cost_model.amount_multiplier
+            .get(&tx.action)
+            .copied()
+            .unwrap_or(1.0);
+        base + (tx.amount.unwrap_or(0) as f64 * mult) as u64
+    }
 }

@@ -108,6 +108,7 @@ fn main() {
         staking_manager,
         epoch_reconciler,
         leader_selector,
+        data_provider,
     ));
 
     // 12. Wire up gossiper message handler

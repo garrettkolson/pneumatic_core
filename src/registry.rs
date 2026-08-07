@@ -33,6 +33,8 @@ pub struct PendingTransactionRegistry {
     pool: Mutex<TransactionPool>,
     /// Admin tax credits collected during token minting, keyed by credit ID.
     admin_credits: DashMap<String, PendingAdminCredit>,
+    /// Gas used per transaction, tracked during validation and deducted on commit.
+    gas_tracker: Mutex<HashMap<String, u64>>,
 }
 
 impl PendingTransactionRegistry {
@@ -41,6 +43,7 @@ impl PendingTransactionRegistry {
             transactions: DashMap::new(),
             pool: Mutex::new(TransactionPool::new()),
             admin_credits: DashMap::new(),
+            gas_tracker: Mutex::new(HashMap::new()),
         }
     }
 
@@ -217,6 +220,16 @@ impl PendingTransactionRegistry {
             result.push(tx);
         }
         Ok(result)
+    }
+
+    /// Record the gas used for a transaction, computed during validation.
+    pub fn record_gas_used(&self, tx_id: &str, gas_used: u64) {
+        self.gas_tracker.lock().unwrap().insert(tx_id.to_string(), gas_used);
+    }
+
+    /// Retrieve the gas used for a transaction. Returns None if not tracked.
+    pub fn get_gas_used(&self, tx_id: &str) -> Option<u64> {
+        self.gas_tracker.lock().unwrap().get(tx_id).copied()
     }
 
     /// Record an admin tax credit collected during token minting.
@@ -671,6 +684,21 @@ mod tests {
         registry.try_add_transaction("tx1").unwrap();
         assert!(!registry.is_empty());
         assert_eq!(registry.len(), 1);
+    }
+
+    // --- Gas tracker tests ---
+
+    #[test]
+    fn gas_tracker_records_and_retrieves() {
+        let registry = PendingTransactionRegistry::new();
+        registry.record_gas_used("tx1", 42);
+        assert_eq!(registry.get_gas_used("tx1"), Some(42));
+    }
+
+    #[test]
+    fn gas_tracker_returns_none_for_unknown_tx() {
+        let registry = PendingTransactionRegistry::new();
+        assert_eq!(registry.get_gas_used("nonexistent"), None);
     }
 
     // --- Concurrent tests ---

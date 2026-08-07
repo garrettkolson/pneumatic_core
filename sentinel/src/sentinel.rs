@@ -109,11 +109,17 @@ impl Sentinel {
         let tx: Transaction = deserialize_rmp_to(&message.body)
             .map_err(|e| SentinelError::Encoding(e))?;
 
-        // Step 1: Basic validation
+        // Step 1: Compute gas used for this transaction (before validation, since validation may fail and we don't track gas for failed txs)
+        let gas_used = self.transaction_validator.compute_gas_used(&tx);
+
+        // Step 2: Basic validation
         if let Err(errors) = self.transaction_validator.validate_transaction(&tx, &message) {
             self.transition_to_failed(&tx.id, tx.clone(), errors);
             return Ok(());
         }
+
+        // Step 3: Record gas used
+        self.registry.record_gas_used(&tx.id, gas_used);
 
         // Step 2: Register transaction in the pending registry
         let tx_id = tx.id.clone();
@@ -133,16 +139,16 @@ impl Sentinel {
 
         // Step 5: Self-signed check — if spec is SelfSigned, skip Executor/Finalizer
         if spec_name == "SelfSigned" {
-            return self.handle_self_signed(tx);
+            return self.handle_self_signed(tx, gas_used);
         }
 
-        // Step 6: Standard pipeline — send to Executor for preloading
+        // Step 7: Standard pipeline — send to Executor for preloading
         self.send_to_executor_for_preload(&tx)
     }
 
     /// Handle a self-signed token transaction — skip Executor and Finalizer,
     /// route directly toward commitment.
-    fn handle_self_signed(&self, tx: Transaction) -> Result<(), SentinelError> {
+    fn handle_self_signed(&self, tx: Transaction, gas_used: u64) -> Result<(), SentinelError> {
         let tx_id = tx.id.clone();
 
         // Transition to Validated state with self-signed result
@@ -158,6 +164,9 @@ impl Sentinel {
                 });
             }
         }
+
+        // Record gas used for this self-signed transaction
+        self.registry.record_gas_used(&tx_id, gas_used);
 
         // For self-signed tokens, the sentinel notifies Committers directly.
         let _ = tx;
@@ -280,7 +289,7 @@ mod tests {
     use pneumatic_core::node::{NodeRegistryType, NodeType, NodeTypeConfig};
     use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::conns::ConnError;
-    use pneumatic_core::data::DataError;
+    use pneumatic_core::data::{DataError, DefaultDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::gossiper::Gossiper;
@@ -290,6 +299,7 @@ mod tests {
     use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState};
     use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
 
+    use super::super::TransactionValidator;
     use super::*;
 
     // --- helpers ---
@@ -536,5 +546,76 @@ mod tests {
         // Verify the sentinel sees the transaction as validated
         let validation = registry.get_validation_result(&tx_id).unwrap();
         assert!(validation.is_valid);
+    }
+
+    // --- compute_gas_used tests ---
+
+    #[test]
+    fn compute_gas_used_with_zero_amount_returns_base_cost() {
+        let validator = TransactionValidator::new(
+            Arc::new(make_test_env_data()),
+            Arc::new(DefaultDataProvider::new()),
+        );
+        let tx = Transaction {
+            id: "test".into(),
+            action: "Process".into(),
+            token_id: vec![],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(0),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let gas = validator.compute_gas_used(&tx);
+        // base_cost=1, amount=0, multiplier=1.0 → 1 + 0 = 1
+        assert_eq!(gas, 1);
+    }
+
+    #[test]
+    fn compute_gas_used_preload_with_amount_applies_multiplier() {
+        let validator = TransactionValidator::new(
+            Arc::new(make_test_env_data()),
+            Arc::new(DefaultDataProvider::new()),
+        );
+        let tx = Transaction {
+            id: "test".into(),
+            action: "Preload".into(),
+            token_id: vec![],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let gas = validator.compute_gas_used(&tx);
+        // base_cost=1, amount=100, Preload multiplier=2.0 → 1 + 200 = 201
+        assert_eq!(gas, 201);
+    }
+
+    #[test]
+    fn compute_gas_used_unknown_action_defaults_to_one() {
+        let validator = TransactionValidator::new(
+            Arc::new(make_test_env_data()),
+            Arc::new(DefaultDataProvider::new()),
+        );
+        let tx = Transaction {
+            id: "test".into(),
+            action: "UnknownAction".into(),
+            token_id: vec![],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let gas = validator.compute_gas_used(&tx);
+        // base_cost=1, amount=100, unknown multiplier=1.0 → 1 + 100 = 101
+        assert_eq!(gas, 101);
     }
 }
