@@ -224,7 +224,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 
 ## Stubbed Functionality Inventory
 
-This section lists all code that is currently a **stub, placeholder, or `todo!()`** — structural scaffolding that is built but has no real implementation. Each item includes the file, line numbers, and what needs to be filled in.
+Items marked **DONE** have been implemented (see commit notes). Remaining items are active stubs/TODOs.
 
 ### pneumatic_core — Priority 1 (Core runtime functions)
 
@@ -291,10 +291,9 @@ Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_ha
 Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach: pick random in `[0, total_stake)`, walk sorted stakers to find who owns that point. Implements `IEpochLeaderSelector` trait. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
 **Tests:** 22 new tests (8 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution).
 
-#### Registry — finalizer_public_key stored separately, not in validation result
-**File:** `src/registry.rs:99-100`
-Comment: `// validation.finalizer_public_key = finalizer_key;`
-**Action:** Update `TransactionValidationResult` in `Validated` state with the finalizer key.
+#### Registry — finalizer_public_key propagation — DONE
+**File:** `src/registry.rs:131-132`
+`set_requested_finalizer()` calls `transition_to_finalizing(transaction, finalizer_key)` which stores the key in `Finalizing { finalizer_key }`. `Finalizer::try_finalize()` reads it from `Finalizing` state — works correctly. The commented-out `validation.finalizer_public_key = ...` is intentional; the key is stored in `Finalizing` state, not duplicated in `TransactionValidationResult`.
 
 #### Token.get_asset_mut — returns immutable copy
 **File:** `src/tokens.rs:111-122`
@@ -326,10 +325,9 @@ Comment: `// TODO: this test causes the test runner to hang as-is - have to fix`
 Comment: `// TODO: initiate drop`
 **Action:** Add `Drop` impl to cancel `listening_thread` and join with timeout.
 
-#### NodeRegistry.send_to_all — creates senders on the fly
-**File:** `src/node/registry.rs:164-187`
-Comment: `// TODO: have to redo this to use registered conns instead of creating senders on the fly`
-**Action:** Use `NodeRegistryNode.conn.send()` instead of `ConnFactory.get_sender()`.
+#### NodeRegistry.send_to_all — uses registered connections — DONE
+**File:** `src/node/registry.rs:163-202`
+Rewrote `send_to_all` to use registered `Connection` objects from `NodeRegistryNode.conn` via `conn.send(&data).await`. Uses `futures::future::join_all` for concurrent broadcasts. Added `send_to_all_blocking` for sync contexts. Changed `Connection::send` to take `&self` with `tokio::sync::Mutex` interior mutability inside `TcpConnection`. `futures = "0.3"` dependency added.
 
 #### NodeRegistry.process_registration — always succeeds
 **File:** `src/node/registry.rs:189`
