@@ -47,7 +47,7 @@ impl MessageDispatcher {
     ///
     /// Serializes the commit message and broadcasts it to all nodes
     /// registered as Committers.
-    pub fn send_to_committers(&self, commit: TransactionCommit) -> Result<(), PneumaticError> {
+    pub async fn send_to_committers(&self, commit: TransactionCommit) -> Result<(), PneumaticError> {
         // Build the message body with the commit data
         let msg_body = serialize_to_bytes_rmp(&commit)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -64,8 +64,8 @@ impl MessageDispatcher {
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Broadcast to all committers (stub — actual networking via registered connections)
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Committer);
+        // Broadcast to all committers via registered connections
+        self.node_registry.send_to_all(payload, &NodeRegistryType::Committer).await;
 
         Ok(())
     }
@@ -74,7 +74,7 @@ impl MessageDispatcher {
     ///
     /// Tells Sentinels to clean up the transaction from their registries
     /// after it has been committed.
-    pub fn send_clear_to_sentinels(&self, tx_id: &str) -> Result<(), PneumaticError> {
+    pub async fn send_clear_to_sentinels(&self, tx_id: &str) -> Result<(), PneumaticError> {
         // Serialize the transaction ID
         let msg_body = serialize_to_bytes_rmp(&tx_id)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -91,8 +91,8 @@ impl MessageDispatcher {
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Broadcast to all sentinels (stub — actual networking via registered connections)
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Sentinel);
+        // Broadcast to all sentinels via registered connections
+        self.node_registry.send_to_all(payload, &NodeRegistryType::Sentinel).await;
 
         Ok(())
     }
@@ -188,8 +188,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_send_to_committers() {
+    #[tokio::test]
+    async fn test_send_to_committers() {
         let registry = make_test_node_registry();
         let dispatcher = MessageDispatcher::new(
             registry,
@@ -199,12 +199,12 @@ mod tests {
         );
 
         let commit = make_test_commit();
-        let result = dispatcher.send_to_committers(commit);
+        let result = dispatcher.send_to_committers(commit).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_send_clear_to_sentinels() {
+    #[tokio::test]
+    async fn test_send_clear_to_sentinels() {
         let registry = make_test_node_registry();
         let dispatcher = MessageDispatcher::new(
             registry,
@@ -213,7 +213,7 @@ mod tests {
             vec![5, 6, 7, 8],
         );
 
-        let result = dispatcher.send_clear_to_sentinels("test_tx_001");
+        let result = dispatcher.send_clear_to_sentinels("test_tx_001").await;
         assert!(result.is_ok());
     }
 }

@@ -6,9 +6,7 @@ pub mod listeners;
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::conns::senders::Sender;
@@ -33,19 +31,6 @@ pub fn get_external_port(node_type: &NodeRegistryType) -> u16 {
         NodeRegistryType::Executor => EXECUTOR_PORT,
         NodeRegistryType::Finalizer => FINALIZER_PORT
     }
-}
-
-pub fn send_on_thread(cloned_data: Arc<RwLock<Vec<u8>>>, conn: Box<dyn Sender>, addr: SocketAddr)
-                      -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        match cloned_data.read() {
-            Err(_) => vec![],
-            Ok(read_data) => {
-                conn.get_response(&read_data)
-                    .unwrap_or_else(|_| vec![])
-            }
-        }
-    })
 }
 
 pub fn get_data(reader: &mut Box<dyn Stream>) -> Result<Vec<u8>, ConnError> {
@@ -78,11 +63,11 @@ pub async fn get_data_async(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8
 
 #[async_trait]
 pub trait Connection : Send + Sync {
-    async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError>;
+    async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError>;
 }
 
 struct TcpConnection {
-    writer: Box<dyn StreamWriter>,
+    writer: tokio::sync::Mutex<Box<dyn StreamWriter>>,
     listening_thread: tokio::task::JoinHandle<()>
 }
 
@@ -90,7 +75,7 @@ impl TcpConnection {
     pub fn from_stream(stream: Box<dyn Stream>,
                           on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
         -> Result<Self, ConnError> {
-        let (mut reader, mut writer) = stream.into_split()?;
+        let (mut reader, writer) = stream.into_split()?;
         let thread = tokio::spawn(async move {
             loop {
                 match get_data_async(&mut reader).await {
@@ -104,7 +89,7 @@ impl TcpConnection {
         });
 
         Ok(TcpConnection {
-            writer,
+            writer: tokio::sync::Mutex::new(writer),
             listening_thread: thread,
         })
     }
@@ -112,10 +97,11 @@ impl TcpConnection {
 
 #[async_trait]
 impl Connection for TcpConnection {
-    async fn send(&mut self, data: &Vec<u8>) -> Result<(), ConnError> {
+    async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
         let length_header = data.len().to_be_bytes();
-        let _ = self.writer.write_all(&length_header).await?;
-        self.writer.write_all(data).await
+        let mut writer = self.writer.lock().await;
+        writer.write_all(&length_header).await?;
+        writer.write_all(data).await
     }
 }
 

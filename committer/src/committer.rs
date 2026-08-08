@@ -134,12 +134,12 @@ impl Committer {
 
     /// Primary entry point — routes incoming messages by action.
     /// Called by the gossiper's message handler after deserialization.
-    pub fn handle_message(&self, message: Message) -> Result<(), CommitterError> {
+    pub async fn handle_message(&self, message: Message) -> Result<(), CommitterError> {
         match message.action.as_str() {
-            "Commit" => self.handle_commit(message),
-            "DistributeToken" => self.handle_token_distribution(message),
-            "DistributeBlock" => self.handle_block_distribution(message),
-            "EpochReconcile" => self.handle_epoch_reconcile(),
+            "Commit" => self.handle_commit(message).await,
+            "DistributeToken" => self.handle_token_distribution(message).await,
+            "DistributeBlock" => self.handle_block_distribution(message).await,
+            "EpochReconcile" => self.handle_epoch_reconcile().await,
             action => Err(CommitterError::UnknownAction(action.to_string())),
         }
     }
@@ -156,7 +156,7 @@ impl Committer {
     /// 3. Acquire lock and verify Finalizing state
     /// 4. Commit the block via BlockServices
     /// 5. Transition to Committed, release lock
-    fn handle_commit(&self, message: Message) -> Result<(), CommitterError> {
+    async fn handle_commit(&self, message: Message) -> Result<(), CommitterError> {
         // Deserialize the TransactionCommit from the message body
         let commit: TransactionCommit =
             deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
@@ -165,7 +165,7 @@ impl Committer {
         self.validate_transaction_message(&commit)?;
 
         // Check and commit the transaction results
-        self.check_and_commit_transaction_results(&commit)
+        self.check_and_commit_transaction_results(&commit).await
     }
 
     /// Check and commit transaction results.
@@ -176,7 +176,7 @@ impl Committer {
     /// 3. Apply the block via BlockServices (commit + distribute)
     /// 4. Update transaction state to Committed
     /// 5. Release the transaction lock
-    fn check_and_commit_transaction_results(
+    async fn check_and_commit_transaction_results(
         &self,
         commit: &TransactionCommit,
     ) -> Result<(), CommitterError> {
@@ -230,7 +230,7 @@ impl Committer {
         }
 
         // Step 6: Distribute the committed block to archivers
-        let _ = self.block_services.distribute_to_archivers(&commit.proposed_block);
+        let _ = self.block_services.distribute_to_archivers(&commit.proposed_block).await;
 
         Ok(())
     }
@@ -241,7 +241,7 @@ impl Committer {
 
     /// Handle token distribution from other committers.
     /// Inserts the token into the local cache for future commits.
-    fn handle_token_distribution(&self, message: Message) -> Result<(), CommitterError> {
+    async fn handle_token_distribution(&self, message: Message) -> Result<(), CommitterError> {
         let token: Token = deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
 
         let token_key = token.id.clone();
@@ -256,7 +256,7 @@ impl Committer {
 
     /// Handle block distribution from other committers.
     /// Logs receipt for observability.
-    fn handle_block_distribution(&self, message: Message) -> Result<(), CommitterError> {
+    async fn handle_block_distribution(&self, message: Message) -> Result<(), CommitterError> {
         let block: pneumatic_core::blocks::Block =
             deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
 
@@ -279,7 +279,7 @@ impl Committer {
     /// 1. Run the epoch reconciler to analyze chain state
     /// 2. Apply staking operations from reconciliation
     /// 3. Select new leader for the epoch
-    fn handle_epoch_reconcile(&self) -> Result<(), CommitterError> {
+    async fn handle_epoch_reconcile(&self) -> Result<(), CommitterError> {
         // Run reconciliation
         let reconciliation = self.epoch_reconciler.reconcile();
 
@@ -660,7 +660,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit);
+        let result = committer.check_and_commit_transaction_results(&commit).await;
         if let Err(ref e) = result {
             eprintln!("Error: {:?}", e);
         }
@@ -699,7 +699,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit);
+        let result = committer.check_and_commit_transaction_results(&commit).await;
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"bob".to_vec(), "token").unwrap();
@@ -735,7 +735,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit);
+        let result = committer.check_and_commit_transaction_results(&commit).await;
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"charlie".to_vec(), "token").unwrap();

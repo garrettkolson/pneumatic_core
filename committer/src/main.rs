@@ -15,7 +15,8 @@ use pneumatic_committer::epoch_manager::{
     EpochReconciler, LeaderSelector, StakeStore, StakingManager,
 };
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // 1. Build config and environment metadata
     let config = match Config::build() {
         Ok(cfg) => cfg,
@@ -115,9 +116,13 @@ fn main() {
     let committer_clone = committer.clone();
     let logger_clone = shared_logger.clone();
     committer.initialize(move |message| {
-        if let Err(e) = committer_clone.handle_message(message) {
-            logger_clone.log(format!("Committer error: {:?}", e));
-        }
+        let committer = committer_clone.clone();
+        let logger = logger_clone.clone();
+        tokio::spawn(async move {
+            if let Err(e) = committer.handle_message(message).await {
+                logger.log(format!("Committer error: {:?}", e));
+            }
+        });
     });
 
     // 13. Log startup and block on shutdown
@@ -126,6 +131,6 @@ fn main() {
     // Block the main thread indefinitely (node runs until killed)
     // In production, this would listen for a shutdown signal
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }

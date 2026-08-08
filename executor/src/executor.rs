@@ -174,8 +174,8 @@ impl Executor {
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
 
-        // Broadcast to all finalizers (stub — actual networking via registered connections)
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer);
+        // Broadcast to all finalizers via registered connections
+        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer).await;
 
         Ok(())
     }
@@ -422,17 +422,6 @@ impl ExecutorHandle {
         result_hash: Vec<u8>,
         finalizer_key: &[u8],
     ) -> Result<(), ExecutorError> {
-        let finalizer_nodes = self
-            .node_registry
-            .get_nodes(&NodeRegistryType::Finalizer)
-            .ok_or_else(|| ExecutorError::NoFinalizers("No finalizers registered".to_string()))?;
-
-        if finalizer_nodes.is_empty() {
-            return Err(ExecutorError::NoFinalizers(
-                "No finalizers registered".to_string(),
-            ));
-        }
-
         let msg_body = serialize_to_bytes_rmp(&ExecutionResult {
             transaction_id: tx_id.to_string(),
             result_data: execution_result,
@@ -449,7 +438,8 @@ impl ExecutorHandle {
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
 
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer);
+        // Broadcast to all finalizers via registered connections
+        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer).await;
 
         Ok(())
     }

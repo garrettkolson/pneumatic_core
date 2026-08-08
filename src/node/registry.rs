@@ -1,8 +1,7 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use dashmap::DashMap;
+use futures::future::join_all;
 use crate::config::Config;
 use crate::{conns, messages, server};
 use crate::conns::ConnTarget;
@@ -160,29 +159,46 @@ impl NodeRegistry {
         request.requester_types.contains(&node_type) && !self.type_is_maxed_out(&node_type)
     }
 
-    pub fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
-        // TODO: have to redo this to use registered conns instead of senders
-        let shared_data = Arc::new(RwLock::new(data));
+    /// Send data to all registered nodes of a given type (async, concurrent).
+    pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
-        let threads: Vec<JoinHandle<Vec<u8>>> = nodes.iter().map(|node| -> JoinHandle<Vec<u8>> {
-            let data_clone = shared_data.clone();
-            let addr = SocketAddr::new(node.value().ip.clone(), conns::get_external_port(node_type));
-            let sender_result = self.conn_factory.get_sender(ConnTarget::Remote(addr));
-            thread::spawn(move || {
-                if let Ok(sender) = sender_result {
-                    let Ok(read_data) = data_clone.read() else { return vec![] };
-                    sender.get_response(read_data.as_slice()).unwrap_or_else(|_| vec![])
-                }
-                else {
-                    vec![]
+        // Collect keys first to release DashMap guards, then send on collected references
+        let keys: Vec<Vec<u8>> = nodes.iter()
+            .filter_map(|entry| Some(entry.key().clone()))
+            .collect();
+
+        // Use get() + block_on for each connection individually (simpler, avoids lifetime issues)
+        let send_futs: Vec<_> = keys.into_iter()
+            .map(|key| {
+                let nodes_clone = nodes.clone();
+                let send_data = data.clone();
+                async move {
+                    if let Some(entry) = nodes_clone.get(&key) {
+                        let _ = entry.value().conn.send(&send_data).await;
+                    }
                 }
             })
-        }).collect();
+            .collect();
+        join_all(send_futs).await;
+    }
 
-        for thread in threads {
-            let _ = thread.join();
-        }
+    /// Blocking version for sync contexts (runs async sends sequentially).
+    pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
+        let Some(nodes) = self.get_nodes(node_type) else { return };
+        let send_data = data.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(async {
+                let keys: Vec<Vec<u8>> = nodes.iter()
+                    .filter_map(|entry| Some(entry.key().clone()))
+                    .collect();
+                for key in keys {
+                    if let Some(entry) = nodes.get(&key) {
+                        let _ = entry.value().conn.send(&send_data).await;
+                    }
+                }
+            })
+        });
     }
 
     fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {

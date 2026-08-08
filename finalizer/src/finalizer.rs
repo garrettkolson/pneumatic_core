@@ -273,10 +273,10 @@ impl Finalizer {
             env_id: self.env_id.clone(),
             proposed_block: block,
         };
-        self.message_dispatcher.send_to_committers(commit)?;
+        self.message_dispatcher.send_to_committers(commit).await?;
 
         // Step 9: Send clear to all Sentinels
-        self.message_dispatcher.send_clear_to_sentinels(tx_id)?;
+        self.message_dispatcher.send_clear_to_sentinels(tx_id).await?;
 
         // Step 10: Transition to Committed state
         if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {

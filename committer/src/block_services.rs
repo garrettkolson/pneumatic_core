@@ -101,7 +101,7 @@ impl BlockServices {
     /// Serializes the block and broadcasts to Archiver node type.
     /// Note: NodeRegistry.get_nodes(Archiver) currently returns None,
     /// so this will log a warning until the registry is updated.
-    pub fn distribute_to_archivers(&self, block: &Block) -> Result<(), CommitterError> {
+    pub async fn distribute_to_archivers(&self, block: &Block) -> Result<(), CommitterError> {
         let payload = serialize_to_bytes_rmp(block)?;
 
         let message = Message {
@@ -114,9 +114,9 @@ impl BlockServices {
 
         let message_payload = serialize_to_bytes_rmp(&message)?;
 
-        // NodeRegistry.send_to_all handles the broadcast
+        // NodeRegistry.send_to_all handles the broadcast via registered connections
         // Note: Archiver nodes are not yet supported in get_nodes()
-        self.node_registry.send_to_all(message_payload, &NodeRegistryType::Archiver);
+        self.node_registry.send_to_all(message_payload, &NodeRegistryType::Archiver).await;
 
         self.logger.log(format!(
             "Attempted to distribute block to archivers (hash: {})",
@@ -128,7 +128,7 @@ impl BlockServices {
 
     /// Distribute a token to other committers (for token initialization
     /// on a new node joining the network).
-    pub fn distribute_token(&self, token_id: &[u8]) -> Result<(), CommitterError> {
+    pub async fn distribute_token(&self, token_id: &[u8]) -> Result<(), CommitterError> {
         let token = self.tokens.get(token_id).ok_or_else(|| {
             CommitterError::TokenNotFound(bytes_to_hex(token_id))
         })?;
@@ -148,7 +148,7 @@ impl BlockServices {
 
         let message_payload = serialize_to_bytes_rmp(&message)?;
         self.node_registry
-            .send_to_all(message_payload, &NodeRegistryType::Committer);
+            .send_to_all(message_payload, &NodeRegistryType::Committer).await;
 
         self.logger.log(format!(
             "Distributed token [{}]",

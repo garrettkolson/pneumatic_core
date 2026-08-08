@@ -2,7 +2,7 @@ pub mod registry;
 
 use std::io::Read;
 use std::net::{IpAddr};
-use std::sync::{Arc};
+use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
