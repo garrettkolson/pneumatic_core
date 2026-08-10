@@ -295,10 +295,9 @@ Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range
 **File:** `src/registry.rs:131-132`
 `set_requested_finalizer()` calls `transition_to_finalizing(transaction, finalizer_key)` which stores the key in `Finalizing { finalizer_key }`. `Finalizer::try_finalize()` reads it from `Finalizing` state — works correctly. The commented-out `validation.finalizer_public_key = ...` is intentional; the key is stored in `Finalizing` state, not duplicated in `TransactionValidationResult`.
 
-#### Token.get_asset_mut — returns immutable copy
-**File:** `src/tokens.rs:111-122`
-Returns `Option<T>` (same as `get_asset`) instead of a mutable reference.
-**Action:** Return `&mut Option<Vec<u8>>` or add a `set_asset` method.
+#### Token.get_asset_mut — DONE
+**File:** `src/tokens.rs:114-147`
+Replaced with three methods: `asset_mut(&mut self) -> Option<&mut Vec<u8>>` returns direct mutable access to raw serialized bytes; `set_asset(&mut self, &impl Serialize) -> Result<(), Error>` serializes and stores; `update_asset<T, F>(&mut self, F: FnOnce(&mut T)) -> Option<T>` deserializes, calls closure to mutate, re-serializes. 5 new tests.
 
 #### EnvironmentMetadataSpec — unused fields
 **File:** `src/environment.rs:84-99`

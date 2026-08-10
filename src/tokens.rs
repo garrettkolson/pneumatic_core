@@ -111,17 +111,30 @@ impl Token {
         }
     }
 
-    pub fn get_asset_mut<T>(&self) -> Option<T>
+    /// Return mutable access to the raw serialized asset bytes.
+    pub fn asset_mut(&mut self) -> Option<&mut Vec<u8>> {
+        self.asset_data.as_mut()
+    }
+
+    /// Serialize an asset and store it, replacing any existing asset data.
+    pub fn set_asset(&mut self, asset: &impl Serialize) -> Result<(), std::io::Error> {
+        let data = encoding::serialize_to_bytes_rmp(asset)?;
+        self.asset_data = Some(data);
+        Ok(())
+    }
+
+    /// Deserialize the asset, call `f` to mutate it, re-serialize the result.
+    /// Returns the mutated value, or None if no asset is stored.
+    pub fn update_asset<T, F>(&mut self, f: F) -> Option<T>
     where
-        T: for<'a> Deserialize<'a>,
+        T: Serialize + for<'a> Deserialize<'a>,
+        F: FnOnce(&mut T),
     {
-        let Some(asset) = &self.asset_data else {
-            return None;
-        };
-        match encoding::deserialize_rmp_to::<T>(asset) {
-            Ok(a) => Some(a),
-            Err(_) => None,
-        }
+        let data = self.asset_data.as_mut()?;
+        let mut asset: T = encoding::deserialize_rmp_to(data).ok()?;
+        f(&mut asset);
+        *data = encoding::serialize_to_bytes_rmp(&asset).ok()?;
+        Some(asset)
     }
 
     /// Validate a block against this token using the appropriate
@@ -707,6 +720,56 @@ mod tests {
         let taken = args.admin_credit_registry.take_admin_credit(&credit_id);
         assert!(taken.is_some());
         assert!(args.admin_credit_registry.get_admin_credit(&credit_id).is_none());
+    }
+
+    // --- asset_mut / set_asset / update_asset ---
+
+    #[test]
+    fn asset_mut_returns_none_when_no_asset() {
+        let mut token = Token::new();
+        assert!(token.asset_mut().is_none());
+    }
+
+    #[test]
+    fn asset_mut_returns_mutable_ref_when_asset_exists() {
+        let mut token = Token::from_asset(&User::new(vec![0xAA])).unwrap();
+        let data = token.asset_mut().unwrap();
+        assert!(!data.is_empty());
+        let len_before = data.len();
+        data.push(0xFF);
+        assert_eq!(token.asset_mut().unwrap().len(), len_before + 1);
+    }
+
+    #[test]
+    fn set_asset_serializes_and_stores() {
+        let mut token = Token::new();
+        let user = User::new(vec![0xBB]);
+        assert!(token.set_asset(&user).is_ok());
+        let retrieved: User = token.get_asset().unwrap();
+        assert_eq!(retrieved.public_key, vec![0xBB]);
+    }
+
+    #[test]
+    fn update_asset_mutates_and_reserializes() {
+        let mut token = Token::from_asset(&User::new(vec![0xCC])).unwrap();
+        let updated = token.update_asset(|user: &mut User| {
+            user.fuel_balance = 500;
+            user.stake = 1000;
+        }).unwrap();
+        assert_eq!(updated.fuel_balance, 500);
+        assert_eq!(updated.stake, 1000);
+        assert_eq!(updated.public_key, vec![0xCC]);
+        // Verify stored data reflects the mutation
+        let stored: User = token.get_asset().unwrap();
+        assert_eq!(stored.fuel_balance, 500);
+        assert_eq!(stored.stake, 1000);
+    }
+
+    #[test]
+    fn update_asset_returns_none_when_no_asset() {
+        let mut token = Token::new();
+        let result: Option<User> = token.update_asset(|_user: &mut User| {});
+        assert!(result.is_none());
     }
 }
 
