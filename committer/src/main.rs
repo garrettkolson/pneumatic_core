@@ -76,6 +76,7 @@ async fn main() {
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         data_provider.clone(),
         env_data.environment_id.clone(),
+        vec![], // token IDs: populated dynamically via token distribution
     ));
 
     let hash_provider = Arc::new(BasicHashProvider::new());

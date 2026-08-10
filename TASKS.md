@@ -278,9 +278,9 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 **File:** `src/gossiper.rs:87-92`
 Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_handler()` registers extras; `handle_message()` clones raw_data and invokes each sequentially.
 
-#### EpochReconciler — stub returns empty; real impl in committer
-**File:** `src/epoch.rs:125-133` (stub in core), `committer/src/epoch_manager.rs:142-178` (real impl with TODOs)
-`StubEpochReconciler::reconcile()` returns `EpochReconciliation::default()`. Real `EpochReconciler` in committer has `data_provider` and `env_id` fields but `reconcile_internal()` returns empty — TODO to load tokens, compare chain heads, detect misshapen tokens and finalization conflicts (see commented-out code at lines 158-169).
+#### EpochReconciler — DONE
+**File:** `committer/src/epoch_manager.rs:142-205`, `committer/src/committer.rs:563-569`
+Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts token IDs from committer. `reconcile_internal()` loads each token via `data_provider.get_token()`, checks `chain_state.is_valid` to detect misshapen chains, and cross-compares block hashes at matching indices across valid tokens to detect finalization conflicts. `StubDataProvider` made always-available (removed `#[cfg(test)]`) for downstream test use. 7 new tests.
 
 #### StakingManager — DONE (StubStakingManager superseded)
 **File:** `src/epoch.rs:136-142` (stub in core), `committer/src/epoch_manager.rs:78-133` (real impl)

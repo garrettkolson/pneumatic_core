@@ -563,6 +563,7 @@ mod tests {
         let epoch_reconciler = Arc::new(EpochReconciler::new(
             data_provider_core.clone(),
             "test".to_string(),
+            vec![vec![1]], // token ID from bootstrap_token
         ));
         let hash_provider = Arc::new(BasicHashProvider::new());
         let leader_selector = Arc::new(LeaderSelector::new(hash_provider));

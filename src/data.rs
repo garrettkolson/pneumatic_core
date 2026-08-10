@@ -217,13 +217,11 @@ pub enum DataError {
 
 /// Test helper that returns pre-loaded tokens instead of connecting to
 /// an external data service. Used exclusively by `#[cfg(test)]` code.
-#[cfg(test)]
 pub struct StubDataProvider {
     tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
     users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
 }
 
-#[cfg(test)]
 impl StubDataProvider {
     pub fn new() -> Self {
         StubDataProvider {
@@ -248,14 +246,12 @@ impl StubDataProvider {
     }
 }
 
-#[cfg(test)]
 impl Default for StubDataProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
 impl DataProvider for StubDataProvider {
     fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
         self.tokens
