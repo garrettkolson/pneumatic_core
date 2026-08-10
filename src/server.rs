@@ -122,7 +122,7 @@ impl Worker {
             };
 
             match mutex.recv() {
-                Err(err) => return Err(WorkerError::WhileReceiving(err.to_string())),
+                Err(_) => return Ok(()),
                 Ok(job) => {
                     job();
                 }
@@ -136,7 +136,7 @@ impl Worker {
             loop {
                 let mutex = receiver.lock().await;
                 match mutex.recv() {
-                    Err(err) => return Err(WorkerError::WhileReceiving(err.to_string())),
+                    Err(_) => return Ok(()),
                     Ok(job) => {
                         let _ = Box::pin(job.await);
                     }
