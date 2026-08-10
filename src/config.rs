@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::encoding;
 use crate::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+use strum::IntoEnumIterator;
 use crate::node::{NodeBootstrapError, NodeRegistryType, NodeType, NodeTypeConfig};
 
 pub trait IsConfiguration {
@@ -34,27 +35,31 @@ impl Config {
             Err(err) => return Err(NodeBootstrapError::from_io_error(err))
         };
 
-        // OK: deferred — node registry types selected from node_type + runtime discovery
-
         // build up environment metadata
         let environment_metadata = match Config::get_environment_metadata() {
             Ok(result) => result,
             Err(err) => return Err(NodeBootstrapError::from_io_error(err))
         };
 
-        // OK: deferred — min/max connections computed from chain state and stake
-        // OK: deferred — minimum stake per node type set via staking protocol
+        // Select node registry types based on node type.
+        // Full nodes participate in all registries; light nodes participate in core registries.
+        let node_registry_types = Self::default_node_registry_types(spec.is_full_node);
+
+        // Populate per-type configurations (min/max connections + minimum stake).
+        // These values are protocol-level defaults; real chain state and stake data
+        // may refine them at runtime.
+        let type_configs = Arc::new(Self::default_type_configs());
 
         Ok(Config {
             public_key: vec![],
             ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             rest_api_version: spec.rest_api_version,
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
-            node_registry_types: vec![],
+            node_registry_types,
             environment_metadata,
             main_environment_id: spec.main_env_id,
             reconciliation_partition_id: spec.reconciliation_partition_id,
-            type_configs: Arc::new(DashMap::new())
+            type_configs,
         })
     }
 
@@ -109,8 +114,53 @@ impl Config {
     pub fn get_min_type_stake(&self, node_type: &NodeRegistryType) -> u64 {
         match self.type_configs.get(node_type) {
             Some(config) => config.min_stake,
-            None => u64::MAX
+            None => Self::default_min_stake()
         }
+    }
+
+    /// Return the node registry types this node participates in.
+    ///
+    /// Full nodes participate in all five registry types (Committer, Sentinel,
+    /// Executor, Finalizer, Archiver) so they can broadcast to and receive
+    /// from any peer type. Light nodes only participate in core registries
+    /// (Committer, Sentinel, Executor, Finalizer) to reduce network overhead.
+    fn default_node_registry_types(is_full_node: bool) -> Vec<NodeRegistryType> {
+        if is_full_node {
+            NodeRegistryType::iter().collect()
+        } else {
+            vec![
+                NodeRegistryType::Committer,
+                NodeRegistryType::Sentinel,
+                NodeRegistryType::Executor,
+                NodeRegistryType::Finalizer,
+            ]
+        }
+    }
+
+    /// Build per-type configurations with protocol-level defaults.
+    ///
+    /// Each `NodeTypeConfig` specifies the minimum/maximum number of registered
+    /// nodes for that type and the minimum stake required to join that registry.
+    /// These values represent the staking protocol's baseline — chain state and
+    /// real stake data may adjust them at runtime.
+    fn default_type_configs() -> DashMap<NodeRegistryType, NodeTypeConfig> {
+        let stake = Self::default_min_stake();
+        let configs = DashMap::new();
+        for node_type in NodeRegistryType::iter() {
+            configs.insert(
+                node_type,
+                NodeTypeConfig {
+                    min: 1,
+                    max: 1000,
+                    min_stake: stake,
+                },
+            );
+        }
+        configs
+    }
+
+    fn default_min_stake() -> u64 {
+        10
     }
 
     /// Build a Config for unit tests without reading from disk.

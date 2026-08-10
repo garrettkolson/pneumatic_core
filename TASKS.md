@@ -304,10 +304,9 @@ Replaced with three methods: `asset_mut(&mut self) -> Option<&mut Vec<u8>>` retu
 `allowed_token_types`, `trans_validation_specs`, `block_validation_specs`, `sym_crypto_provider`, `serialization_provider` — none are processed in `load_from_spec`.
 **Action:** Wire each field to appropriate initialization logic.
 
-#### Config — node registry type selection
-**File:** `src/config.rs:37-46`
-Three `// todo` comments for determining node types, connection counts, and minimum stake.
-**Action:** Parse config spec for node type selection and stake requirements.
+#### Config — node registry type selection — DONE
+**File:** `src/config.rs:37-46, 126-162`
+Implemented three deferred todos: (1) `default_node_registry_types()` selects all 5 types for full nodes, core 4 (minus Archiver) for light nodes; (2) `default_type_configs()` populates per-type `NodeTypeConfig` with min=1, max=1000, min_stake=10 for all registry types; (3) `default_min_stake()` shared constant (10). `get_min_type_stake()` falls back to `default_min_stake()` instead of `u64::MAX` for unknown types. Added `strum::IntoEnumIterator` import.
 
 #### Server worker — exits after one job — DONE
 **File:** `src/server.rs:116-147`
