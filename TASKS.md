@@ -299,10 +299,13 @@ Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range
 **File:** `src/tokens.rs:114-147`
 Replaced with three methods: `asset_mut(&mut self) -> Option<&mut Vec<u8>>` returns direct mutable access to raw serialized bytes; `set_asset(&mut self, &impl Serialize) -> Result<(), Error>` serializes and stores; `update_asset<T, F>(&mut self, F: FnOnce(&mut T)) -> Option<T>` deserializes, calls closure to mutate, re-serializes. 5 new tests.
 
-#### EnvironmentMetadataSpec — unused fields
-**File:** `src/environment.rs:84-99`
-`allowed_token_types`, `trans_validation_specs`, `block_validation_specs`, `sym_crypto_provider`, `serialization_provider` — none are processed in `load_from_spec`.
-**Action:** Wire each field to appropriate initialization logic.
+#### EnvironmentMetadataSpec — unused fields — DONE
+**File:** `src/environment.rs:145-165` (spec), `environment.rs:17-84` (metadata)
+All 5 fields now wired in `load_from_spec`:
+- `sym_crypto_provider` and `serialization_provider` stored as `String` fields on `EnvironmentMetadata` for diagnostics
+- `trans_validation_specs` and `block_validation_specs` iterated and registered into existing `ValidationSpecRegistry` / `BlockValidatorSpecRegistry` by name ("SelfSigned", "Executed"); unknown names silently skipped
+- `allowed_token_types` already stored (line 132); no enforcement needed
+Added imports for `SelfSignedBlockValidatorSpec` and `ExecutedBlockValidatorSpec`. 267 tests pass.
 
 #### Config — node registry type selection — DONE
 **File:** `src/config.rs:37-46, 126-162`

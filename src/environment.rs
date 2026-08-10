@@ -6,7 +6,8 @@ use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::logging::{FileLogger, Logger};
 use crate::tokens::BlockValidator;
-use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry};
+use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry,
+    SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec};
 
 /// Gas cost model: pricing for actions and protocol-level policy.
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +74,12 @@ pub struct EnvironmentMetadata {
     pub block_validator_specs: Arc<BlockValidatorSpecRegistry>,
     /// Allowed token types for this environment (from spec).
     pub allowed_token_types: Vec<String>,
+    /// Symmetric crypto provider identifier (from spec).
+    /// AES-256-GCM is used directly via Ed25519Provider — no pluggable layer.
+    pub sym_crypto_provider: String,
+    /// Serialization provider identifier (from spec).
+    /// rmp-serde (MsgPack) is the wire format; serde_json for config files.
+    pub serialization_provider: String,
     pub logger: Arc<dyn Logger>,
 }
 
@@ -107,11 +114,36 @@ impl EnvironmentMetadata {
         let asym_crypto_provider = crypto::get_asym_provider(&spec.asym_crypto_provider);
         let logger: Arc<dyn Logger> = Arc::new(FileLogger::new(spec.log_file.clone()));
 
+        // Store crypto/serialization provider identifiers for diagnostics.
+        // Symmetric crypto is AES-256-GCM (baked into Ed25519Provider);
+        // serialization is rmp-serde (MsgPack) for wire format.
+        let sym_crypto_provider = spec.sym_crypto_provider.clone();
+        let serialization_provider = spec.serialization_provider.clone();
+
         let mut specs = ValidationSpecRegistry::new();
         specs.register_defaults();
 
+        // Wire trans_validation_specs from JSON into the transaction validation registry.
+        // Names not found in defaults are silently skipped (graceful degradation).
+        for name in &spec.trans_validation_specs {
+            match name.as_str() {
+                "SelfSigned" => specs.register(Box::new(SelfSignedBlockValidatorSpec::new())),
+                "Executed" => specs.register(Box::new(ExecutedBlockValidatorSpec::new(0))),
+                _ => {} // silently skip unknown spec names
+            }
+        }
+
         let mut block_specs = BlockValidatorSpecRegistry::new();
         block_specs.register_defaults();
+
+        // Wire block_validation_specs from JSON into the block validator registry.
+        for name in &spec.block_validation_specs {
+            match name.as_str() {
+                "SelfSigned" => block_specs.register("SelfSigned", Box::new(SelfSignedBlockValidatorSpec::new())),
+                "Executed" => block_specs.register("Executed", Box::new(ExecutedBlockValidatorSpec::new(0))),
+                _ => {} // silently skip unknown spec names
+            }
+        }
 
         EnvironmentMetadata {
             environment_id: spec.environment_id,
@@ -130,6 +162,8 @@ impl EnvironmentMetadata {
             transaction_validation_specs: Arc::new(specs),
             block_validator_specs: Arc::new(block_specs),
             allowed_token_types: spec.allowed_token_types,
+            sym_crypto_provider,
+            serialization_provider,
             logger,
         }
     }
