@@ -510,7 +510,7 @@ mod tests {
         let json = r#"{"environment_id":"test","environment_name":"test",
             "partitions":[{"id":"token","partition_type":"Token"},
             {"id":"slush","partition_type":"Slush"}],
-            "asym_crypto_provider":{"RSA":null},"sym_crypto_provider":"sym",
+            "asym_crypto_provider":{"Ed25519":null},"sym_crypto_provider":"sym",
             "serialization_provider":"rmp","quorum_percentage":67.0,
             "override_quorum_percentage":0.0,"max_risk":1.0,
             "allowed_token_types":[],"trans_validation_specs":[],

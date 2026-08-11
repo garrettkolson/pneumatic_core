@@ -14,12 +14,12 @@ use crate::errors::PneumaticError;
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
 pub enum AsymCryptoProviderType {
-    RSA,
+    Ed25519,
 }
 
 pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> Arc<RwLock<dyn AsymCryptoProvider>> {
     match provider_type {
-        AsymCryptoProviderType::RSA => {
+        AsymCryptoProviderType::Ed25519 => {
             let provider = Ed25519Provider::generate();
             Arc::new(RwLock::new(provider))
         }
@@ -49,10 +49,10 @@ pub trait AsymCryptoProvider: Send + Sync {
 
 /// Ed25519 asymmetric crypto provider backed by ed25519-dalek.
 ///
-/// Ed25519 is used instead of RSA for blockchain signatures because:
-/// - Fixed 32-byte keys (vs 2048+ bit RSA keys)
-/// - Constant-time signature generation
-/// - No padding oracle vulnerabilities
+/// Ed25519 is used for blockchain signatures because:
+/// - Fixed 32-byte keys and signatures
+/// - Constant-time signature generation and verification
+/// - No padding oracle or malleability vulnerabilities
 /// - Better performance per security level
 ///
 /// Hybrid encryption uses AES-256-GCM with ephemeral X25519 key exchange:

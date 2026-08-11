@@ -352,7 +352,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Area | Tasks |
 |------|-------|
-| **Security** | ~~Wire framing fix (SA_01)~~, ~~deterministic leader election (SA_02)~~, ~~nonce validation (SA_03)~~, ~~DH-to-AES KDF + random nonce (SA_04)~~, ~~panic-free error returns (SA_05)~~, deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
+| **Security** | ~~Wire framing fix (SA_01)~~, ~~deterministic leader election (SA_02)~~, ~~nonce validation (SA_03)~~, ~~DH-to-AES KDF + random nonce (SA_04)~~, ~~panic-free error returns (SA_05)~~, deterministic gas math (SA_06), ~~enum rename (SA_07)~~, max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
 | **Observability** | Structured logging (json), Prometheus metrics (tx throughput, epoch duration, quorum latency), distributed tracing |
 | **Deployment** | Docker compose for multi-node testnet, health check endpoints, graceful shutdown with task drain |
 | **Networking** | TLS for TCP connections (SA_09), connection pooling, reconnection logic for dropped peers |
@@ -374,11 +374,11 @@ This roadmap tracks the work from current foundation state through a production-
 | SA_04 | ~~Add HKDF between DH output and AES key; use random 96-bit nonce (not zero)~~ — `derive_aes_key()` via HKDF-SHA256, `generate_nonce()` via `getrandom`, wire format `[32-byte PK][12-byte nonce][ciphertext + tag]` | Critical | `src/crypto.rs` | ~~4h~~ 2h |
 | SA_05 | ~~Replace `.expect()` / `panic!` on network paths with `Result` error returns~~ — `PneumaticError::CryptoError`, `ConnError::DecryptError`, `DataError::CryptoError`, `Display` impls, atomic `add_transaction` | High | `crypto.rs`, `errors.rs`, `data.rs`, `registry.rs` | ~~4h~~ 1h |
 | SA_06 | Integer fixed-point gas math — no `f64` in consensus-relevant computation | High | `src/action_router.rs` | 2h |
-| SA_07 | Rename `AsymCryptoProviderType::RSA` → `Ed25519` | Medium | `src/crypto.rs` | 1h |
+| SA_07 | ~~Rename `AsymCryptoProviderType::RSA` → `Ed25519`~~ | Medium | `src/crypto.rs` | ~~1h~~ |
 | SA_08 | Max frame size limit (16 MB) before `vec!` allocation | Medium | `src/conns.rs` | 1h |
 | SA_09 | TLS for TCP connections (rustls) | Medium | `conns::listeners`, `conns::factories` | 8h |
 
-**Sub-total**: 24h / ~3 days (SA_01 + SA_02 + SA_03 + SA_04 complete — 7h saved)
+**Sub-total**: 24h / ~3 days (SA_01 + SA_02 + SA_03 + SA_04 + SA_05 + SA_07 complete — 8h saved)
 
 **Tracking:** Full audit remediation plan with code-level details in [TASKS.md](TASKS.md) section "Security Audit Remediation".
 

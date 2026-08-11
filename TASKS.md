@@ -392,21 +392,11 @@ Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, 
 
 **Estimate:** 2h → actual ~30min
 
-### SA_07 Rename misleading `AsymCryptoProviderType::RSA` — `src/crypto.rs`
+### ~~SA_07~~ Rename misleading `AsymCryptoProviderType::RSA` → `Ed25519` — `src/crypto.rs`
 
-**Severity:** Medium (currently harmless, future landmine). The enum variant is named `RSA` but instantiates `Ed25519Provider`.
+**Completed:** 2026-08-11 — Renamed enum variant in `crypto.rs`, updated match arm, cleaned comment, updated 4 test JSON configs.
 
-**Fix:**
-```rust
-pub enum AsymCryptoProviderType {
-    Ed25519,  // was RSA
-    // TODO: add RSA variant in future when needed
-}
-```
-
-Update all match arms and config deserialization accordingly.
-
-**Estimate:** 1h
+**Severity:** Medium (currently harmless, future landmine). The enum variant was named `RSA` but instantiates `Ed25519Provider`.
 
 ---
 
