@@ -346,7 +346,7 @@ use crate::encoding::deserialize_rmp_to;
 
 ---
 
-### SA_05 Replace panics with error returns on network-reachable paths — `src/crypto.rs`, `src/environment.rs`
+### SA_05 Replace panics with error returns on network-reachable paths — `src/crypto.rs`, `src/environment.rs` ✅ COMPLETE
 
 **Severity:** High. A single malformed/tampered message can panic a handling thread → remote DoS.
 
@@ -361,14 +361,20 @@ use crate::encoding::deserialize_rmp_to;
 self.crypto_provider.read().expect("RwLock poisoned").decrypt(...)
 
 // Use:
-self.crypto_provider.read().map_err(|e| DataError::CryptoError(e.to_string()))?
+self.crypto_provider.read().map_err(|e| PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e)))?
     .decrypt(...)
-    .map_err(|e| ConnError::DecryptError(e.to_string()))?
+    .map_err(|e| PneumaticError::CryptoError(e.to_string()))?
 ```
 
-Add `PneumaticError::CryptoError(String)` and `ConnError::DecryptError(String)` variants. Document that RwLock poisoning is handled gracefully (read lock is released on panic, poison only means another thread panicked while holding the lock — the data is still valid).
+Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, and `DataError::CryptoError(String)` variants. RwLock poisoning and GCM decryption errors now return errors gracefully instead of panicking.
 
-**Estimate:** 4h
+**Also fixed:** TOCTOU race in `PendingTransactionRegistry::add_transaction` (concurrent inserts of same id could both succeed under `contains_key`-then-`insert`); replaced with atomic `insert`-return-check.
+
+**Tests added:** `test_decrypt_short_input_returns_error`, `test_decrypt_from_wrong_recipient_returns_error`, `pneumatic_error_display_crypto_error`, `pneumatic_error_from_conn_error_decrypt`, `data_error_crypto_error_display`, `data_op_display`, `get_op_display`, `save_op_display`, `block_validation_error_display`.
+
+**Verification:** `cargo test --workspace` — 299 passing, 1 ignored.
+
+**Estimate:** 4h → actual ~1h
 
 ### SA_06 Deterministic gas accounting — integer math only — `src/action_router.rs`
 

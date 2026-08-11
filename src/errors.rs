@@ -7,7 +7,7 @@ use crate::data::DataError;
 #[derive(Debug)]
 pub enum PneumaticError {
     /// Crypto provider errors (encryption, signing, signature verification)
-    Crypto(String),
+    CryptoError(String),
     /// Serialization/deserialization failures
     Encoding(String),
     /// Data provider operation failures
@@ -35,6 +35,28 @@ pub enum PneumaticError {
         block_a: Vec<u8>,
         block_b: Vec<u8>,
     },
+}
+
+impl std::fmt::Display for PneumaticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PneumaticError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
+            PneumaticError::Encoding(msg) => write!(f, "Encoding({})", msg),
+            PneumaticError::Data(e) => write!(f, "Data({})", e),
+            PneumaticError::Network(msg) => write!(f, "Network({})", msg),
+            PneumaticError::Validation(reasons) => write!(f, "Validation({:?})", reasons),
+            PneumaticError::Registry(msg) => write!(f, "Registry({})", msg),
+            PneumaticError::Epoch(msg) => write!(f, "Epoch({})", msg),
+            PneumaticError::Block(e) => write!(f, "Block({})", e),
+            PneumaticError::StaleBlock { block_hash, stale_leader, current_leader, epoch_number } => {
+                write!(f, "StaleBlock {{ block_hash: {:?}, stale_leader: {:?}, current_leader: {:?}, epoch_number: {} }}",
+                    block_hash, stale_leader, current_leader, epoch_number)
+            }
+            PneumaticError::BlockConflict { height, block_a, block_b } => {
+                write!(f, "BlockConflict {{ height: {}, block_a: {:?}, block_b: {:?} }}", height, block_a, block_b)
+            }
+        }
+    }
 }
 
 impl From<std::io::Error> for PneumaticError {
@@ -195,6 +217,9 @@ pub use crate::tokens::BlockValidationError;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conns::ConnError;
+    use crate::user::User;
+    use crate::tokens::Token;
 
     // --- From implementations ---
 
@@ -311,8 +336,24 @@ mod tests {
 
     #[test]
     fn pneumatic_error_debug_fmt_no_panic() {
-        let err = PneumaticError::Crypto("key expired".to_string());
+        let err = PneumaticError::CryptoError("key expired".to_string());
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("Crypto"));
+    }
+
+    #[test]
+    fn pneumatic_error_display_crypto_error() {
+        let err = PneumaticError::CryptoError("decryption failed".to_string());
+        assert!(err.to_string().contains("decryption failed"));
+    }
+
+    #[test]
+    fn pneumatic_error_from_conn_error_decrypt() {
+        let conn_err = ConnError::DecryptError("bad nonce".to_string());
+        let pneumatic_err = PneumaticError::from(conn_err);
+        match pneumatic_err {
+            PneumaticError::Network(msg) => assert!(msg.contains("bad nonce")),
+            _ => panic!("expected Network variant"),
+        }
     }
 }

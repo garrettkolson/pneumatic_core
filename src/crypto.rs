@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use crate::errors::PneumaticError;
 
 // ---------------------------------------------------------------------------
 // AsymCryptoProvider — Ed25519 for blockchain signing/verification
@@ -26,18 +27,24 @@ pub fn get_asym_provider(provider_type: &AsymCryptoProviderType) -> Arc<RwLock<d
 }
 
 pub trait AsymCryptoProvider: Send + Sync {
-    fn encrypt(&self, data: Vec<u8>) -> Vec<u8>;
-    fn decrypt(&self, data: Vec<u8>) -> Vec<u8>;
+    /// Encrypt data for self (using this provider's static X25519 secret).
+    /// Returns `[32-byte ephemeral PK][12-byte nonce][ciphertext + GCM tag]`.
+    fn encrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError>;
+    /// Decrypt data that was encrypted for self via `encrypt`.
+    fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError>;
     /// Encrypt `data` to an arbitrary recipient identified by their 32-byte
     /// X25519 public key.  Anyone with the recipient's public key can encrypt;
     /// only the recipient (holding the matching static secret) can decrypt.
-    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Vec<u8>;
+    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Result<Vec<u8>, PneumaticError>;
     /// Decrypt data that was encrypted to this provider via `encrypt_to`.
     /// The sender's ephemeral public key is embedded in the ciphertext.
-    fn decrypt_from(&self, data: Vec<u8>) -> Vec<u8>;
-    fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> bool;
-    fn sign_data(&self, data: &[u8]) -> Vec<u8>;
-    fn public_key(&self) -> Vec<u8>;
+    fn decrypt_from(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError>;
+    /// Verify a Ed25519 signature over `data` using `public_key`.
+    fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> Result<bool, PneumaticError>;
+    /// Sign `data` with this provider's Ed25519 signing key.
+    fn sign_data(&self, data: &[u8]) -> Result<Vec<u8>, PneumaticError>;
+    /// Return the Ed25519 verifying key (for signature verification).
+    fn public_key(&self) -> Result<Vec<u8>, PneumaticError>;
 }
 
 /// Ed25519 asymmetric crypto provider backed by ed25519-dalek.
@@ -93,10 +100,11 @@ impl Ed25519Provider {
 
     /// Encrypt using a static secret (self or recipient) + ephemeral secret.
     /// Returns `[32-byte ephemeral PK][12-byte nonce][ciphertext + GCM tag]`.
+    /// Returns `PneumaticError::CryptoError` on any crypto failure.
     fn dh_encrypt(
         static_secret: &StaticSecret,
         data: &[u8],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, PneumaticError> {
         let ephemeral = EphemeralSecret::random();
         let ephemeral_pub = PublicKey::from(&ephemeral);
         let ephemeral_pub_bytes = ephemeral_pub.to_bytes();
@@ -106,43 +114,47 @@ impl Ed25519Provider {
         let cipher = Aes256Gcm::new(&aes_key.into());
         let nonce_bytes = Self::generate_nonce();
         let nonce = Nonce::try_from(nonce_bytes.as_slice())
-            .expect("nonce must be 12 bytes");
+            .map_err(|_| PneumaticError::CryptoError("nonce must be 12 bytes".to_string()))?;
 
         let ciphertext = cipher
             .encrypt(&nonce, data)
-            .expect("AES-GCM encryption failed");
+            .map_err(|e| PneumaticError::CryptoError(format!("AES-GCM encryption failed: {:?}", e)))?;
 
         let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub_bytes);
         result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
-        result
+        Ok(result)
     }
 
     /// Decrypt using a static secret + ephemeral public key from ciphertext.
     /// Expects `[32-byte ephemeral PK][12-byte nonce][ciphertext + GCM tag]`.
-    fn dh_decrypt(static_secret: &StaticSecret, data: &[u8]) -> Vec<u8> {
+    /// Returns `PneumaticError::CryptoError` on any crypto failure or invalid input.
+    fn dh_decrypt(static_secret: &StaticSecret, data: &[u8]) -> Result<Vec<u8>, PneumaticError> {
         if data.len() < 44 {
-            panic!("Decrypt input too short to contain ephemeral PK and nonce");
+            return Err(PneumaticError::CryptoError(
+                "Decrypt input too short to contain ephemeral PK and nonce".to_string()
+            ));
         }
         let ephemeral_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| {
-            panic!("Decrypt input too short to contain X25519 public key");
-        })
-        .expect("Invalid ephemeral public key");
+            PneumaticError::CryptoError("Decrypt input too short to contain X25519 public key".to_string())
+        })?;
         let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
 
         let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
         let aes_key = Self::derive_aes_key(shared_secret.as_bytes());
         let cipher = Aes256Gcm::new(&aes_key.into());
         let nonce_bytes: [u8; 12] = data[32..44].try_into()
-            .expect("ciphertext too short to contain nonce");
+            .map_err(|_| PneumaticError::CryptoError("ciphertext too short to contain nonce".to_string()))?;
         let nonce = Nonce::try_from(nonce_bytes.as_slice())
-            .expect("nonce must be 12 bytes");
+            .map_err(|_| PneumaticError::CryptoError("nonce must be 12 bytes".to_string()))?;
 
         let plaintext = cipher
             .decrypt(&nonce, &data[44..])
-            .expect("AES-GCM decryption failed (wrong key or tampered)");
-        plaintext.to_vec()
+            .map_err(|e| PneumaticError::CryptoError(
+                format!("AES-GCM decryption failed (wrong key or tampered): {:?}", e)
+            ))?;
+        Ok(plaintext.to_vec())
     }
 }
 
@@ -151,17 +163,21 @@ impl Default for Ed25519Provider {
 }
 
 impl AsymCryptoProvider for Ed25519Provider {
-    fn encrypt(&self, data: Vec<u8>) -> Vec<u8> {
-        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+    fn encrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError> {
+        let static_secret = self.x25519_static_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
         Self::dh_encrypt(&static_secret, &data)
     }
 
-    fn decrypt(&self, data: Vec<u8>) -> Vec<u8> {
-        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+    fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError> {
+        let static_secret = self.x25519_static_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
         Self::dh_decrypt(&static_secret, &data)
     }
 
-    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Vec<u8> {
+    fn encrypt_to(&self, recipient_public_key: &[u8; 32], data: Vec<u8>) -> Result<Vec<u8>, PneumaticError> {
         let recipient_key = PublicKey::from(*recipient_public_key);
 
         // Generate fresh ephemeral keypair for this encryption.
@@ -176,49 +192,55 @@ impl AsymCryptoProvider for Ed25519Provider {
         let cipher = Aes256Gcm::new(&aes_key.into());
         let nonce_bytes = Self::generate_nonce();
         let nonce = Nonce::try_from(nonce_bytes.as_slice())
-            .expect("nonce must be 12 bytes");
+            .map_err(|_| PneumaticError::CryptoError("nonce must be 12 bytes".to_string()))?;
 
         let ciphertext = cipher
             .encrypt(&nonce, data.as_ref())
-            .expect("AES-GCM encryption failed");
+            .map_err(|e| PneumaticError::CryptoError(format!("AES-GCM encryption failed: {:?}", e)))?;
 
         let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub_bytes);
         result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
-        result
+        Ok(result)
     }
 
-    fn decrypt_from(&self, data: Vec<u8>) -> Vec<u8> {
-        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
+    fn decrypt_from(&self, data: Vec<u8>) -> Result<Vec<u8>, PneumaticError> {
+        let static_secret = self.x25519_static_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
         Self::dh_decrypt(&static_secret, &data)
     }
 
-    fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> bool {
+    fn check_signature(&self, signature: &[u8], public_key: &[u8], data: &[u8]) -> Result<bool, PneumaticError> {
         let sig = match ed25519_dalek::Signature::from_slice(signature) {
             Ok(s) => s,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         let pk_bytes: [u8; 32] = match public_key.try_into() {
             Ok(b) => b,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
         let pk = match VerifyingKey::from_bytes(&pk_bytes) {
             Ok(pk) => pk,
-            Err(_) => return false,
+            Err(_) => return Ok(false),
         };
-        pk.verify(data, &sig).is_ok()
+        Ok(pk.verify(data, &sig).is_ok())
     }
 
-    fn sign_data(&self, data: &[u8]) -> Vec<u8> {
-        let signing_key = self.signing_key.read().expect("RwLock poisoned");
+    fn sign_data(&self, data: &[u8]) -> Result<Vec<u8>, PneumaticError> {
+        let signing_key = self.signing_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
         let sig = signing_key.sign(data);
-        sig.to_vec()
+        Ok(sig.to_vec())
     }
 
-    fn public_key(&self) -> Vec<u8> {
-        let pk = *self.verifying_key.read().expect("RwLock poisoned");
-        pk.to_bytes().to_vec()
+    fn public_key(&self) -> Result<Vec<u8>, PneumaticError> {
+        let pk = *self.verifying_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
+        Ok(pk.to_bytes().to_vec())
     }
 }
 
@@ -226,9 +248,11 @@ impl Ed25519Provider {
     /// Return the 32-byte X25519 public key (for use with encrypt_to).
     /// This is different from `public_key()` which returns the Ed25519
     /// verifying key (for signature verification).
-    pub fn x25519_public_key(&self) -> [u8; 32] {
-        let static_secret = self.x25519_static_key.read().expect("RwLock poisoned");
-        PublicKey::from(&*static_secret).to_bytes()
+    pub fn x25519_public_key(&self) -> Result<[u8; 32], PneumaticError> {
+        let static_secret = self.x25519_static_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
+        Ok(PublicKey::from(&*static_secret).to_bytes())
     }
 }
 
@@ -274,30 +298,30 @@ mod tests {
     fn test_sign_and_verify() {
         let provider = Ed25519Provider::generate();
         let data = b"test message";
-        let signature = provider.sign_data(data);
-        assert!(provider.check_signature(&signature, &provider.public_key(), data));
+        let signature = provider.sign_data(data).unwrap();
+        assert!(provider.check_signature(&signature, &provider.public_key().unwrap(), data).unwrap());
     }
 
     #[test]
     fn test_signature_rejected_for_tampered_data() {
         let provider = Ed25519Provider::generate();
-        let sig = provider.sign_data(b"test message");
-        assert!(!provider.check_signature(&sig, &provider.public_key(), b"tampered message"));
+        let sig = provider.sign_data(b"test message").unwrap();
+        assert!(!provider.check_signature(&sig, &provider.public_key().unwrap(), b"tampered message").unwrap());
     }
 
     #[test]
     fn test_signature_with_wrong_public_key() {
         let provider = Ed25519Provider::generate();
-        let sig = provider.sign_data(b"test message");
+        let sig = provider.sign_data(b"test message").unwrap();
         let other = Ed25519Provider::generate();
-        assert!(!provider.check_signature(&sig, &other.public_key(), b"test message"));
+        assert!(!provider.check_signature(&sig, &other.public_key().unwrap(), b"test message").unwrap());
     }
 
     #[test]
     fn test_public_key_consistent() {
         let provider = Ed25519Provider::generate();
-        let pk1 = provider.public_key();
-        let pk2 = provider.public_key();
+        let pk1 = provider.public_key().unwrap();
+        let pk2 = provider.public_key().unwrap();
         assert_eq!(pk1, pk2);
         assert_eq!(pk1.len(), 32);
     }
@@ -326,8 +350,8 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip() {
         let provider = Ed25519Provider::generate();
         let data = vec![1u8, 2, 3, 4];
-        let encrypted = provider.encrypt(data.clone());
-        let decrypted = provider.decrypt(encrypted);
+        let encrypted = provider.encrypt(data.clone()).unwrap();
+        let decrypted = provider.decrypt(encrypted).unwrap();
         assert_eq!(data, decrypted);
     }
 
@@ -335,9 +359,9 @@ mod tests {
     fn test_encrypt_decrypt_empty_data() {
         let provider = Ed25519Provider::generate();
         let data = vec![];
-        let encrypted = provider.encrypt(data);
+        let encrypted = provider.encrypt(data).unwrap();
         assert_eq!(encrypted.len(), 60); // 32-byte PK + 12-byte nonce + 16-byte GCM tag only
-        let decrypted = provider.decrypt(encrypted);
+        let decrypted = provider.decrypt(encrypted).unwrap();
         assert_eq!(decrypted, Vec::<u8>::new());
     }
 
@@ -348,76 +372,74 @@ mod tests {
     fn test_encrypt_to_decrypt_from_roundtrip() {
         let sender = Ed25519Provider::generate();
         let recipient = Ed25519Provider::generate();
-        let recipient_pk = recipient.x25519_public_key();
+        let recipient_pk = recipient.x25519_public_key().unwrap();
         let data = b"cross-recipient message";
 
-        let encrypted = sender.encrypt_to(&recipient_pk, data.to_vec());
-        let decrypted = recipient.decrypt_from(encrypted);
+        let encrypted = sender.encrypt_to(&recipient_pk, data.to_vec()).unwrap();
+        let decrypted = recipient.decrypt_from(encrypted).unwrap();
         assert_eq!(data.to_vec(), decrypted);
     }
 
     #[test]
-    fn test_encrypt_to_wrong_recipient_panics() {
+    fn test_decrypt_from_wrong_recipient_returns_error() {
         let sender = Ed25519Provider::generate();
         let recipient = Ed25519Provider::generate();
         let wrong_receiver = Ed25519Provider::generate();
-        let recipient_pk = recipient.x25519_public_key();
+        let recipient_pk = recipient.x25519_public_key().unwrap();
 
-        let encrypted = sender.encrypt_to(&recipient_pk, b"secret".to_vec());
-        // Decrypting with a different provider's key should panic (AES-GCM tag mismatch).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wrong_receiver.decrypt_from(encrypted);
-        }));
-        assert!(result.is_err(), "decrypt_from should panic with wrong key");
+        let encrypted = sender.encrypt_to(&recipient_pk, b"secret".to_vec()).unwrap();
+        // Decrypting with a different provider's key should return an error (AES-GCM tag mismatch).
+        let result = wrong_receiver.decrypt_from(encrypted);
+        assert!(result.is_err(), "decrypt_from should return error with wrong key");
     }
 
     #[test]
     fn test_encrypt_to_empty_data() {
         let sender = Ed25519Provider::generate();
         let recipient = Ed25519Provider::generate();
-        let recipient_pk = recipient.x25519_public_key();
+        let recipient_pk = recipient.x25519_public_key().unwrap();
 
-        let encrypted = sender.encrypt_to(&recipient_pk, vec![]);
+        let encrypted = sender.encrypt_to(&recipient_pk, vec![]).unwrap();
         assert_eq!(encrypted.len(), 60); // 32-byte PK + 12-byte nonce + 16-byte GCM tag only
-        let decrypted = recipient.decrypt_from(encrypted);
+        let decrypted = recipient.decrypt_from(encrypted).unwrap();
         assert_eq!(decrypted, Vec::<u8>::new());
     }
 
     #[test]
     fn test_encrypt_to_self() {
         let provider = Ed25519Provider::generate();
-        let pk = provider.x25519_public_key();
+        let pk = provider.x25519_public_key().unwrap();
         let data = b"self-encrypted";
 
-        let encrypted = provider.encrypt_to(&pk, data.to_vec());
-        let decrypted = provider.decrypt_from(encrypted);
+        let encrypted = provider.encrypt_to(&pk, data.to_vec()).unwrap();
+        let decrypted = provider.decrypt_from(encrypted).unwrap();
         assert_eq!(data.to_vec(), decrypted);
     }
 
     #[test]
     fn test_invalid_signature_length() {
         let provider = Ed25519Provider::generate();
-        assert!(!provider.check_signature(&vec![0u8; 100], &provider.public_key(), b"test"));
+        assert!(!provider.check_signature(&vec![0u8; 100], &provider.public_key().unwrap(), b"test").unwrap());
     }
 
     #[test]
     fn test_invalid_public_key_length() {
         let provider = Ed25519Provider::generate();
-        let sig = provider.sign_data(b"test");
-        assert!(!provider.check_signature(&sig, &vec![0u8; 100], b"test"));
+        let sig = provider.sign_data(b"test").unwrap();
+        assert!(!provider.check_signature(&sig, &vec![0u8; 100], b"test").unwrap());
     }
 
     #[test]
     fn test_default_generates_key() {
-        assert_eq!(Ed25519Provider::default().public_key().len(), 32);
+        assert_eq!(Ed25519Provider::default().public_key().unwrap().len(), 32);
     }
 
     #[test]
     fn test_different_nonces_per_encryption() {
         let provider = Ed25519Provider::generate();
         let data = b"repeated plaintext";
-        let encrypted1 = provider.encrypt(data.to_vec());
-        let encrypted2 = provider.encrypt(data.to_vec());
+        let encrypted1 = provider.encrypt(data.to_vec()).unwrap();
+        let encrypted2 = provider.encrypt(data.to_vec()).unwrap();
         // Ciphertexts must differ (new ephemeral key + new nonce each time)
         assert_ne!(encrypted1, encrypted2);
     }
@@ -427,11 +449,18 @@ mod tests {
         let sender1 = Ed25519Provider::generate();
         let sender2 = Ed25519Provider::generate();
         let recipient = Ed25519Provider::generate();
-        let recipient_pk = recipient.x25519_public_key();
+        let recipient_pk = recipient.x25519_public_key().unwrap();
         let data = b"same plaintext";
-        let encrypted1 = sender1.encrypt_to(&recipient_pk, data.to_vec());
-        let encrypted2 = sender2.encrypt_to(&recipient_pk, data.to_vec());
+        let encrypted1 = sender1.encrypt_to(&recipient_pk, data.to_vec()).unwrap();
+        let encrypted2 = sender2.encrypt_to(&recipient_pk, data.to_vec()).unwrap();
         // Different ephemeral keys → different ciphertexts
         assert_ne!(encrypted1, encrypted2);
+    }
+
+    #[test]
+    fn test_decrypt_short_input_returns_error() {
+        let provider = Ed25519Provider::generate();
+        let result = provider.decrypt_from(vec![0u8; 10]);
+        assert!(result.is_err(), "decrypt_from should return error for too-short input");
     }
 }

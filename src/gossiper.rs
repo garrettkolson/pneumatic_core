@@ -92,11 +92,15 @@ impl Gossiper {
         self.cache.insert(signature_key, ());
 
         // Validate sender's cryptographic signature over the message body.
-        if !self
+        // RwLock poison and crypto errors are propagated as DataError instead of
+        // panicking, so a malformed/tampered message cannot crash a handling thread.
+        let crypto = self
             .crypto_provider
             .read()
-            .expect("RwLock poisoned")
+            .map_err(|e| DataError::CryptoError(format!("RwLock poisoned: {:?}", e)))?;
+        if !crypto
             .check_signature(&message.signature, &message.public_key, &message.body)
+            .map_err(|e| DataError::CryptoError(e.to_string()))?
         {
             return Err(DataError::InvalidSignature);
         }
@@ -161,8 +165,8 @@ mod tests {
         action: &str,
         body: Vec<u8>,
     ) -> Message {
-        let pk = provider.public_key();
-        let sig = provider.sign_data(&body);
+        let pk = provider.public_key().unwrap();
+        let sig = provider.sign_data(&body).unwrap();
         Message {
             chain_id: chain_id.to_string(),
             action: action.to_string(),

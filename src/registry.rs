@@ -54,12 +54,15 @@ impl PendingTransactionRegistry {
 
     /// Add a new pending transaction to the registry.
     pub fn add_transaction(&self, id: String, transaction: PendingTransaction) -> Result<(), PneumaticError> {
-        if self.transactions.contains_key(&id) {
+        // `insert` is atomic: it returns the old value if the key was present.
+        // Using the return value instead of a prior `contains_key` check
+        // avoids a TOCTOU race under concurrent inserts of the same id.
+        let id_clone = id.clone();
+        if self.transactions.insert(id, transaction).is_some() {
             return Err(PneumaticError::Registry(format!(
-                "Transaction {} already exists in registry", id
+                "Transaction {} already exists in registry", id_clone
             )));
         }
-        self.transactions.insert(id, transaction);
         Ok(())
     }
 

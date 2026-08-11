@@ -825,6 +825,34 @@ pub enum BlockValidationError {
     InvalidFinalizerSignature,
 }
 
+impl std::fmt::Display for BlockValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockValidationError::TokenNotFound => write!(f, "TokenNotFound"),
+            BlockValidationError::ImproperBlockFormatting => write!(f, "ImproperBlockFormatting"),
+            BlockValidationError::IncorrectExecutorTransactionHash => write!(f, "IncorrectExecutorTransactionHash"),
+            BlockValidationError::IncorrectExecutorTransactionSignature => write!(f, "IncorrectExecutorTransactionSignature"),
+            BlockValidationError::FinalizedTransactionDataWasModified => write!(f, "FinalizedTransactionDataWasModified"),
+            BlockValidationError::InvalidFinalizerSignature => write!(f, "InvalidFinalizerSignature"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block validation error tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod block_validation_error_tests {
+    use super::*;
+
+    #[test]
+    fn block_validation_error_display() {
+        let err = BlockValidationError::TokenNotFound;
+        assert_eq!(err.to_string(), "TokenNotFound");
+    }
+}
+
 #[derive(Debug)]
 pub enum BlockCommitError {
     TokenWriteLockPoisoned,

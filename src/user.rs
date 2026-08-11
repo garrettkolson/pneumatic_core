@@ -14,6 +14,17 @@ pub struct User {
     pub nonce: usize,
 }
 
+impl Default for User {
+    fn default() -> Self {
+        User {
+            public_key: Vec::new(),
+            fuel_balance: 0,
+            stake: 0,
+            nonce: 0,
+        }
+    }
+}
+
 impl User {
     pub fn new(public_key: Vec<u8>) -> Self {
         User {

@@ -167,6 +167,15 @@ pub enum DataOp {
     Save(SaveOp)
 }
 
+impl std::fmt::Display for DataOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataOp::Get(op) => write!(f, "Get({})", op),
+            DataOp::Save(op) => write!(f, "Save({})", op),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum GetOp {
     Token,
@@ -174,11 +183,31 @@ pub enum GetOp {
     User,
 }
 
+impl std::fmt::Display for GetOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GetOp::Token => write!(f, "Token"),
+            GetOp::Data => write!(f, "Data"),
+            GetOp::User => write!(f, "User"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SaveOp {
     Token(Token),
     Data(Vec<u8>),
     User(User),
+}
+
+impl std::fmt::Display for SaveOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveOp::Token(_) => write!(f, "Token"),
+            SaveOp::Data(_) => write!(f, "Data"),
+            SaveOp::User(_) => write!(f, "User"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -209,6 +238,56 @@ pub enum DataError {
     Poisoned,
     InvalidOperation(DataOp),
     InvalidSignature,
+    /// Cryptographic error encountered during message processing
+    CryptoError(String),
+}
+
+impl std::fmt::Display for DataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataError::FromStore(msg) => write!(f, "FromStore({})", msg),
+            DataError::SerializationError(e) => write!(f, "SerializationError({})", e),
+            DataError::DeserializationError(e) => write!(f, "DeserializationError({})", e),
+            DataError::DataNotFound => write!(f, "DataNotFound"),
+            DataError::StoreNotFound => write!(f, "StoreNotFound"),
+            DataError::CacheError => write!(f, "CacheError"),
+            DataError::Poisoned => write!(f, "Poisoned"),
+            DataError::InvalidOperation(op) => write!(f, "InvalidOperation({})", op),
+            DataError::InvalidSignature => write!(f, "InvalidSignature"),
+            DataError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_error_crypto_error_display() {
+        let err = DataError::CryptoError("RwLock poisoned: ...".to_string());
+        assert!(err.to_string().contains("CryptoError"));
+    }
+
+    #[test]
+    fn data_op_display() {
+        assert_eq!(DataOp::Get(GetOp::Token).to_string(), "Get(Token)");
+        assert_eq!(DataOp::Save(SaveOp::Token(Token::default())).to_string(), "Save(Token)");
+    }
+
+    #[test]
+    fn get_op_display() {
+        assert_eq!(GetOp::Token.to_string(), "Token");
+        assert_eq!(GetOp::Data.to_string(), "Data");
+        assert_eq!(GetOp::User.to_string(), "User");
+    }
+
+    #[test]
+    fn save_op_display() {
+        assert_eq!(SaveOp::Token(Token::default()).to_string(), "Token");
+        assert_eq!(SaveOp::Data(vec![]).to_string(), "Data");
+        assert_eq!(SaveOp::User(User::default()).to_string(), "User");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -147,7 +147,9 @@ pub enum ConnError {
     CouldNotEstablishStream,
     WriteError(Option<String>),
     ReadError(Option<String>),
-    ConnectionRejectedByRemote
+    ConnectionRejectedByRemote,
+    /// Cryptographic decryption failure on a network-reachable path
+    DecryptError(String),
 }
 
 impl Debug for ConnError {
@@ -161,6 +163,7 @@ impl Debug for ConnError {
             ConnError::ConnectionRejectedByRemote => {
                 f.write_str("ConnectionRejectedByRemote")
             }
+            ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
         }
     }
 }
@@ -176,6 +179,7 @@ impl Display for ConnError {
             ConnError::ConnectionRejectedByRemote => {
                 f.write_str("ConnectionRejectedByRemote")
             }
+            ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
         }
     }
 }
