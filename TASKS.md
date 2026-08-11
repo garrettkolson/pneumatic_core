@@ -114,7 +114,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [ ] P2_05 Implement `handle_confirmation` (state-check, process) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:184-199
 - [ ] P2_06 Implement `process_transaction` — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:201-215
 - [ ] P2_07 Implement `handle_rejection` (reassign finalizer) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:217-229
-- [ ] P2_08 Implement `handle_register_request` / `handle_clear_request` — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:124-129, 231-235
+- [x] P2_08 Implement `handle_register_request` / `handle_clear_request` — `sentinel/src/sentinel.rs` — P2_08 DONE: handle_register_request fully implemented (deserializes NodeRegistryRequest, validates stake, registers node in DashMap); handle_clear_request was already implemented — refs: C# Sentinel.cs:124-129, 231-235
 - [ ] P2_09 Risk-based routing (higher risk → more finalizers) — `sentinel/src/sentinel.rs`
 
 ### 2.2 TransactionValidator
@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (277 passing across 5 crates — 214 core + 22 finalizer + 9 executor + 22 sentinel + 10 committer)
+## Phase 7: Tests (280 passing across 5 crates — 214 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 277 tests across 5 crate targets (214 core + 22 sentinel + 22 finalizer + 9 executor + 10 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 280 tests across 5 crate targets (214 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -352,9 +352,9 @@ Added `NoOpConnection` placeholder impl for registrations without live connectio
 **File:** `sentinel/src/sentinel.rs:232-316`
 **Completed:** Deserializes tx_id, acquires lock, verifies rejecting `public_key` matches assigned finalizer, collects candidate finalizers excluding the rejected one (iterates DashMap), reassigns via `std::mem::replace` + `transition_to_finalizing`, sends `request_single_finalizer` to the new finalizer via targeted send, notifies sentinels via `notify_delete`, releases lock. Added `NoTarget(NodeRegistryType)` variant to `SentinelError`. Added `TransactionNotifier.request_single_finalizer` for targeted finalizer delivery. Added 3 tests: no alternative finalizer → error, unassigned finalizer → error, terminal state → error.
 
-#### Sentinel.handle_register_request — stub
-**File:** `sentinel/src/sentinel.rs:187-189`
-**Action:** Deserialize `NodeRegistryRequest`, validate stake, register node.
+#### Sentinel.handle_register_request — DONE
+**File:** `sentinel/src/sentinel.rs:318-357`
+**Completed:** Deserializes `NodeRegistryRequest` from message body, rejects if already registered, validates stake via `DataProvider.get_user()` against minimum for requested type, adds node to each requested type's DashMap with `NoOpConnection` placeholder. Added `data_provider: Arc<dyn DataProvider>` field to `Sentinel`, updated `new()` constructor. Added `NodeRegistry.get_config()` accessor. Added 3 tests: sufficient stake → success + verified in registry, already registered → error, insufficient stake → error.
 
 #### TransactionValidator.validate_transaction — spec now invoked — done
 **File:** `sentinel/src/transaction_validator.rs:33-70`
@@ -410,9 +410,9 @@ Stubbed within implemented methods:
 **Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing
 **Covered:** Signature add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior.
 
-#### Tests added to pneumatic_sentinel — 22 tests
+#### Tests added to pneumatic_sentinel — 25 tests
 **Files:** `sentinel/src/sentinel.rs`
-**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default), TransactionNotifier send methods (4: executors, finalizer, notify_clear, notify_delete — all verify no-panic with no runtime), handle_confirmation (3: valid finalizer → Committed, unassigned finalizer → error, non-Finalizing state → error), handle_rejection (3: no alternative finalizer → error, unassigned finalizer → error, terminal state → error).
+**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default), TransactionNotifier send methods (4: executors, finalizer, notify_clear, notify_delete — all verify no-panic with no runtime), handle_confirmation (3: valid finalizer → Committed, unassigned finalizer → error, non-Finalizing state → error), handle_rejection (3: no alternative finalizer → error, unassigned finalizer → error, terminal state → error), handle_register_request (3: sufficient stake → success with registry verification, already registered → error, insufficient stake → error).
 
 #### Tests added to pneumatic_executor — 9 tests
 **Files:** `executor/src/executor.rs`

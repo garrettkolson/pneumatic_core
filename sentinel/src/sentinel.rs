@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use pneumatic_core::config::Config;
 use pneumatic_core::conns::ConnError;
-use pneumatic_core::data::{DataError, DefaultDataProvider};
+use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
-use pneumatic_core::node::{NodeRegistryType, registry::NodeRegistry};
+use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, registry::NodeRegistry};
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::transactions::{Transaction, TransactionState};
 
@@ -29,6 +29,7 @@ pub struct Sentinel {
     gossiper: Arc<Gossiper>,
     transaction_notifier: Arc<super::transaction_notifier::TransactionNotifier>,
     transaction_validator: Arc<super::transaction_validator::TransactionValidator>,
+    data_provider: Arc<dyn DataProvider>,
     /// The environment this sentinel operates on.
     env_data: Arc<EnvironmentMetadata>,
 }
@@ -45,12 +46,12 @@ impl Sentinel {
         node_registry: Arc<NodeRegistry>,
         registry: Arc<PendingTransactionRegistry>,
         gossiper: Arc<Gossiper>,
+        data_provider: Arc<dyn DataProvider>,
     ) -> Self {
         let transaction_notifier = Arc::new(
             super::transaction_notifier::TransactionNotifier::new(config, Arc::clone(&node_registry))
         );
-        let data_provider = Arc::new(DefaultDataProvider::new());
-        let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), data_provider);
+        let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), Arc::clone(&data_provider));
 
         Sentinel {
             node_registry,
@@ -58,6 +59,7 @@ impl Sentinel {
             gossiper,
             transaction_notifier,
             transaction_validator: Arc::new(validator),
+            data_provider,
             env_data,
         }
     }
@@ -314,8 +316,45 @@ impl Sentinel {
     }
 
     /// Handle a "Register" request — a node registering with this sentinel.
-    fn handle_register_request(&self, _message: Message) -> Result<(), SentinelError> {
+    fn handle_register_request(&self, message: Message) -> Result<(), SentinelError> {
+        let request: NodeRegistryRequest = deserialize_rmp_to(&message.body)
+            .map_err(|e| SentinelError::Encoding(e))?;
+
+        // Reject if already registered for the requested type.
+        if self.node_registry.node_is_already_registered(&request.requester_key, &request.requested_type) {
+            return Err(SentinelError::Registry(format!(
+                "Node {:?} already registered as {:?}",
+                request.requester_key, request.requested_type
+            )));
+        }
+
+        // Validate stake for the requested type.
+        if !self.check_stake_for_type(&request.requester_key, &request.requested_type)? {
+            return Err(SentinelError::Registry(format!(
+                "Insufficient stake for node {:?} registering as {:?}",
+                request.requester_key, request.requested_type
+            )));
+        }
+
+        // Add node to each requested type's registry.
+        for node_type in &request.requester_types {
+            if let Some(nodes) = self.node_registry.get_nodes(node_type) {
+                let node_entry = pneumatic_core::node::NodeRegistryNode {
+                    ip: request.requester_ip,
+                    conn: Box::new(NoOpConnection),
+                };
+                nodes.insert(request.requester_key.clone(), node_entry);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Check if the user with the given key has sufficient stake for the requested node type.
+    fn check_stake_for_type(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> Result<bool, SentinelError> {
+        let user = self.data_provider.get_user(key, &self.env_data.environment_id)?;
+        let min_stake = self.node_registry.get_config().get_min_type_stake(node_type);
+        Ok(user.stake >= min_stake)
     }
 
     /// Handle a "Clear"/"Delete" request — remove a transaction from the registry.
@@ -404,6 +443,15 @@ impl From<super::transaction_notifier::NotifyError> for SentinelError {
     }
 }
 
+// Placeholder connection for nodes registered without a live TCP/UDS connection.
+#[async_trait::async_trait]
+impl pneumatic_core::conns::Connection for NoOpConnection {
+    async fn send(&self, _data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+        Ok(())
+    }
+}
+struct NoOpConnection;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -414,10 +462,11 @@ mod tests {
 
     use dashmap::DashMap;
     use pneumatic_core::config::Config;
-    use pneumatic_core::node::{NodeRegistryType, NodeType, NodeTypeConfig};
+    use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, NodeType, NodeTypeConfig};
+    use pneumatic_core::user::User;
     use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::conns::ConnError;
-    use pneumatic_core::data::{DataError, DefaultDataProvider};
+    use pneumatic_core::data::{DataError, DefaultDataProvider, StubDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::gossiper::Gossiper;
@@ -471,6 +520,12 @@ mod tests {
     }
 
     fn make_sentinel_fixture() -> (Sentinel, Arc<PendingTransactionRegistry>) {
+        make_sentinel_fixture_with_data_provider(StubDataProvider::new())
+    }
+
+    fn make_sentinel_fixture_with_data_provider(
+        data_provider: StubDataProvider,
+    ) -> (Sentinel, Arc<PendingTransactionRegistry>) {
         let registry = Arc::new(PendingTransactionRegistry::new());
         let node_registry = make_test_node_registry();
         let env_data = Arc::new(make_test_env_data());
@@ -486,6 +541,7 @@ mod tests {
             node_registry,
             registry.clone(),
             gossiper,
+            Arc::new(data_provider),
         );
         (sentinel, registry)
     }
@@ -984,6 +1040,113 @@ mod tests {
         match result.unwrap_err() {
             SentinelError::TransactionInTerminalState(id) => assert_eq!(id, "tx_terminal"),
             _ => panic!("expected TransactionInTerminalState error"),
+        }
+    }
+
+    // --- handle_register_request tests ---
+
+    #[test]
+    fn handle_register_request_with_sufficient_stake_succeeds() {
+        let mut data_provider = StubDataProvider::new();
+        data_provider = data_provider.with_user(
+            b"register_node".to_vec(),
+            "test".to_string(),
+            User { public_key: b"register_node".to_vec(), fuel_balance: 1000, stake: 100, nonce: 0 },
+        );
+        let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        let req = NodeRegistryRequest::new(
+            b"register_node".to_vec(),
+            "127.0.0.1".parse().unwrap(),
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Register".into(),
+            body: serialize_to_bytes_rmp(&req).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_ok());
+
+        // Verify the node was added to the sentinel registry.
+        let nodes = sentinel.node_registry.get_nodes(&NodeRegistryType::Sentinel).unwrap();
+        assert!(nodes.contains_key(&b"register_node".to_vec()));
+    }
+
+    #[test]
+    fn handle_register_request_already_registered_returns_error() {
+        let mut data_provider = StubDataProvider::new();
+        data_provider = data_provider.with_user(
+            b"already_registered".to_vec(),
+            "test".to_string(),
+            User { public_key: b"register_node".to_vec(), fuel_balance: 1000, stake: 100, nonce: 0 },
+        );
+        let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        // Pre-register the node.
+        let nodes = sentinel.node_registry.get_nodes(&NodeRegistryType::Sentinel).unwrap();
+        nodes.insert(b"already_registered".to_vec(),
+            pneumatic_core::node::NodeRegistryNode {
+                ip: "127.0.0.1".parse().unwrap(),
+                conn: Box::new(NoOpConnection),
+            });
+
+        let req = NodeRegistryRequest::new(
+            b"already_registered".to_vec(),
+            "127.0.0.1".parse().unwrap(),
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Register".into(),
+            body: serialize_to_bytes_rmp(&req).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("already registered")),
+            _ => panic!("expected Registry error"),
+        }
+    }
+
+    #[test]
+    fn handle_register_request_insufficient_stake_returns_error() {
+        let mut data_provider = StubDataProvider::new();
+        // Stake of 1 < default min_stake of 10
+        data_provider = data_provider.with_user(
+            b"poor_node".to_vec(),
+            "test".to_string(),
+            User { public_key: b"poor_node".to_vec(), fuel_balance: 0, stake: 1, nonce: 0 },
+        );
+        let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        let req = NodeRegistryRequest::new(
+            b"poor_node".to_vec(),
+            "127.0.0.1".parse().unwrap(),
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Register".into(),
+            body: serialize_to_bytes_rmp(&req).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("Insufficient stake")),
+            _ => panic!("expected Registry error"),
         }
     }
 }

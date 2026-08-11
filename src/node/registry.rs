@@ -41,6 +41,10 @@ impl NodeRegistry {
         }
     }
 
+    pub fn get_config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     pub fn get_nodes(&self, node_type: &NodeRegistryType) -> Option<Nodes> {
         match node_type {
             NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
