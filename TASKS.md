@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (288 passing across 5 crates — 222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+## Phase 7: Tests (289 passing across 5 crates — 223 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 288 tests across 5 crate targets (222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 289 tests across 5 crate targets (223 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -295,20 +295,32 @@ fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
 
 ### SA_03 Hardcoded nonce check always validates against 0 — `src/action_router.rs`
 
-**Severity:** Critical. `check_nonce(&sender, 0)` only ever succeeds for the sender's first transaction. Every subsequent transaction is rejected — both correctness and replay protection are defeated.
+**Severity:** Critical. ~~`check_nonce(&sender, 0)` only ever succeeds for the sender's first transaction.~~ **FIXED (2026-08-11)**
 
-**Fix:** Extract the nonce from the transaction body (it presumably lives in `Transaction.sequence_number` or similar), pass it to `check_nonce`:
+**Bug:** `check_nonce(&sender, 0)` always passed hardcoded `0`. The `message.body` contained a MsgPack-serialized `Transaction` with `sequence_number` (nonce) and `amount` fields — both were ignored. "Process" and "Preload" handlers also hardcoded `amount=0` for gas calculation.
+
+**Fix applied:**
 ```rust
+// src/action_router.rs — Process handler
+use crate::transactions::Transaction;
+use crate::encoding::deserialize_rmp_to;
+
 "Process" => {
-    let tx: Transaction = deserialize_rmp_to(&message.body)?;
-    let nonce_result = self.check_nonce(&sender, &tx.sequence_number).await?;
+    let tx: Transaction = deserialize_rmp_to(&message.body)
+        .map_err(PneumaticError::from)?;
+    let nonce_result = self.check_nonce(&sender, tx.sequence_number).await?;
+    let gas_result = self.verify_gas(&sender, "Process", tx.amount.unwrap_or(0)).await?;
     // ...
 }
+
+// Preload handler: same pattern, extracts amount for verify_gas
 ```
 
-Or if the wire protocol should carry a top-level nonce, add it to the `Message` struct and read from `message.nonce`.
+**Design note:** Nonce comes from `message.body` (cryptographically bound by sender's signature), NOT top-level `Message` struct (signature only covers body, not metadata fields).
 
-**Estimate:** 2h
+**Tests added:** `route_process_invalid_body_returns_encoding_error` — corrupt body → Encoding error. `route_process_nonce_mismatch_from_body_returns_invalid_nonce` — body seq=5, user nonce=3 → InvalidNonce. 2 existing tests renamed, 4 existing tests updated with serialized body helpers.
+
+**Estimate:** 2h — **ACTUAL: ~1h**
 
 ### SA_04 Raw X25519 DH output as AES key + always-zero nonce — `src/crypto.rs`
 
@@ -443,11 +455,11 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 288 tests across workspace (222 core + 22 finalizer + 9 executor + 25 sentinel + 10 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 289 tests across workspace (223 core + 22 finalizer + 9 executor + 25 sentinel + 10 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
-**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 288 tests passing.
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 289 tests passing.
 
 #### TokenFactory — minting fee deduction — DONE
 **File:** `src/tokens.rs:290-347`
@@ -460,7 +472,7 @@ All action branches dispatch and all coordination helpers use protocol-level use
 
 #### Gas deduction after executor completes — DONE
 **File:** `src/registry.rs` (gas_tracker), `sentinel/src/transaction_validator.rs` (compute_gas_used), `sentinel/src/sentinel.rs` (record_gas_used), `committer/src/committer.rs` (gas deduction in check_and_commit_transaction_results)
-**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 288 tests passing across workspace.
+**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 289 tests passing across workspace.
 
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
@@ -496,7 +508,7 @@ Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts 
 #### LeaderSelector — stake-weighted deterministic selection ✓ (DONE — SA_02, 2026-08-11)
 **File:** `src/epoch.rs:154-186`, `committer/src/epoch_manager.rs:220-263`
 Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach. Deterministic seed: `SHA-256(epoch_number.to_be_bytes())` via `ring`, produces `StdRng` — every honest node with same `StakeSet` + `epoch_number` picks same leader. Replaced `HashMap::iter()` with sorted key walk. Trait: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
-**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer = 288 total.
+**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 223 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer = 288 total.
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`

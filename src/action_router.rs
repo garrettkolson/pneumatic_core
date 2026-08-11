@@ -9,6 +9,8 @@ use crate::errors::{PneumaticError, ValidationFailureReason};
 use crate::messages::Message;
 use crate::node::NodeRegistryType;
 use crate::registry::PendingTransactionRegistry;
+use crate::transactions::Transaction;
+use crate::encoding::deserialize_rmp_to;
 
 // ---------------------------------------------------------------------------
 // IActionRouter — routes messages to appropriate handlers
@@ -205,10 +207,13 @@ impl IActionRouter for ActionRouter {
     async fn route(&self, message: Message) -> Result<ActionRouterResult, PneumaticError> {
         match message.action.as_str() {
             "Process" => {
-                // Utility token coordination: check nonce + gas for the sender
+                // Utility token coordination: extract nonce + amount from transaction body,
+                // then check nonce and gas for the sender
                 let sender = message.public_key.clone();
-                let nonce_result = self.check_nonce(&sender, 0).await?;
-                let gas_result = self.verify_gas(&sender, "Process", 0).await?;
+                let tx: Transaction = deserialize_rmp_to(&message.body)
+                    .map_err(PneumaticError::from)?;
+                let nonce_result = self.check_nonce(&sender, tx.sequence_number).await?;
+                let gas_result = self.verify_gas(&sender, "Process", tx.amount.unwrap_or(0)).await?;
                 let _ = gas_result; // GasVerified result available to caller
                 match nonce_result {
                     ActionRouterResult::NonceUpdated { sender, new_nonce } => {
@@ -218,9 +223,11 @@ impl IActionRouter for ActionRouter {
                 }
             }
             "Preload" => {
-                // Preload: verify gas balance, check stake, forward to executor
+                // Preload: verify gas balance with actual amount, check stake, forward to executor
                 let sender = message.public_key.clone();
-                self.verify_gas(&sender, "Preload", 0).await?;
+                let tx: Transaction = deserialize_rmp_to(&message.body)
+                    .map_err(PneumaticError::from)?;
+                self.verify_gas(&sender, "Preload", tx.amount.unwrap_or(0)).await?;
                 let stake = self.check_stake(&sender, NodeRegistryType::Executor).await?;
                 Ok(stake)
             }
@@ -362,12 +369,42 @@ mod tests {
         }
     }
 
+    fn make_message_with_body(action: &str, public_key: Vec<u8>, body: Vec<u8>) -> Message {
+        Message {
+            chain_id: "test".into(),
+            action: action.into(),
+            body,
+            signature: vec![],
+            public_key,
+        }
+    }
+
+    fn make_process_message(public_key: Vec<u8>, nonce: usize, amount: u64) -> Message {
+        let tx = Transaction {
+            id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
+            sequence_number: nonce, sender: public_key.clone(), receiver: vec![],
+            amount: Some(amount), timestamp: 0, result_hash: vec![],
+        };
+        let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
+        make_message_with_body("Process", public_key, body)
+    }
+
+    fn make_preload_message(public_key: Vec<u8>, amount: u64) -> Message {
+        let tx = Transaction {
+            id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
+            sequence_number: 0, sender: public_key.clone(), receiver: vec![],
+            amount: Some(amount), timestamp: 0, result_hash: vec![],
+        };
+        let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
+        make_message_with_body("Preload", public_key, body)
+    }
+
     // --- IActionRouter::route tests ---
 
     #[tokio::test]
     async fn route_process_returns_nonce_updated() {
         let router = make_router();
-        let msg = make_message("Process", vec![1, 2, 3]);
+        let msg = make_process_message(vec![1, 2, 3], 0, 0);
         let result = router.route(msg).await.unwrap();
         match result {
             ActionRouterResult::NonceUpdated { sender, new_nonce } => {
@@ -381,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn route_preload_returns_stake_checked_for_executor() {
         let router = make_router();
-        let msg = make_message("Preload", vec![1]);
+        let msg = make_preload_message(vec![1], 0);
         let result = router.route(msg).await.unwrap();
         match result {
             ActionRouterResult::StakeChecked { node_type, stake } => {
@@ -501,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn handle_delegates_to_route() {
         let router = make_router();
-        let msg = make_message("Process", vec![1]);
+        let msg = make_process_message(vec![1], 0, 0);
         // handle() should produce same result as route()
         let handle_result = router.handle(msg.clone()).await.unwrap();
         let route_result = router.route(msg).await.unwrap();
@@ -543,7 +580,7 @@ mod tests {
             Arc::new(stub),
         );
 
-        let msg = make_message("Process", vec![1, 2, 3]);
+        let msg = make_process_message(vec![1, 2, 3], 0, 0);
         let result = router.route(msg).await;
         assert!(result.is_err());
         match result {
@@ -572,7 +609,7 @@ mod tests {
             Arc::new(stub),
         );
 
-        let msg = make_message("Preload", vec![1]);
+        let msg = make_preload_message(vec![1], 0);
         let result = router.route(msg).await;
         assert!(result.is_err());
         match result {
@@ -627,14 +664,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_process_fails_nonce_mismatch() {
+    async fn route_process_nonce_mismatch_from_body_returns_invalid_nonce() {
         let env = make_test_env();
         let config = make_test_config(&env);
         let token_partition = env.token_partition_id.clone();
-        // User has nonce=5 but routing passes expected_nonce=0
+        // User has nonce=3 in data store, body has sequence_number=5 → mismatch
         let stub = StubDataProvider::new()
-            .with_token(vec![1, 2, 3], token_partition.clone(), make_user_token(vec![1, 2, 3], 1000, 5))
-            .with_user(vec![1, 2, 3], token_partition.clone(), User { public_key: vec![1, 2, 3], fuel_balance: 1000, stake: 1000, nonce: 5 });
+            .with_user(vec![1, 2, 3], token_partition.clone(), User { public_key: vec![1, 2, 3], fuel_balance: 1000, stake: 1000, nonce: 3 });
 
         let router = ActionRouter::new_with_config(
             env,
@@ -643,7 +679,7 @@ mod tests {
             Arc::new(stub),
         );
 
-        let msg = make_message("Process", vec![1, 2, 3]);
+        let msg = make_process_message(vec![1, 2, 3], 5, 0); // body says 5, user has 3
         let result = router.route(msg).await;
         assert!(result.is_err());
         match result {
@@ -651,6 +687,25 @@ mod tests {
                 assert!(reasons.iter().any(|r| matches!(r, ValidationFailureReason::InvalidNonce)));
             }
             _ => panic!("expected Validation error, got {:?}", result),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_process_invalid_body_returns_encoding_error() {
+        // Invalid MsgPack body fails deserialization → Encoding error
+        let router = make_router();
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: vec![0xFF, 0xFF, 0xFF], // invalid MsgPack
+            signature: vec![],
+            public_key: vec![1, 2, 3],
+        };
+        let result = router.route(msg).await;
+        assert!(result.is_err());
+        match result {
+            Err(PneumaticError::Encoding(_)) => {}
+            other => panic!("expected Encoding error, got {:?}", other),
         }
     }
 
