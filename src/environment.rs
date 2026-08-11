@@ -35,6 +35,45 @@ impl CostModel {
         map.insert("Sign".to_string(), 1.5);
         map
     }
+
+    /// Fixed-point scale for integer gas computation.
+    ///
+    /// Converting the f64 multiplier to an integer at this scale ensures
+    /// that all per-transaction gas arithmetic is bitwise-identical across
+    /// CPU architectures (no FPU precision differences). 10_000 gives
+    /// four decimal places of precision — sufficient for multipliers such
+    /// as 1.0, 1.5, 2.0 and 2.5.
+    const GAS_SCALE: u64 = 10_000;
+
+    /// Convert an f64 amount multiplier to an integer fixed-point value.
+    ///
+    /// e.g. `1.5 → 15000`, `2.0 → 20000`, `0.5 → 5000`.
+    fn multiplier_to_fixed(multiplier: f64) -> u64 {
+        (multiplier * Self::GAS_SCALE as f64).round() as u64
+    }
+
+    /// Compute the gas attributable to a transaction amount using integer
+    /// fixed-point arithmetic.
+    ///
+    /// `gas_from_amount = (amount × multiplier_fixed) / GAS_SCALE`
+    ///
+    /// Uses `saturating_mul` so that no malformed or extreme amount can
+    /// cause an arithmetic panic.
+    fn gas_from_amount(amount: u64, multiplier: u64) -> u64 {
+        amount.saturating_mul(multiplier) / Self::GAS_SCALE
+    }
+
+    /// Compute total gas for a transaction.
+    ///
+    /// `gas_used = base_cost + gas_from_amount(amount, multiplier)`
+    ///
+    /// All arithmetic is integer-based, guaranteeing bitwise-identical
+    /// results across every CPU architecture.
+    pub fn compute_gas(&self, amount: u64, multiplier: f64) -> u64 {
+        let multiplier_fixed = Self::multiplier_to_fixed(multiplier);
+        let gas_from_amount = Self::gas_from_amount(amount, multiplier_fixed);
+        self.base_cost.saturating_add(gas_from_amount)
+    }
 }
 
 impl Default for CostModel {

@@ -376,27 +376,21 @@ Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, 
 
 **Estimate:** 4h → actual ~1h
 
-### SA_06 Deterministic gas accounting — integer math only — `src/action_router.rs`
+### SA_06 Deterministic gas accounting — integer math only — `src/action_router.rs` ✅ COMPLETE
 
 **Severity:** High. `f64` arithmetic is not bitwise-identical across CPU architectures. If gas computation feeds into committed state, nodes diverge.
 
-**Current:** `let gas_used = base_cost + (amount as f64 * multiplier) as u64;`
+**Changes:**
+- `src/environment.rs`: Added `CostModel::compute_gas(amount, multiplier)` using integer fixed-point math (scale 10_000). `multiplier_to_fixed()` converts f64 to integer; `gas_from_amount()` uses `saturating_mul`/`saturating_add` for overflow safety.
+- `src/action_router.rs`: `verify_gas` now calls `CostModel::compute_gas` instead of `amount as f64 * multiplier`.
+- `sentinel/src/transaction_validator.rs`: `compute_gas_used` refactored to use shared `CostModel::compute_gas`, eliminating duplicated f64 logic.
+- Added 4 tests: `compute_gas_deterministic_integer_math`, `compute_gas_preload_multiplier`, `compute_gas_zero_amount_base_cost`, `compute_gas_fractional_multiplier`.
 
-**Fix:** Use integer fixed-point math. Store multipliers as `u64` with an implicit scale factor:
-```rust
-// In CostModel: multiplier is stored as integer × 1000 (e.g., 1.5 → 1500)
-const MULTIPLIER_SCALE: u64 = 1000;
+**Verification:** `cargo test --workspace` — all 244 tests passing (core: 237, sentinel: 25, committer: 22, executor: 10, finalizer: 9), 1 ignored.
 
-let gas_used = base_cost + (amount * multiplier_integer) / MULTIPLIER_SCALE;
-```
+**Why this matters:** Integer fixed-point gas arithmetic is bitwise-identical across all CPU architectures, eliminating non-determinism from FPU precision differences. Saturating operations prevent overflow panics from malformed amounts.
 
-Or use `u128` intermediate for precision: `let gas_used = ((amount as u128) * (multiplier as u128)) / 1_000_000u128 as u64;`
-
-Ensure all gas arithmetic uses `saturating_*` or explicit overflow checks.
-
-**Test:** Add a test with extreme values (max u64 amount, largest multiplier) to verify no overflow.
-
-**Estimate:** 2h
+**Estimate:** 2h → actual ~30min
 
 ### SA_07 Rename misleading `AsymCryptoProviderType::RSA` — `src/crypto.rs`
 

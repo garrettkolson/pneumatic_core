@@ -151,12 +151,11 @@ impl ActionRouter {
         let token_partition = &self.environment.token_partition_id;
 
         let user = self.data_provider.get_user(&sender.to_vec(), token_partition)?;
-        let base_cost = self.environment.cost_model.base_cost;
         let multiplier = self.environment.cost_model.amount_multiplier
             .get(action)
             .copied()
             .unwrap_or(1.0);
-        let gas_used = base_cost + (amount as f64 * multiplier) as u64;
+        let gas_used = self.environment.cost_model.compute_gas(amount, multiplier);
 
         if gas_used > user.fuel_balance {
             return Err(PneumaticError::Validation(vec![
@@ -851,5 +850,54 @@ mod tests {
         assert_eq!(model.amount_multiplier.get("Process"), Some(&1.0));
         assert_eq!(model.amount_multiplier.get("Preload"), Some(&2.0));
         assert_eq!(model.amount_multiplier.get("Sign"), Some(&1.5));
+    }
+
+    /// Verify CostModel::compute_gas uses deterministic integer math.
+    ///
+    /// The fixed-point computation is bitwise-identical across CPU
+    /// architectures — no FPU precision differences. Integer arithmetic
+    /// also avoids overflow panics via saturating operations.
+    #[test]
+    fn compute_gas_deterministic_integer_math() {
+        let model = CostModel::default();
+        // Amount large enough to exercise the full integer path but
+        // safely below the overflow threshold for multiplier 2.0.
+        let amount = 1_000_000_000_000_u64; // 1 trillion
+        // base_cost(1) + (1T * 20000) / 10000 = 1 + 2T = 2T + 1
+        let gas = model.compute_gas(amount, 2.0);
+        assert_eq!(gas, 2_000_000_000_001);
+
+        // Deterministic: same input always produces identical output.
+        for _ in 0..100 {
+            assert_eq!(model.compute_gas(amount, 2.0), gas);
+        }
+
+        // No overflow panic for large but valid amounts.
+        let large = u64::MAX / 20_001; // safely below overflow threshold for mult 2.0
+        let _ = model.compute_gas(large, 2.0); // should not panic
+    }
+
+    /// Verify Preload multiplier 2.0 gives the expected gas.
+    #[test]
+    fn compute_gas_preload_multiplier() {
+        let model = CostModel::default();
+        let gas = model.compute_gas(100, 2.0);
+        assert_eq!(gas, 201); // 1 + (100 * 2.0) = 201
+    }
+
+    /// Verify zero amount returns base_cost only.
+    #[test]
+    fn compute_gas_zero_amount_base_cost() {
+        let model = CostModel::default();
+        let gas = model.compute_gas(0, 1.0);
+        assert_eq!(gas, 1); // base_cost only
+    }
+
+    /// Verify fractional multiplier (Sign = 1.5) gives exact integer result.
+    #[test]
+    fn compute_gas_fractional_multiplier() {
+        let model = CostModel::default();
+        let gas = model.compute_gas(100, 1.5);
+        assert_eq!(gas, 151); // 1 + (100 * 1.5) = 151
     }
 }
