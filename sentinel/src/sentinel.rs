@@ -8,7 +8,7 @@ use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
-use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::{NodeRegistryType, registry::NodeRegistry};
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::transactions::{Transaction, TransactionState};
 
@@ -231,7 +231,85 @@ impl Sentinel {
 
     /// Handle a "Reject" message — a finalizer rejected the transaction.
     /// Reassign to a different finalizer using risk-based selection.
-    fn handle_rejection(&self, _message: Message) -> Result<(), SentinelError> {
+    fn handle_rejection(&self, message: Message) -> Result<(), SentinelError> {
+        let tx_id: String = deserialize_rmp_to(&message.body)
+            .map_err(|e| SentinelError::Encoding(e))?;
+
+        // Acquire the transaction to prevent concurrent access during reassignment.
+        if self.registry.acquire_transaction(&tx_id).is_err() {
+            return Err(SentinelError::TransactionInTerminalState(tx_id.clone()));
+        }
+
+        // Verify the rejecting finalizer was actually the assigned one.
+        let rejected_key = message.public_key.clone();
+        if !self.registry.is_requested_finalizer(&tx_id, &rejected_key) {
+            return Err(SentinelError::Registry(format!(
+                "Rejection from non-assigned finalizer {:?} for tx {}",
+                rejected_key, tx_id
+            )));
+        }
+
+        // Extract the transaction from Finalizing state, then pick a new finalizer.
+        let node_registry = Arc::clone(&self.node_registry);
+        let new_finalizer_key = {
+            let Some(nodes) = node_registry.get_nodes(&NodeRegistryType::Finalizer) else {
+                return Err(SentinelError::NoTarget(NodeRegistryType::Finalizer));
+            };
+
+            // Collect keys excluding the rejected finalizer.
+            let mut candidates: Vec<Vec<u8>> = Vec::new();
+            for entry in nodes.iter() {
+                let key = entry.key();
+                if key != &rejected_key {
+                    candidates.push(key.clone());
+                }
+            }
+
+            candidates.into_iter().next()
+        };
+
+        let new_key = match new_finalizer_key {
+            Some(k) => k,
+            None => {
+                // Restore the original state since we can't reassign.
+                // Note: release_transaction will decrement lock; caller should remove.
+                let _ = self.registry.release_transaction(&tx_id);
+                return Err(SentinelError::Registry(format!(
+                    "No alternative finalizer available for tx {} after rejection", tx_id
+                )));
+            }
+        };
+
+        // Transition to Finalizing with the new finalizer key.
+        if let Ok(mut entry) = self.registry.get_transaction_mut(&tx_id) {
+            let old_state = std::mem::replace(
+                &mut entry.state,
+                TransactionState::Pending,
+            );
+            if let TransactionState::Finalizing { transaction, .. } = old_state {
+                entry.transition_to_finalizing(transaction, new_key.clone());
+            } else {
+                entry.state = old_state;
+                let _ = self.registry.release_transaction(&tx_id);
+                return Err(SentinelError::Registry(format!(
+                    "Transaction {} not in Finalizing state for rejection handling", tx_id
+                )));
+            }
+        }
+
+        // Send the transaction to the new finalizer.
+        if let Ok(tx) = self.registry.get_transaction(&tx_id) {
+            let _ = self.transaction_notifier.request_single_finalizer(
+                &tx, new_key.clone(), &self.env_data
+            );
+        }
+
+        // Notify all sentinels that this transaction is being reassigned.
+        let _ = self.transaction_notifier.notify_delete(&tx_id, &self.env_data);
+
+        // Release lock — transaction remains in Finalizing for new finalizer.
+        let _ = self.registry.release_transaction(&tx_id);
+
         Ok(())
     }
 
@@ -291,6 +369,8 @@ pub enum SentinelError {
     TransactionInTerminalState(String),
     /// Transaction is not awaiting finalizer (for rejection handling)
     TransactionNotAwaitingFinalizer(String),
+    /// No target nodes of a given type available
+    NoTarget(NodeRegistryType),
     /// Unknown action type in incoming message
     UnknownAction(String),
 }
@@ -319,9 +399,7 @@ impl From<super::transaction_notifier::NotifyError> for SentinelError {
             super::transaction_notifier::NotifyError::Encoding(inner) => SentinelError::Encoding(inner),
             super::transaction_notifier::NotifyError::Connection(inner) => SentinelError::Connection(inner),
             super::transaction_notifier::NotifyError::Data(inner) => SentinelError::Data(inner),
-            super::transaction_notifier::NotifyError::NoTarget(t) => {
-                SentinelError::Registry(format!("No target nodes for {t:?}"))
-            }
+            super::transaction_notifier::NotifyError::NoTarget(t) => SentinelError::NoTarget(t),
         }
     }
 }
@@ -824,5 +902,88 @@ mod tests {
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
         assert!(result.is_err());
+    }
+
+    // --- handle_rejection tests ---
+
+    #[test]
+    fn handle_rejection_reassigns_to_new_finalizer() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let rejected_key = vec![1];
+        let new_key = vec![2];
+        make_finalizing_entry(&registry, "tx_reject", rejected_key.clone());
+
+        // Send a "Reject" message from the assigned finalizer.
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Reject".into(),
+            body: serialize_to_bytes_rmp(&"tx_reject".to_string()).unwrap(),
+            signature: vec![],
+            public_key: rejected_key,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("No alternative finalizer")),
+            e => panic!("expected Registry error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn handle_rejection_unassigned_finalizer_returns_error() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let assigned_key = vec![99];
+        make_finalizing_entry(&registry, "tx_bad_reject", assigned_key.clone());
+
+        // Send a "Reject" message from a non-assigned finalizer.
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Reject".into(),
+            body: serialize_to_bytes_rmp(&"tx_bad_reject".to_string()).unwrap(),
+            signature: vec![],
+            public_key: vec![5, 6, 7],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("non-assigned")),
+            _ => panic!("expected Registry error"),
+        }
+    }
+
+    #[test]
+    fn handle_rejection_terminal_state_returns_error() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        // Register a pending transaction (terminal state = Failed/Committed would reject acquire)
+        registry.register_pending("tx_terminal".into()).unwrap();
+        // Transition to Failed (terminal)
+        if let Ok(mut entry) = registry.get_transaction_mut("tx_terminal") {
+            entry.transition_to_failed(
+                Transaction {
+                    id: "tx_terminal".into(), action: "Transfer".into(),
+                    token_id: vec![], bid: None, sequence_number: 0,
+                    sender: vec![], receiver: vec![], amount: None,
+                    timestamp: 0, result_hash: vec![],
+                },
+                vec![],
+            );
+        }
+
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Reject".into(),
+            body: serialize_to_bytes_rmp(&"tx_terminal".to_string()).unwrap(),
+            signature: vec![],
+            public_key: vec![1],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::TransactionInTerminalState(id) => assert_eq!(id, "tx_terminal"),
+            _ => panic!("expected TransactionInTerminalState error"),
+        }
     }
 }

@@ -108,6 +108,40 @@ impl TransactionNotifier {
         Ok(vec![])
     }
 
+    /// Request a specific Finalizer (by key) to take responsibility for a validated transaction.
+    pub fn request_single_finalizer(
+        &self,
+        tx: &Transaction,
+        finalizer_key: Vec<u8>,
+        env: &EnvironmentMetadata,
+    ) -> Result<(), NotifyError> {
+        let msg = Message {
+            chain_id: env.token_partition_id.clone(),
+            action: String::from("FinalizerRequest"),
+            body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
+            signature: vec![],
+            public_key: self.config.public_key.clone(),
+        };
+
+        let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
+        let registry = Arc::clone(&self.node_registry);
+        let payload_clone = payload.clone();
+        let finalizer_key_clone = finalizer_key.clone();
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("could not build mini runtime for request_single_finalizer");
+            rt.block_on(async {
+                let Some(nodes) = registry.get_nodes(&NodeRegistryType::Finalizer) else { return };
+                if let Some(entry) = nodes.get(&finalizer_key_clone) {
+                    let _ = entry.value().conn.send(&payload_clone).await;
+                };
+            });
+        });
+        Ok(())
+    }
+
     /// Broadcast a message to all nodes of a given type in the registry.
     fn send_to_nodes(&self, target_type: NodeRegistryType, payload: Vec<u8>) -> Result<(), NotifyError> {
         let registry = Arc::clone(&self.node_registry);

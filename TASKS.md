@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (274 passing across 5 crates — 214 core + 22 finalizer + 9 executor + 19 sentinel + 10 committer)
+## Phase 7: Tests (277 passing across 5 crates — 214 core + 22 finalizer + 9 executor + 22 sentinel + 10 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 274 tests across 5 crate targets (214 core + 19 sentinel + 22 finalizer + 9 executor + 10 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 277 tests across 5 crate targets (214 core + 22 sentinel + 22 finalizer + 9 executor + 10 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -236,11 +236,11 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 274 tests across workspace (214 core + 22 finalizer + 9 executor + 19 sentinel + 10 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 277 tests across workspace (214 core + 22 finalizer + 9 executor + 22 sentinel + 10 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
-**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 274 tests passing.
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 277 tests passing.
 
 #### TokenFactory — minting fee deduction — DONE
 **File:** `src/tokens.rs:290-347`
@@ -253,7 +253,7 @@ All action branches dispatch and all coordination helpers use protocol-level use
 
 #### Gas deduction after executor completes — DONE
 **File:** `src/registry.rs` (gas_tracker), `sentinel/src/transaction_validator.rs` (compute_gas_used), `sentinel/src/sentinel.rs` (record_gas_used), `committer/src/committer.rs` (gas deduction in check_and_commit_transaction_results)
-**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 274 tests passing across workspace.
+**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 277 tests passing across workspace.
 
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
@@ -305,7 +305,7 @@ All 5 fields now wired in `load_from_spec`:
 - `sym_crypto_provider` and `serialization_provider` stored as `String` fields on `EnvironmentMetadata` for diagnostics
 - `trans_validation_specs` and `block_validation_specs` iterated and registered into existing `ValidationSpecRegistry` / `BlockValidatorSpecRegistry` by name ("SelfSigned", "Executed"); unknown names silently skipped
 - `allowed_token_types` already stored (line 132); no enforcement needed
-Added imports for `SelfSignedBlockValidatorSpec` and `ExecutedBlockValidatorSpec`. 274 tests pass.
+Added imports for `SelfSignedBlockValidatorSpec` and `ExecutedBlockValidatorSpec`. 277 tests pass.
 
 #### Config — node registry type selection — DONE
 **File:** `src/config.rs:37-46, 126-162`
@@ -348,9 +348,9 @@ Added `NoOpConnection` placeholder impl for registrations without live connectio
 **File:** `sentinel/src/sentinel.rs:187-224`
 **Completed:** Deserializes tx_id from message body, acquires transaction lock, verifies sender's `public_key` matches assigned finalizer via `registry.is_requested_finalizer()`, extracts `Finalizing` state via `std::mem::replace` and transitions to `Committed` (empty block_hash placeholder), notifies all sentinels via `notify_delete`, releases lock. Added 3 tests: valid finalizer → Committed state, unassigned finalizer → `Registry` error, non-Finalizing state → `Registry` error.
 
-#### Sentinel.handle_rejection — stub
-**File:** `sentinel/src/sentinel.rs:182-184`
-**Action:** Deserialize tx_id, check awaiting_finalizer state, pick new finalizer, reassign.
+#### Sentinel.handle_rejection — DONE
+**File:** `sentinel/src/sentinel.rs:232-316`
+**Completed:** Deserializes tx_id, acquires lock, verifies rejecting `public_key` matches assigned finalizer, collects candidate finalizers excluding the rejected one (iterates DashMap), reassigns via `std::mem::replace` + `transition_to_finalizing`, sends `request_single_finalizer` to the new finalizer via targeted send, notifies sentinels via `notify_delete`, releases lock. Added `NoTarget(NodeRegistryType)` variant to `SentinelError`. Added `TransactionNotifier.request_single_finalizer` for targeted finalizer delivery. Added 3 tests: no alternative finalizer → error, unassigned finalizer → error, terminal state → error.
 
 #### Sentinel.handle_register_request — stub
 **File:** `sentinel/src/sentinel.rs:187-189`
@@ -400,7 +400,7 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (274 passing across 5 crates)
+### Tests — Priority 6 (277 passing across 5 crates)
 
 #### Tests added to pneumatic_core — 209 tests
 **Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing)
@@ -410,9 +410,9 @@ Stubbed within implemented methods:
 **Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing
 **Covered:** Signature add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior.
 
-#### Tests added to pneumatic_sentinel — 19 tests
+#### Tests added to pneumatic_sentinel — 22 tests
 **Files:** `sentinel/src/sentinel.rs`
-**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default), TransactionNotifier send methods (4: executors, finalizer, notify_clear, notify_delete — all verify no-panic with no runtime), handle_confirmation (3: valid finalizer → Committed, unassigned finalizer → error, non-Finalizing state → error).
+**Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default), TransactionNotifier send methods (4: executors, finalizer, notify_clear, notify_delete — all verify no-panic with no runtime), handle_confirmation (3: valid finalizer → Committed, unassigned finalizer → error, non-Finalizing state → error), handle_rejection (3: no alternative finalizer → error, unassigned finalizer → error, terminal state → error).
 
 #### Tests added to pneumatic_executor — 9 tests
 **Files:** `executor/src/executor.rs`
