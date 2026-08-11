@@ -4,6 +4,8 @@ use ed25519_dalek::{SigningKey, Signer, Verifier, VerifyingKey};
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 // ---------------------------------------------------------------------------
 // AsymCryptoProvider — Ed25519 for blockchain signing/verification
@@ -48,8 +50,9 @@ pub trait AsymCryptoProvider: Send + Sync {
 ///
 /// Hybrid encryption uses AES-256-GCM with ephemeral X25519 key exchange:
 /// each `encrypt()` call generates a new ephemeral keypair, derives a shared
-/// secret via Diffie-Hellman, and encrypts the payload. Output format:
-/// `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
+/// secret via Diffie-Hellman, derives an AES key via HKDF-SHA256, and encrypts
+/// the payload with a fresh random nonce. Output format:
+/// `[32-byte ephemeral PK][12-byte nonce][ciphertext + 16-byte GCM tag]`
 pub struct Ed25519Provider {
     signing_key: RwLock<SigningKey>,
     verifying_key: RwLock<VerifyingKey>,
@@ -72,8 +75,24 @@ impl Ed25519Provider {
         }
     }
 
+    /// Derive an AES-256 key from X25519 shared secret via HKDF-SHA256.
+    fn derive_aes_key(shared_secret: &[u8; 32]) -> [u8; 32] {
+        let mut okm = [0u8; 32];
+        let hk = Hkdf::<Sha256>::new(Some(b"aes256-gcm-key"), shared_secret);
+        hk.expand(b"aes256-gcm-key", &mut okm)
+            .expect("HKDF expand failed (output buffer too short)");
+        okm
+    }
+
+    /// Generate a fresh 12-byte random nonce for AES-GCM.
+    fn generate_nonce() -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).expect("failed to generate random nonce");
+        nonce
+    }
+
     /// Encrypt using a static secret (self or recipient) + ephemeral secret.
-    /// Returns `[32-byte ephemeral PK][ciphertext + GCM tag]`.
+    /// Returns `[32-byte ephemeral PK][12-byte nonce][ciphertext + GCM tag]`.
     fn dh_encrypt(
         static_secret: &StaticSecret,
         data: &[u8],
@@ -83,24 +102,28 @@ impl Ed25519Provider {
         let ephemeral_pub_bytes = ephemeral_pub.to_bytes();
 
         let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
-        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
-            .expect("AES-256 key derivation failed (wrong secret size)");
-        let nonce = Nonce::default(); // safe: unique ephemeral -> unique shared secret
+        let aes_key = Self::derive_aes_key(shared_secret.as_bytes());
+        let cipher = Aes256Gcm::new(&aes_key.into());
+        let nonce_bytes = Self::generate_nonce();
+        let nonce = Nonce::try_from(nonce_bytes.as_slice())
+            .expect("nonce must be 12 bytes");
 
         let ciphertext = cipher
             .encrypt(&nonce, data)
             .expect("AES-GCM encryption failed");
 
-        let mut result = Vec::with_capacity(32 + ciphertext.len());
+        let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub_bytes);
+        result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
         result
     }
 
     /// Decrypt using a static secret + ephemeral public key from ciphertext.
+    /// Expects `[32-byte ephemeral PK][12-byte nonce][ciphertext + GCM tag]`.
     fn dh_decrypt(static_secret: &StaticSecret, data: &[u8]) -> Vec<u8> {
-        if data.len() < 32 {
-            panic!("Decrypt input too short to contain X25519 public key");
+        if data.len() < 44 {
+            panic!("Decrypt input too short to contain ephemeral PK and nonce");
         }
         let ephemeral_pub_bytes: [u8; 32] = data[..32].try_into().map_err(|_| {
             panic!("Decrypt input too short to contain X25519 public key");
@@ -109,12 +132,15 @@ impl Ed25519Provider {
         let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
 
         let shared_secret = static_secret.diffie_hellman(&ephemeral_pub);
-        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
-            .expect("AES-256 key derivation failed (wrong secret size)");
-        let nonce = Nonce::default();
+        let aes_key = Self::derive_aes_key(shared_secret.as_bytes());
+        let cipher = Aes256Gcm::new(&aes_key.into());
+        let nonce_bytes: [u8; 12] = data[32..44].try_into()
+            .expect("ciphertext too short to contain nonce");
+        let nonce = Nonce::try_from(nonce_bytes.as_slice())
+            .expect("nonce must be 12 bytes");
 
         let plaintext = cipher
-            .decrypt(&nonce, &data[32..])
+            .decrypt(&nonce, &data[44..])
             .expect("AES-GCM decryption failed (wrong key or tampered)");
         plaintext.to_vec()
     }
@@ -146,17 +172,19 @@ impl AsymCryptoProvider for Ed25519Provider {
         // DH: ephemeral secret * recipient's static public key = shared secret.
         // Anyone who knows the recipient's public key can encrypt to them.
         let shared_secret = ephemeral.diffie_hellman(&recipient_key);
-
-        let cipher = Aes256Gcm::new_from_slice(shared_secret.as_bytes())
-            .expect("AES-256 key derivation failed (wrong secret size)");
-        let nonce = Nonce::default(); // safe: unique ephemeral -> unique shared secret
+        let aes_key = Self::derive_aes_key(shared_secret.as_bytes());
+        let cipher = Aes256Gcm::new(&aes_key.into());
+        let nonce_bytes = Self::generate_nonce();
+        let nonce = Nonce::try_from(nonce_bytes.as_slice())
+            .expect("nonce must be 12 bytes");
 
         let ciphertext = cipher
             .encrypt(&nonce, data.as_ref())
             .expect("AES-GCM encryption failed");
 
-        let mut result = Vec::with_capacity(32 + ciphertext.len());
+        let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
         result.extend_from_slice(&ephemeral_pub_bytes);
+        result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
         result
     }
@@ -308,7 +336,7 @@ mod tests {
         let provider = Ed25519Provider::generate();
         let data = vec![];
         let encrypted = provider.encrypt(data);
-        assert_eq!(encrypted.len(), 48); // 32-byte PK + 16-byte GCM tag only
+        assert_eq!(encrypted.len(), 60); // 32-byte PK + 12-byte nonce + 16-byte GCM tag only
         let decrypted = provider.decrypt(encrypted);
         assert_eq!(decrypted, Vec::<u8>::new());
     }
@@ -350,7 +378,7 @@ mod tests {
         let recipient_pk = recipient.x25519_public_key();
 
         let encrypted = sender.encrypt_to(&recipient_pk, vec![]);
-        assert_eq!(encrypted.len(), 48); // 32-byte PK + 16-byte GCM tag only
+        assert_eq!(encrypted.len(), 60); // 32-byte PK + 12-byte nonce + 16-byte GCM tag only
         let decrypted = recipient.decrypt_from(encrypted);
         assert_eq!(decrypted, Vec::<u8>::new());
     }
@@ -382,5 +410,28 @@ mod tests {
     #[test]
     fn test_default_generates_key() {
         assert_eq!(Ed25519Provider::default().public_key().len(), 32);
+    }
+
+    #[test]
+    fn test_different_nonces_per_encryption() {
+        let provider = Ed25519Provider::generate();
+        let data = b"repeated plaintext";
+        let encrypted1 = provider.encrypt(data.to_vec());
+        let encrypted2 = provider.encrypt(data.to_vec());
+        // Ciphertexts must differ (new ephemeral key + new nonce each time)
+        assert_ne!(encrypted1, encrypted2);
+    }
+
+    #[test]
+    fn test_encrypt_to_different_ciphertexts() {
+        let sender1 = Ed25519Provider::generate();
+        let sender2 = Ed25519Provider::generate();
+        let recipient = Ed25519Provider::generate();
+        let recipient_pk = recipient.x25519_public_key();
+        let data = b"same plaintext";
+        let encrypted1 = sender1.encrypt_to(&recipient_pk, data.to_vec());
+        let encrypted2 = sender2.encrypt_to(&recipient_pk, data.to_vec());
+        // Different ephemeral keys → different ciphertexts
+        assert_ne!(encrypted1, encrypted2);
     }
 }
