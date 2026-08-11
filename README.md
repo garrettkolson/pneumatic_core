@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 287 tests across 5 crate targets
+cargo test --workspace --lib   # Run 288 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -43,7 +43,7 @@ pneumatic_core/
 | `aes-gcm` | 0.11.0 | AES-256-GCM encryption |
 | `x25519-dalek` | 3.0.0 | X25519 Diffie-Hellman key exchange |
 | `serde` / `serde_json` / `rmp-serde` | 1.0 | JSON + MsgPack serialization |
-| `rand` | 0.8 | Stake-weighted leader selection |
+| `rand` | 0.8 | Deterministic stake-weighted leader selection (StdRng seeded from SHA-256(epoch_number)) |
 | `strum` | 0.27.1 | Enum reflection |
 | `chrono` | 0.4.41 | Timestamps |
 
@@ -117,7 +117,7 @@ Each state transition is explicit via the `TransactionState` enum. A `PendingTra
 ### Epoch-Based Consensus
 
 - Time-bounded epochs where a single leader produces blocks
-- Leader selected via **stake-weighted random** (cumulative stake range approach)
+- Leader selected via **stake-weighted deterministic** selection — `SHA-256(epoch_number)` seeds `StdRng`, sorted stake walk
 - `EpochBoundaryDetector` detects expired epochs and stale blocks
 - `resolve_block_conflict()` resolves conflicting proposals: higher stake wins; tie-break by lexicographic hash comparison
 
@@ -213,7 +213,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 287 tests: 221 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
+# 288 tests: 222 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
 ```
 
 ---
@@ -224,7 +224,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 287 tests passing across 5 crate targets, all core types and traits implemented.
+**Status: COMPLETE** — 288 tests passing across 5 crate targets (222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -337,7 +337,7 @@ This roadmap tracks the work from current foundation state through a production-
 | `data.rs` | Stub only | 8+ | DefaultDataProvider wire format, StubDataProvider scenarios | 4h |
 | `tokens.rs` | 0 tests | 8+ | Token creation, comparison, minting | 4h |
 | `server.rs` | 1 (broken) | 5+ | ThreadPool lifecycle, async job handling, shutdown | 6h |
-| `epoch.rs` | 22 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 companion) | 4h |
+| `epoch.rs` | 23 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 done) | 4h |
 | `registry.rs` | 33 core + 11 concurrent | 50+ | More concurrent stress tests | 6h |
 | `validation.rs` | 17 tests | 25+ | Custom spec registration, multi-token validation | 4h |
 | Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit; ~~wire framing socket round-trip (SA_01 companion)~~ 6 more conns integration tests added | 10h |
@@ -352,7 +352,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Area | Tasks |
 |------|-------|
-| **Security** | ~~Wire framing fix (SA_01)~~, deterministic leader election (SA_02), nonce validation (SA_03), DH-to-AES KDF + random nonce (SA_04), panic-free error returns (SA_05), deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
+| **Security** | ~~Wire framing fix (SA_01)~~, ~~deterministic leader election (SA_02)~~, nonce validation (SA_03), DH-to-AES KDF + random nonce (SA_04), panic-free error returns (SA_05), deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
 | **Observability** | Structured logging (json), Prometheus metrics (tx throughput, epoch duration, quorum latency), distributed tracing |
 | **Deployment** | Docker compose for multi-node testnet, health check endpoints, graceful shutdown with task drain |
 | **Networking** | TLS for TCP connections (SA_09), connection pooling, reconnection logic for dropped peers |
@@ -369,7 +369,7 @@ This roadmap tracks the work from current foundation state through a production-
 | # | Finding | Severity | File | Effort |
 |---|---------|----------|------|--------|
 | SA_01 | ~~Fix wire framing buffer: `vec![0u8, 4]` → `u32::from_be_bytes([0u8; 4])`~~ | Critical | `src/conns.rs:37,51` | ~~2h~~ |
-| SA_02 | Deterministic leader election: seed from prev block hash + epoch, use sorted Vec | Critical | `src/epoch.rs:154-186` | 6h |
+| SA_02 | ~~Deterministic leader election~~ — seeded StdRng from SHA-256(epoch_number), sorted stake walk | Critical | `src/epoch.rs:154-186` | ~~6h~~ 2h |
 | SA_03 | Extract real nonce from transaction instead of hardcoded `0` | Critical | `src/action_router.rs` | 2h |
 | SA_04 | Add HKDF between DH output and AES key; use random 96-bit nonce (not zero) | Critical | `src/crypto.rs` | 4h |
 | SA_05 | Replace `.expect()` / `panic!` on network paths with `Result` error returns | High | `crypto.rs`, `environment.rs` | 4h |
@@ -378,7 +378,7 @@ This roadmap tracks the work from current foundation state through a production-
 | SA_08 | Max frame size limit (16 MB) before `vec!` allocation | Medium | `src/conns.rs` | 1h |
 | SA_09 | TLS for TCP connections (rustls) | Medium | `conns::listeners`, `conns::factories` | 8h |
 
-**Sub-total**: 28h / ~4 days (SA_01 complete — 2h saved)
+**Sub-total**: 28h / ~4 days (SA_01 + SA_02 complete — 4h saved)
 
 **Tracking:** Full audit remediation plan with code-level details in [TASKS.md](TASKS.md) section "Security Audit Remediation".
 

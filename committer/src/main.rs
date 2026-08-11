@@ -111,6 +111,7 @@ async fn main() {
         epoch_reconciler,
         leader_selector,
         data_provider,
+        0, // current_epoch_number
     ));
 
     // 12. Wire up gossiper message handler

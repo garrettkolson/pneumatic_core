@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -64,6 +65,8 @@ pub struct Committer {
     leader_selector: Arc<LeaderSelector>,
     /// Data provider for loading/saving user data (gas deduction)
     data_provider: Arc<dyn DataProvider>,
+    /// Current epoch number for deterministic leader selection
+    current_epoch_number: AtomicU64,
     /// Flag: is the committer shutting down?
     awaiting_shutdown: Arc<Mutex<bool>>,
 }
@@ -84,6 +87,7 @@ impl Committer {
         epoch_reconciler: Arc<EpochReconciler>,
         leader_selector: Arc<LeaderSelector>,
         data_provider: Arc<dyn DataProvider>,
+        current_epoch_number: u64,
     ) -> Self {
         Committer {
             env_data,
@@ -98,6 +102,7 @@ impl Committer {
             epoch_reconciler,
             leader_selector,
             data_provider,
+                current_epoch_number: AtomicU64::new(current_epoch_number),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
         }
     }
@@ -290,7 +295,9 @@ impl Committer {
 
         // Select new leader for the epoch
         let stake_set = self.stake_store.to_stake_set();
-        let leader_key = self.leader_selector.select(&stake_set);
+        let new_epoch_number = self.current_epoch_number.load(Ordering::SeqCst) + 1;
+        let leader_key = self.leader_selector.select(&stake_set, new_epoch_number);
+        self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
 
         let logger = &self.env_data.logger;
         if !leader_key.is_empty() {
@@ -589,6 +596,7 @@ mod tests {
             epoch_reconciler,
             leader_selector,
             data_provider,
+            0,
         );
 
         (committer, pending_registry)

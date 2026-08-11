@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use rand::Rng;
+use rand::SeedableRng;
 
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::data::DataProvider;
@@ -229,32 +230,42 @@ impl LeaderSelector {
     }
 
     /// Select leader(s) from the current stake set using
-    /// stake-weighted random selection.
-    fn select_internal(&self, stakers: &StakeSet) -> Vec<u8> {
+    /// stake-weighted deterministic selection.
+    fn select_internal(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
         let total = stakers.total_stake();
         if total == 0 {
             return vec![];
         }
 
-        let mut rng = rand::thread_rng();
+        // Deterministic seed: hash(epoch_number) using the provided hash provider
+        let seed = self.hash_provider.hash(&epoch_number.to_be_bytes());
+        let mut rng = rand::rngs::StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
+            // SHA-256 produces 32 bytes, exactly fits [u8; 32]
+            unreachable!("hash provider always produces 32 bytes")
+        }));
         let target: u64 = rng.gen_range(0..total);
 
+        // Deterministic iteration: sort keys lexicographically
+        let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+        keys.sort();
+
+        let first_key = keys[0].clone(); // backup for fallback
         let mut cumulative = 0u64;
-        for (key, stake) in &stakers.stakers {
+        for key in keys {
+            let stake = *stakers.stakers.get(key).unwrap();
             cumulative += stake;
             if cumulative >= target {
                 return key.clone();
             }
         }
-
         // Fallback: return the first staker (shouldn't happen if total > 0)
-        stakers.stakers.keys().next().cloned().unwrap_or_default()
+        first_key
     }
 }
 
 impl IEpochLeaderSelector for LeaderSelector {
-    fn select(&self, stakers: &StakeSet) -> Vec<u8> {
-        self.select_internal(stakers)
+    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
+        self.select_internal(stakers, epoch_number)
     }
 }
 

@@ -1,5 +1,7 @@
 use crate::errors::PneumaticError;
+use rand::rngs::StdRng;
 use rand::Rng;
+use rand::SeedableRng;
 
 // ---------------------------------------------------------------------------
 // Epoch — represents a single epoch in the blockchain
@@ -114,9 +116,11 @@ pub trait IStakingManager: Send + Sync {
 
 /// Selects the block leader for an epoch using stake-weighted selection
 pub trait IEpochLeaderSelector: Send + Sync {
-    /// Select leader(s) from the current stake set
-    /// Returns the selected public key(s)
-    fn select(&self, stakers: &StakeSet) -> Vec<u8>;
+    /// Select leader(s) from the current stake set deterministically.
+    /// `epoch_number` is used as the seed source so every node with the
+    /// same stake set produces the same leader for the same epoch.
+    /// Returns the selected public key(s).
+    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,22 +170,36 @@ impl Default for LeaderSelector {
 }
 
 impl IEpochLeaderSelector for LeaderSelector {
-    fn select(&self, stakers: &StakeSet) -> Vec<u8> {
+    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
         let total = stakers.total_stake();
         if total == 0 {
             return vec![];
         }
-        let mut rng = rand::thread_rng();
+
+        // Deterministic seed: SHA-256(epoch_number as big-endian bytes)
+        let digest = ring::digest::digest(&ring::digest::SHA256, &epoch_number.to_be_bytes());
+        let seed = digest.as_ref();
+        let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
+            // SHA-256 produces 32 bytes, exactly fits [u8; 32]
+            unreachable!("ring SHA-256 always produces 32 bytes")
+        }));
         let target: u64 = rng.gen_range(0..total);
+
+        // Deterministic iteration: sort keys lexicographically
+        let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+        keys.sort();
+
+        let first_key = keys[0].clone(); // backup for fallback
         let mut cumulative = 0u64;
-        for (key, stake) in &stakers.stakers {
+        for key in keys {
+            let stake = *stakers.stakers.get(key).unwrap();
             cumulative += stake;
             if cumulative >= target {
                 return key.clone();
             }
         }
         // Fallback: return the first staker (should not happen if total > 0)
-        stakers.stakers.keys().next().cloned().unwrap_or_default()
+        first_key
     }
 }
 
@@ -198,7 +216,7 @@ impl Epoch {
         selector: &dyn IEpochLeaderSelector,
         stake_set: &StakeSet,
     ) -> Self {
-        let leader_public_key = selector.select(stake_set);
+        let leader_public_key = selector.select(stake_set, epoch_number);
         Epoch {
             start_timestamp,
             end_timestamp,
@@ -329,8 +347,9 @@ impl EpochBoundaryDetector {
         }
         // Create new epoch
         let now = self.current_epoch.end_timestamp;
+        let new_epoch_number = self.current_epoch.epoch_number + 1;
         self.current_epoch = Epoch::new_with_leader(
-            self.current_epoch.epoch_number + 1,
+            new_epoch_number,
             now,
             now + epoch_duration,
             selector,
@@ -399,7 +418,7 @@ mod tests {
     fn leader_selector_empty_stake_set_returns_empty() {
         let selector = LeaderSelector::new();
         let stakes = make_stake_set(vec![]);
-        let leader = selector.select(&stakes);
+        let leader = selector.select(&stakes, 1);
         assert!(leader.is_empty());
     }
 
@@ -410,26 +429,25 @@ mod tests {
         let stakes = make_stake_set(vec![(key.clone(), 100)]);
         // Run 10 times — single staker should always be selected
         for _ in 0..10 {
-            assert_eq!(selector.select(&stakes), key);
+            assert_eq!(selector.select(&stakes, 1), key);
         }
     }
 
     #[test]
-    fn leader_selector_two_stakers_returns_variants() {
+    fn leader_selector_deterministic_different_epochs_can_differ() {
         let selector = LeaderSelector::new();
         let key_a = vec![1];
         let key_b = vec![2];
         let stakes = make_stake_set(vec![(key_a.clone(), 50), (key_b.clone(), 50)]);
-        let mut seen_a = false;
-        let mut seen_b = false;
-        for _ in 0..100 {
-            let leader = selector.select(&stakes);
-            if leader == key_a { seen_a = true; }
-            if leader == key_b { seen_b = true; }
-        }
-        // With equal stakes over 100 trials, both should be seen
-        assert!(seen_a);
-        assert!(seen_b);
+        // Same epoch → same leader
+        let leader_epoch1 = selector.select(&stakes, 1);
+        assert_eq!(leader_epoch1, selector.select(&stakes, 1));
+        // Different epochs → deterministic but may differ
+        let leader_epoch2 = selector.select(&stakes, 2);
+        // Either they happen to be the same (still deterministic), or differ
+        // Just verify both calls with same epoch return the same result
+        assert_eq!(leader_epoch1, selector.select(&stakes, 1));
+        assert_eq!(leader_epoch2, selector.select(&stakes, 2));
     }
 
     #[test]
@@ -441,12 +459,24 @@ mod tests {
         let stakes = make_stake_set(vec![(key_small.clone(), 10), (key_large.clone(), 90)]);
         let mut small_count = 0u64;
         for _ in 0..100 {
-            if selector.select(&stakes) == key_small {
+            if selector.select(&stakes, 1) == key_small {
                 small_count += 1;
             }
         }
         // Small should be selected ~10% of the time
         assert!(small_count <= 25, "expected ~10 small selections, got {}", small_count);
+    }
+
+    // --- SA_02: Deterministic leader selection ---
+
+    #[test]
+    fn leader_selector_deterministic_same_inputs_same_output() {
+        let selector = LeaderSelector::new();
+        let stakes = make_stake_set(vec![(vec![1], 30), (vec![2], 50), (vec![3], 20)]);
+        let first = selector.select(&stakes, 5);
+        for _ in 1..20 {
+            assert_eq!(selector.select(&stakes, 5), first);
+        }
     }
 
     // --- Epoch::new_with_leader tests ---

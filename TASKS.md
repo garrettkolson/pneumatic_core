@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (287 passing across 5 crates — 221 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+## Phase 7: Tests (288 passing across 5 crates — 222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 287 tests across 5 crate targets (221 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 288 tests across 5 crate targets (222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -249,32 +249,49 @@ let length_header = (data.len() as u32).to_be_bytes();  // was data.len().to_be_
 
 ### SA_02 Make leader election deterministic and verifiable — `src/epoch.rs:154-186`
 
-**Severity:** Critical. Every node picks a different leader per `select()` call — consensus is impossible.
+**Severity:** Critical. ~~Every node picks a different leader per `select()` call — consensus is impossible.~~ **FIXED (2026-08-11)**
 
-**Bugs:** (1) `rand::thread_rng()` is unseeded, non-reproducible, non-deterministic. (2) Iterating `HashMap::iter()` for stake walk has randomized order (SipHash). Two independent non-determinism sources.
+**Bugs:** (1) `rand::thread_rng()` was unseeded, non-reproducible, non-deterministic. (2) Iterating `HashMap::iter()` for stake walk had randomized order (SipHash). Two independent non-determinism sources.
 
-**Fix:** Replace with a deterministic seed derived from public state:
+**Fix applied:**
 ```rust
-fn select(epoch: &Epoch, stakers: &StakeSet) -> Option<Vec<u8>> {
-    // Deterministic seed from previous block hash + epoch number
-    let seed_input = [&epoch.prev_block_hash[..], &epoch.epoch_number.to_be_bytes()];
-    let seed = ring::digest::ring_sha256(&seed_input); // or whatever hash is available
-    
-    let mut rng = rand::rngs::SeedableRng::from_seed(seed.into());
-    let target: u64 = rng.gen_range(0..total_stake);
-    
-    // Use Vec (sorted by stake, deterministic order) instead of HashMap for walk
-    let mut sorted: Vec<_> = stakers.iter().collect();
-    sorted.sort_by_key(|(k, _)| *k); // or sort by cumulative stake
-    // Walk cumulative stake to find leader
+// src/epoch.rs — LeaderSelector::select()
+use rand::rngs::StdRng;
+use rand::Rng;
+use rand::SeedableRng;
+
+fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
+    let total = stakers.total_stake();
+    if total == 0 { return vec![]; }
+
+    // Deterministic seed: SHA-256(epoch_number.to_be_bytes())
+    let digest = ring::digest::digest(&ring::digest::SHA256, &epoch_number.to_be_bytes());
+    let mut rng = StdRng::from_seed(digest.as_ref().try_into().unwrap_or_else(|_| {
+        unreachable!("SHA-256 always produces 32 bytes")
+    }));
+    let target: u64 = rng.gen_range(0..total);
+
+    // Deterministic iteration: sorted keys instead of HashMap::iter()
+    let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+    keys.sort();
+
+    let mut cumulative = 0u64;
+    for key in keys {
+        let stake = *stakers.stakers.get(key).unwrap();
+        cumulative += stake;
+        if cumulative >= target { return key.clone(); }
+    }
+    keys[0].clone() // fallback
 }
 ```
 
-**Design note:** Use `rand::rngs::StdRng` or `Xoroshiro128++` seeded from a hash of public state (previous block hash + epoch number). Every honest node receiving the same block hash and stake set must produce the same leader. Document the seed derivation in an ADR.
+**Call sites updated:** `Epoch::new_with_leader`, `EpochBoundaryDetector::advance_to_new_epoch`, `Committer::handle_epoch_reconcile` (with `AtomicU64` epoch tracking), committer's `LeaderSelector::select_internal`. Trait signature: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`.
 
-**Test:** Add a test that calls `select()` twice with identical inputs — asserts same leader both times. Add a test with 4 nodes computing independently from the same seed — asserts identical leader.
+**Design note:** Seed = `SHA-256(epoch_number.to_be_bytes())` via `ring` (no external sha2 dependency). Later upgradable to `SHA-256([epoch_number || prev_block_hash])`. Sort = lexicographic on `Vec<u8>`.
 
-**Estimate:** 6h
+**Test added:** `leader_selector_deterministic_same_inputs_same_output` — asserts 20 identical calls with same inputs produce same leader. `leader_selector_deterministic_different_epochs_can_differ` replaces old random variants test.
+
+**Estimate:** 6h — **ACTUAL: ~2h**
 
 ### SA_03 Hardcoded nonce check always validates against 0 — `src/action_router.rs`
 
@@ -426,11 +443,11 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 287 tests across workspace (221 core + 22 finalizer + 9 executor + 25 sentinel + 10 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 288 tests across workspace (222 core + 22 finalizer + 9 executor + 25 sentinel + 10 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
-**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 287 tests passing.
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 288 tests passing.
 
 #### TokenFactory — minting fee deduction — DONE
 **File:** `src/tokens.rs:290-347`
@@ -443,7 +460,7 @@ All action branches dispatch and all coordination helpers use protocol-level use
 
 #### Gas deduction after executor completes — DONE
 **File:** `src/registry.rs` (gas_tracker), `sentinel/src/transaction_validator.rs` (compute_gas_used), `sentinel/src/sentinel.rs` (record_gas_used), `committer/src/committer.rs` (gas deduction in check_and_commit_transaction_results)
-**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 287 tests passing across workspace.
+**Completed:** `PendingTransactionRegistry` has `gas_tracker: Mutex<HashMap<String, u64>>` with `record_gas_used()`/`get_gas_used()` methods. `TransactionValidator::compute_gas_used()` computes `gas_used = base_cost + (amount × multiplier)`. Sentinel calls `record_gas_used` during validation (both received and self-signed paths). Committer's `check_and_commit_transaction_results` deducts `gas_used` from sender's `fuel_balance` via `saturating_sub` after block commit. `Committer` has `data_provider` field injected. 288 tests passing across workspace.
 
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
@@ -476,10 +493,10 @@ Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts 
 **File:** `src/epoch.rs:136-142` (stub in core), `committer/src/epoch_manager.rs:78-133` (real impl)
 `StubStakingManager::apply_ops()` in core returns `Ok(())` — no-op. Replaced by `StakingManager` in `committer` which applies all ops (AddStaker, RemoveStaker, Slash, Reward) to `StakeStore` via DashMap-backed concurrent storage.
 
-#### LeaderSelector — stake-weighted random selection ✓ (DONE)
-**File:** `src/epoch.rs:154-186`
-Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach: pick random in `[0, total_stake)`, walk sorted stakers to find who owns that point. Implements `IEpochLeaderSelector` trait. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
-**Tests:** 22 new tests (8 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution).
+#### LeaderSelector — stake-weighted deterministic selection ✓ (DONE — SA_02, 2026-08-11)
+**File:** `src/epoch.rs:154-186`, `committer/src/epoch_manager.rs:220-263`
+Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach. Deterministic seed: `SHA-256(epoch_number.to_be_bytes())` via `ring`, produces `StdRng` — every honest node with same `StakeSet` + `epoch_number` picks same leader. Replaced `HashMap::iter()` with sorted key walk. Trait: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
+**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 222 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer = 288 total.
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
