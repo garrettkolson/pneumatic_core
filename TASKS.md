@@ -376,7 +376,7 @@ Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, 
 
 **Estimate:** 4h → actual ~1h
 
-### SA_06 Deterministic gas accounting — integer math only — `src/action_router.rs` ✅ COMPLETE
+### ~~SA_06~~ Deterministic gas accounting — integer math only — `src/action_router.rs` ✅ COMPLETE
 
 **Severity:** High. `f64` arithmetic is not bitwise-identical across CPU architectures. If gas computation feeds into committed state, nodes diverge.
 
@@ -400,23 +400,11 @@ Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, 
 
 ---
 
-### SA_08 Add max frame size limit — `src/conns.rs` (after SA_01 is fixed)
+### ~~SA_08~~ Add max frame size limit — `src/conns.rs` ✅ COMPLETE
+
+**Completed:** 2026-08-11 — Added `MAX_FRAME_SIZE` (16 MB) constant, bounds checks in `get_data()` and `get_data_async()` returning `ConnError::MalformedData` on violation. Two integration tests verify oversized rejection and valid acceptance.
 
 **Severity:** Medium. Once the framing bug (SA_01) is fixed, `vec![0u8; data_length]` allocates based on an attacker-controlled 8-byte length with no upper bound → trivial memory-exhaustion DoS.
-
-**Fix:** Add a constant and check before allocation:
-```rust
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
-
-// In get_data and get_data_async, after reading data_length:
-if data_length > MAX_FRAME_SIZE {
-    return Err(ConnError::MalformedData(format!(
-        "Frame size {} exceeds maximum {}", data_length, MAX_FRAME_SIZE
-    )));
-}
-```
-
-**Estimate:** 1h
 
 ### SA_09 TLS for transport security — tracked in roadmap Phase 7
 

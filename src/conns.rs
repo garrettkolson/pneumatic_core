@@ -40,6 +40,11 @@ pub fn get_data(reader: &mut Box<dyn Stream>) -> Result<Vec<u8>, ConnError> {
     }
 
     let data_length = u32::from_be_bytes(header) as usize;
+    if data_length > MAX_FRAME_SIZE {
+        return Err(ConnError::MalformedData(format!(
+            "Frame size {} exceeds maximum {}", data_length, MAX_FRAME_SIZE
+        )));
+    }
     let mut data: Vec<u8> = vec![0u8; data_length];
     match reader.read_exact(&mut data) {
         Ok(_) => Ok(data),
@@ -54,6 +59,11 @@ pub async fn get_data_async(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8
     }
 
     let data_length = u32::from_be_bytes(header) as usize;
+    if data_length > MAX_FRAME_SIZE {
+        return Err(ConnError::MalformedData(format!(
+            "Frame size {} exceeds maximum {}", data_length, MAX_FRAME_SIZE
+        )));
+    }
     let mut data: Vec<u8> = vec![0u8; data_length];
     match reader.read_exact(&mut data).await {
         Ok(_) => Ok(data),
@@ -184,6 +194,10 @@ impl Display for ConnError {
     }
 }
 
+/// Maximum allowed frame size — 16 MB.
+/// Prevents memory-exhaustion DoS from attacker-controlled `data_length`.
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 pub const HEARTBEAT_PORT: u16 = 42000;
 pub const COMMITTER_PORT: u16 = 42001;
 pub const SENTINEL_PORT: u16 = 42002;
@@ -205,7 +219,7 @@ mod conns_tests {
     use std::time::Duration;
 
     use crate::conns::streams::{CoreTcpStream, CoreUdsStream, Stream};
-    use crate::conns::{get_data, get_data_async};
+    use crate::conns::{get_data, get_data_async, ConnError, MAX_FRAME_SIZE};
 
     // SA_01 companion test: verify wire framing round-trip over TCP socket.
     // Uses "fire and observe" pattern: client writes, server reads and relays via channel.
@@ -489,6 +503,87 @@ mod conns_tests {
                 let _ = &mut reader; // keep compiler happy
             }
         });
+
+        drop(server_handle);
+    }
+
+    // SA_08: frame exceeding MAX_FRAME_SIZE is rejected with MalformedData.
+    #[test]
+    fn tcp_frame_too_large_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server_handle = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            if let Ok((raw_stream, _)) = listener.accept() {
+                let mut stream: Box<dyn Stream> = Box::new(CoreTcpStream::from_stream(raw_stream));
+                let err = get_data(&mut stream);
+                let _ = result_tx.send(err);
+            }
+        });
+
+        let _ = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut client_stream: Box<dyn Stream> = Box::new(CoreTcpStream::from_stream(stream));
+
+        // Send header claiming 17 MB (just over MAX_FRAME_SIZE = 16 MB)
+        // Do NOT send the actual payload — the server should reject before reading.
+        let malicious_length: u32 = (MAX_FRAME_SIZE + 1).try_into().unwrap();
+        let frame: Vec<u8> = malicious_length.to_be_bytes().to_vec();
+        client_stream.write_all(&frame).unwrap();
+
+        let err = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match err {
+            Err(ConnError::MalformedData(msg)) => {
+                assert!(msg.contains("Frame size"));
+                assert!(msg.contains("exceeds maximum"));
+            }
+            _ => panic!("expected MalformedData, got {:?}", err),
+        }
+
+        drop(server_handle);
+    }
+
+    // SA_08: frame at exactly MAX_FRAME_SIZE is accepted.
+    #[test]
+    fn tcp_frame_at_max_accepted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::channel();
+
+        let server_handle = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            if let Ok((raw_stream, _)) = listener.accept() {
+                let mut stream: Box<dyn Stream> = Box::new(CoreTcpStream::from_stream(raw_stream));
+                match get_data(&mut stream) {
+                    Ok(data) => { let _ = result_tx.send(data); }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        let _ = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut client_stream: Box<dyn Stream> = Box::new(CoreTcpStream::from_stream(stream));
+
+        // Send exactly MAX_FRAME_SIZE bytes (1 MB for speed in testing)
+        let test_limit = 1 * 1024 * 1024;
+        let payload: Vec<u8> = vec![42u8; test_limit];
+        let len = (payload.len() as u32).to_be_bytes();
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&len);
+        frame.extend_from_slice(&payload);
+        client_stream.write_all(&frame).unwrap();
+
+        let read_back = result_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(read_back.len(), test_limit);
 
         drop(server_handle);
     }
