@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 267 tests across 5 crate targets
+cargo test --workspace --lib   # Run 280 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -213,7 +213,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 267 tests: 214 core + 22 finalizer + 12 sentinel + 9 executor + 10 committer
+# 280 tests: 214 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
 ```
 
 ---
@@ -224,7 +224,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 267 tests passing across 5 crate targets, all core types and traits implemented.
+**Status: COMPLETE** — 280 tests passing across 5 crate targets, all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -331,16 +331,16 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Module | Current | Target | Gap |
 |--------|---------|--------|-----|
-| `crypto.rs` | Partial | Full | HashProvider tests, crypto round-trip encrypt/decrypt | 6h |
+| `crypto.rs` | Partial | Full | HashProvider tests, crypto round-trip encrypt/decrypt, HKDF key derivation (SA_04 companion) | 6h |
 | `blocks.rs` | 6 tests | 10+ | Chain validation edge cases, BlockFactory hash determinism | 4h |
 | `config.rs` | 0 tests | 5+ | Config loading, environment spec parsing | 4h |
 | `data.rs` | Stub only | 8+ | DefaultDataProvider wire format, StubDataProvider scenarios | 4h |
 | `tokens.rs` | 0 tests | 8+ | Token creation, comparison, minting | 4h |
 | `server.rs` | 1 (broken) | 5+ | ThreadPool lifecycle, async job handling, shutdown | 6h |
-| `epoch.rs` | 22 tests | 30+ | EpochReconciler integration, StakeSet edge cases | 4h |
+| `epoch.rs` | 22 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 companion) | 4h |
 | `registry.rs` | 33 core + 11 concurrent | 50+ | More concurrent stress tests | 6h |
 | `validation.rs` | 17 tests | 25+ | Custom spec registration, multi-token validation | 4h |
-| Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit | 12h |
+| Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit; wire framing socket round-trip (SA_01 companion) | 12h |
 
 **Sub-total**: 56h / ~1 week
 
@@ -352,13 +352,35 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Area | Tasks |
 |------|-------|
-| **Security** | Key rotation, rate limiting on incoming connections, input size limits on MsgPack frames, circuit breaker for downstream data provider |
+| **Security** | Wire framing fix (SA_01), deterministic leader election (SA_02), nonce validation (SA_03), DH-to-AES KDF + random nonce (SA_04), panic-free error returns (SA_05), deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
 | **Observability** | Structured logging (json), Prometheus metrics (tx throughput, epoch duration, quorum latency), distributed tracing |
 | **Deployment** | Docker compose for multi-node testnet, health check endpoints, graceful shutdown with task drain |
-| **Networking** | TLS for TCP connections, connection pooling, reconnection logic for dropped peers |
+| **Networking** | TLS for TCP connections (SA_09), connection pooling, reconnection logic for dropped peers |
 | **Data Layer** | Persistent data store backend (replace `DefaultDataProvider` TCP stub with real DB), backup/restore for token state |
-| **Testing** | Chaos testing (network partitions, node crashes), load testing (tx/s throughput), fuzz testing on MsgPack deserialization |
+| **Testing** | Chaos testing (network partitions, node crashes), load testing (tx/s throughput), fuzz testing on MsgPack deserialization, integration tests exercising real socket paths (SA_01 companion test) |
 | **Documentation** | API documentation (rustdoc), architecture decision records (ADRs), runbook for operators |
+
+---
+
+### Phase 8: Security Audit Remediation (Priority: HIGH — Pre-release)
+
+**Goal:** Fix all blocking and high-severity findings from the 2026-08-11 external audit. This phase MUST complete before any testnet deployment.
+
+| # | Finding | Severity | File | Effort |
+|---|---------|----------|------|--------|
+| SA_01 | Fix wire framing buffer: `vec![0u8, 4]` → `u32::from_be_bytes([0u8; 4])` | Critical | `src/conns.rs:37,51` | 2h |
+| SA_02 | Deterministic leader election: seed from prev block hash + epoch, use sorted Vec | Critical | `src/epoch.rs:154-186` | 6h |
+| SA_03 | Extract real nonce from transaction instead of hardcoded `0` | Critical | `src/action_router.rs` | 2h |
+| SA_04 | Add HKDF between DH output and AES key; use random 96-bit nonce (not zero) | Critical | `src/crypto.rs` | 4h |
+| SA_05 | Replace `.expect()` / `panic!` on network paths with `Result` error returns | High | `crypto.rs`, `environment.rs` | 4h |
+| SA_06 | Integer fixed-point gas math — no `f64` in consensus-relevant computation | High | `src/action_router.rs` | 2h |
+| SA_07 | Rename `AsymCryptoProviderType::RSA` → `Ed25519` | Medium | `src/crypto.rs` | 1h |
+| SA_08 | Max frame size limit (16 MB) before `vec!` allocation | Medium | `src/conns.rs` | 1h |
+| SA_09 | TLS for TCP connections (rustls) | Medium | `conns::listeners`, `conns::factories` | 8h |
+
+**Sub-total**: 30h / ~4 days
+
+**Tracking:** Full audit remediation plan with code-level details in [TASKS.md](TASKS.md) section "Security Audit Remediation".
 
 ---
 

@@ -220,6 +220,193 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
+## Security Audit Remediation (2026-08-11 external audit)
+
+Critical findings from external code audit — ordered by severity + impact. Items 1-4 are **blocking** (render the system non-functional or cryptographically unsafe). Items 5-7 are **high risk** (DoS / correctness hazards). Items 8-9 are **medium risk** (known gaps, tracked in roadmap).
+
+### SA_01 Fix wire framing buffer allocation — `src/conns.rs:37,51`
+
+**Severity:** Critical. The protocol is completely broken for inbound messages.
+
+**Bug:** `vec![0u8, 4]` creates a 2-element vector `[0, 4]` instead of a 4-element buffer of zeros. `read_exact` consumes only 2 bytes from the socket. `usize::from_be_bytes` needs 8 bytes on 64-bit — `try_into()` always fails, `unwrap_or_default()` returns `0`. Every inbound frame reads zero-length payload, desyncing the length-prefixed protocol. Sender-side writes 8 bytes (`to_be_bytes()` on `usize`), so reader and writer are fundamentally incompatible.
+
+**Fix:**
+```rust
+// Line 37 (get_data) and line 51 (get_data_async):
+let mut header = [0u8; 4];
+reader.read_exact(&mut header)?;
+let data_length = u32::from_be_bytes(header) as usize;
+```
+
+Also change the return type of `get_data` / `get_data_async` from `Result<Vec<u8>, ConnError>` to `Result<Vec<u8>, ConnError>` (already correct) but ensure the error variant covers `MalformedFrame` for this case.
+
+**Test:** Add `src/conns.rs` integration test that writes an 8-byte length header (e.g., `0x00 0x00 0x00 0x0A` for 10 bytes) + payload over a TCP socket, reads back with `get_data`, asserts payload matches. This exercise the real socket path rather than only mock `Stream`.
+
+**Estimate:** 2h
+
+### SA_02 Make leader election deterministic and verifiable — `src/epoch.rs:154-186`
+
+**Severity:** Critical. Every node picks a different leader per `select()` call — consensus is impossible.
+
+**Bugs:** (1) `rand::thread_rng()` is unseeded, non-reproducible, non-deterministic. (2) Iterating `HashMap::iter()` for stake walk has randomized order (SipHash). Two independent non-determinism sources.
+
+**Fix:** Replace with a deterministic seed derived from public state:
+```rust
+fn select(epoch: &Epoch, stakers: &StakeSet) -> Option<Vec<u8>> {
+    // Deterministic seed from previous block hash + epoch number
+    let seed_input = [&epoch.prev_block_hash[..], &epoch.epoch_number.to_be_bytes()];
+    let seed = ring::digest::ring_sha256(&seed_input); // or whatever hash is available
+    
+    let mut rng = rand::rngs::SeedableRng::from_seed(seed.into());
+    let target: u64 = rng.gen_range(0..total_stake);
+    
+    // Use Vec (sorted by stake, deterministic order) instead of HashMap for walk
+    let mut sorted: Vec<_> = stakers.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k); // or sort by cumulative stake
+    // Walk cumulative stake to find leader
+}
+```
+
+**Design note:** Use `rand::rngs::StdRng` or `Xoroshiro128++` seeded from a hash of public state (previous block hash + epoch number). Every honest node receiving the same block hash and stake set must produce the same leader. Document the seed derivation in an ADR.
+
+**Test:** Add a test that calls `select()` twice with identical inputs — asserts same leader both times. Add a test with 4 nodes computing independently from the same seed — asserts identical leader.
+
+**Estimate:** 6h
+
+### SA_03 Hardcoded nonce check always validates against 0 — `src/action_router.rs`
+
+**Severity:** Critical. `check_nonce(&sender, 0)` only ever succeeds for the sender's first transaction. Every subsequent transaction is rejected — both correctness and replay protection are defeated.
+
+**Fix:** Extract the nonce from the transaction body (it presumably lives in `Transaction.sequence_number` or similar), pass it to `check_nonce`:
+```rust
+"Process" => {
+    let tx: Transaction = deserialize_rmp_to(&message.body)?;
+    let nonce_result = self.check_nonce(&sender, &tx.sequence_number).await?;
+    // ...
+}
+```
+
+Or if the wire protocol should carry a top-level nonce, add it to the `Message` struct and read from `message.nonce`.
+
+**Estimate:** 2h
+
+### SA_04 Raw X25519 DH output as AES key + always-zero nonce — `src/crypto.rs`
+
+**Severity:** Critical. AES-GCM nonce reuse under the same key enables full plaintext recovery and forgery. Without a KDF between DH output and symmetric key, the entire scheme's safety rests on one unenforced invariant (fresh ephemeral scalar every call).
+
+**Fix:**
+```rust
+// DH output → AES key via HKDF
+use hkdf::Hkdf;
+use sha2::Sha256;
+
+let (okm, _) = Hkdf::<Sha256>::new(Some(b"aes256-gcm-key"), shared_secret.as_bytes());
+let mut key_material = [0u8; 32];
+okm.expand(b"", &mut key_material).expect("HKDF should not fail");
+let cipher = Aes256Gcm::new_from_slice(&key_material).expect("valid key length");
+
+// Nonce: 96-bit random nonce per encryption (not default/zero)
+let nonce = aes_gcm::Nonce::from_slice(&ephemeral_nonce_bytes[0..12]);
+// OR use aes-gcm's NewNonce:
+let nonce = aes_gcm::Nonce::from_slice(&rng.gen::<[u8; 12]>());
+```
+
+Wire format must change to include the nonce: `[32-byte ephemeral PK][12-byte nonce][ciphertext + 16-byte GCM tag]` (+12 bytes to wire size).
+
+**Test:** Add a round-trip encrypt→decrypt test that verifies the ciphertext differs between two calls (proving nonces are unique). Add a test that encrypts the same plaintext twice and asserts different ciphertexts.
+
+**Estimate:** 4h
+
+---
+
+### SA_05 Replace panics with error returns on network-reachable paths — `src/crypto.rs`, `src/environment.rs`
+
+**Severity:** High. A single malformed/tampered message can panic a handling thread → remote DoS.
+
+**Locations:**
+- `crypto.rs`: `.expect("AES-GCM decryption failed...")` on decryption failure
+- `crypto.rs`: `panic!("Decrypt input too short...")` on payload length check
+- Throughout: `RwLock::read().expect("poisoned")` / `write().expect("poisoned")`
+
+**Fix:** Return `Result<T, PneumaticError>` instead of panicking:
+```rust
+// Instead of:
+self.crypto_provider.read().expect("RwLock poisoned").decrypt(...)
+
+// Use:
+self.crypto_provider.read().map_err(|e| DataError::CryptoError(e.to_string()))?
+    .decrypt(...)
+    .map_err(|e| ConnError::DecryptError(e.to_string()))?
+```
+
+Add `PneumaticError::CryptoError(String)` and `ConnError::DecryptError(String)` variants. Document that RwLock poisoning is handled gracefully (read lock is released on panic, poison only means another thread panicked while holding the lock — the data is still valid).
+
+**Estimate:** 4h
+
+### SA_06 Deterministic gas accounting — integer math only — `src/action_router.rs`
+
+**Severity:** High. `f64` arithmetic is not bitwise-identical across CPU architectures. If gas computation feeds into committed state, nodes diverge.
+
+**Current:** `let gas_used = base_cost + (amount as f64 * multiplier) as u64;`
+
+**Fix:** Use integer fixed-point math. Store multipliers as `u64` with an implicit scale factor:
+```rust
+// In CostModel: multiplier is stored as integer × 1000 (e.g., 1.5 → 1500)
+const MULTIPLIER_SCALE: u64 = 1000;
+
+let gas_used = base_cost + (amount * multiplier_integer) / MULTIPLIER_SCALE;
+```
+
+Or use `u128` intermediate for precision: `let gas_used = ((amount as u128) * (multiplier as u128)) / 1_000_000u128 as u64;`
+
+Ensure all gas arithmetic uses `saturating_*` or explicit overflow checks.
+
+**Test:** Add a test with extreme values (max u64 amount, largest multiplier) to verify no overflow.
+
+**Estimate:** 2h
+
+### SA_07 Rename misleading `AsymCryptoProviderType::RSA` — `src/crypto.rs`
+
+**Severity:** Medium (currently harmless, future landmine). The enum variant is named `RSA` but instantiates `Ed25519Provider`.
+
+**Fix:**
+```rust
+pub enum AsymCryptoProviderType {
+    Ed25519,  // was RSA
+    // TODO: add RSA variant in future when needed
+}
+```
+
+Update all match arms and config deserialization accordingly.
+
+**Estimate:** 1h
+
+---
+
+### SA_08 Add max frame size limit — `src/conns.rs` (after SA_01 is fixed)
+
+**Severity:** Medium. Once the framing bug (SA_01) is fixed, `vec![0u8; data_length]` allocates based on an attacker-controlled 8-byte length with no upper bound → trivial memory-exhaustion DoS.
+
+**Fix:** Add a constant and check before allocation:
+```rust
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
+// In get_data and get_data_async, after reading data_length:
+if data_length > MAX_FRAME_SIZE {
+    return Err(ConnError::MalformedData(format!(
+        "Frame size {} exceeds maximum {}", data_length, MAX_FRAME_SIZE
+    )));
+}
+```
+
+**Estimate:** 1h
+
+### SA_09 TLS for transport security — tracked in roadmap Phase 7
+
+**Severity:** Medium. Plain TCP/Unix sockets with no encryption or authentication. Fine for testnet/localhost, but a prerequisite for anything beyond a trusted environment.
+
+**Current status:** Already tracked in README.md Phase 7 under "Networking". No action needed beyond tracking.
+
 ---
 
 ## Stubbed Functionality Inventory
