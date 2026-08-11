@@ -8,7 +8,7 @@ use crate::conns::ConnError;
 
 pub trait Stream : Send + Sync {
     fn read_to_end(&mut self, buffer: &mut Vec<u8>) -> Result<usize, Error>;
-    fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<(), Error>;
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), Error>;
     fn write_all(&mut self, data: &Vec<u8>) -> Result<(), Error>;
     fn into_split(self: Box<Self>) -> Result<(Box<dyn StreamReader>, Box<dyn StreamWriter>), ConnError>;
 }
@@ -30,7 +30,7 @@ impl Stream for CoreUdsStream {
         self.inner_stream.read_to_end(buffer)
     }
 
-    fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<(), Error> {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
         self.inner_stream.read_exact(buffer)
     }
 
@@ -72,7 +72,7 @@ impl Stream for CoreTcpStream {
         self.inner_stream.read_to_end(buffer)
     }
 
-    fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<(), Error> {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
         self.inner_stream.read_exact(buffer)
     }
 
@@ -99,7 +99,7 @@ impl Stream for CoreTcpStream {
 
 #[async_trait]
 pub trait StreamReader : Send + Sync {
-    async fn read_exact(&mut self, buffer: &mut Vec<u8>) -> Result<usize, ConnError>;
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<usize, ConnError>;
 }
 
 pub struct UdsReader {
@@ -116,7 +116,7 @@ impl UdsReader {
 
 #[async_trait]
 impl StreamReader for UdsReader {
-    async fn read_exact(&mut self, mut buffer: &mut Vec<u8>) -> Result<usize, ConnError> {
+    async fn read_exact(&mut self, mut buffer: &mut [u8]) -> Result<usize, ConnError> {
         match self.inner_reader.read_exact(&mut buffer).await {
             Ok(bytes_read) => Ok(bytes_read),
             Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
@@ -138,7 +138,7 @@ impl TcpReader {
 
 #[async_trait]
 impl StreamReader for TcpReader {
-    async fn read_exact(&mut self, mut buffer: &mut Vec<u8>) -> Result<usize, ConnError>{
+    async fn read_exact(&mut self, mut buffer: &mut [u8]) -> Result<usize, ConnError>{
         match self.inner_reader.read_exact(&mut buffer).await {
             Ok(bytes_read) => Ok(bytes_read),
             Err(err) => Err(ConnError::ReadError(Some(err.to_string())))

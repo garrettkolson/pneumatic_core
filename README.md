@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 280 tests across 5 crate targets
+cargo test --workspace --lib   # Run 287 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -213,7 +213,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 280 tests: 214 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
+# 287 tests: 221 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
 ```
 
 ---
@@ -224,7 +224,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 280 tests passing across 5 crate targets, all core types and traits implemented.
+**Status: COMPLETE** — 287 tests passing across 5 crate targets, all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -340,7 +340,7 @@ This roadmap tracks the work from current foundation state through a production-
 | `epoch.rs` | 22 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 companion) | 4h |
 | `registry.rs` | 33 core + 11 concurrent | 50+ | More concurrent stress tests | 6h |
 | `validation.rs` | 17 tests | 25+ | Custom spec registration, multi-token validation | 4h |
-| Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit; wire framing socket round-trip (SA_01 companion) | 12h |
+| Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit; ~~wire framing socket round-trip (SA_01 companion)~~ 6 more conns integration tests added | 10h |
 
 **Sub-total**: 56h / ~1 week
 
@@ -352,7 +352,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Area | Tasks |
 |------|-------|
-| **Security** | Wire framing fix (SA_01), deterministic leader election (SA_02), nonce validation (SA_03), DH-to-AES KDF + random nonce (SA_04), panic-free error returns (SA_05), deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
+| **Security** | ~~Wire framing fix (SA_01)~~, deterministic leader election (SA_02), nonce validation (SA_03), DH-to-AES KDF + random nonce (SA_04), panic-free error returns (SA_05), deterministic gas math (SA_06), enum rename (SA_07), max frame size limit (SA_08), key rotation, rate limiting, circuit breaker, input size limits on MsgPack frames |
 | **Observability** | Structured logging (json), Prometheus metrics (tx throughput, epoch duration, quorum latency), distributed tracing |
 | **Deployment** | Docker compose for multi-node testnet, health check endpoints, graceful shutdown with task drain |
 | **Networking** | TLS for TCP connections (SA_09), connection pooling, reconnection logic for dropped peers |
@@ -368,7 +368,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 | # | Finding | Severity | File | Effort |
 |---|---------|----------|------|--------|
-| SA_01 | Fix wire framing buffer: `vec![0u8, 4]` → `u32::from_be_bytes([0u8; 4])` | Critical | `src/conns.rs:37,51` | 2h |
+| SA_01 | ~~Fix wire framing buffer: `vec![0u8, 4]` → `u32::from_be_bytes([0u8; 4])`~~ | Critical | `src/conns.rs:37,51` | ~~2h~~ |
 | SA_02 | Deterministic leader election: seed from prev block hash + epoch, use sorted Vec | Critical | `src/epoch.rs:154-186` | 6h |
 | SA_03 | Extract real nonce from transaction instead of hardcoded `0` | Critical | `src/action_router.rs` | 2h |
 | SA_04 | Add HKDF between DH output and AES key; use random 96-bit nonce (not zero) | Critical | `src/crypto.rs` | 4h |
@@ -378,7 +378,7 @@ This roadmap tracks the work from current foundation state through a production-
 | SA_08 | Max frame size limit (16 MB) before `vec!` allocation | Medium | `src/conns.rs` | 1h |
 | SA_09 | TLS for TCP connections (rustls) | Medium | `conns::listeners`, `conns::factories` | 8h |
 
-**Sub-total**: 30h / ~4 days
+**Sub-total**: 28h / ~4 days (SA_01 complete — 2h saved)
 
 **Tracking:** Full audit remediation plan with code-level details in [TASKS.md](TASKS.md) section "Security Audit Remediation".
 
