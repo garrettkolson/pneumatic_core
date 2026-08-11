@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 224 tests across 4 crate targets
+cargo test --workspace --lib   # Run 267 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -20,7 +20,7 @@ cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 
 ```
 pneumatic_core/
-├── src/                        # Core library (13 modules)
+├── src/                        # pneumatic_core crate — core library (21 modules)
 ├── sentinel/                   # pneumatic_sentinel crate — transaction validation & routing
 ├── executor/                   # pneumatic_executor crate — contract execution
 ├── finalizer/                  # pneumatic_finalizer crate — quorum & block building
@@ -150,7 +150,7 @@ Transaction validation and routing node. Handles actions: `Process`, `Confirm`, 
 - **TransactionValidator**: Loads token from `DataProvider`, delegates to spec-based validation
 - **Gossiper**: Message dedup (TTL cache) + signature verification + fan-out to handlers
 
-**Test count**: 9
+**Test count**: 12
 
 ### pneumatic_executor
 
@@ -213,7 +213,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 224 tests: 162 core + 22 finalizer + 9 sentinel + 9 executor
+# 267 tests: 214 core + 22 finalizer + 12 sentinel + 9 executor + 10 committer
 ```
 
 ---
@@ -224,10 +224,12 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 224 tests passing, all core types and traits implemented.
+**Status: COMPLETE** — 267 tests passing across 5 crate targets, all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
+- TokenFactory minting, Token data CRU operations, per-action gas cost modeling, transaction gas deduction/persistence
+- Node registry type selection, registration handling, environment metadata specs, TcpConnection graceful shutdown
 - Sub-crates: sentinel, executor, finalizer, committer all build and test
 
 ---
