@@ -10,7 +10,7 @@ use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::registry::PendingTransactionRegistry;
-use pneumatic_core::transactions::Transaction;
+use pneumatic_core::transactions::{Transaction, TransactionState};
 
 /// Sentinel — the gatekeeper node type in the pneumatic pipeline.
 ///
@@ -185,9 +185,47 @@ impl Sentinel {
     }
 
     /// Handle a "Confirm" message — a finalizer has confirmed transaction processing.
-    fn handle_confirmation(&self, _message: Message) -> Result<(), SentinelError> {
-        // Acquire the transaction, verify the finalizer is the assigned one.
-        // If confirmed, transition to Committed and notify all sentinels.
+    fn handle_confirmation(&self, message: Message) -> Result<(), SentinelError> {
+        let tx_id: String = deserialize_rmp_to(&message.body)
+            .map_err(|e| SentinelError::Encoding(e))?;
+
+        // Acquire the transaction to prevent concurrent access during transition.
+        if self.registry.acquire_transaction(&tx_id).is_err() {
+            return Err(SentinelError::TransactionInTerminalState(tx_id.clone()));
+        }
+
+        // Verify the sender (message.public_key) matches the assigned finalizer.
+        let sender_key = message.public_key.clone();
+        if !self.registry.is_requested_finalizer(&tx_id, &sender_key) {
+            return Err(SentinelError::Registry(format!(
+                "Confirmation from unassigned finalizer {:?} for tx {}",
+                sender_key, tx_id
+            )));
+        }
+
+        // Transition to Committed state.
+        if let Ok(mut entry) = self.registry.get_transaction_mut(&tx_id) {
+            // Extract the transaction from Finalizing state to move it to Committed.
+            let old_state = std::mem::replace(
+                &mut entry.state,
+                TransactionState::Pending,
+            );
+            if let TransactionState::Finalizing { transaction, .. } = old_state {
+                entry.transition_to_committed(transaction, vec![]); // block_hash not yet available
+            } else {
+                entry.state = old_state;
+                return Err(SentinelError::Registry(format!(
+                    "Transaction {} not in Finalizing state for confirmation", tx_id
+                )));
+            }
+        }
+
+        // Notify all other sentinels that this transaction is committed.
+        let _ = self.transaction_notifier.notify_delete(&tx_id, &self.env_data);
+
+        // Release lock — transaction will be cleaned up after commit.
+        let _ = self.registry.release_transaction(&tx_id);
+
         Ok(())
     }
 
@@ -308,7 +346,8 @@ mod tests {
     use pneumatic_core::messages::Message;
     use pneumatic_core::registry::PendingTransactionRegistry;
     use pneumatic_core::tokens::Token;
-    use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState};
+    use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult};
+    use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
 
     use super::super::transaction_notifier::TransactionNotifier;
@@ -520,8 +559,8 @@ mod tests {
 
     #[test]
     fn sentinel_self_signed_token_flow_end_to_end() {
-        let (sentinel, registry) = make_sentinel_fixture();
-        let (token, node_registry) = (
+        let (_sentinel, registry) = make_sentinel_fixture();
+        let (token, _node_registry) = (
             {
                 let mut token = Token::new();
                 token.set_metadata("owner".to_string(), "alice".to_string());
@@ -697,5 +736,93 @@ mod tests {
         let env = make_test_env_data();
         let result = notifier.notify_delete("tx_123", &env);
         assert!(result.is_ok());
+    }
+
+    // --- handle_confirmation tests ---
+
+    fn make_finalizing_entry(registry: &PendingTransactionRegistry, tx_id: &str, finalizer_key: Vec<u8>) {
+        registry.register_pending(tx_id.into()).unwrap();
+        if let Ok(mut entry) = registry.get_transaction_mut(tx_id) {
+            entry.transition_to_validated(
+                Transaction {
+                    id: tx_id.into(), action: "Transfer".into(),
+                    token_id: vec![1], bid: None, sequence_number: 1,
+                    sender: vec![1], receiver: vec![2], amount: Some(100),
+                    timestamp: 0, result_hash: vec![],
+                },
+                TransactionValidationResult::valid(
+                    finalizer_key.clone(),
+                    TransactionRiskFactor {
+                        affected_parties: 2, amount: 100,
+                        is_contract: false, is_multi_party: false,
+                    },
+                ),
+            );
+        }
+        registry.set_requested_finalizer(tx_id, finalizer_key).unwrap();
+    }
+
+    #[test]
+    fn handle_confirmation_valid_finalizer_transitions_to_committed() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let finalizer_key = vec![99];
+        make_finalizing_entry(&registry, "tx_confirm", finalizer_key.clone());
+
+        // Send a "Confirm" message from the assigned finalizer.
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Confirm".into(),
+            body: serialize_to_bytes_rmp(&"tx_confirm".to_string()).unwrap(),
+            signature: vec![],
+            public_key: finalizer_key,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_ok());
+
+        // Transaction should now be in Committed state.
+        let entry = registry.get_transaction_mut("tx_confirm").unwrap();
+        assert!(matches!(entry.state, TransactionState::Committed { .. }));
+    }
+
+    #[test]
+    fn handle_confirmation_unassigned_finalizer_returns_error() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let finalizer_key = vec![99];
+        make_finalizing_entry(&registry, "tx_bad_confirm", finalizer_key.clone());
+
+        // Send a "Confirm" message from an unassigned finalizer.
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Confirm".into(),
+            body: serialize_to_bytes_rmp(&"tx_bad_confirm".to_string()).unwrap(),
+            signature: vec![],
+            public_key: vec![1, 2, 3], // wrong key
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("unassigned")),
+            _ => panic!("expected Registry error"),
+        }
+    }
+
+    #[test]
+    fn handle_confirmation_not_in_finalizing_state_returns_error() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        // Register but don't set a finalizer — stays in Pending.
+        registry.register_pending("tx_no_finalizer".into()).unwrap();
+
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Confirm".into(),
+            body: serialize_to_bytes_rmp(&"tx_no_finalizer".to_string()).unwrap(),
+            signature: vec![],
+            public_key: vec![99],
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
     }
 }
