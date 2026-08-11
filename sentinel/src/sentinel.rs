@@ -23,6 +23,7 @@ use pneumatic_core::transactions::Transaction;
 /// 4. Manage transaction lifecycle in the PendingTransactionRegistry
 /// 5. Handle risk-based routing (higher risk → more finalizers)
 pub struct Sentinel {
+    #[allow(dead_code)]
     node_registry: Arc<NodeRegistry>,
     registry: Arc<PendingTransactionRegistry>,
     gossiper: Arc<Gossiper>,
@@ -46,7 +47,7 @@ impl Sentinel {
         gossiper: Arc<Gossiper>,
     ) -> Self {
         let transaction_notifier = Arc::new(
-            super::transaction_notifier::TransactionNotifier::new(config)
+            super::transaction_notifier::TransactionNotifier::new(config, Arc::clone(&node_registry))
         );
         let data_provider = Arc::new(DefaultDataProvider::new());
         let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), data_provider);
@@ -179,10 +180,8 @@ impl Sentinel {
 
     /// Send a transaction to Executors for data preloading.
     fn send_to_executor_for_preload(&self, tx: &Transaction) -> Result<(), SentinelError> {
-        // In production: use TransactionNotifier to send Preload action
-        // to Executor nodes in this environment
-        let _ = tx;
-        Ok(())
+        self.transaction_notifier.send_to_executors_for_preload(tx, &self.env_data)
+            .map_err(Into::into)
     }
 
     /// Handle a "Confirm" message — a finalizer has confirmed transaction processing.
@@ -276,6 +275,19 @@ impl From<DataError> for SentinelError {
     }
 }
 
+impl From<super::transaction_notifier::NotifyError> for SentinelError {
+    fn from(e: super::transaction_notifier::NotifyError) -> Self {
+        match e {
+            super::transaction_notifier::NotifyError::Encoding(inner) => SentinelError::Encoding(inner),
+            super::transaction_notifier::NotifyError::Connection(inner) => SentinelError::Connection(inner),
+            super::transaction_notifier::NotifyError::Data(inner) => SentinelError::Data(inner),
+            super::transaction_notifier::NotifyError::NoTarget(t) => {
+                SentinelError::Registry(format!("No target nodes for {t:?}"))
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -299,6 +311,7 @@ mod tests {
     use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState};
     use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
 
+    use super::super::transaction_notifier::TransactionNotifier;
     use super::super::TransactionValidator;
     use super::*;
 
@@ -617,5 +630,72 @@ mod tests {
         let gas = validator.compute_gas_used(&tx);
         // base_cost=1, amount=100, unknown multiplier=1.0 → 1 + 100 = 101
         assert_eq!(gas, 101);
+    }
+
+    // --- TransactionNotifier tests ---
+
+    #[test]
+    fn transaction_notifier_send_to_executors_does_not_panic() {
+        let node_registry = make_test_node_registry();
+        let config = make_test_config();
+        let notifier = TransactionNotifier::new(config, node_registry);
+        let env = make_test_env_data();
+        let tx = Transaction {
+            id: "test_tx".into(),
+            action: "Preload".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        // Should succeed (spawns async task; no nodes registered means no sends)
+        let result = notifier.send_to_executors_for_preload(&tx, &env);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transaction_notifier_send_to_finalizer_does_not_panic() {
+        let node_registry = make_test_node_registry();
+        let config = make_test_config();
+        let notifier = TransactionNotifier::new(config, node_registry);
+        let env = make_test_env_data();
+        let tx = Transaction {
+            id: "test_tx".into(),
+            action: "Preload".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        let result = notifier.send_to_finalizer_for_preload(&tx, b"finalizer_key", &env);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transaction_notifier_notify_clear_does_not_panic() {
+        let node_registry = make_test_node_registry();
+        let config = make_test_config();
+        let notifier = TransactionNotifier::new(config, node_registry);
+        let env = make_test_env_data();
+        let result = notifier.notify_clear_to_process("tx_123", &env);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn transaction_notifier_notify_delete_does_not_panic() {
+        let node_registry = make_test_node_registry();
+        let config = make_test_config();
+        let notifier = TransactionNotifier::new(config, node_registry);
+        let env = make_test_env_data();
+        let result = notifier.notify_delete("tx_123", &env);
+        assert!(result.is_ok());
     }
 }

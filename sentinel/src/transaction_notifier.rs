@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use pneumatic_core::config::Config;
 use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::DataError;
@@ -5,17 +7,19 @@ use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::NodeRegistryType;
+use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::transactions::Transaction;
 
 /// Handles all outbound message sending from the Sentinel to other node types.
 /// Packages transactions and commands into the proper `Message` wire format.
 pub struct TransactionNotifier {
     config: Config,
+    node_registry: Arc<NodeRegistry>,
 }
 
 impl TransactionNotifier {
-    pub fn new(config: Config) -> Self {
-        TransactionNotifier { config }
+    pub fn new(config: Config, node_registry: Arc<NodeRegistry>) -> Self {
+        TransactionNotifier { config, node_registry }
     }
 
     /// Send a transaction to all Executors for data preloading.
@@ -105,9 +109,19 @@ impl TransactionNotifier {
     }
 
     /// Broadcast a message to all nodes of a given type in the registry.
-    fn send_to_nodes(&self, _target_type: NodeRegistryType, _payload: Vec<u8>) -> Result<(), NotifyError> {
-        // Stub: actual networking wired when node registries are injected.
-        // Pattern: iterate NodeRegistry entries for target type → get Sender per node → send.
+    fn send_to_nodes(&self, target_type: NodeRegistryType, payload: Vec<u8>) -> Result<(), NotifyError> {
+        let registry = Arc::clone(&self.node_registry);
+        let payload_clone = payload.clone();
+        // Spawn a bare OS thread that creates its own mini Tokio runtime
+        // to drive the async send_to_all. Works inside or outside any
+        // existing Tokio reactor context.
+        let _ = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("could not build mini runtime for send_to_nodes");
+            rt.block_on(registry.send_to_all(payload_clone, &target_type));
+        });
         Ok(())
     }
 }
