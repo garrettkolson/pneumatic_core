@@ -67,8 +67,8 @@ pub trait Connection : Send + Sync {
 }
 
 struct TcpConnection {
-    writer: tokio::sync::Mutex<Box<dyn StreamWriter>>,
-    listening_thread: tokio::task::JoinHandle<()>
+    writer: Option<tokio::sync::Mutex<Box<dyn StreamWriter>>>,
+    listening_thread: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl TcpConnection {
@@ -84,13 +84,11 @@ impl TcpConnection {
                     _ => break
                 }
             }
-
-            // TODO: initiate drop
         });
 
         Ok(TcpConnection {
-            writer: tokio::sync::Mutex::new(writer),
-            listening_thread: thread,
+            writer: Some(tokio::sync::Mutex::new(writer)),
+            listening_thread: Some(thread),
         })
     }
 }
@@ -99,9 +97,23 @@ impl TcpConnection {
 impl Connection for TcpConnection {
     async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
         let length_header = data.len().to_be_bytes();
-        let mut writer = self.writer.lock().await;
-        writer.write_all(&length_header).await?;
-        writer.write_all(data).await
+        let writer = self.writer.as_ref().expect("connection dropped");
+        let mut w = writer.lock().await;
+        w.write_all(&length_header).await?;
+        w.write_all(data).await
+    }
+}
+
+impl Drop for TcpConnection {
+    fn drop(&mut self) {
+        // Drop the writer to close the write half of the split stream.
+        // This causes the reader in listening_thread to fail with a ReadError,
+        // breaking out of the loop and allowing the task to complete.
+        drop(self.writer.take());
+
+        // Detach the thread: if the stream was already closed externally,
+        // the read loop may not exit. The OS cleans up the thread.
+        drop(self.listening_thread.take());
     }
 }
 
