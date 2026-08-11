@@ -319,19 +319,20 @@ Both `get_sync_thread` and `get_async_thread` loop body fixed: changed `Err` bra
 **File:** `src/server.rs:252-275`
 Test was commented out because `thread::spawn` with async blocks in a Tokio context causes hangs. Fixed by updating the server loop (above) — workers now exit cleanly on channel close. The underlying issue was the same: workers not continuing to process jobs. The commented-out test remains deferred until the thread pool is restructured to use a proper tokio runtime for async jobs.
 
-#### TcpConnection — cleanup on drop
-**File:** `src/conns.rs:103`
-Comment: `// TODO: initiate drop`
-**Action:** Add `Drop` impl to cancel `listening_thread` and join with timeout.
+#### TcpConnection — cleanup on drop — DONE
+**File:** `src/conns.rs:69-117`
+Added `Drop` impl that drops `writer` first (closing the write half of the split stream, signaling the reader to stop), then drops `listening_thread` via `take()` to detach the OS thread. Wrapped both fields in `Option` for safe removal. Removed the `// TODO: initiate drop` comment.
 
 #### NodeRegistry.send_to_all — uses registered connections — DONE
 **File:** `src/node/registry.rs:163-202`
 Rewrote `send_to_all` to use registered `Connection` objects from `NodeRegistryNode.conn` via `conn.send(&data).await`. Uses `futures::future::join_all` for concurrent broadcasts. Added `send_to_all_blocking` for sync contexts. Changed `Connection::send` to take `&self` with `tokio::sync::Mutex` interior mutability inside `TcpConnection`. `futures = "0.3"` dependency added.
 
-#### NodeRegistry.process_registration — always succeeds
-**File:** `src/node/registry.rs:189`
-Returns `RegistrationBatchResult::Success` without processing the batch or validating entries.
-**Action:** Iterate Add/Remove, insert/remove from DashMap, validate entries.
+#### NodeRegistry.process_registration — DONE
+**File:** `src/node/registry.rs:204-269`
+Implemented `process_registration(RegistrationBatch)` with full batch processing:
+- **Add entries**: validates each entry via `check_db_node_user` (DB stake check) and `type_is_maxed_out` (registry limit check). Skips invalid entries. On any rejection, returns `Failure` with details. Inserts valid entries into per-type DashMap with a `NoOpConnection` placeholder (real connections established via `process_conn_request`).
+- **Remove entries**: removes by key from the appropriate DashMap for each requested node type.
+Added `NoOpConnection` placeholder impl for registrations without live connections.
 
 ### pneumatic_sentinel — Priority 2 (Node-specific logic)
 

@@ -202,6 +202,75 @@ impl NodeRegistry {
     }
 
     fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {
-        Success
+        match registration_batch {
+            RegistrationBatch::Add(entries) => {
+                let mut errors = Vec::new();
+                let mut added = Vec::new();
+
+                for entry in &entries {
+                    // Validate: check stake via DB
+                    if !Self::check_db_node_user(&entry.node_key,
+                                                 &self.config.main_environment_id,
+                                                 entry.node_types.iter()
+                                                     .map(|t| self.config.get_min_type_stake(t))
+                                                     .min()
+                                                     .unwrap_or(u64::MAX)) {
+                        errors.push(entry.node_key.clone());
+                        continue;
+                    }
+
+                    // Validate: check registry not maxed out for each requested type
+                    if entry.node_types.iter().any(|t| self.type_is_maxed_out(t)) {
+                        errors.push(entry.node_key.clone());
+                        continue;
+                    }
+
+                    added.push(entry.clone());
+                }
+
+                if !errors.is_empty() {
+                    return RegistrationBatchResult::Failure(NodeRegistrationError::FromUnderlying(
+                        format!("Rejected {} entries: {:?}", errors.len(), errors)
+                    ));
+                }
+
+                for entry in &added {
+                    for node_type in &entry.node_types {
+                        if let Some(nodes) = self.get_nodes(node_type) {
+                            nodes.insert(entry.node_key.clone(), NodeRegistryNode::new(
+                                entry.ip_addr.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                                // No connection at registration time — placeholder
+                                // Connections are established via process_conn_request
+                                Box::new(NoOpConnection),
+                            ));
+                        }
+                    }
+                }
+
+                RegistrationBatchResult::Success
+            }
+            RegistrationBatch::Remove(entries) => {
+                for entry in &entries {
+                    for node_type in &entry.node_types {
+                        if let Some(nodes) = self.get_nodes(node_type) {
+                            nodes.remove(&entry.node_key);
+                        }
+                    }
+                }
+                RegistrationBatchResult::Success
+            }
+        }
+    }
+}
+
+/// Placeholder connection for entries registered without a live connection.
+/// Used as a sentinel until a real connection is established via process_conn_request.
+struct NoOpConnection;
+
+#[async_trait::async_trait]
+impl conns::Connection for NoOpConnection {
+    async fn send(&self, _data: &Vec<u8>) -> Result<(), conns::ConnError> {
+        // No-op: placeholder for registrations without live connections
+        Ok(())
     }
 }
