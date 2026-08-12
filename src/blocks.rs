@@ -7,6 +7,17 @@ use crate::crypto::{BasicHashProvider, HashProvider};
 use crate::tokens::Token;
 use crate::transactions::SignedTransaction;
 
+/// Finality status of a block — tracks whether a block could still be superseded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FinalityStatus {
+    /// Optimistic: block was committed without conflict but could theoretically be
+    /// overridden if a higher-stake competing proposal is later detected.
+    Optimistic,
+    /// Confirmed: block has been observed with no conflict for enough time to be
+    /// considered irreversible.
+    Confirmed,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Block {
     pub signed_trans: SignedTransaction,
@@ -14,6 +25,10 @@ pub struct Block {
     pub previous_hash: Vec<u8>,
     pub current_hash: Vec<u8>,
     pub timestamp: i64,
+    /// Whether this block is optimistically committed or confirmed.
+    pub finality_status: FinalityStatus,
+    /// Public key of the proposer who created this block.
+    pub proposer_key: Vec<u8>,
 }
 
 impl Block {
@@ -28,15 +43,17 @@ impl Block {
         };
 
         Block {
-            signed_trans: signed,
+            signed_trans: signed.clone(),
             token_metadata: token.metadata.clone(),
             previous_hash: prev_hash,
             timestamp: Utc::now().timestamp(),
             current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: signed.leader_address.clone(),
         }
     }
 
-    fn test_block(prev_hash: Vec<u8>) -> Self {
+    pub(crate) fn test_block(prev_hash: Vec<u8>) -> Self {
         let test_transaction = SignedTransaction::test_transaction();
         let mut block = Block {
             signed_trans: test_transaction,
@@ -44,6 +61,8 @@ impl Block {
             previous_hash: prev_hash,
             current_hash: vec![],
             timestamp: Utc::now().timestamp(),
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
         };
 
         block.current_hash = BlockFactory::create_hash(&block);
@@ -174,6 +193,39 @@ impl ChainState {
 pub mod tests {
     use super::*;
     use crate::blocks::Block;
+
+    // --- FinalityStatus tests ---
+
+    #[test]
+    fn finality_status_optimistic_deserializes() {
+        let status = FinalityStatus::Optimistic;
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&status).unwrap();
+        let recovered: FinalityStatus = crate::encoding::deserialize_rmp_to(&bytes).unwrap();
+        assert_eq!(recovered, FinalityStatus::Optimistic);
+    }
+
+    #[test]
+    fn finality_status_confirmed_deserializes() {
+        let status = FinalityStatus::Confirmed;
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&status).unwrap();
+        let recovered: FinalityStatus = crate::encoding::deserialize_rmp_to(&bytes).unwrap();
+        assert_eq!(recovered, FinalityStatus::Confirmed);
+    }
+
+    #[test]
+    fn finality_status_block_default_is_optimistic() {
+        let tx = SignedTransaction::test_transaction();
+        let blockchain = Blockchain::new();
+        let token = Token::test_token();
+        let block = Block::from_transaction(tx, blockchain, &token);
+        assert_eq!(block.finality_status, FinalityStatus::Optimistic);
+    }
+
+    #[test]
+    fn block_test_block_has_optimistic_finality() {
+        let block = Block::test_block(vec![1, 2, 3]);
+        assert_eq!(block.finality_status, FinalityStatus::Optimistic);
+    }
 
     #[test]
     fn get_current_chain_state_with_empty_chain() {
