@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (313 passing across 5 crates — 239 core + 28 sentinel + 22 finalizer + 9 executor + 15 committer)
+## Phase 7: Tests (318 passing across 5 crates — 239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -212,11 +212,11 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P1_Add tests for Gossiper — `gossiper.rs` — 9 tests: accept first, ignore duplicate, accept different, capacity, fan-out invokes-all, fan-out receives-copy, fan-out dedup-skips-all, fan-out three-handlers, fan-out concurrent-invocation
 - [x] P1_Add tests for ValidationSpec — `validation.rs` — 17 tests: SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec, ValidationSpecRegistry, nonce validation
 - [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 16 tests: From impls, creation, spec name routing, action dispatch, self-signed flow, compute_gas_used (3), TransactionNotifier send methods (4)
-- [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
+- [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 8 tests: add_success, add_duplicate_fails, add_multiple, check_quorum_met, check_quorum_not_met, reconcile_stake_weighted_supermajority, reconcile_single_sets_winner, reconcile_zero_stake_empty, reconcile_all_needed, plus 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 313 tests across 5 crate targets (239 core + 28 sentinel + 22 finalizer + 9 executor + 15 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 318 tests across 5 crate targets (239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -428,7 +428,7 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 313 tests across workspace (239 core + 22 finalizer + 9 executor + 28 sentinel + 15 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 318 tests across workspace (239 core + 26 finalizer + 9 executor + 28 sentinel + 15 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
@@ -452,7 +452,8 @@ All action branches dispatch and all coordination helpers use protocol-level use
 **Current state:** Foundation complete. `TransactionPool` provides per-token deterministic ordering (sorted by sender ASC, sequence_number ASC, timestamp ASC). `LeaderSelector` implements stake-weighted random selection. `BlockProposer` dequeues and wraps transactions in `SignedTransaction` with leader metadata. `EpochBoundaryDetector` detects stale blocks and advances epochs. `resolve_block_conflict()` handles conflicting block proposals with stake-based resolution and hash tie-break. `PendingTransactionRegistry` has `transition_to_validated_and_enqueue()`, `enqueue_to_pool()`, `dequeue_for_leader()`, `get_ordered_transactions()`. Error variants: `PneumaticError::StaleBlock`, `PneumaticError::BlockConflict`, `ValidationFailureReason::StaleEpochBlock`, `ValidationFailureReason::BlockConflict`.
 **Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 9 new tests (3 sentinel + 6 committer). Total: 313 tests passing across 5 crates.
 **Completed (2026-08-12):** Finalizer → Committer commit message path wired. `check_and_commit_transaction_results()` now accepts transactions in both `Finalizing` (standard pipeline) and `Validated` (leader-proposal) state, transitions to `Committed`, and releases the lock. 2 new tests for leader-proposal commit path with gas deduction and overflow saturation.
-**Remaining:** Implement Finalizer quorum stake-weighted selection.
+**Completed (2026-08-12):** SignatureCollector `reconcile_signatures()` now implements stake-weighted supermajority selection. Sorts candidates by stake descending, accumulates until quorum threshold reached, returns winning set with `conflict_resolved=true`. 4 new tests.
+**Remaining:** `Finalizer.initialize` — gossiper message handler subscription; `Finalizer.try_finalize` — placeholder data for total_stake, total_voters, previous_hash.
 
 #### Gossiper — handler stored and wired ✓ (DONE)
 **File:** `src/gossiper.rs:23`
@@ -579,10 +580,10 @@ Checks `result_hash` non-empty but never invoked in the pipeline (execution task
 Returns finalizer key from registry but never used.
 **Action:** Use to send execution result to the correct finalizer.
 
-### pneumatic_finalizer — Priority 4 (Complete: 22 tests pass)
+### pneumatic_finalizer — Priority 4 (Complete: 26 tests pass)
 
 Stubbed within implemented methods:
-- `SignatureCollector.reconcile_signatures` — Conflict resolution (supermajority/stake-weighted) stubbed; currently returns all signatures
+- `SignatureCollector.reconcile_signatures` — Now fully implemented: sorts candidates by stake descending, accumulates until quorum threshold (2/3) reached, returns winning supermajority set. Sets `winning_finalizer` to the executor that crossed quorum. `conflict_resolved` = true when quorum-crossing signature found. 4 new tests added.
 - `Finalizer.initialize` — Message handler subscription via gossiper stubbed (closure parameter accepted but not wired)
 - `Finalizer.try_finalize` — Steps 5, 7 use placeholder data (total_stake=0, total_voters=0, previous_hash=[])
 - `MessageDispatcher.send_to_all` — Uses NodeRegistry stub, not registered connections (see node/registry.rs:165)

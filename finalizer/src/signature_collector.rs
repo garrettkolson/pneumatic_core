@@ -90,12 +90,18 @@ impl SignatureCollector {
         Ok(reached)
     }
 
-    /// Reconcile collected signatures into a unified result.
+    /// Reconcile collected signatures via stake-weighted supermajority.
     ///
-    /// Returns `ReconciledSignatures` containing all executor signatures.
-    /// In the current implementation, all valid signatures are merged.
-    /// Conflict resolution (supermajority vote, stake-weighted selection)
-    /// is stubbed and returns the union of all signatures.
+    /// Walks executor signatures sorted by stake descending, accumulating
+    /// stake until the quorum threshold is reached. Returns only the
+    /// signatures from the winning supermajority set.
+    ///
+    /// - `winning_finalizer` = executor public key that pushed cumulative
+    ///   stake over the supermajority threshold.
+    /// - `conflict_resolved` = true when multiple distinct executor
+    ///   signatures were collected (signifies the reconciliation path ran;
+    ///   in the single-finalizer model this is always true after the
+    ///   first quorum-crossing signature).
     ///
     /// This method returns data only — it does NOT build blocks or send messages.
     pub fn reconcile_signatures(&self, tx_id: &str) -> Result<ReconciledSignatures, PneumaticError> {
@@ -106,22 +112,58 @@ impl SignatureCollector {
                 "Transaction {} not in signature registry for reconciliation", tx_id
             )))?;
 
-        let executor_sigs: Vec<pneumatic_core::errors::ExecutorSignature> = sig_map
+        // Build flat list of (executor_key, stake, signature_bytes)
+        let mut candidates: Vec<(Vec<u8>, u64, Vec<u8>)> = sig_map
             .iter()
-            .map(|(key, sig)| pneumatic_core::errors::ExecutorSignature {
-                executor_public_key: key.clone(),
-                signature: sig.signature.clone(),
-                stake: sig.current_stake,
-            })
+            .map(|(key, sig)| (key.clone(), sig.current_stake, sig.signature.clone()))
             .collect();
 
-        // In production: if multiple finalizers produced conflicting results,
-        // resolve via supermajority vote or stake-weighted selection.
-        // For now, all signatures agree (single finalizer model).
+        // Sort descending by stake: higher-stake executors vote first
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let total_stake: u64 = candidates.iter().map(|(_, s, _)| *s).sum();
+        if total_stake == 0 {
+            return Ok(ReconciledSignatures {
+                executor_signatures: vec![],
+                winning_finalizer: vec![],
+                conflict_resolved: false,
+            });
+        }
+
+        // Supermajority threshold: accumulate stake until reaching quorum%.
+        // Uses the same comparison as check_quorum for consistency:
+        // cumulative >= total_stake * quorum_percentage / 100
+        let quorum_threshold = total_stake as f64 * (self.quorum_percentage as f64) / 100.0;
+
+        let mut cumulative = 0u64;
+        let mut winning = Vec::new();
+        let mut winning_finalizer = vec![];
+        let mut conflict_resolved = false;
+
+        for (executor_key, stake, sig) in &candidates {
+            cumulative += stake;
+            winning.push(pneumatic_core::errors::ExecutorSignature {
+                executor_public_key: executor_key.clone(),
+                signature: sig.clone(),
+                stake: *stake,
+            });
+            if (cumulative as f64) >= quorum_threshold {
+                winning_finalizer = executor_key.clone();
+                conflict_resolved = true;
+                break;
+            }
+        }
+
+        // If we exhausted all candidates without reaching quorum, return all
+        // (caller's check_quorum should have prevented this, but be defensive).
+        if winning_finalizer.is_empty() {
+            winning_finalizer = candidates.first().map(|(k, _, _)| k.clone()).unwrap_or_default();
+        }
+
         Ok(ReconciledSignatures {
-            executor_signatures: executor_sigs,
-            winning_finalizer: vec![], // Single finalizer — not yet conflict-resolved
-            conflict_resolved: false,
+            executor_signatures: winning,
+            winning_finalizer,
+            conflict_resolved,
         })
     }
 
@@ -236,6 +278,65 @@ mod tests {
 
         let reconciled = collector.reconcile_signatures("tx_1").unwrap();
         assert_eq!(reconciled.executor_signatures.len(), 2);
+        assert!(reconciled.conflict_resolved);
+    }
+
+    #[test]
+    fn test_reconcile_single_signature_sets_winner() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+
+        collector.add_signature("tx_1", b"executor_1".to_vec(), make_sample_signature("tx_1", b"executor_1", 10)).unwrap();
+
+        let reconciled = collector.reconcile_signatures("tx_1").unwrap();
+        assert_eq!(reconciled.executor_signatures.len(), 1);
+        assert_eq!(reconciled.winning_finalizer, b"executor_1".to_vec());
+        assert!(reconciled.conflict_resolved);
+    }
+
+    #[test]
+    fn test_reconcile_stake_weighted_supermajority() {
+        // 3 executors: A=10, B=50, C=40. Total=100. Quorum=67.
+        // Sorted desc by stake: B(50), C(40), A(10)
+        // B=50, not enough. B+C=90 >= 67 → winner = C, conflict resolved.
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+
+        collector.add_signature("tx_1", b"A".to_vec(), make_sample_signature("tx_1", b"A", 10)).unwrap();
+        collector.add_signature("tx_1", b"B".to_vec(), make_sample_signature("tx_1", b"B", 50)).unwrap();
+        collector.add_signature("tx_1", b"C".to_vec(), make_sample_signature("tx_1", b"C", 40)).unwrap();
+
+        let reconciled = collector.reconcile_signatures("tx_1").unwrap();
+        assert_eq!(reconciled.executor_signatures.len(), 2);
+        assert_eq!(reconciled.winning_finalizer, b"C".to_vec());
+        assert!(reconciled.conflict_resolved);
+    }
+
+    #[test]
+    fn test_reconcile_all_needed_for_quorum() {
+        // 2 executors each with 50 stake. Total=100. Quorum=67.
+        // First executor (50) < 67. Both (100) >= 67.
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+
+        collector.add_signature("tx_1", b"A".to_vec(), make_sample_signature("tx_1", b"A", 50)).unwrap();
+        collector.add_signature("tx_1", b"B".to_vec(), make_sample_signature("tx_1", b"B", 50)).unwrap();
+
+        let reconciled = collector.reconcile_signatures("tx_1").unwrap();
+        assert_eq!(reconciled.executor_signatures.len(), 2);
+        assert!(reconciled.conflict_resolved);
+    }
+
+    #[test]
+    fn test_reconcile_zero_stake_returns_empty() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+
+        collector.add_signature("tx_1", b"executor_1".to_vec(), make_sample_signature("tx_1", b"executor_1", 0)).unwrap();
+
+        let reconciled = collector.reconcile_signatures("tx_1").unwrap();
+        assert!(reconciled.executor_signatures.is_empty());
+        assert!(reconciled.winning_finalizer.is_empty());
         assert!(!reconciled.conflict_resolved);
     }
 
