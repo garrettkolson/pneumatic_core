@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rand::Rng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::data::DataProvider;
-use pneumatic_core::epoch::{Conflict, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, StakeSet, StakingOp};
+use pneumatic_core::epoch::{CandidateRegistry, Conflict, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, StakeSet, StakingOp};
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::logging::Logger;
 
@@ -138,68 +137,84 @@ impl IStakingManager for StakingManager {
 // ---------------------------------------------------------------------------
 
 /// Examines chain state and returns staking/conflict operations to apply.
-/// Initial implementation returns defaults with TODOs for full chain analysis.
-/// Replaces `StubEpochReconciler` from core.
+/// Uses CandidateRegistry for same-chain conflict detection and StakeStore
+/// for real stake resolution (Phase 2 of Protocol Rearchitecture).
 pub struct EpochReconciler {
+    stake_store: Arc<StakeStore>,
+    candidate_registry: Arc<CandidateRegistry>,
     data_provider: Arc<dyn DataProvider>,
     env_id: String,
     token_ids: Vec<Vec<u8>>,
 }
 
 impl EpochReconciler {
-    pub fn new(data_provider: Arc<dyn DataProvider>, env_id: String, token_ids: Vec<Vec<u8>>) -> Self {
-        EpochReconciler { data_provider, env_id, token_ids }
+    pub fn new(
+        stake_store: Arc<StakeStore>,
+        candidate_registry: Arc<CandidateRegistry>,
+        data_provider: Arc<dyn DataProvider>,
+        env_id: String,
+        token_ids: Vec<Vec<u8>>,
+    ) -> Self {
+        EpochReconciler {
+            stake_store,
+            candidate_registry,
+            data_provider,
+            env_id,
+            token_ids,
+        }
     }
 
     /// Run epoch reconciliation — detect misshapen chains and
-    /// finalization conflicts across known tokens.
+    /// same-chain fork conflicts via CandidateRegistry.
+    ///
+    /// For same-chain detection: a conflict exists when the CandidateRegistry
+    /// holds 2+ candidates at the same `(token_id, previous_hash)` — meaning
+    /// two proposers built on the same parent block.
     fn reconcile_internal(&self) -> EpochReconciliation {
+        // Build a StakeSet from StakeStore for conflict resolution
+        let mut stake_set = StakeSet {
+            stakers: self.stake_store.iter()
+                .map(|(key, stake)| (key, stake))
+                .collect(),
+        };
+
         let mut reconciliation = EpochReconciliation::default();
 
-        // Load each token and check chain validity
+        // Load each token and check chain validity / conflicts
         for token_id in &self.token_ids {
-            match self.data_provider.get_token(token_id, &self.env_id) {
-                Ok(token) => {
-                    let chain_state = token.blockchain.get_current_chain_state();
-                    if !chain_state.is_valid {
-                        reconciliation.misshapen_tokens.push(token_id.clone());
-                    }
-                }
+            let token = match self.data_provider.get_token(token_id, &self.env_id) {
+                Ok(token) => token,
                 Err(_) => continue, // token not found, skip
+            };
+
+            // Check chain validity
+            let chain_state = token.blockchain.get_current_chain_state();
+            if !chain_state.is_valid {
+                reconciliation.misshapen_tokens.push(token_id.clone());
+                continue;
             }
-        }
 
-        // Collect valid chains for cross-comparison
-        let mut valid_chains: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            // Check CandidateRegistry for same-chain conflicts at the tip
+            let tip_hash = chain_state.last_hash_in;
+            let candidate_count = self.candidate_registry.candidate_count(token_id, &tip_hash);
+            if candidate_count >= 2 {
+                let candidates = self.candidate_registry.get_candidates(token_id, &tip_hash);
+                for pair in candidates.windows(2) {
+                    let (block_a, proposer_a) = &pair[0];
+                    let (block_b, proposer_b) = &pair[1];
 
-        for token_id in &self.token_ids {
-            if let Ok(token) = self.data_provider.get_token(token_id, &self.env_id) {
-                let chain_state = token.blockchain.get_current_chain_state();
-                if !chain_state.is_valid {
-                    continue; // skip misshapen chains
-                }
-                let hashes: Vec<Vec<u8>> = token.blockchain.chain.iter()
-                    .map(|b| b.current_hash.clone())
-                    .collect();
-                valid_chains.push((token_id.clone(), hashes));
-            }
-        }
+                    let stake_a = self.stake_store.get_stake(&proposer_a);
+                    let stake_b = self.stake_store.get_stake(&proposer_b);
 
-        // Cross-compare: for each pair, check blocks at matching indices
-        for i in 0..valid_chains.len() {
-            for j in (i + 1)..valid_chains.len() {
-                let (_, hashes_i) = &valid_chains[i];
-                let (_, hashes_j) = &valid_chains[j];
-                let min_len = hashes_i.len().min(hashes_j.len());
-                for idx in 0..min_len {
-                    if hashes_i[idx] != hashes_j[idx] {
-                        reconciliation.finalization_conflicts.push(Conflict {
-                            block_a: hashes_i[idx].clone(),
-                            block_b: hashes_j[idx].clone(),
-                            stake_a: 0, // TODO: resolve from staking state
-                            stake_b: 0,
-                        });
-                    }
+                    stake_set.stakers.insert(proposer_a.clone(), stake_a);
+                    stake_set.stakers.insert(proposer_b.clone(), stake_b);
+
+                    reconciliation.finalization_conflicts.push(Conflict {
+                        block_a: block_a.current_hash.clone(),
+                        block_b: block_b.current_hash.clone(),
+                        stake_a,
+                        stake_b,
+                    });
                 }
             }
         }
@@ -279,11 +294,11 @@ mod tests {
 
     use pneumatic_core::blocks::{Block, FinalityStatus};
     use pneumatic_core::data::{DataProvider, StubDataProvider};
-    use pneumatic_core::epoch::IEpochReconciler;
+    use pneumatic_core::epoch::{CandidateRegistry, IEpochReconciler};
     use pneumatic_core::tokens::Token;
     use pneumatic_core::transactions::SignedTransaction;
 
-    use super::EpochReconciler;
+    use super::{EpochReconciler, StakeStore};
 
     fn build_valid_block(prev_hash: Vec<u8>) -> Block {
         let signed = SignedTransaction::test_transaction();
@@ -309,37 +324,54 @@ mod tests {
             prev_hash = block.current_hash.clone();
             token.blockchain.add_block(block);
         }
-        // Verify chain is valid
         assert!(token.blockchain.get_current_chain_state().is_valid);
         token
     }
 
     fn make_invalid_token(id: Vec<u8>) -> Token {
         let mut token = make_valid_token(id, 2);
-        // Corrupt the chain by breaking hash chaining
-        let state = token.blockchain.get_current_chain_state();
-        if state.is_valid {
-            // Tamper with the last block's hash
-            if let Some(block) = token.blockchain.chain.back_mut() {
-                block.current_hash = vec![99u8; 32];
-            }
+        if let Some(block) = token.blockchain.chain.back_mut() {
+            block.current_hash = vec![99u8; 32];
         }
         assert!(!token.blockchain.get_current_chain_state().is_valid);
         token
     }
 
-    fn make_reconciler(tokens: Vec<(Vec<u8>, Token)>, token_ids: Vec<Vec<u8>>) -> EpochReconciler {
+    fn make_stake_store(stakes: Vec<(Vec<u8>, u64)>) -> Arc<StakeStore> {
+        let store = Arc::new(StakeStore::new());
+        for (key, stake) in stakes {
+            store.add_staker(key, stake);
+        }
+        store
+    }
+
+    fn make_reconciler(
+        stakes: Vec<(Vec<u8>, u64)>,
+        tokens: Vec<(Vec<u8>, Token)>,
+        token_ids: Vec<Vec<u8>>,
+    ) -> (EpochReconciler, Arc<StakeStore>, Arc<CandidateRegistry>) {
+        let stake_store = make_stake_store(stakes);
+        let registry = Arc::new(CandidateRegistry::new());
         let mut stub = StubDataProvider::new();
         for (key, token) in tokens {
             stub = stub.with_token(key, "test".to_string(), token);
         }
         let data_provider: Arc<dyn DataProvider> = Arc::new(stub);
-        EpochReconciler::new(data_provider, "test".to_string(), token_ids)
+        let reconciler = EpochReconciler::new(
+            stake_store.clone(),
+            registry.clone(),
+            data_provider,
+            "test".to_string(),
+            token_ids,
+        );
+        (reconciler, stake_store, registry)
     }
+
+    // --- Basic reconciliation ---
 
     #[test]
     fn reconcile_empty_token_ids_returns_default() {
-        let reconciler = make_reconciler(vec![], vec![]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![]);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.is_empty());
         assert!(result.finalization_conflicts.is_empty());
@@ -347,7 +379,7 @@ mod tests {
 
     #[test]
     fn reconcile_token_not_found_skipped() {
-        let reconciler = make_reconciler(vec![], vec![vec![1], vec![2]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![vec![1], vec![2]]);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.is_empty());
         assert!(result.finalization_conflicts.is_empty());
@@ -356,7 +388,7 @@ mod tests {
     #[test]
     fn reconcile_valid_chain_not_misshapen() {
         let token = make_valid_token(vec![1], 3);
-        let reconciler = make_reconciler(vec![(vec![1], token)], vec![vec![1]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]]);
         let result = reconciler.reconcile();
         assert!(!result.misshapen_tokens.contains(&vec![1]));
         assert!(result.misshapen_tokens.is_empty());
@@ -365,62 +397,121 @@ mod tests {
     #[test]
     fn reconcile_invalid_chain_detected_as_misshapen() {
         let token = make_invalid_token(vec![1]);
-        let reconciler = make_reconciler(vec![(vec![1], token)], vec![vec![1]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]]);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.contains(&vec![1]));
     }
 
-    #[test]
-    fn reconcile_conflict_at_matching_height() {
-        // Two tokens with same chain height but different genesis hashes
-        let mut token_a = Token::new();
-        token_a.id = vec![1];
-        let block = build_valid_block(vec![1u8; 32]); // different genesis
-        token_a.blockchain.add_block(block);
-
-        let token_b = make_valid_token(vec![2], 2); // genesis hash [42; 32]
-
-        let reconciler = make_reconciler(
-            vec![(vec![1], token_a), (vec![2], token_b)],
-            vec![vec![1], vec![2]],
-        );
-        let result = reconciler.reconcile();
-        assert!(!result.finalization_conflicts.is_empty());
-        // Should have at least one conflict at index 0
-        let first = &result.finalization_conflicts[0];
-        assert_ne!(first.block_a, first.block_b);
-    }
+    // --- Same-chain conflict detection via CandidateRegistry ---
 
     #[test]
-    fn reconcile_no_conflict_same_hash() {
-        // Two tokens with identical chains at same height
-        let token_a = make_valid_token(vec![1], 2);
-        let token_b = make_valid_token(vec![2], 2);
-
-        // Token B's chain should have the same hashes since they use the same
-        // genesis hash [42; 32] and the same test transaction.
-        // But wait — test_block uses a different test_transaction each time?
-        // SignedTransaction::test_transaction() is deterministic, so yes.
-        let reconciler = make_reconciler(
-            vec![(vec![1], token_a), (vec![2], token_b)],
-            vec![vec![1], vec![2]],
+    fn reconcile_no_candidates_no_conflicts() {
+        let (reconciler, _, _) = make_reconciler(
+            vec![(vec![1], 100)],
+            vec![(vec![1], make_valid_token(vec![1], 2))],
+            vec![vec![1]],
         );
+        // No candidates inserted → no conflicts
         let result = reconciler.reconcile();
-        // No conflicts because hashes match at all matching indices
         assert!(result.finalization_conflicts.is_empty());
     }
 
     #[test]
-    fn reconcile_different_heights_only_compare_to_min() {
-        let token_a = make_valid_token(vec![1], 3); // 3 blocks
-        let token_b = make_valid_token(vec![2], 1); // 1 block
-
-        let reconciler = make_reconciler(
-            vec![(vec![1], token_a), (vec![2], token_b)],
-            vec![vec![1], vec![2]],
+    fn reconcile_single_candidate_no_conflict() {
+        let (reconciler, store, registry) = make_reconciler(
+            vec![(vec![1], 100)],
+            vec![(vec![1], make_valid_token(vec![1], 2))],
+            vec![vec![1]],
         );
+        let tip_hash = tip_hash_for(&reconciler);
+        let block = build_valid_block(vec![1, 2, 3]);
+        store.add_staker(vec![1], 100);
+        registry.insert(vec![1], tip_hash, block, vec![1]);
         let result = reconciler.reconcile();
-        // Only index 0 is compared (min of 3 and 1). Since both use same genesis, no conflict.
         assert!(result.finalization_conflicts.is_empty());
+    }
+
+    // --- Helper to get tip hash from first valid token ---
+
+    fn tip_hash_for(reconciler: &EpochReconciler) -> Vec<u8> {
+        for token_id in &reconciler.token_ids {
+            if let Ok(token) = reconciler.data_provider.get_token(token_id, &reconciler.env_id) {
+                let state = token.blockchain.get_current_chain_state();
+                if state.is_valid && !state.last_hash_in.is_empty() {
+                    return state.last_hash_in;
+                }
+            }
+        }
+        vec![0u8; 32]
+    }
+
+    #[test]
+    fn reconcile_conflict_at_tip_detected() {
+        let (reconciler, store, registry) = make_reconciler(
+            vec![(vec![1], 100)],
+            vec![(vec![1], make_valid_token(vec![1], 2))],
+            vec![vec![1]],
+        );
+        let tip_hash = tip_hash_for(&reconciler);
+        let block_a = build_valid_block(vec![1, 2, 3]);
+        let block_b = build_valid_block(vec![4, 5, 6]);
+        store.add_staker(vec![1], 100);
+        store.add_staker(vec![2], 200);
+        registry.insert(vec![1], tip_hash.clone(), block_a, vec![1]);
+        registry.insert(vec![1], tip_hash, block_b, vec![2]);
+
+        let result = reconciler.reconcile();
+        assert_eq!(result.finalization_conflicts.len(), 1);
+        let conflict = &result.finalization_conflicts[0];
+        assert_ne!(conflict.block_a, conflict.block_b);
+        assert_eq!(conflict.stake_a, 100);
+        assert_eq!(conflict.stake_b, 200);
+    }
+
+    #[test]
+    fn reconcile_conflict_stake_resolution_returns_real_stakes() {
+        let (reconciler, store, registry) = make_reconciler(
+            vec![(vec![1], 500)],
+            vec![(vec![1], make_valid_token(vec![1], 2))],
+            vec![vec![1]],
+        );
+        let tip_hash = tip_hash_for(&reconciler);
+        let block_a = build_valid_block(vec![10]);
+        let block_b = build_valid_block(vec![20]);
+        store.add_staker(vec![1], 100);
+        store.add_staker(vec![2], 500);
+        registry.insert(vec![1], tip_hash.clone(), block_a, vec![1]);
+        registry.insert(vec![1], tip_hash, block_b, vec![2]);
+
+        let result = reconciler.reconcile();
+        assert_eq!(result.finalization_conflicts.len(), 1);
+        let conflict = &result.finalization_conflicts[0];
+        // Proposer 2 has more stake → should have higher stake in conflict
+        assert_eq!(conflict.stake_a, 100);
+        assert_eq!(conflict.stake_b, 500);
+    }
+
+    // --- Concurrent access ---
+
+    #[test]
+    fn reconcile_concurrent_token_access_no_panic() {
+        let stakes: Vec<(Vec<u8>, u64)> = (0..5).map(|i| (vec![i], 100)).collect();
+        let tokens: Vec<(Vec<u8>, Token)> = (0..5).map(|i| {
+            (vec![i], make_valid_token(vec![i], 2))
+        }).collect();
+        let token_ids: Vec<Vec<u8>> = (0..5).map(|i| vec![i]).collect();
+        let (reconciler, _, _) = make_reconciler(stakes, tokens, token_ids);
+        let result = std::thread::scope(|s| {
+            let mut handles = vec![];
+            for _ in 0..10 {
+                let r = &reconciler;
+                handles.push(s.spawn(|| r.reconcile()));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        // All joins succeeded → no data races
+        for res in &result {
+            assert!(res.misshapen_tokens.is_empty());
+        }
     }
 }

@@ -530,7 +530,7 @@ mod tests {
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::deserialize_rmp_to;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
-    use pneumatic_core::epoch::{BlockProposer, Epoch, EpochBoundaryDetector};
+    use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
     use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::gossiper::Gossiper;
     use pneumatic_core::messages::Message;
@@ -735,7 +735,10 @@ mod tests {
         let stake_store = Arc::new(StakeStore::new());
         let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
         let data_provider_core = Arc::new(pneumatic_core::data::DefaultDataProvider::new());
+        let candidate_registry = Arc::new(CandidateRegistry::new());
         let epoch_reconciler = Arc::new(EpochReconciler::new(
+            stake_store.clone(),
+            candidate_registry,
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]], // token ID from bootstrap_token
@@ -1101,7 +1104,10 @@ mod tests {
         let stake_store = Arc::new(StakeStore::new());
         let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
         let data_provider_core = Arc::new(pneumatic_core::data::DefaultDataProvider::new());
+        let candidate_registry = Arc::new(CandidateRegistry::new());
         let epoch_reconciler = Arc::new(EpochReconciler::new(
+            stake_store.clone(),
+            candidate_registry,
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]],

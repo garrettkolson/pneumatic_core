@@ -189,11 +189,11 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [ ] Add `finality_status` enum (`Optimistic`, `Confirmed`) to `Block` struct — `src/blocks.rs`
 - [ ] Add proposer public key to `Block`/`SignedTransaction` if not recoverable from signatures — `src/transactions.rs`, `src/blocks.rs`
 
-### Phase 2 — Replace Conflict Detection Logic
+### Phase 2 — Replace Conflict Detection Logic ✅ COMPLETE (2026-08-12)
 
-- [ ] Replace `EpochReconciler::reconcile_internal()` with same-chain detection — `committer/src/epoch_manager.rs`
-- [ ] Check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions
-- [ ] Fill `stake_a`/`stake_b` from `StakeStore::get_stake()` instead of hardcoded `0`
+- [x] Replace `EpochReconciler::reconcile_internal()` with same-chain detection — `committer/src/epoch_manager.rs` — replaced cross-token hash comparison with CandidateRegistry-based same-chain fork detection; builds StakeSet from StakeStore for real stake values
+- [x] Check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions — `reconcile_internal()` checks `candidate_count(token_id, tip_hash) >= 2` and reports pairwise conflicts
+- [x] Fill `stake_a`/`stake_b` from `StakeStore::get_stake()` instead of hardcoded `0` — both conflict fields resolved from `self.stake_store.get_stake()` per proposer
 
 ### Phase 3 — Wire `resolve_block_conflict()` Into Commit Path
 
@@ -254,7 +254,7 @@ Start with **Phase 1 + 2** together (candidate registry + real fork detection) �
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (317 passing across 5 crates — 239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
+## Phase 7: Tests (331 passing across 5 crates — 251 core + 28 sentinel + 26 finalizer + 9 executor + 17 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -270,7 +270,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 317 tests across 5 crate targets (239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 331 tests across 5 crate targets (251 core + 28 sentinel + 26 finalizer + 9 executor + 17 committer) — +18 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -522,10 +522,9 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 **File:** `src/gossiper.rs:87-92`
 Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_handler()` registers extras; `handle_message()` clones raw_data and invokes each sequentially.
 
-#### EpochReconciler — DONE (Phase 5 replaces with same-chain detection)
-**File:** `committer/src/epoch_manager.rs:142-205`, `committer/src/committer.rs:563-569`
-Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts token IDs from committer. `reconcile_internal()` loads each token via `data_provider.get_token()`, checks `chain_state.is_valid` to detect misshapen chains, and cross-compares block hashes at matching indices across valid tokens to detect finalization conflicts. `StubDataProvider` made always-available (removed `#[cfg(test)]`) for downstream test use. 7 new tests.
-**Phase 5 note:** Current `reconcile_internal()` compares block hashes at matching indices **across different tokens** — invalidly matches and isn't the fork case. Phase 5 replaces with same-chain detection via `CandidateRegistry`.
+#### EpochReconciler — DONE (Phase 2 replaces with same-chain detection, 2026-08-12)
+**File:** `committer/src/epoch_manager.rs`, `committer/src/committer.rs`
+Phase 2: `reconcile_internal()` now uses `CandidateRegistry` for same-chain fork detection. Accepts `Arc<StakeStore>` + `Arc<CandidateRegistry>` + `Arc<dyn DataProvider>` + env_id + token_ids. Builds `StakeSet` from `StakeStore`, checks `candidate_count(token_id, tip_hash) >= 2` per token, reports pairwise conflicts with real `stake_a`/`stake_b` from `StakeStore::get_stake()`. Misshapen chain detection preserved. Phase 5 (cross-token) removed. 6 new tests.
 
 #### StakingManager — DONE (StubStakingManager superseded)
 **File:** `src/epoch.rs:136-142` (stub in core), `committer/src/epoch_manager.rs:78-133` (real impl)
@@ -583,13 +582,17 @@ Implemented `process_registration(RegistrationBatch)` with full batch processing
 - **Remove entries**: removes by key from the appropriate DashMap for each requested node type.
 Added `NoOpConnection` placeholder impl for registrations without live connections.
 
-#### CandidateRegistry — NOT YET IMPLEMENTED (Phase 5)
-**File:** `src/epoch.rs` (target)
-DashMap-backed registry keyed by `(token_id, previous_hash)` holding competing block proposals before finality resolution. Replaces the current single-linear-chain assumption in `Blockchain.chain: VecDeque<Block>`.
+#### CandidateRegistry — DONE (Phase 1, 2026-08-12)
+**File:** `src/epoch.rs` (implemented)
+DashMap-backed registry keyed by `(token_id, previous_hash)` holding competing block proposals. Phase 2 consumes it in `EpochReconciler::reconcile_internal()` for same-chain fork detection. 8 tests (6 unit + 2 concurrent).
 
-#### Block finality_status — NOT YET IMPLEMENTED (Phase 5)
-**File:** `src/blocks.rs` (target)
-`finality_status` enum (`Optimistic`, `Confirmed`) on `Block` so downstream consumers know whether a block could still be superseded.
+#### Block finality_status — DONE (Phase 1, 2026-08-12)
+**File:** `src/blocks.rs` (implemented)
+`FinalityStatus` enum (`Optimistic`, `Confirmed`) on `Block`. Blocks created via `from_transaction`, `test_block`, `create_block` default to `Optimistic`. Serialization round-trip tests pass. 4 tests.
+
+#### Proposer key on Block/SignedTransaction — DONE (Phase 1, 2026-08-12)
+**File:** `src/transactions.rs` (SignedTransaction.proposer_key), `src/blocks.rs` (Block.proposer_key)
+Explicit proposer public key for conflict-resolution stake lookup. Propagated from leader_address in BlockProposer and BlockBuilder.
 
 #### Vote/Dispute messages — NOT YET IMPLEMENTED (Phase 5)
 **File:** `src/messages.rs` (target)

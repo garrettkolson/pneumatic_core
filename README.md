@@ -185,7 +185,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 | `BlockServices` | Token block commitment, block distribution |
 | `StakeStore` | In-memory stake tracking |
 | `StakingManager` | Applies staking ops (stubbed — no persistence) |
-| `EpochReconciler` | Chain analysis at epoch boundaries (stubbed — returns empty) |
+| `EpochReconciler` | Same-chain fork detection via `CandidateRegistry`, stake resolution from `StakeStore` (Phase 2) |
 | `LeaderSelector` | Stake-weighted leader selection (replaced stub with real implementation) |
 
 ## Development
@@ -313,19 +313,19 @@ This roadmap tracks the work from current foundation state through a production-
 
 **Goal:** Replace per-transaction blocking quorum with conflict-only voting; enable instant finality in the happy path.
 
-| Task | Description | Estimate |
-|------|-------------|----------|
-| Lock design decisions | Resolve 4 Phase-0 questions (see TASKS.md §Protocol Rearchitecture Phase 0): conflict definition, quorum scope, voting weight pool, losing block behavior | 4h |
-| Add `CandidateRegistry` | DashMap-backed `(token_id, previous_hash) → Vec<(Block, proposer_key)>` keyed candidate store matching existing `NodeRegistry` style | 8h |
-| Add `finality_status` to `Block` | `Optimistic` vs `Confirmed` enum; downstream consumers check status | 4h |
-| Add proposer public key to `Block`/`SignedTransaction` | Explicit proposer key for conflict resolution stake lookup | 4h |
-| Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection: check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions; fill `stake_a`/`stake_b` from `StakeStore` | 12h |
-| Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h |
-| Replace quorum gate with optimistic path | One Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h |
-| Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X"; reuse gossiper dedup/fan-out | 8h |
-| Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h |
-| Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` stake selection → hash tie-break | 8h |
-| Concurrency + e2e pipeline tests | Near-simultaneous candidate submission; submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing | 12h |
+| Task | Description | Estimate | Status |
+|------|-------------|----------|--------|
+| Lock design decisions | Resolve 4 Phase-0 questions (see TASKS.md §Protocol Rearchitecture Phase 0): conflict definition, quorum scope, voting weight pool, losing block behavior | 4h | Open |
+| Add `CandidateRegistry` | DashMap-backed `(token_id, previous_hash) → Vec<(Block, proposer_key)>` keyed candidate store matching existing `NodeRegistry` style | 8h | **DONE** (Phase 1, 2026-08-12) |
+| Add `finality_status` to `Block` | `Optimistic` vs `Confirmed` enum; downstream consumers check status | 4h | **DONE** (Phase 1, 2026-08-12) |
+| Add proposer public key to `Block`/`SignedTransaction` | Explicit proposer key for conflict resolution stake lookup | 4h | **DONE** (Phase 1, 2026-08-12) |
+| Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection: check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions; fill `stake_a`/`stake_b` from `StakeStore` | 12h | **DONE** (Phase 2, 2026-08-12) |
+| Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h | Open |
+| Replace quorum gate with optimistic path | One Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h | Open |
+| Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X"; reuse gossiper dedup/fan-out | 8h | Open |
+| Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h | Open |
+| Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` stake selection → hash tie-break | 8h | Open |
+| Concurrency + e2e pipeline tests | Near-simultaneous candidate submission; submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing | 12h | Open |
 
 **Sub-total**: ~92h / ~2.5 weeks
 

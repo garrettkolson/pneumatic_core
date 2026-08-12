@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::BasicHashProvider;
 use pneumatic_core::data::DefaultDataProvider;
-use pneumatic_core::epoch::{BlockProposer, Epoch, EpochBoundaryDetector};
+use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
@@ -74,7 +74,10 @@ async fn main() {
 
     // 7. Create EpochReconciler and LeaderSelector
     let data_provider = Arc::new(DefaultDataProvider::new());
+    let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
+        stake_store.clone(),
+        candidate_registry,
         data_provider.clone(),
         env_data.environment_id.clone(),
         vec![], // token IDs: populated dynamically via token distribution
