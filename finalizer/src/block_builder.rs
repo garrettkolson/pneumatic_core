@@ -5,7 +5,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use pneumatic_core::blocks::{Block, BlockFactory};
+use pneumatic_core::blocks::{Block, BlockFactory, FinalityStatus};
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
@@ -117,6 +117,7 @@ impl BlockBuilder {
             finalizer_addr: self.finalizer_addr.clone(),
             finalizer_sig: placeholder_sig,
             executor_sigs,
+            proposer_key: self.leader_address.clone(),
         }
     }
 
@@ -174,12 +175,15 @@ impl BlockBuilder {
         signed_tx: SignedTransaction,
         previous_hash: Vec<u8>,
     ) -> Block {
+        let proposer_key = signed_tx.proposer_key.clone();
         let block = Block {
             signed_trans: signed_tx,
             token_metadata: HashMap::new(),
             previous_hash,
             current_hash: vec![],
             timestamp: chrono::Utc::now().timestamp(),
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: proposer_key.clone(),
         };
         // Compute the block hash
         let current_hash = BlockFactory::create_hash(&block);
@@ -189,6 +193,8 @@ impl BlockBuilder {
             previous_hash: block.previous_hash,
             current_hash,
             timestamp: block.timestamp,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key,
         }
     }
 }

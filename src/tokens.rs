@@ -98,6 +98,12 @@ impl Token {
         self.metadata.insert(key, value);
     }
 
+    /// Test helper: create a minimal Token for use in tests.
+    #[cfg(test)]
+    pub fn test_token() -> Self {
+        Token::new()
+    }
+
     pub fn get_asset<T>(&self) -> Option<T>
     where
         T: for<'a> Deserialize<'a>,
@@ -170,6 +176,7 @@ impl Token {
             0 => signed_tx.leader_hash.clone(),
             _ => self.blockchain.get_current_chain_state().last_hash_in,
         };
+        let proposer_key = signed_tx.proposer_key.clone();
 
         Block {
             signed_trans: signed_tx,
@@ -177,6 +184,8 @@ impl Token {
             previous_hash: prev_hash,
             timestamp: chrono::Utc::now().timestamp(),
             current_hash: vec![],
+            finality_status: crate::blocks::FinalityStatus::Optimistic,
+            proposer_key,
         }
     }
 

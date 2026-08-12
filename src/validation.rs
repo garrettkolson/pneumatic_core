@@ -682,10 +682,12 @@ mod tests {
             finalizer_addr: vec![2],
             finalizer_sig,
             executor_sigs,
+            proposer_key: vec![1],
         }
     }
 
     fn make_valid_block(signed_tx: SignedTransaction, blockchain: &mut Blockchain) -> crate::blocks::Block {
+        let proposer_key = signed_tx.proposer_key.clone();
         // Pre-populate chain with a genesis block so validate_next_block works
         // (validate_next_block returns false for empty chains)
         if blockchain.get_count() == 0 {
@@ -717,6 +719,7 @@ mod tests {
                     current_stake: 10,
                 },
                 executor_sigs: HashMap::new(),
+                proposer_key: vec![1],
             };
             let mut gen_block = crate::blocks::Block {
                 signed_trans: genesis,
@@ -724,6 +727,8 @@ mod tests {
                 previous_hash: signed_tx.leader_hash.clone(),
                 timestamp: 0,
                 current_hash: vec![],
+                finality_status: crate::blocks::FinalityStatus::Optimistic,
+                proposer_key: vec![1],
             };
             gen_block.current_hash = BlockFactory::create_hash(&gen_block);
             blockchain.add_block(gen_block);
@@ -735,6 +740,8 @@ mod tests {
             previous_hash: prev_hash,
             timestamp: 0,
             current_hash: vec![],
+            finality_status: crate::blocks::FinalityStatus::Optimistic,
+            proposer_key,
         };
         block.current_hash = BlockFactory::create_hash(&block);
         block

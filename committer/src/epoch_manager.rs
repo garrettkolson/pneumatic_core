@@ -277,7 +277,7 @@ impl IEpochLeaderSelector for LeaderSelector {
 mod tests {
     use std::sync::Arc;
 
-    use pneumatic_core::blocks::Block;
+    use pneumatic_core::blocks::{Block, FinalityStatus};
     use pneumatic_core::data::{DataProvider, StubDataProvider};
     use pneumatic_core::epoch::IEpochReconciler;
     use pneumatic_core::tokens::Token;
@@ -293,6 +293,8 @@ mod tests {
             previous_hash: prev_hash,
             timestamp: 0,
             current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
         };
         block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
         block

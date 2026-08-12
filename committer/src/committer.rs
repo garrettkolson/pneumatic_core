@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
-use pneumatic_core::blocks::{Block, Blockchain};
+use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
 use pneumatic_core::epoch::{BlockProposer, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
@@ -654,6 +654,7 @@ mod tests {
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
+            proposer_key: vec![],
         };
 
         let mut block = Block {
@@ -662,6 +663,8 @@ mod tests {
             previous_hash: prev_hash,
             timestamp: 0,
             current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
         };
         block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
         block
@@ -677,6 +680,8 @@ mod tests {
             previous_hash: prev_hash,
             timestamp: 0,
             current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
         };
         genesis.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis);
 

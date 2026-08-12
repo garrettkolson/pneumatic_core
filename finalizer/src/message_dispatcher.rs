@@ -184,6 +184,8 @@ mod tests {
                 previous_hash: vec![1, 2, 3],
                 current_hash: vec![4, 5, 6],
                 timestamp: chrono::Utc::now().timestamp(),
+                finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+                proposer_key: vec![],
             },
         }
     }

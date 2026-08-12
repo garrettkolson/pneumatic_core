@@ -271,6 +271,9 @@ pub struct SignedTransaction {
     pub finalizer_sig: TransactionSignature,
     /// Executor signatures keyed by executor public key
     pub executor_sigs: HashMap<Vec<u8>, TransactionSignature>,
+    /// Public key of the proposer who created this transaction/block.
+    /// Used for conflict-resolution stake lookup.
+    pub proposer_key: Vec<u8>,
 }
 
 impl SignedTransaction {
@@ -303,6 +306,7 @@ impl SignedTransaction {
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
+            proposer_key: vec![],
         }
     }
 }
