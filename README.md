@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 303 tests across 5 crate targets
+cargo test --workspace --lib   # Run 317 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -71,7 +71,7 @@ pneumatic_core/
 | `transactions` | `Transaction`, `SignedTransaction`, `TransactionCommit`, `TransactionPool`, explicit state machine |
 | `validation` | `TransactionValidationSpec` and `BlockValidatorSpec` traits, SelfSigned/Executed specs, spec registries |
 | `registry` | `PendingTransactionRegistry` (DashMap-backed tx CRUD + state transitions), `TransactionSignatureRegistry` |
-| `epoch` | `Epoch`, `StakeSet`, `LeaderSelector`, `BlockProposer`, `EpochBoundaryDetector`, `resolve_block_conflict()` |
+| `epoch` | `Epoch`, `StakeSet`, `LeaderSelector`, `BlockProposer`, `EpochBoundaryDetector`, `resolve_block_conflict()`, `CandidateRegistry` (Phase 5) |
 | `gossiper` | Message deduplication (TTL cache) + fan-out to multiple handlers |
 | `messages` | Wire message format (`Message` struct), ack/reject helpers |
 | `logging` | `Logger` trait with `FileLogger` (file-locked append writes) |
@@ -85,7 +85,7 @@ pneumatic_core/
 |------|------|
 | **Sentinel** | Gatekeeper — receives raw transactions, validates, routes to executor or direct-to-committer for self-signed tokens |
 | **Executor** | Contract execution — fetches data, runs contract logic, hashes results, sends to finalizer |
-| **Finalizer** | Quorum orchestration — collects executor signatures, builds blocks, dispatches to committers |
+| **Finalizer** | Quorum orchestration — collects executor signatures **for conflict resolution only**; single-finalizer dispatch for optimistic commit in the happy path (Phase 5) |
 | **Committer** | Terminal node — commits blocks to token blockchains, manages epoch transitions, staking, leader selection |
 | **Archiver** | Block distribution recipient |
 
@@ -120,6 +120,7 @@ Each state transition is explicit via the `TransactionState` enum. A `PendingTra
 - Leader selected via **stake-weighted deterministic** selection — `SHA-256(epoch_number)` seeds `StdRng`, sorted stake walk
 - `EpochBoundaryDetector` detects expired epochs and stale blocks
 - `resolve_block_conflict()` resolves conflicting proposals: higher stake wins; tie-break by lexicographic hash comparison
+- **Optimistic finality (Phase 5):** Standard tokens commit immediately after single-executor execution + single-finalizer signature. The 2/3 quorum requirement is repurposed for conflict-resolution only — invoked when `CandidateRegistry` detects a genuine fork. Blocks start as `Optimistic` and become `Confirmed` after N seconds with no observed conflict.
 
 ### Gas Model
 
@@ -172,7 +173,7 @@ Decomposed from a monolithic C# design into three focused components:
 | `BlockBuilder` | Builds `SignedTransaction` and `Block` from reconciled signatures, signs with finalizer key |
 | `MessageDispatcher` | Sends blocks to committers, clear notifications to sentinels |
 
-**Test count**: 22
+**Test count**: 26
 
 ### pneumatic_committer
 
@@ -213,7 +214,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 303 tests: 237 core + 22 finalizer + 25 sentinel + 9 executor + 10 committer
+# 317 tests: 239 core + 26 finalizer + 28 sentinel + 9 executor + 15 committer
 ```
 
 ---
@@ -224,7 +225,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 303 tests passing across 5 crate targets (237 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer), all core types and traits implemented.
+**Status: COMPLETE** — 317 tests passing across 5 crate targets (239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -308,7 +309,29 @@ This roadmap tracks the work from current foundation state through a production-
 
 ---
 
-### Phase 5: Server & Infrastructure (Priority: MEDIUM)
+### Phase 5: Optimistic Finality (Priority: HIGH)
+
+**Goal:** Replace per-transaction blocking quorum with conflict-only voting; enable instant finality in the happy path.
+
+| Task | Description | Estimate |
+|------|-------------|----------|
+| Lock design decisions | Resolve 4 Phase-0 questions (see TASKS.md §Protocol Rearchitecture Phase 0): conflict definition, quorum scope, voting weight pool, losing block behavior | 4h |
+| Add `CandidateRegistry` | DashMap-backed `(token_id, previous_hash) → Vec<(Block, proposer_key)>` keyed candidate store matching existing `NodeRegistry` style | 8h |
+| Add `finality_status` to `Block` | `Optimistic` vs `Confirmed` enum; downstream consumers check status | 4h |
+| Add proposer public key to `Block`/`SignedTransaction` | Explicit proposer key for conflict resolution stake lookup | 4h |
+| Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection: check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions; fill `stake_a`/`stake_b` from `StakeStore` | 12h |
+| Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h |
+| Replace quorum gate with optimistic path | One Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h |
+| Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X"; reuse gossiper dedup/fan-out | 8h |
+| Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h |
+| Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` stake selection → hash tie-break | 8h |
+| Concurrency + e2e pipeline tests | Near-simultaneous candidate submission; submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing | 12h |
+
+**Sub-total**: ~92h / ~2.5 weeks
+
+---
+
+### Phase 6: Server & Infrastructure (Priority: MEDIUM)
 
 **Goal**: Fix server bugs, improve connection management.
 
@@ -325,7 +348,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ---
 
-### Phase 6: Test Coverage Expansion (Priority: MEDIUM)
+### Phase 7: Test Coverage Expansion (Priority: MEDIUM)
 
 **Goal**: Close remaining test gaps across all modules.
 
@@ -346,7 +369,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ---
 
-### Phase 7: Production Readiness (Priority: LOW — Post-MVP)
+### Phase 8: Production Readiness (Priority: LOW — Post-MVP)
 
 **Goal**: Security hardening, observability, deployment infrastructure.
 
@@ -362,7 +385,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ---
 
-### Phase 8: Security Audit Remediation (Priority: HIGH — Pre-release)
+### Phase 9: Security Audit Remediation (Priority: HIGH — Pre-release)
 
 **Goal:** Fix all blocking and high-severity findings from the 2026-08-11 external audit. This phase MUST complete before any testnet deployment.
 
@@ -393,12 +416,13 @@ This roadmap tracks the work from current foundation state through a production-
 | 2. Executor Execution | ~3 days | Phase 1 (Partial — can run in parallel with Sentinel wiring) |
 | 3. Finalizer Completion | ~3 days | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
-| 5. Server & Infra | ~3 days | Can run in parallel with 1-3 |
-| 6. Test Coverage | ~1 week | Phase 1-4 |
-| 7. Production Readiness | ~4 weeks | Phases 1-6 |
+| 5. Optimistic Finality | ~2.5 weeks | Phase 1-4 |
+| 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
+| 7. Test Coverage | ~1 week | Phase 1-5 |
+| 8. Production Readiness | ~4 weeks | Phases 1-7 |
 
-**MVP Total**: ~12 weeks (with parallel work: ~8 weeks)
-**Production Total**: ~16 weeks from MVP
+**MVP Total**: ~14.5 weeks (with parallel work: ~10 weeks)
+**Production Total**: ~18.5 weeks from MVP
 
 ---
 

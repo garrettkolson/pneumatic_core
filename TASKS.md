@@ -170,6 +170,60 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P4_14 Implement `send_to_committers` — `finalizer/src/message_dispatcher.rs` — refs: C# TransactionReconciler.cs:107-111
 - [x] P4_15 Implement `send_clear_to_sentinels` — `finalizer/src/message_dispatcher.rs` — refs: C# TransactionReconciler.cs:113-122
 
+## Protocol Rearchitecture: Optimistic Finality
+
+Audited by external review (`PROTOCOL_CHANGES.md`). Maps to README.md Phase 5.
+
+### Phase 0 — Design Decisions (Open TODOs)
+
+Resolve these before writing code — choices will ripple through all phases below.
+
+- [ ] **What exactly triggers "a conflict"?** Formal invariant: two different valid `Block`s that both reference the same `previous_hash` for the same token (i.e., two proposers building on the same parent). Nothing in current code can represent this state yet.
+- [ ] **Does the mandatory 2/3 executor quorum go away for standard tokens, or shrink to a minimal-validity check?** Full optimistic finality means most tokens shouldn't need any quorum in the happy path — this is the biggest thing blocking "instant by default."
+- [ ] **Is voting weight for conflict resolution the same global `StakeSet` used for epoch leader election, or a logically separate "representative" set?** Nano keeps these distinct (delegated voting weight vs. block production). Currently only have one pool — worth deciding on purpose.
+- [ ] **What happens to a losing block/proposer?** Just discarded, or slashed via existing (currently unwired) `StakingOp::Slash`? Real forks often indicate bad-faith double-proposing — worth punishing the latter.
+
+### Phase 1 — Data Model: Represent "Competing Candidates"
+
+- [ ] Add `CandidateRegistry` (DashMap-backed, keyed by `(token_id, previous_hash) → Vec<(Block, proposer_key)>`) — `src/epoch.rs`
+- [ ] Add `finality_status` enum (`Optimistic`, `Confirmed`) to `Block` struct — `src/blocks.rs`
+- [ ] Add proposer public key to `Block`/`SignedTransaction` if not recoverable from signatures — `src/transactions.rs`, `src/blocks.rs`
+
+### Phase 2 — Replace Conflict Detection Logic
+
+- [ ] Replace `EpochReconciler::reconcile_internal()` with same-chain detection — `committer/src/epoch_manager.rs`
+- [ ] Check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions
+- [ ] Fill `stake_a`/`stake_b` from `StakeStore::get_stake()` instead of hardcoded `0`
+
+### Phase 3 — Wire `resolve_block_conflict()` Into Commit Path
+
+- [ ] Call `resolve_block_conflict()` on conflict detection with real stakes — `committer/src/lib.rs`
+- [ ] Commit winning block to `Blockchain`; drop loser from `CandidateRegistry`
+- [ ] Optional: slash double-proposers (only if same proposer signed both competing blocks)
+- [ ] Broadcast resolution outcome via gossiper/message dispatcher
+
+### Phase 4 — Make Default Path Actually Optimistic
+
+- [ ] For standard tokens: one Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`
+- [ ] Quorum/voting in `SignatureCollector` repurposed for conflict-resolution only
+- [ ] Define "confirmed" guarantee (e.g., "final after N seconds with no conflict")
+- [ ] Expose via `finality_status`
+
+### Phase 5 — Networking Additions
+
+- [ ] Add vote/dispute message type in `messages.rs` — "I saw candidate block" + "I vote for block X"
+- [ ] Add conflict-vote aggregation structurally similar to `SignatureCollector` but conflict-scoped — `finalizer/src/`
+
+### Phase 6 — Testing
+
+- [ ] Unit tests: two proposers, same `previous_hash`, `CandidateRegistry` catch, stake resolution, hash tie-break
+- [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
+- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
+
+### Implementation Order Recommendation
+
+Start with **Phase 1 + 2** together (candidate registry + real fork detection) — build and unit-test in isolation without touching the finalizer's quorum behavior. This gives you a correct detector before changing what "instant" means in Phase 4.
+
 ## Phase 5: Refactor pneumatic_committer
 
 ### 5.1 Committer
@@ -200,7 +254,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (318 passing across 5 crates — 239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
+## Phase 7: Tests (317 passing across 5 crates — 239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +270,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 318 tests across 5 crate targets (239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 317 tests across 5 crate targets (239 core + 28 sentinel + 26 finalizer + 9 executor + 15 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -428,7 +482,7 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 318 tests across workspace (239 core + 26 finalizer + 9 executor + 28 sentinel + 15 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 317 tests across workspace (239 core + 26 finalizer + 9 executor + 28 sentinel + 15 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
@@ -468,9 +522,10 @@ Handler stored as `Mutex<Option<Box<dyn Fn(Vec<u8>) + Send + Sync>>>`. The `init
 **File:** `src/gossiper.rs:87-92`
 Handlers stored as `Vec` behind `Mutex`; `initialize()` registers first, `add_handler()` registers extras; `handle_message()` clones raw_data and invokes each sequentially.
 
-#### EpochReconciler — DONE
+#### EpochReconciler — DONE (Phase 5 replaces with same-chain detection)
 **File:** `committer/src/epoch_manager.rs:142-205`, `committer/src/committer.rs:563-569`
 Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts token IDs from committer. `reconcile_internal()` loads each token via `data_provider.get_token()`, checks `chain_state.is_valid` to detect misshapen chains, and cross-compares block hashes at matching indices across valid tokens to detect finalization conflicts. `StubDataProvider` made always-available (removed `#[cfg(test)]`) for downstream test use. 7 new tests.
+**Phase 5 note:** Current `reconcile_internal()` compares block hashes at matching indices **across different tokens** — invalidly matches and isn't the fork case. Phase 5 replaces with same-chain detection via `CandidateRegistry`.
 
 #### StakingManager — DONE (StubStakingManager superseded)
 **File:** `src/epoch.rs:136-142` (stub in core), `committer/src/epoch_manager.rs:78-133` (real impl)
@@ -527,6 +582,22 @@ Implemented `process_registration(RegistrationBatch)` with full batch processing
 - **Add entries**: validates each entry via `check_db_node_user` (DB stake check) and `type_is_maxed_out` (registry limit check). Skips invalid entries. On any rejection, returns `Failure` with details. Inserts valid entries into per-type DashMap with a `NoOpConnection` placeholder (real connections established via `process_conn_request`).
 - **Remove entries**: removes by key from the appropriate DashMap for each requested node type.
 Added `NoOpConnection` placeholder impl for registrations without live connections.
+
+#### CandidateRegistry — NOT YET IMPLEMENTED (Phase 5)
+**File:** `src/epoch.rs` (target)
+DashMap-backed registry keyed by `(token_id, previous_hash)` holding competing block proposals before finality resolution. Replaces the current single-linear-chain assumption in `Blockchain.chain: VecDeque<Block>`.
+
+#### Block finality_status — NOT YET IMPLEMENTED (Phase 5)
+**File:** `src/blocks.rs` (target)
+`finality_status` enum (`Optimistic`, `Confirmed`) on `Block` so downstream consumers know whether a block could still be superseded.
+
+#### Vote/Dispute messages — NOT YET IMPLEMENTED (Phase 5)
+**File:** `src/messages.rs` (target)
+New `Message` variants for conflict voting: "I saw candidate block" and "I vote for block X in this conflict."
+
+#### Conflict-vote aggregation — NOT YET IMPLEMENTED (Phase 5)
+**File:** `finalizer/src/` (target)
+Structurally similar to `SignatureCollector` but scoped to conflicts rather than per-transaction quorum.
 
 ### pneumatic_sentinel — Priority 2 (Node-specific logic)
 
