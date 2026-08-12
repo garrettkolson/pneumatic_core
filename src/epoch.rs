@@ -1,4 +1,5 @@
 use crate::errors::PneumaticError;
+use dashmap::DashMap;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -292,6 +293,7 @@ impl IBlockProposer for BlockProposer {
                     current_stake: 0,
                 },
                 executor_sigs: std::collections::HashMap::new(),
+                proposer_key: self.leader_address.clone(),
             };
             result.push((tx, signed));
         }
@@ -399,12 +401,85 @@ pub fn resolve_block_conflict(
 }
 
 // ---------------------------------------------------------------------------
+// CandidateRegistry — competing block proposals
+// ---------------------------------------------------------------------------
+
+/// Registry of competing block candidates keyed by (token_id, previous_hash).
+/// Used for conflict detection — when two or more valid blocks reference the
+/// same previous_hash for the same token, they represent a fork.
+#[derive(Debug, Default)]
+pub struct CandidateRegistry {
+    /// (token_id, previous_hash) → list of candidate (block, proposer_key) pairs
+    candidates: DashMap<(Vec<u8>, Vec<u8>), Vec<(crate::blocks::Block, Vec<u8>)>>,
+}
+
+impl CandidateRegistry {
+    pub fn new() -> Self {
+        CandidateRegistry {
+            candidates: DashMap::new(),
+        }
+    }
+
+    /// Insert a candidate block. If another candidate already exists at this
+    /// (token_id, previous_hash), the new candidate is appended — a conflict
+    /// is detected when the vec has length >= 2.
+    pub fn insert(&self, token_id: Vec<u8>, previous_hash: Vec<u8>,
+                  block: crate::blocks::Block, proposer_key: Vec<u8>) {
+        let key = (token_id, previous_hash);
+        let mut entry = self.candidates.entry(key).or_insert_with(Vec::new);
+        entry.push((block, proposer_key));
+    }
+
+    /// Get all candidates for a given (token_id, previous_hash).
+    pub fn get_candidates(&self, token_id: &[u8], previous_hash: &[u8]) -> Vec<(crate::blocks::Block, Vec<u8>)> {
+        let key = (token_id.to_vec(), previous_hash.to_vec());
+        self.candidates.get(&key)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
+    /// Check if a conflict exists: 2+ candidates at the same (token_id, previous_hash).
+    pub fn has_conflict(&self, token_id: &[u8], previous_hash: &[u8]) -> bool {
+        let key = (token_id.to_vec(), previous_hash.to_vec());
+        self.candidates.get(&key)
+            .map(|entry| entry.value().len() >= 2)
+            .unwrap_or(false)
+    }
+
+    /// Get the number of candidates at a specific key.
+    pub fn candidate_count(&self, token_id: &[u8], previous_hash: &[u8]) -> usize {
+        let key = (token_id.to_vec(), previous_hash.to_vec());
+        self.candidates.get(&key)
+            .map(|entry| entry.value().len())
+            .unwrap_or(0)
+    }
+
+    /// Remove all candidates at a key (after resolving a conflict).
+    pub fn remove_conflicted(&self, token_id: &[u8], previous_hash: &[u8]) -> usize {
+        let key = (token_id.to_vec(), previous_hash.to_vec());
+        self.candidates.remove(&key).map(|(_, v)| v.len()).unwrap_or(0)
+    }
+
+    /// Total number of distinct (token_id, previous_hash) keys.
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// Returns true if there are no candidate groups.
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use crate::blocks::{Block, FinalityStatus};
 
     // --- LeaderSelector tests ---
 
@@ -708,5 +783,137 @@ mod tests {
             &stakes,
         ).unwrap();
         assert_eq!(winner, b"aa");
+    }
+
+    // --- CandidateRegistry tests ---
+
+    #[test]
+    fn registry_empty_on_creation() {
+        let registry = CandidateRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn registry_insert_and_get_candidates() {
+        let registry = CandidateRegistry::new();
+        let block = Block::test_block(vec![1, 2, 3]);
+        let token_id = vec![1, 2];
+        let prev_hash = vec![4, 5, 6];
+        let proposer = vec![99];
+
+        registry.insert(token_id.clone(), prev_hash.clone(), block, proposer.clone());
+
+        let candidates = registry.get_candidates(&token_id, &prev_hash);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, proposer);
+    }
+
+    #[test]
+    fn registry_detects_conflict_on_second_insert() {
+        let registry = CandidateRegistry::new();
+        let block_a = Block::test_block(vec![1]);
+        let block_b = Block::test_block(vec![2]);
+        let token_id = vec![1, 2];
+        let prev_hash = vec![3, 4, 5];
+
+        registry.insert(token_id.clone(), prev_hash.clone(), block_a, vec![1]);
+        assert!(!registry.has_conflict(&token_id, &prev_hash));
+
+        registry.insert(token_id.clone(), prev_hash.clone(), block_b, vec![2]);
+        assert!(registry.has_conflict(&token_id, &prev_hash));
+    }
+
+    #[test]
+    fn registry_candidate_count_returns_correct_count() {
+        let registry = CandidateRegistry::new();
+        let token_id = vec![1];
+        let prev_hash = vec![2];
+
+        assert_eq!(registry.candidate_count(&token_id, &prev_hash), 0);
+
+        registry.insert(token_id.clone(), prev_hash.clone(), Block::test_block(vec![1]), vec![1]);
+        assert_eq!(registry.candidate_count(&token_id, &prev_hash), 1);
+
+        registry.insert(token_id.clone(), prev_hash.clone(), Block::test_block(vec![2]), vec![2]);
+        assert_eq!(registry.candidate_count(&token_id, &prev_hash), 2);
+    }
+
+    #[test]
+    fn registry_remove_conflicted_clears_entry() {
+        let registry = CandidateRegistry::new();
+        let token_id = vec![1, 2];
+        let prev_hash = vec![3, 4, 5];
+
+        registry.insert(token_id.clone(), prev_hash.clone(), Block::test_block(vec![1]), vec![1]);
+        registry.insert(token_id.clone(), prev_hash.clone(), Block::test_block(vec![2]), vec![2]);
+
+        assert_eq!(registry.candidate_count(&token_id, &prev_hash), 2);
+        let removed = registry.remove_conflicted(&token_id, &prev_hash);
+        assert_eq!(removed, 2);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_separate_keys_independent() {
+        let registry = CandidateRegistry::new();
+        let block = Block::test_block(vec![1]);
+
+        registry.insert(vec![1], vec![2], block.clone(), vec![1]);
+        registry.insert(vec![3], vec![4], block, vec![2]);
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.candidate_count(&[1], &[2]), 1);
+        assert_eq!(registry.candidate_count(&[3], &[4]), 1);
+        assert!(!registry.has_conflict(&[1], &[2]));
+    }
+
+    // --- CandidateRegistry concurrent tests ---
+
+    #[test]
+    fn registry_concurrent_inserts_no_panic() {
+        let registry = Arc::new(CandidateRegistry::new());
+        let token_id = vec![1];
+        let prev_hash = vec![2];
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let reg = Arc::clone(&registry);
+            let tid = token_id.clone();
+            let ph = prev_hash.clone();
+            handles.push(std::thread::spawn(move || {
+                let block = Block::test_block(vec![i as u8]);
+                reg.insert(tid, ph, block, vec![i]);
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(registry.candidate_count(&token_id, &prev_hash), 10);
+        assert!(registry.has_conflict(&token_id, &prev_hash));
+    }
+
+    #[test]
+    fn registry_concurrent_separate_keys_no_race() {
+        let registry = Arc::new(CandidateRegistry::new());
+        let mut handles = vec![];
+
+        for i in 0..5 {
+            let reg = Arc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                let token_id = vec![i];
+                let prev_hash = vec![i, 0];
+                let block = Block::test_block(vec![i as u8]);
+                reg.insert(token_id, prev_hash, block, vec![i]);
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert_eq!(registry.len(), 5);
     }
 }
