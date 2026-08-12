@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::BasicHashProvider;
 use pneumatic_core::data::DefaultDataProvider;
+use pneumatic_core::epoch::{BlockProposer, Epoch, EpochBoundaryDetector};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
@@ -88,6 +89,22 @@ async fn main() {
     // 9. Create PendingTransactionRegistry
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
 
+    // 9.5. Create epoch tracking components
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let epoch_duration = 300; // 5 minutes
+    let initial_epoch = Epoch::new_with_leader(
+        1,
+        now,
+        now + epoch_duration,
+        leader_selector.as_ref(),
+        &stake_store.to_stake_set(),
+    );
+    let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
+    let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
+
     // 10. Create BlockServices
     let block_services = Arc::new(BlockServices::new(
         tokens.clone(),
@@ -112,6 +129,10 @@ async fn main() {
         leader_selector,
         data_provider,
         0, // current_epoch_number
+        Some(epoch_detector),
+        block_proposer,
+        epoch_duration,
+        5000, // proposal_interval_ms: check every 5 seconds
     ));
 
     // 12. Wire up gossiper message handler
@@ -127,7 +148,23 @@ async fn main() {
         });
     });
 
-    // 13. Log startup and block on shutdown
+    // 13. Start background epoch loop — polls for block proposals periodically
+    let epoch_committer = committer.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = epoch_committer.run_epoch_loop().await {
+                // Log but don't crash — epoch loop errors are non-fatal
+                epoch_committer.logger()
+                    .log(format!("Epoch loop error: {:?}", e));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                epoch_committer.proposal_interval_ms(),
+            ))
+            .await;
+        }
+    });
+
+    // 14. Log startup and block on shutdown
     shared_logger.log("Committer node started".to_string());
 
     // Block the main thread indefinitely (node runs until killed)

@@ -200,7 +200,7 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (292 passing across 5 crates — 225 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+## Phase 7: Tests (311 passing across 5 crates — 239 core + 28 sentinel + 22 finalizer + 9 executor + 13 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -216,7 +216,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 292 tests across 5 crate targets (225 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer)
+- [x] T07 Migrate existing tests — all test-bearing files — total 311 tests across 5 crate targets (239 core + 28 sentinel + 22 finalizer + 9 executor + 13 committer)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -428,11 +428,11 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 292 tests across workspace (225 core + 22 finalizer + 9 executor + 25 sentinel + 10 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 311 tests across workspace (239 core + 22 finalizer + 9 executor + 28 sentinel + 13 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
-**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 292 tests passing.
+**Completed:** `User` struct has `stake` field (separate from `fuel_balance`). `Account` struct added for per-token balances. `CostModel` added to `EnvironmentMetadata` with `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, `amount_multiplier`. `DataProvider` trait has `get_user()`/`save_user()` methods. `DefaultDataProvider` and `StubDataProvider` implement them. `ActionRouter::check_nonce()`, `verify_gas()`, `check_stake()` use `get_user()` instead of `get_token() + get_asset::<User>()`. `verify_gas()` calculates real gas cost with per-action multipliers. `check_stake()` checks both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. `node/registry::check_db_node_user()` updated. 311 tests passing.
 
 #### TokenFactory — minting fee deduction — DONE
 **File:** `src/tokens.rs:290-347`
@@ -450,12 +450,8 @@ All action branches dispatch and all coordination helpers use protocol-level use
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
 **Current state:** Foundation complete. `TransactionPool` provides per-token deterministic ordering (sorted by sender ASC, sequence_number ASC, timestamp ASC). `LeaderSelector` implements stake-weighted random selection. `BlockProposer` dequeues and wraps transactions in `SignedTransaction` with leader metadata. `EpochBoundaryDetector` detects stale blocks and advances epochs. `resolve_block_conflict()` handles conflicting block proposals with stake-based resolution and hash tie-break. `PendingTransactionRegistry` has `transition_to_validated_and_enqueue()`, `enqueue_to_pool()`, `dequeue_for_leader()`, `get_ordered_transactions()`. Error variants: `PneumaticError::StaleBlock`, `PneumaticError::BlockConflict`, `ValidationFailureReason::StaleEpochBlock`, `ValidationFailureReason::BlockConflict`.
-**Race scenarios:**
-- Two leaders propose conflicting blocks at the same height → `resolve_block_conflict()` resolves via stake comparison, hash tie-break
-- Epoch boundary: old leader's block arrives after new leader's block → `EpochBoundaryDetector.is_stale_block()` detects this
-- Leader reads from empty queue → `TransactionPool` integration via `PendingTransactionRegistry.dequeue_for_leader()`
-- Multiple senders with same nonce to same token → conflict resolved by timestamp ordering in pool
-**Action:** Wire BlockProposer into the actual pipeline (Sentinel → executor → finalizer → leader block construction). Implement Finalizer quorum stake-weighted selection.
+**Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 7 new tests (3 sentinel + 4 committer). Total: 311 tests passing across 5 crates.
+**Remaining:** Implement Finalizer quorum stake-weighted selection.
 
 #### Gossiper — handler stored and wired ✓ (DONE)
 **File:** `src/gossiper.rs:23`
@@ -481,7 +477,7 @@ Added `token_ids: Vec<Vec<u8>>` field to `EpochReconciler`; constructor accepts 
 #### LeaderSelector — stake-weighted deterministic selection ✓ (DONE — SA_02, 2026-08-11)
 **File:** `src/epoch.rs:154-186`, `committer/src/epoch_manager.rs:220-263`
 Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach. Deterministic seed: `SHA-256(epoch_number.to_be_bytes())` via `ring`, produces `StdRng` — every honest node with same `StakeSet` + `epoch_number` picks same leader. Replaced `HashMap::iter()` with sorted key walk. Trait: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
-**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 225 core + 25 sentinel + 22 finalizer + 9 executor + 10 committer = 291 total.
+**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 239 core + 28 sentinel + 22 finalizer + 9 executor + 13 committer = 311 total.
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
@@ -497,7 +493,7 @@ All 5 fields now wired in `load_from_spec`:
 - `sym_crypto_provider` and `serialization_provider` stored as `String` fields on `EnvironmentMetadata` for diagnostics
 - `trans_validation_specs` and `block_validation_specs` iterated and registered into existing `ValidationSpecRegistry` / `BlockValidatorSpecRegistry` by name ("SelfSigned", "Executed"); unknown names silently skipped
 - `allowed_token_types` already stored (line 132); no enforcement needed
-Added imports for `SelfSignedBlockValidatorSpec` and `ExecutedBlockValidatorSpec`. 287 tests pass.
+Added imports for `SelfSignedBlockValidatorSpec` and `ExecutedBlockValidatorSpec`. 311 tests pass.
 
 #### Config — node registry type selection — DONE
 **File:** `src/config.rs:37-46, 126-162`
@@ -596,7 +592,7 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (287 passing across 5 crates)
+### Tests — Priority 6 (311 passing across 5 crates)
 
 #### Tests added to pneumatic_core — 216 tests
 **Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing), `conns.rs` (7 SA_01 wire framing integration tests), `streams.rs` (9 streams unit tests)

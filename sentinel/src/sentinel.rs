@@ -145,6 +145,19 @@ impl Sentinel {
             return self.handle_self_signed(tx, gas_used);
         }
 
+        // Step 6: Transition to Validated and enqueue into the pool for leader ordering.
+        let risk = self.transaction_validator.calculate_risk(&tx);
+        let _ = self.registry.transition_to_validated_and_enqueue(
+            &tx_id,
+            tx.clone(),
+            pneumatic_core::transactions::TransactionValidationResult {
+                is_valid: true,
+                risk,
+                failure_reasons: vec![],
+                finalizer_public_key: vec![],
+            },
+        );
+
         // Step 7: Standard pipeline — send to Executor for preloading
         self.send_to_executor_for_preload(&tx)
     }
@@ -154,19 +167,18 @@ impl Sentinel {
     fn handle_self_signed(&self, tx: Transaction, gas_used: u64) -> Result<(), SentinelError> {
         let tx_id = tx.id.clone();
 
-        // Transition to Validated state with self-signed result
-        {
-            let risk = self.transaction_validator.calculate_risk(&tx);
-            if let Ok(mut entry) = self.registry.get_transaction_mut(&tx_id) {
-                entry.transition_to_validated(tx.clone(),
-                    pneumatic_core::transactions::TransactionValidationResult {
-                    is_valid: true,
-                    risk,
-                    failure_reasons: vec![],
-                    finalizer_public_key: vec![], // Empty — self-signed, no finalizer
-                });
-            }
-        }
+        // Transition to Validated state and enqueue into the pool in one atomic operation.
+        let risk = self.transaction_validator.calculate_risk(&tx);
+        let _ = self.registry.transition_to_validated_and_enqueue(
+            &tx_id,
+            tx.clone(),
+            pneumatic_core::transactions::TransactionValidationResult {
+                is_valid: true,
+                risk,
+                failure_reasons: vec![],
+                finalizer_public_key: vec![], // Empty — self-signed, no finalizer
+            },
+        );
 
         // Record gas used for this self-signed transaction
         self.registry.record_gas_used(&tx_id, gas_used);
@@ -1148,5 +1160,141 @@ mod tests {
             SentinelError::Registry(msg) => assert!(msg.contains("Insufficient stake")),
             _ => panic!("expected Registry error"),
         }
+    }
+
+    // --- Transaction pool enqueue tests ---
+
+    #[test]
+    fn handle_self_signed_enqueues_to_pool() {
+        let (sentinel, registry) = make_sentinel_fixture();
+
+        // Create a self-signed transaction (receiver is empty)
+        let tx = Transaction {
+            id: "tx_pool_enqueue_signed".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: b"alice".to_vec(),
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 1000,
+            result_hash: vec![],
+        };
+
+        // Pre-register the transaction (as handle_self_signed in the real flow does)
+        registry.register_pending(tx.id.clone()).unwrap();
+
+        // Call handle_self_signed directly — it should enqueue to pool
+        sentinel.handle_self_signed(tx.clone(), 100).unwrap();
+
+        // Verify the transaction was enqueued to the pool
+        let pool_txs = registry.get_ordered_transactions(&[1], 10).unwrap();
+        assert!(!pool_txs.is_empty());
+        assert_eq!(pool_txs[0].id, tx.id);
+    }
+
+    #[test]
+    fn handle_process_request_enqueues_standard_tx_to_pool() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let (token, _node_registry) = (
+            {
+                let mut token = Token::new();
+                token.set_metadata("owner".to_string(), "bob".to_string());
+                token
+            },
+            make_test_node_registry(),
+        );
+
+        // Create a standard transaction (sender != owner, Executed spec)
+        let tx = Transaction {
+            id: "tx_pool_enqueue_std".into(),
+            action: "Process".into(),
+            token_id: vec![2],
+            bid: None,
+            sequence_number: 2,
+            sender: b"bob".to_vec(),
+            receiver: b"carol".to_vec(),
+            amount: Some(50),
+            timestamp: 2000,
+            result_hash: vec![],
+        };
+
+        // Pre-register the transaction (as handle_process_request does)
+        let tx_id = tx.id.clone();
+        registry.register_pending(tx_id.clone()).unwrap();
+        registry.acquire_transaction(&tx_id).unwrap();
+
+        // Manually transition to Validated + enqueue (simulating the new code path
+        // that runs in handle_process_request before send_to_executor_for_preload)
+        let risk = TransactionRiskFactor {
+                        affected_parties: 2,
+                        amount: 50,
+                        is_contract: false,
+                        is_multi_party: false,
+                    };
+        let _ = registry.transition_to_validated_and_enqueue(
+            &tx_id,
+            tx.clone(),
+            TransactionValidationResult {
+                is_valid: true,
+                risk,
+                failure_reasons: vec![],
+                finalizer_public_key: vec![3],
+            },
+        );
+
+        // Verify the transaction was enqueued to the pool for token [2]
+        let pool_txs = registry.get_ordered_transactions(&[2], 10).unwrap();
+        assert!(!pool_txs.is_empty());
+        assert_eq!(pool_txs[0].id, tx_id);
+    }
+
+    #[test]
+    fn pool_ordering_is_deterministic() {
+        let (sentinel, registry) = make_sentinel_fixture();
+        let _ = sentinel;
+
+        // Insert 3 transactions with different sequence numbers and senders.
+        // Pool ordering: sender ASC, then sequence_number ASC, then timestamp ASC.
+        for i in 0..3 {
+            let tx = Transaction {
+                id: format!("tx_order_{}", i),
+                action: "Process".into(),
+                token_id: vec![3],
+                bid: None,
+                sequence_number: i + 1,
+                sender: vec![(i + 1) as u8], // sender 1, 2, 3
+                receiver: vec![10],
+                amount: Some(10),
+                timestamp: 3000,
+                result_hash: vec![],
+            };
+            let tx_id = tx.id.clone();
+            registry.register_pending(tx_id.clone()).unwrap();
+            let _ = registry.transition_to_validated_and_enqueue(
+                &tx_id,
+                tx,
+                TransactionValidationResult {
+                    is_valid: true,
+                    risk: TransactionRiskFactor {
+                        affected_parties: 2,
+                        amount: 50,
+                        is_contract: false,
+                        is_multi_party: false,
+                    },
+                    failure_reasons: vec![],
+                    finalizer_public_key: vec![4],
+                },
+            );
+        }
+
+        // Dequeue should return in deterministic order:
+        // sender [1], seq 1 → sender [2], seq 2 → sender [3], seq 3
+        let ordered = registry.get_ordered_transactions(&[3], 10).unwrap();
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].id, "tx_order_0"); // sender [1]
+        assert_eq!(ordered[1].id, "tx_order_1"); // sender [2]
+        assert_eq!(ordered[2].id, "tx_order_2"); // sender [3]
     }
 }

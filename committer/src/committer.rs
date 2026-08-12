@@ -7,13 +7,15 @@ use tokio::sync::Mutex;
 use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
-use pneumatic_core::epoch::{IEpochLeaderSelector, IEpochReconciler, IStakingManager};
+use pneumatic_core::blocks::{Block, Blockchain};
+use pneumatic_core::epoch::{BlockProposer, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager};
 use pneumatic_core::gossiper::Gossiper;
+use pneumatic_core::logging::Logger;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::tokens::Token;
-use pneumatic_core::transactions::{TransactionCommit, TransactionState};
+use pneumatic_core::transactions::{SignedTransaction, TransactionCommit, TransactionState};
 
 use super::block_services::BlockServices;
 use super::committer_error::CommitterError;
@@ -69,10 +71,19 @@ pub struct Committer {
     current_epoch_number: AtomicU64,
     /// Flag: is the committer shutting down?
     awaiting_shutdown: Arc<Mutex<bool>>,
+    /// Epoch boundary detector — leader checks expiry and advances epochs
+    epoch_detector: Arc<Mutex<Option<EpochBoundaryDetector>>>,
+    /// Block proposer — dequeues transactions from the pool for batch proposal
+    block_proposer: Arc<dyn IBlockProposer>,
+    /// Duration of each epoch in seconds
+    epoch_duration: i64,
+    /// Interval between proposal polls in milliseconds
+    proposal_interval_ms: u64,
 }
 
 impl Committer {
     /// Create a new Committer with all required components.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         env_data: Arc<EnvironmentMetadata>,
@@ -88,6 +99,10 @@ impl Committer {
         leader_selector: Arc<LeaderSelector>,
         data_provider: Arc<dyn DataProvider>,
         current_epoch_number: u64,
+        epoch_detector: Option<EpochBoundaryDetector>,
+        block_proposer: Arc<dyn IBlockProposer>,
+        epoch_duration: i64,
+        proposal_interval_ms: u64,
     ) -> Self {
         Committer {
             env_data,
@@ -102,8 +117,12 @@ impl Committer {
             epoch_reconciler,
             leader_selector,
             data_provider,
-                current_epoch_number: AtomicU64::new(current_epoch_number),
+            current_epoch_number: AtomicU64::new(current_epoch_number),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
+            epoch_detector: Arc::new(Mutex::new(epoch_detector)),
+            block_proposer,
+            epoch_duration,
+            proposal_interval_ms,
         }
     }
 
@@ -349,6 +368,130 @@ impl Committer {
     pub fn cached_token_count(&self) -> usize {
         self.tokens.len()
     }
+
+    /// Get the proposal poll interval in milliseconds.
+    pub fn proposal_interval_ms(&self) -> u64 {
+        self.proposal_interval_ms
+    }
+
+    /// Get a reference to the logger.
+    pub fn logger(&self) -> &Arc<dyn Logger> {
+        &self.env_data.logger
+    }
+
+    // -----------------------------------------------------------------------
+    // Block proposal
+    // -----------------------------------------------------------------------
+
+    /// Advance to a new epoch: bump the epoch number, select a new leader,
+    /// and save the previous leader for stale block detection.
+    fn advance_epoch(&self) -> Option<Vec<u8>> {
+        let mut detector = self.epoch_detector.try_lock().ok()?;
+        let detector = detector.as_mut()?;
+        let stake_set = self.stake_store.to_stake_set();
+        detector.advance_to_new_epoch(
+            self.leader_selector.as_ref(),
+            &stake_set,
+            self.epoch_duration,
+        );
+        let new_epoch_number = detector.current_epoch.epoch_number;
+        self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
+        let new_leader = detector.current_epoch.leader_public_key.clone();
+        // Advance may have set previous_leader — that's fine, it stays in the detector.
+        Some(new_leader)
+    }
+
+    /// Propose a batch of transactions for a given token.
+    ///
+    /// Steps:
+    /// 1. Check epoch expiry — if expired, advance to new epoch
+    /// 2. Verify this node is the current epoch leader
+    /// 3. Dequeue transactions from the pool via BlockProposer
+    /// 4. Build TransactionCommit for each dequeued transaction
+    /// 5. Return commits for dispatch to the Finalizer
+    pub async fn propose_blocks(
+        &self,
+        token_id: &[u8],
+        limit: usize,
+    ) -> Result<Vec<TransactionCommit>, CommitterError> {
+        // Step 1: Check epoch expiry and advance if needed
+        {
+            let now = chrono::Utc::now().timestamp();
+            let should_advance = {
+                let detector = self.epoch_detector.lock().await;
+                if let Some(ref d) = *detector {
+                    d.is_epoch_expired(now)
+                } else {
+                    false
+                }
+            };
+
+            if should_advance {
+                if let Some(new_leader) = self.advance_epoch() {
+                    let epoch_num = self.current_epoch_number.load(Ordering::SeqCst);
+                    let logger = &self.env_data.logger;
+                    logger.log(format!(
+                        "Epoch advanced to {} (new leader: {})",
+                        epoch_num,
+                        bytes_to_hex(&new_leader),
+                    ));
+                }
+            }
+        }
+
+        // Step 2: Check if this node is the current epoch leader
+        let is_leader = {
+            let detector = self.epoch_detector.lock().await;
+            if let Some(ref d) = *detector {
+                d.current_leader() == Some(self.public_key.as_slice())
+            } else {
+                false
+            }
+        };
+
+        if !is_leader {
+            return Ok(Vec::new());
+        }
+
+        // Step 3: Dequeue transactions from the pool
+        let batch = self
+            .block_proposer
+            .propose_batch(&self.pending_registry, token_id, limit)
+            .map_err(|e| CommitterError::Core(e))?;
+
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 4: Build TransactionCommit for each dequeued transaction
+        let env_id = self.env_data.environment_id.clone();
+        let token_id_vec = token_id.to_vec();
+        let mut commits = Vec::with_capacity(batch.len());
+
+        for (tx, signed) in batch {
+            let commit = TransactionCommit {
+                trans_id: tx.id.into_bytes(),
+                token_id: token_id_vec.clone(),
+                env_id: env_id.clone(),
+                proposed_block: Block::from_transaction(
+                    signed,
+                    Blockchain::new(),
+                    &Token::new(),
+                ),
+            };
+            commits.push(commit);
+        }
+
+        Ok(commits)
+    }
+
+    /// Run the epoch loop: iterate registered token IDs and propose blocks for each.
+    pub async fn run_epoch_loop(&self) -> Result<(), CommitterError> {
+        for token_id in self.tokens.iter().map(|r| r.key().clone()) {
+            let _ = self.propose_blocks(&token_id, 10).await?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,15 +509,17 @@ mod tests {
     use pneumatic_core::config::Config;
     use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::crypto::BasicHashProvider;
-    use pneumatic_core::data::{DataError, DataProvider};
+    use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::deserialize_rmp_to;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+    use pneumatic_core::epoch::{BlockProposer, Epoch, EpochBoundaryDetector};
+    use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::gossiper::Gossiper;
     use pneumatic_core::messages::Message;
     use pneumatic_core::node::registry::NodeRegistry;
     use pneumatic_core::node::NodeRegistryType;
     use pneumatic_core::registry::PendingTransactionRegistry;
-    use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature, TransactionState};
+    use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature, TransactionState, TransactionValidationResult};
     use pneumatic_core::user::User;
 
     use super::*;
@@ -575,6 +720,22 @@ mod tests {
         let hash_provider = Arc::new(BasicHashProvider::new());
         let leader_selector = Arc::new(LeaderSelector::new(hash_provider));
 
+        // Epoch tracking components
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let epoch_duration = 300;
+        let initial_epoch = Epoch::new_with_leader(
+            1,
+            now,
+            now + epoch_duration,
+            leader_selector.as_ref(),
+            &stake_store.to_stake_set(),
+        );
+        let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
+        let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
+
         let block_services = Arc::new(BlockServices::new(
             tokens.clone(),
             data_provider_core.clone(),
@@ -597,6 +758,10 @@ mod tests {
             leader_selector,
             data_provider,
             0,
+            Some(epoch_detector),
+            block_proposer,
+            epoch_duration,
+            5000,
         );
 
         (committer, pending_registry)
@@ -749,5 +914,187 @@ mod tests {
 
         let user = dp.get_user(&b"charlie".to_vec(), "token").unwrap();
         assert_eq!(user.fuel_balance, 0);
+    }
+
+    // --- propose_blocks and advance_epoch tests ---
+
+    /// Build a Committer where the leader is controlled by `leader_key`.
+    /// The committer's own public key is `committer_key`.
+    fn make_committer_for_leader_test(
+        committer_key: Vec<u8>,
+        leader_key: Vec<u8>,
+    ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<TestDataProvider>) {
+        let env_data = Arc::new(make_test_env_data());
+        let config = Config {
+            public_key: committer_key.clone(),
+            ip_address: "127.0.0.1".parse().unwrap(),
+            rest_api_version: 1,
+            node_type: pneumatic_core::node::NodeType::Full,
+            node_registry_types: vec![NodeRegistryType::Committer],
+            main_environment_id: "test".to_string(),
+            reconciliation_partition_id: "recon".to_string(),
+            environment_metadata: Arc::new(DashMap::new()),
+            type_configs: Arc::new(DashMap::new()),
+        };
+        let conn_factory = ConnFactory::new();
+        let on_received = Arc::new(|_data: Vec<u8>| {});
+        let node_registry = Arc::new(NodeRegistry::init(
+            Arc::new(config),
+            Box::new(conn_factory),
+            on_received,
+        ));
+
+        let gossiper = Arc::new(Gossiper::new(
+            NodeRegistryType::Committer,
+            Config {
+                public_key: vec![2],
+                ip_address: "127.0.0.1".parse().unwrap(),
+                rest_api_version: 1,
+                node_type: pneumatic_core::node::NodeType::Full,
+                node_registry_types: vec![NodeRegistryType::Committer],
+                main_environment_id: "test".to_string(),
+                reconciliation_partition_id: "recon".to_string(),
+                environment_metadata: Arc::new(DashMap::new()),
+                type_configs: Arc::new(DashMap::new()),
+            },
+            60,
+            env_data.asym_crypto_provider.clone(),
+        ));
+
+        let tokens = Arc::new(DashMap::new());
+        let pending_registry = Arc::new(PendingTransactionRegistry::new());
+        let stake_store = Arc::new(StakeStore::new());
+        let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
+        let data_provider_core = Arc::new(pneumatic_core::data::DefaultDataProvider::new());
+        let epoch_reconciler = Arc::new(EpochReconciler::new(
+            data_provider_core.clone(),
+            "test".to_string(),
+            vec![vec![1]],
+        ));
+        let hash_provider = Arc::new(BasicHashProvider::new());
+        let leader_selector = Arc::new(LeaderSelector::new(hash_provider));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let epoch_duration = 3600; // 1 hour — is_epoch_expired returns false
+        let initial_epoch = Epoch {
+            epoch_number: 1,
+            start_timestamp: now,
+            end_timestamp: now + epoch_duration,
+            leader_public_key: leader_key.clone(),
+        };
+        let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
+        let block_proposer = Arc::new(BlockProposer::new(leader_key, 100, vec![]));
+
+        let block_services = Arc::new(BlockServices::new(
+            tokens.clone(),
+            data_provider_core.clone(),
+            node_registry.clone(),
+            env_data.clone(),
+            env_data.logger.clone(),
+        ));
+
+        let test_dp = Arc::new(TestDataProvider::new());
+        let committer = Committer::new(
+            env_data,
+            committer_key,
+            gossiper,
+            block_services,
+            node_registry,
+            tokens,
+            pending_registry.clone(),
+            stake_store,
+            staking_manager,
+            epoch_reconciler,
+            leader_selector,
+            test_dp.clone(),
+            1,
+            Some(epoch_detector),
+            block_proposer,
+            epoch_duration,
+            5000,
+        );
+
+        (committer, pending_registry, test_dp)
+    }
+
+    #[tokio::test]
+    async fn propose_blocks_returns_empty_when_not_leader() {
+        let (committer, _registry, _dp) = make_committer_for_leader_test(
+            vec![99], // committer key
+            b"leader".to_vec(), // leader key — different
+        );
+
+        let result = committer.propose_blocks(&[1], 10).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn propose_blocks_returns_batch_when_leader_with_pool_items() {
+        let (committer, registry, _dp) = make_committer_for_leader_test(
+            b"leader".to_vec(), // committer key
+            b"leader".to_vec(), // leader key — same, so this IS the leader
+        );
+
+        // Bootstrap token so it's in the cache
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+
+        // Add a transaction to the pool
+        let tx_id = "tx_propose_1".to_string();
+        registry.register_pending(tx_id.clone()).unwrap();
+        let tx = Transaction {
+            id: tx_id.clone(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: b"sender".to_vec(),
+            receiver: b"receiver".to_vec(),
+            amount: Some(50),
+            timestamp: 5000,
+            result_hash: vec![],
+        };
+        registry.transition_to_validated_and_enqueue(
+            &tx_id,
+            tx.clone(),
+            TransactionValidationResult {
+                is_valid: true,
+                risk: TransactionRiskFactor {
+                    affected_parties: 2,
+                    amount: 50,
+                    is_contract: false,
+                    is_multi_party: false,
+                },
+                failure_reasons: vec![],
+                finalizer_public_key: vec![5],
+            },
+        ).unwrap();
+
+        // This committer IS the leader and has pool items — should return a batch
+        let result = committer.propose_blocks(&[1], 10).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].trans_id, tx_id.into_bytes());
+    }
+
+    #[tokio::test]
+    async fn advance_epoch_bumps_number() {
+        let (committer, _registry, _dp) = make_committer_for_leader_test(
+            b"leader".to_vec(),
+            b"leader".to_vec(),
+        );
+
+        // Add a staker so leader selection produces a non-empty result
+        committer.stake_store.add_staker(b"leader".to_vec(), 100);
+
+        let before = committer.current_epoch_number.load(Ordering::SeqCst);
+        let new_leader = committer.advance_epoch();
+
+        let after = committer.current_epoch_number.load(Ordering::SeqCst);
+        assert_eq!(after, before + 1);
+        assert!(!new_leader.unwrap().is_empty());
     }
 }
