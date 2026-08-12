@@ -194,11 +194,17 @@ impl Committer {
 
     /// Check and commit transaction results.
     ///
+    /// Accepts transactions in two states:
+    /// - **Finalizing**: standard pipeline (Sentinel → Executor → Finalizer → Committer).
+    ///   The transaction was assigned a finalizer and collected quorum signatures.
+    /// - **Validated**: leader-proposal path. The leader dequeued the transaction
+    ///   from the pool and proposed it directly. No finalizer key is present.
+    ///
     /// Flow:
     /// 1. Acquire lock on the transaction in the pending registry
-    /// 2. Verify the transaction is in Finalizing state
+    /// 2. Verify the transaction is in Finalizing OR Validated state
     /// 3. Apply the block via BlockServices (commit + distribute)
-    /// 4. Update transaction state to Committed
+    /// 4. Update transaction state to Committed (or remove from pool for leader path)
     /// 5. Release the transaction lock
     async fn check_and_commit_transaction_results(
         &self,
@@ -211,15 +217,20 @@ impl Committer {
             .acquire_transaction(&tx_id)
             .map_err(|_| CommitterError::TransactionNotInFinalizing(tx_id.clone()))?;
 
-        // Step 2: Verify the transaction is in Finalizing state and extract
-        // the inner transaction for later state transition
-        let transaction = {
+        // Step 2: Extract transaction from either Finalizing (standard pipeline)
+        // or Validated (leader-proposal) state.
+        let (transaction, is_leader_proposal) = {
             let entry = self
                 .pending_registry
                 .get_transaction_mut(&tx_id)?;
 
             match &entry.state {
-                TransactionState::Finalizing { transaction, .. } => transaction.clone(),
+                TransactionState::Finalizing { transaction, .. } => {
+                    (transaction.clone(), false)
+                }
+                TransactionState::Validated { transaction, .. } => {
+                    (transaction.clone(), true)
+                }
                 _ => {
                     return Err(CommitterError::TransactionNotInFinalizing(tx_id));
                 }
@@ -241,7 +252,14 @@ impl Committer {
             }
         }
 
-        // Step 4: Transition to Committed state
+        // Step 4: Update transaction state
+        if is_leader_proposal {
+            // Leader-proposal path: remove from pool, then transition to Committed
+            // so that release() returns true (entry cleanup requires Committed/Failed state).
+            self.pending_registry.remove_from_pool(&tx_id);
+        }
+        // Transition to Committed for BOTH paths — release() checks for Committed/Failed
+        // to decide whether to remove the entry when lock_count reaches 0.
         if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx_id) {
             entry.transition_to_committed(transaction, result.token_id);
         }
@@ -913,6 +931,118 @@ mod tests {
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"charlie".to_vec(), "token").unwrap();
+        assert_eq!(user.fuel_balance, 0);
+    }
+
+    fn make_validated_entry(
+        pending_registry: &PendingTransactionRegistry,
+        tx_id: &str,
+        sender: Vec<u8>,
+    ) {
+        pending_registry.register_pending(tx_id.to_string()).unwrap();
+        let tx = Transaction {
+            id: tx_id.to_string(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: sender.clone(),
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        };
+        // Transition to Validated (NOT Finalizing) — simulates leader-proposal path
+        {
+            let mut entry = pending_registry.get_transaction_mut(tx_id).unwrap();
+            entry.transition_to_validated(tx.clone(),
+                pneumatic_core::transactions::TransactionValidationResult {
+                    is_valid: true,
+                    risk: pneumatic_core::errors::TransactionRiskFactor {
+                        affected_parties: 2, amount: 100,
+                        is_contract: false, is_multi_party: false,
+                    },
+                    failure_reasons: vec![],
+                    finalizer_public_key: vec![3],
+                });
+        }
+    }
+
+    #[tokio::test]
+    async fn check_and_commit_validated_state_succeeds() {
+        // Leader-proposal path: transaction is in Validated state (not Finalizing).
+        // The Committer should still commit the block and transition to Committed.
+        let dp = Arc::new(TestDataProvider::new());
+        dp.insert_user(b"alice".to_vec(), "token".to_string(), User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry) = make_test_committer(dp.clone());
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_leader_proposal";
+        make_validated_entry(&registry, tx_id, b"alice".to_vec());
+        registry.record_gas_used(tx_id, 75);
+
+        let block = make_test_block_for_token(&committer, tx_id);
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+
+        // Gas was deducted
+        let user = dp.get_user(&b"alice".to_vec(), "token").unwrap();
+        assert_eq!(user.fuel_balance, 925);
+
+        // Transaction was removed from pool (leader-proposal path)
+        assert!(!registry.contains(tx_id));
+    }
+
+    #[tokio::test]
+    async fn check_and_commit_validated_saturates_on_overflow() {
+        // Leader-proposal path with gas exceeding balance — should saturate to 0
+        let dp = Arc::new(TestDataProvider::new());
+        dp.insert_user(b"bob".to_vec(), "token".to_string(), User {
+            public_key: b"bob".to_vec(),
+            fuel_balance: 50,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_leader_overflow";
+        make_validated_entry(&registry, tx_id, b"bob".to_vec());
+        registry.record_gas_used(tx_id, 200); // exceeds balance
+
+        let block = make_test_block_for_token(&committer, tx_id);
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+
+        let user = dp.get_user(&b"bob".to_vec(), "token").unwrap();
         assert_eq!(user.fuel_balance, 0);
     }
 
