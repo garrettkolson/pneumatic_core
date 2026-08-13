@@ -296,6 +296,60 @@ Each transaction gets its own deterministic finalizer via a stake snapshot — e
 
 ---
 
+## Protocol Rearchitecture: Executor Sharding + Optimistic Commit (2026-08-13)
+
+Combines executor sharding (per-transaction executor group assignment) with optimistic commit (1 signature = immediate finalize). Quorum becomes a dispute mechanism, not a blocking gate.
+
+### Phase A: Executor Set Model (pneumatic_core) ✅ COMPLETE
+
+- [x] P6_A_01 Add `ExecutorSet` struct (HashMap<Vec<u8>, u64> — public_key → stake) — `src/epoch.rs`
+- [x] P6_A_02 Add `Shuffler` struct with deterministic Fisher-Yates shuffle from SHA-256(epoch_number) seed — `src/epoch.rs`
+- [x] P6_A_03 Add `get_executor_set`/`save_executor_set` to `DataProvider` trait — `src/data.rs`
+- [x] P6_A_04 Implement in `DefaultDataProvider` via TCP/UDS `DataOp::Get(GetOp::ExecutorSet(epoch))` — `src/data.rs`
+- [x] P6_A_05 Add `staker_sets` + `with_executor_set()` builder to `StubDataProvider` — `src/data.rs`
+- [x] P6_A_06 Add stub implementation to committer's `TestDataProvider` — `committer/src/committer.rs`
+- [x] P6_A_07 Add `shard_count: u32` + `shard_quorum_percentage: f32` to `EnvironmentMetadata` — `src/environment.rs`
+- [x] P6_A_08 Expose `deterministic_select_shard` + `ExecutorSet` from `src/lib.rs` — `src/lib.rs`
+- [x] P6_A_09 Add `ExecutorRoutingError` enum — `src/errors.rs` — 4 variants + From impl
+
+### Phase B: Deterministic Shard Selection (pneumatic_core) ✅ COMPLETE
+
+- [x] P6_B_01 Implement `deterministic_select_shard(executors, shard_count, tx_id, epoch_number)` — `src/epoch.rs`
+- [x] P6_B_02 Stake-balanced round-robin partition: shuffle executors, assign to lowest-stake shard
+- [x] P6_B_03 6 unit tests: empty returns none, single executor same shard, distributes across shards, deterministic across epochs, shuffler deterministic, shuffler different seed different order
+
+### Phase C: Sentinel Shard-Aware Routing ✅ COMPLETE
+
+- [x] P6_C_01 Create `sentinel/src/executor_set_cache.rs` — Three-tier cache (local → DataProvider → peer) — `sentinel/src/executor_set_cache.rs`
+- [x] P6_C_02 Add `ExecutorSetCache` with `get(epoch)`, `put(epoch, executors)`, `invalidate_all()`, `cached_count()` — `sentinel/src/executor_set_cache.rs`
+- [x] P6_C_03 5 tests: empty_returns_none, put_and_get, fallback_to_data_provider, independent_epochs, invalidate_all_clears
+- [x] P6_C_04 Add `executor_set_cache` field to `Sentinel` struct — `sentinel/src/sentinel.rs`
+- [x] P6_C_05 Wire `ExecutorSetCache` into `Sentinel::new()` constructor — `sentinel/src/sentinel.rs`
+- [x] P6_C_06 Implement `get_shard_executors()` — uses `deterministic_select_shard()` on cached executor set — `sentinel/src/sentinel.rs`
+- [x] P6_C_07 Update `send_to_executor_for_preload()` — branch: shard-aware routing when `shard_count > 1`, broadcast otherwise — `sentinel/src/sentinel.rs`
+- [x] P6_C_08 Add `send_to_shard_executors_for_preload()` to `TransactionNotifier` — shard-aware sender — `sentinel/src/transaction_notifier.rs`
+- [x] P6_C_09 Test: `get_shard_executors_returns_executors`
+
+### Phase D: Optimistic Commit (finalizer) ✅ COMPLETE
+
+- [x] P6_D_01 Add `build_signed_transaction_optimistic(sig, transaction, executor_key)` — builds SignedTransaction with single executor's signature — `finalizer/src/block_builder.rs`
+- [x] P6_D_02 Add `create_block_optimistic()` — alias for `create_block` (both use FinalityStatus::Optimistic) — `finalizer/src/block_builder.rs`
+- [x] P6_D_03 Add `try_finalize_optimistic(tx_id, single_sig, executor_key)` — fast path with 1 signature — `finalizer/src/finalizer.rs`
+- [x] P6_D_04 Update `handle_signature()` — first valid signature triggers optimistic finalize; subsequent → acknowledge — `finalizer/src/finalizer.rs`
+- [x] P6_D_05 2 tests: `test_handle_signature_optimistic_first_sig`, updated `test_handle_signature_adds_to_collector`
+
+### Phase E: Epoch Transition + Shard Rotation ✅ COMPLETE
+
+- [x] P6_E_01 Wire `save_executor_set` into `Committer::handle_epoch_reconcile` — persists new executor set at epoch boundary — `committer/src/committer.rs`
+- [x] P6_E_02 Wire `CandidateRegistry` into committer `main.rs` — added missing `Arc<CandidateRegistry>` argument — `committer/src/main.rs`
+- [x] P6_E_03 Add `current_epoch` + `advance_epoch()` to `Sentinel` — invalidates caches for reshuffle — `sentinel/src/sentinel.rs`
+- [x] P6_E_04 Add `invalidate_all()` to `StakeSnapshotCache` — cleared on epoch transition — `sentinel/src/stake_snapshot_cache.rs`
+- [x] P6_E_05 2 tests: `cache_invalidate_all_clears_snapshots`, `advance_epoch_invalidates_caches`
+
+**Total tests: 369 passing (21 committer + 272 core + 9 executor + 27 finalizer + 40 sentinel)**
+
+---
+
 ## Phase 5: Refactor pneumatic_committer
 
 ### 5.1 Committer
@@ -326,7 +380,7 @@ Each transaction gets its own deterministic finalizer via a stake snapshot — e
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (345 passing across 5 crates — 256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer)
+## Phase 7: Tests (369 passing across 5 crates — 272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -342,7 +396,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 345 tests across 5 crate targets (256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other)
+- [x] T07 Migrate existing tests — all test-bearing files — total 369 tests across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -610,7 +664,7 @@ Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range
 #### Conflict Resolution — wired into commit path ✓ (DONE — 2026-08-13)
 **File:** `src/epoch.rs:393-430` (ConflictResolution enum + enriched resolve_block_conflict), `committer/src/committer.rs:380-487` (handle_conflict_at_commit), `committer/src/committer.rs:78-84` (CandidateRegistry field)
 `resolve_block_conflict()` now returns `ConflictResolution` enum: `DiscardLoser` (different proposers, network race), `SameProposerSlash` (same proposer double-signed), `TieFlagBoth` (equal stakes, hash tie-break). The Committer's `handle_conflict_at_commit()` checks `CandidateRegistry` at commit time before `commit_block()`. On conflict, resolves with real stakes from `StakeStore`. `SameProposerSlash` emits `StakingOp::Slash` via `StakingManager.apply_ops()`.
-**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 345 tests.
+**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 369 tests (across 5 crates with executor sharding + optimistic commit additions).
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`

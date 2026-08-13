@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 345 tests across 5 crate targets
+cargo test --workspace --lib   # Run 369 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -43,7 +43,7 @@ pneumatic_core/
 | `aes-gcm` | 0.11.0 | AES-256-GCM encryption |
 | `x25519-dalek` | 3.0.0 | X25519 Diffie-Hellman key exchange |
 | `serde` / `serde_json` / `rmp-serde` | 1.0 | JSON + MsgPack serialization |
-| `rand` | 0.8 | Deterministic stake-weighted leader selection + per-transaction finalizer routing (StdRng seeded from SHA-256) |
+| `rand` | 0.8 | Deterministic stake-weighted leader selection + per-transaction finalizer routing + executor shard selection (StdRng seeded from SHA-256) |
 | `strum` | 0.27.1 | Enum reflection |
 | `chrono` | 0.4.41 | Timestamps |
 
@@ -71,7 +71,7 @@ pneumatic_core/
 | `transactions` | `Transaction`, `SignedTransaction`, `TransactionCommit`, `TransactionPool`, explicit state machine, proposer_key for conflict resolution |
 | `validation` | `TransactionValidationSpec` and `BlockValidatorSpec` traits, SelfSigned/Executed specs, spec registries |
 | `registry` | `PendingTransactionRegistry` (DashMap-backed tx CRUD + state transitions), `TransactionSignatureRegistry` |
-| `epoch` | `Epoch`, `StakeSet` (serializable), `deterministic_select()` (per-tx routing), `LeaderSelector`, `BlockProposer`, `EpochBoundaryDetector`, `resolve_block_conflict()`, `CandidateRegistry`, `IEpochReconciler`, `IStakingManager`, `IEpochLeaderSelector`, `IBlockProposer` |
+| `epoch` | `Epoch`, `StakeSet` (serializable), `ExecutorSet`, `Shuffler`, `deterministic_select()` (per-tx routing), `deterministic_select_shard()` (shard-aware), `LeaderSelector`, `BlockProposer`, `EpochBoundaryDetector`, `resolve_block_conflict()`, `CandidateRegistry`, `IEpochReconciler`, `IStakingManager`, `IEpochLeaderSelector`, `IBlockProposer` |
 | `gossiper` | Message deduplication (TTL cache) + fan-out to multiple handlers |
 | `messages` | Wire message format (`Message` struct), ack/reject helpers |
 | `logging` | `Logger` trait with `FileLogger` (file-locked append writes) |
@@ -85,7 +85,7 @@ pneumatic_core/
 |------|------|
 | **Sentinel** | Gatekeeper — receives raw transactions, validates, routes to executor or direct-to-committer for self-signed tokens |
 | **Executor** | Contract execution — fetches data, runs contract logic, hashes results, sends to finalizer |
-| **Finalizer** | Quorum orchestration — collects executor signatures **for conflict resolution only**; single-finalizer dispatch for optimistic commit in the happy path; deterministic per-transaction routing via stake snapshots; tracks epoch number for block creation |
+| **Finalizer** | Optimistic commit — first executor signature triggers immediate finalize; quorum for conflict resolution only; deterministic per-transaction routing via stake snapshots; shard-aware finalizer assignment; tracks epoch number for block creation |
 | **Committer** | Terminal node — commits blocks to token blockchains, manages epoch transitions, staking, leader selection |
 | **Archiver** | Block distribution recipient |
 
@@ -151,6 +151,18 @@ Resolution uses `resolve_block_conflict()`: higher-stake proposer wins; tie-brea
 
 **Rationale**: Defining conflict at the chain position level (same `previous_hash`) rather than by provenance (how the blocks arose) keeps detection simple and correct across all scenarios. A race, a double-spend, and a malicious double-propose all look identical at the chain level — same parent, different hash. The branch on proposer identity is the *only* provenance check needed: it distinguishes an honest relaying race (different proposers) from an intentional violation (same proposer). The `CandidateRegistry` is already implemented and tested; `resolve_block_conflict` is also implemented and tested. The wiring between them — the Committer's commit path — is the remaining implementation gap.
 
+### ADR-009: Executor Sharding with Per-Epoch Rotation
+
+Executors are partitioned into disjoint shards per epoch. `deterministic_select_shard(executors, shard_count, tx_id, epoch_number)` uses a SHA-256 seeded Fisher-Yates shuffle followed by stake-balanced round-robin partitioning. Each transaction is routed only to the executors in its assigned shard.
+
+**Rationale**: Broadcasting every transaction to all executors creates a linear bottleneck — throughput is bounded by the slowest executor in the entire set. Sharding reduces per-executor load proportionally to `1/shard_count`. Stake-balanced round-robin prevents one shard from accumulating disproportionate stake (which would lower its effective quorum and create a single point of failure). Per-epoch rotation via `advance_epoch()` reshuffles executor-to-shard assignments, preventing stable cartel formation among bad actors. The `ExecutorSetCache` and `StakeSnapshotCache` are invalidated together on epoch boundary, ensuring a consistent view.
+
+### ADR-010: Optimistic Commit with Quorum as Dispute Mechanism
+
+The first valid executor signature triggers immediate block finalization. The 2/3 quorum machinery is repurposed for conflict resolution only — invoked when `CandidateRegistry` detects a genuine fork.
+
+**Rationale**: Requiring 2/3 quorum in the happy path wastes bandwidth and latency. In normal operation, one honest executor's signature is sufficient proof. The quorum protocol remains available to resolve genuine forks where multiple executors produce conflicting results. Blocks start as `Optimistic` and are upgraded to `Confirmed` after a time-based or depth-based guarantee with no observed conflict. The optimistic path uses a dedicated `try_finalize_optimistic()` code path that bypasses signature reconciliation; subsequent signatures accumulate stake and acknowledge, with quorum eventually triggering reconfirmation.
+
 ---
 
 ## Consensus Flow
@@ -163,8 +175,8 @@ Sender → Sentinel → ──────────────────�
                         ├─ SelfSigned token: Sentinel validates → Committer (skips Executor + Finalizer)
                         │
                         └─ Standard token:
-                            Sentinel → Executor (preload + execute + hash) →
-                            Finalizer (collect signatures → quorum → build block) →
+                            Sentinel → Executor (preload + execute + hash, shard-aware) →
+                            Finalizer (first sig → optimistic commit; quorum for conflicts only) →
                             Committer (commit block to chain)
 ```
 
@@ -185,16 +197,19 @@ Each state transition is explicit via the `TransactionState` enum. A `PendingTra
 - `EpochBoundaryDetector` detects expired epochs and stale blocks
 - `resolve_block_conflict()` resolves conflicting proposals: higher stake wins; tie-break by lexicographic hash comparison
 - **Optimistic finality:** Standard tokens commit immediately after single-executor execution + single-finalizer signature. The 2/3 quorum requirement is repurposed for conflict-resolution only — invoked when `CandidateRegistry` detects a genuine fork. Blocks start as `Optimistic` and become `Confirmed` after N seconds with no observed conflict.
+- **Executor sharding:** Executors partitioned into disjoint shards per epoch via `deterministic_select_shard()` (SHA-256 seeded Fisher-Yates shuffle + stake-balanced round-robin). Each tx routed only to its shard, increasing throughput. Epoch boundary triggers reshuffle via `advance_epoch()` cache invalidation.
 
 ### Deterministic Per-Transaction Routing
 
 A stake snapshot frozen at each epoch boundary enables each transaction to be routed to its own deterministic finalizer, eliminating the epoch-wide leader bottleneck and enabling parallel transaction processing.
 
-- **Snapshot model:** At epoch transitions, the Committer saves a frozen `StakeSet` via `DataProvider`. All nodes can recover it for deterministic routing.
+- **Snapshot model:** At epoch transitions, the Committer saves a frozen `StakeSet` (and `ExecutorSet`) via `DataProvider`. All nodes can recover it for deterministic routing.
 - **Selection function:** `deterministic_select(stakers, seed_bytes, epoch_number)` — seeds a `StdRng` with `SHA-256(epoch_number || seed_bytes)`, then walks the sorted stake set to pick a finalizer. Identical algorithm to epoch leader selection, but per-transaction seed gives per-transaction variation.
-- **Three-tier cache** (sentinel): (1) Local cache loaded when first block of new epoch is seen — O(1), no network; (2) DataProvider call (~1ms); (3) Peer request from `NodeRegistry` — reserved.
+- **Shard selection:** `deterministic_select_shard(executors, shard_count, tx_id, epoch_number)` — deterministic executor shard assignment via Fisher-Yates shuffle + stake-balanced round-robin. Each tx routed only to its shard's executors.
+- **Three-tier cache** (sentinel): (1) Local cache loaded when first block of new epoch is seen — O(1), no network; (2) DataProvider call (~1ms); (3) Peer request from `NodeRegistry` — reserved. Separate caches for `StakeSnapshotCache` (finalizer assignment) and `ExecutorSetCache` (executor routing).
 - **Per-tx assignment:** `assign_finalizer_deterministic()` routes each transaction to its assigned finalizer. On rejection, reassignment uses the same function with a retry suffix to pick a different finalizer.
-- **Epoch tracking:** Block and Finalizer both track `epoch_number: u64`. Sentinel assignment, finalizer block creation, and epoch snapshots all use a consistent epoch coordinate.
+- **Shard-aware routing:** When `shard_count > 1`, `send_to_executor_for_preload()` routes to specific shard executors instead of broadcasting to all. When `shard_count == 1`, falls back to broadcast (backward compatible).
+- **Epoch tracking:** Block, Finalizer, and Sentinel all track `epoch_number: u64`. Sentinel's `advance_epoch()` invalidates both caches for reshuffle. Sentinel assignment, finalizer block creation, and epoch snapshots all use a consistent epoch coordinate.
 
 ### Gas Model
 
@@ -225,7 +240,7 @@ Transaction validation and routing node. Handles actions: `Process`, `Confirm`, 
 - **TransactionValidator**: Loads token from `DataProvider`, delegates to spec-based validation
 - **Gossiper**: Message dedup (TTL cache) + signature verification + fan-out to handlers
 
-**Test count**: 12
+**Test count**: 40
 
 ### pneumatic_executor
 
@@ -244,12 +259,12 @@ Decomposed from a monolithic C# design into three focused components:
 | Component | Responsibility |
 |-----------|---------------|
 | `SignatureCollector` | Collects/verifies executor signatures, checks quorum (supermajority, stake-weighted conflict resolution) |
-| `BlockBuilder` | Builds `SignedTransaction` and `Block` from reconciled signatures, signs with finalizer key |
+| `BlockBuilder` | Builds `SignedTransaction` and `Block` from reconciled signatures, signs with finalizer key; optimistic path with single executor signature |
 | `MessageDispatcher` | Sends blocks to committers, clear notifications to sentinels |
 
-Epoch tracking: `Finalizer` tracks `current_epoch` for block creation. `BlockBuilder::create_block()` accepts `epoch_number` for hash-chain integrity.
+Optimistic commit: `handle_signature()` dispatches first valid signature to `try_finalize_optimistic()` for immediate block creation. Subsequent signatures acknowledged for stake accumulation. Epoch tracking: `Finalizer` tracks `current_epoch` for block creation. `BlockBuilder::create_block()` accepts `epoch_number` for hash-chain integrity.
 
-**Test count**: 26
+**Test count**: 27
 
 ### pneumatic_committer
 
@@ -292,7 +307,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 345 tests: 256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer
+# 369 tests: 272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer
 ```
 
 ---
@@ -303,7 +318,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 340 tests passing across 5 crate targets (256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer), all core types and traits implemented.
+**Status: COMPLETE** — 369 tests passing across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -313,7 +328,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 5: Deterministic Per-Transaction Routing ✅
 
-**Status: COMPLETE** — 2026-08-12 — 18 new tests (5 deterministic_select, 4 stake_snapshot_cache, 2 block_builder, 2 message_dispatcher, 5 other).
+**Status: COMPLETE** — 2026-08-12 → 2026-08-13 — 34 new tests (5 deterministic_select, 4 stake_snapshot_cache, 6 executor_set/shuffler, 2 block_builder_optimistic, 2 message_dispatcher, 5 executor_set_cache, 2 epoch_transition).
 
 - `StakeSet` made serializable; `DataProvider` gained `get_stake_snapshot`/`save_stake_snapshot` methods
 - `deterministic_select(stakers, seed_bytes, epoch_number)` pure function — seeded SHA-256, sorted stake walk
@@ -379,7 +394,7 @@ This roadmap tracks the work from current foundation state through a production-
 | Shutdown handling | Proper drain of in-flight tasks on shutdown | 2h | **DONE** |
 | Epoch tracking | `Finalizer.current_epoch` field, `advance_epoch()` accessor, wire into block creation | 4h | **DONE** (Phase 5) |
 
-**Sub-total**: 26h / ~3 days — 3 tasks remaining
+**Sub-total**: 26h / ~3 days — 2 tasks remaining
 
 ---
 
@@ -416,7 +431,7 @@ This roadmap tracks the work from current foundation state through a production-
 | Add proposer public key to `Block`/`SignedTransaction` | Explicit proposer key for conflict resolution stake lookup | 4h | **DONE** |
 | Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection via `CandidateRegistry`; fill `stake_a`/`stake_b` from `StakeStore` | 12h | **DONE** |
 | Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h | **DONE** |
-| Replace quorum gate with optimistic path | One Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h | **DONE** |
+| Replace quorum gate with optimistic path | One Executor executes (shard-aware) → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h | **DONE** |
 | Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X" | 8h | Open |
 | Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h | Open |
 | Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` → hash tie-break | 8h | **DONE** (4 committer tests: no conflict, conflict+stake, conflict+slash, conflict+no candidates) |
@@ -437,6 +452,20 @@ This roadmap tracks the work from current foundation state through a production-
 | Finalizer Epoch Tracking | `Finalizer.current_epoch`, `advance_epoch()` accessor | 4h | **DONE** |
 
 **Sub-total**: 34h / ~1 week — **COMPLETE**
+
+### Phase 5c: Executor Sharding + Optimistic Commit (NEW — Completed)
+
+| Task | Description | Estimate | Status |
+|------|-------------|----------|--------|
+| ExecutorSet model | `ExecutorSet` struct, `Shuffler` with Fisher-Yates shuffle, DataProvider methods | 8h | **DONE** |
+| Deterministic shard selection | `deterministic_select_shard()` — stake-balanced round-robin partitioning | 4h | **DONE** |
+| ExecutorSetCache | 3-tier cache in sentinel, `invalidate_all()`, 5 tests | 6h | **DONE** |
+| Shard-aware routing | `get_shard_executors()`, `send_to_shard_executors_for_preload()`, branch on `shard_count > 1` | 6h | **DONE** |
+| Optimistic commit | `try_finalize_optimistic()`, first-sig dispatch, `build_signed_transaction_optimistic()` | 12h | **DONE** |
+| Epoch transition | Persist executor set at epoch boundary, sentinel `advance_epoch()`, cache invalidation | 4h | **DONE** |
+| Wiring fixes | `CandidateRegistry` in committer `main.rs`, borrow/lifetime fixes | 2h | **DONE** |
+
+**Sub-total**: 42h / ~1 week — **COMPLETE**
 
 ---
 
@@ -527,11 +556,12 @@ This roadmap tracks the work from current foundation state through a production-
 | 4. Committer Completion | ~1 week | Phase 1-3 |
 | 5. Optimistic Finality | ~2 weeks remaining | Phase 1-4 |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
+| 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
 | 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
 | 7. Test Coverage | ~1 week | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |
 
-**MVP Total**: ~14 weeks (with parallel work: ~9.5 weeks)
+**MVP Total**: ~14 weeks (with parallel work: ~9 weeks)
 **Production Total**: ~18 weeks from MVP
 
 ---
