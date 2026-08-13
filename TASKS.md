@@ -105,28 +105,30 @@ Tracks all tasks for implementing the full pneumatic blockchain protocol in Rust
 
 ## Phase 2: pneumatic_sentinel Crate
 
-### 2.1 Sentinel
+### 2.1 Sentinel ✅ COMPLETE
 
-- [ ] P2_01 Create sentinel crate — `sentinel/Cargo.toml` — structural
-- [ ] P2_02 Implement `Sentinel` struct — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs
-- [ ] P2_03 Implement `on_data_received`, route by action — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:51-79
-- [ ] P2_04 Implement `handle_process_request` (preload, validate, assign finalizer) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:131-175
-- [ ] P2_05 Implement `handle_confirmation` (state-check, process) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:184-199
-- [ ] P2_06 Implement `process_transaction` — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:201-215
-- [ ] P2_07 Implement `handle_rejection` (reassign finalizer) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:217-229
+- [x] P2_01 Create sentinel crate — `sentinel/Cargo.toml` — structural
+- [x] P2_02 Implement `Sentinel` struct — `sentinel/src/sentinel.rs` — full struct with all dependency fields; refs: C# Sentinel.cs
+- [x] P2_03 Implement `on_data_received`, route by action — `sentinel/src/sentinel.rs` — dispatches Process/Confirm/Reject/Register/Clear/Delete; refs: C# Sentinel.cs:51-79
+- [x] P2_04 Implement `handle_process_request` (preload, validate, assign finalizer) — `sentinel/src/sentinel.rs` — gas computation, validation, spec lookup, self-signed bypass, enqueue to pool, shard-aware executor routing; refs: C# Sentinel.cs:131-175
+- [x] P2_05 Implement `handle_confirmation` (state-check, process) — `sentinel/src/sentinel.rs` — refs: C# Sentinel.cs:184-199
+- [x] P2_06 Implement `process_transaction` — `sentinel/src/sentinel.rs` — integrated into `handle_process_request` with full pipeline dispatch
+- [x] P2_07 Implement `handle_rejection` (reassign finalizer) — `sentinel/src/sentinel.rs` — deterministic retry + registry fallback; refs: C# Sentinel.cs:217-229
 - [x] P2_08 Implement `handle_register_request` / `handle_clear_request` — `sentinel/src/sentinel.rs` — P2_08 DONE: handle_register_request fully implemented (deserializes NodeRegistryRequest, validates stake, registers node in DashMap); handle_clear_request was already implemented — refs: C# Sentinel.cs:124-129, 231-235
-- [ ] P2_09 Risk-based routing (higher risk → more finalizers) — `sentinel/src/sentinel.rs`
+- [x] P2_09 Risk-based routing (higher risk → more finalizers) — `sentinel/src/transaction_validator.rs` — `route_finalizers()` maps risk score to 1/2/3 finalizers
 
-### 2.2 TransactionValidator
+### 2.2 TransactionValidator ✅ COMPLETE
 
-- [ ] P2_10 Create `transaction_validator.rs` — `sentinel/src/transaction_validator.rs` — refs: C# TransactionValidator.cs
-- [ ] P2_11 Implement `validate_transaction` with spec lookup — `sentinel/src/transaction_validator.rs`
-- [ ] P2_12 Implement concrete `calculate_risk` — `sentinel/src/transaction_validator.rs`
+- [x] P2_10 Create `transaction_validator.rs` — `sentinel/src/transaction_validator.rs` — refs: C# TransactionValidator.cs
+- [x] P2_11 Implement `validate_transaction` with spec lookup — `sentinel/src/transaction_validator.rs` — loads token from DataProvider, delegates to action spec, falls back to "Executed"
+- [x] P2_12 Implement concrete `calculate_risk` — `sentinel/src/transaction_validator.rs` — 4-metric risk factor
 
-### 2.3 TransactionNotifier
+### 2.3 TransactionNotifier ✅ COMPLETE
 
-- [ ] P2_13 Create `transaction_notifier.rs` — `sentinel/src/transaction_notifier.rs` — refs: C# TransactionNotifier.cs
-- [ ] P2_14 Implement all notifier methods — `sentinel/src/transaction_notifier.rs`
+- [x] P2_13 Create `transaction_notifier.rs` — `sentinel/src/transaction_notifier.rs` — refs: C# TransactionNotifier.cs
+- [x] P2_14 Implement all notifier methods — `sentinel/src/transaction_notifier.rs` — 6 send methods (preload to executors, shard-aware preload, preload to finalizer, notify clear, notify delete, request finalizer, request single finalizer)
+
+**Phase 2 total: 40 tests (30 sentinel core + 5 stake_snapshot_cache + 5 executor_set_cache)**
 
 ## Phase 3: pneumatic_executor Crate
 
@@ -403,7 +405,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P1_Add tests for PendingTransaction acquire/release — `registry.rs` — included in registry tests above
 - [x] P1_Add tests for Gossiper — `gossiper.rs` — 9 tests: accept first, ignore duplicate, accept different, capacity, fan-out invokes-all, fan-out receives-copy, fan-out dedup-skips-all, fan-out three-handlers, fan-out concurrent-invocation
 - [x] P1_Add tests for ValidationSpec — `validation.rs` — 17 tests: SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec, ValidationSpecRegistry, nonce validation
-- [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 16 tests: From impls, creation, spec name routing, action dispatch, self-signed flow, compute_gas_used (3), TransactionNotifier send methods (4)
+- [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 30 tests (Phase 7 originals: From impls 2, creation 1, spec name routing 2, action dispatch 2, self-signed integration 1, compute_gas_used 3, TransactionNotifier 4, handle_confirmation 3, handle_rejection 3, handle_register_request 3, pool enqueue 2, pool ordering 1, shard routing 1, epoch advance 1) + 5 stake_snapshot_cache tests + 5 executor_set_cache tests = **40 total**
 - [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 8 tests: add_success, add_duplicate_fails, add_multiple, check_quorum_met, check_quorum_not_met, reconcile_stake_weighted_supermajority, reconcile_single_sets_winner, reconcile_zero_stake_empty, reconcile_all_needed, plus 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
@@ -750,9 +752,9 @@ Conflict detection operates locally at epoch boundaries via `CandidateRegistry` 
 **File:** `sentinel/src/sentinel.rs:78-80`
 `.initialize()` accepts a closure and passes it to `self.gossiper.initialize(gossiper_handle)`. Caller creates closure wrapping `self.on_data_received(raw)`.
 
-#### Sentinel.send_to_executor_for_preload — empty stub
-**File:** `sentinel/src/sentinel.rs:166-171`
-**Action:** Call `self.transaction_notifier.send_to_executors_for_preload(tx, self.env_data)`.
+#### ~~Sentinel.send_to_executor_for_preload — DONE~~
+**File:** `sentinel/src/sentinel.rs:218-231`
+**Completed:** Fully implemented with shard-aware routing. When `shard_count > 1`, uses `get_shard_executors()` + `TransactionNotifier.send_to_shard_executors_for_preload()`. Otherwise broadcasts to all executors.
 
 #### Sentinel.handle_confirmation — DONE
 **File:** `sentinel/src/sentinel.rs:187-224`

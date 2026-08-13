@@ -561,7 +561,7 @@ This roadmap tracks the work from current foundation state through a production-
 | Phase | Effort | Blockers Previous Phase |
 |-------|--------|------------------------|
 | 0. Foundation | ✅ Done | — |
-| 1. Sentinel Integration | ~1 week (8 tasks left) | Phase 0 |
+| 1. Sentinel Integration | ✅ Done (40 tests, ~8h) | Phase 0 |
 | 2. Executor Execution | ~3 days | Phase 1 (Partial — can run in parallel with Sentinel wiring) |
 | 3. Finalizer Completion | ~3 days (3 tasks left) | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
