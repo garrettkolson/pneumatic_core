@@ -214,14 +214,17 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [ ] Define "confirmed" guarantee (e.g., "final after N seconds with no conflict")
 - [ ] Expose via `finality_status`
 
-### Phase 5 — Networking Additions
+### Phase 5 — Block Awareness Gossip ✅ COMPLETE (2026-08-13)
 
-- [ ] Add vote/dispute message type in `messages.rs` — "I saw candidate block" + "I vote for block X"
-- [ ] Add conflict-vote aggregation structurally similar to `SignatureCollector` but conflict-scoped — `finalizer/src/`
+- [x] Add `BlockConfirmed` message action in finalizer `MessageDispatcher` — serializes `Block`, broadcasts to both Committers and Archivars — `finalizer/src/message_dispatcher.rs`
+- [x] Wire `send_block_confirmed` into `try_finalize_optimistic` — called after `send_to_committers` — `finalizer/src/finalizer.rs`
+- [x] Add `handle_block_confirmed` to Committer — deserializes Block, validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), appends to blockchain, distributes to archivars — `committer/src/committer.rs`
+- [x] 5 new tests: 4 committer unit tests (valid append, orphan ignored, tampered rejected, unknown token error) + 1 dispatcher serialization test
 
 ### Phase 6 — Testing
 
 - [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
+- [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
 - [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
 - [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
 
@@ -396,7 +399,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 369 tests across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other)
+- [x] T07 Migrate existing tests — all test-bearing files — total 374 tests across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 26 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +5 tests from Phase 5b block gossip (4 committer + 1 dispatcher)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -725,13 +728,12 @@ DashMap-backed registry keyed by `(token_id, previous_hash)` holding competing b
 **File:** `src/transactions.rs` (SignedTransaction.proposer_key), `src/blocks.rs` (Block.proposer_key)
 Explicit proposer public key for conflict-resolution stake lookup. Propagated from leader_address in BlockProposer and BlockBuilder.
 
-#### Vote/Dispute messages — NOT YET IMPLEMENTED (Phase 5)
-**File:** `src/messages.rs` (target)
-New `Message` variants for conflict voting: "I saw candidate block" and "I vote for block X in this conflict."
+#### Vote/Dispute messages — DONE (Phase 5, replaced with gossip)
+**File:** `finalizer/src/message_dispatcher.rs`
+Replaced with `BlockConfirmed` message action. The finalizer broadcasts committed blocks to Committers and Archivars via `send_block_confirmed()` — no vote/dispute protocol needed due to executor sharding architecture.
 
-#### Conflict-vote aggregation — NOT YET IMPLEMENTED (Phase 5)
-**File:** `finalizer/src/` (target)
-Structurally similar to `SignatureCollector` but scoped to conflicts rather than per-transaction quorum.
+#### Conflict-vote aggregation — NOT NEEDED (executor sharding)
+Conflict detection operates locally at epoch boundaries via `CandidateRegistry` + `resolve_block_conflict()`. Distributed voting protocol removed from scope.
 
 ### pneumatic_sentinel — Priority 2 (Node-specific logic)
 

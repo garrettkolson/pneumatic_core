@@ -373,9 +373,12 @@ impl Finalizer {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: transaction.token_id.clone(),
             env_id: self.env_id.clone(),
-            proposed_block: block,
+            proposed_block: block.clone(),
         };
         self.message_dispatcher.send_to_committers(commit).await?;
+
+        // Step 7.5: Broadcast block to all committers and archivars via gossip
+        self.message_dispatcher.send_block_confirmed(block).await?;
 
         // Step 8: Send clear to all Sentinels
         self.message_dispatcher.send_clear_to_sentinels(tx_id).await?;

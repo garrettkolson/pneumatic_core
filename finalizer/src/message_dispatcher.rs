@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use pneumatic_core::blocks::Block;
 use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::messages::Message;
@@ -96,6 +97,38 @@ impl MessageDispatcher {
 
         Ok(())
     }
+
+    /// Broadcast a BlockConfirmed message to all Committers and Archivars.
+    ///
+    /// Sent after an optimistic commit so that other nodes can learn about
+    /// the committed block without fetching from an archiver.
+    pub async fn send_block_confirmed(&self, block: Block) -> Result<(), PneumaticError> {
+        // Serialize the block as the message body
+        let msg_body = serialize_to_bytes_rmp(&block)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Package as a wire message
+        let message = Message {
+            chain_id: self.env_id.clone(),
+            action: String::from("BlockConfirmed"),
+            body: msg_body,
+            signature: self.finalizer_signature.clone(),
+            public_key: self.public_key.clone(),
+        };
+
+        let payload = serialize_to_bytes_rmp(&message)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Broadcast to all committers
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Committer).await;
+
+        // Broadcast to all archivars
+        self.node_registry
+            .send_to_all(payload, &NodeRegistryType::Archiver).await;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,8 +139,11 @@ impl MessageDispatcher {
 mod tests {
     use super::*;
     use dashmap::DashMap;
+    use pneumatic_core::blocks::{Block, FinalityStatus};
     use pneumatic_core::config::Config;
+    use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+    use pneumatic_core::messages::Message;
     use pneumatic_core::node::{NodeRegistryType, NodeType};
     use pneumatic_core::transactions::{SignedTransaction, TransactionCommit};
     use std::collections::HashMap;
@@ -218,5 +254,40 @@ mod tests {
 
         let result = dispatcher.send_clear_to_sentinels("test_tx_001").await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_confirmed_serializes() {
+        // Verify BlockConfirmed serialization produces a valid MsgPack message
+        let block = Block {
+            signed_trans: SignedTransaction::test_transaction(),
+            token_metadata: HashMap::new(),
+            previous_hash: vec![1, 2, 3],
+            current_hash: vec![4, 5, 6],
+            timestamp: chrono::Utc::now().timestamp(),
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+
+        let body = serialize_to_bytes_rmp(&block).expect("Block serialization should succeed");
+        let message = Message {
+            chain_id: "test_env".to_string(),
+            action: String::from("BlockConfirmed"),
+            body,
+            signature: vec![],
+            public_key: vec![],
+        };
+
+        let payload = serialize_to_bytes_rmp(&message).expect("Message serialization should succeed");
+
+        // Verify round-trip deserialization
+        let recovered: Message = deserialize_rmp_to(&payload).expect("Round-trip should succeed");
+        assert_eq!(recovered.action, "BlockConfirmed");
+        assert_eq!(recovered.chain_id, "test_env");
+
+        let recovered_block: Block = deserialize_rmp_to(&recovered.body).expect("Block deserialization should succeed");
+        assert_eq!(recovered_block.previous_hash, vec![1, 2, 3]);
+        assert_eq!(recovered_block.current_hash, vec![4, 5, 6]);
     }
 }

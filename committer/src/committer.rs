@@ -168,6 +168,7 @@ impl Committer {
             "DistributeToken" => self.handle_token_distribution(message).await,
             "DistributeBlock" => self.handle_block_distribution(message).await,
             "EpochReconcile" => self.handle_epoch_reconcile().await,
+            "BlockConfirmed" => self.handle_block_confirmed(message).await,
             action => Err(CommitterError::UnknownAction(action.to_string())),
         }
     }
@@ -314,6 +315,62 @@ impl Committer {
             "Received distributed block (hash: {})",
             bytes_to_hex(&block.current_hash)
         ));
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Block confirmation gossip handling
+    // -----------------------------------------------------------------------
+
+    /// Handle "BlockConfirmed" gossip from the finalizer.
+    ///
+    /// This is a notification path — the block was already committed by
+    /// the primary committer. This handler updates local chain state
+    /// so other committers stay in sync.
+    async fn handle_block_confirmed(&self, message: Message) -> Result<(), CommitterError> {
+        let block: Block = deserialize_rmp_to(&message.body)
+            .map_err(CommitterError::Deserialization)?;
+
+        let token_id = &block.signed_trans.transaction.token_id;
+
+        // Check token exists, get chain tip for validation
+        let tip = {
+            let token_entry = self.tokens.get(token_id).ok_or_else(|| {
+                CommitterError::TokenNotFound(bytes_to_hex(token_id))
+            })?;
+            token_entry.value().blockchain.get_current_chain_state()
+        };
+
+        // Validate chain linkage (non-fatal if node is behind)
+        if block.previous_hash != tip.last_hash_in {
+            self.env_data.logger.log(format!(
+                "BlockConfirmed: previous_hash mismatch for token [{}], ignoring",
+                bytes_to_hex(token_id)
+            ));
+            return Ok(());
+        }
+
+        // Validate block hash (fatal if tampered)
+        let expected_hash = BlockFactory::create_hash(&block);
+        if expected_hash != block.current_hash {
+            self.env_data.logger.log(format!(
+                "BlockConfirmed: invalid hash for token [{}], rejecting",
+                bytes_to_hex(token_id)
+            ));
+            return Err(CommitterError::InvalidBlockHash);
+        }
+
+        // Append block to local chain
+        {
+            let mut entry = self.tokens.get_mut(token_id).ok_or_else(|| {
+                CommitterError::TokenNotFound(bytes_to_hex(token_id))
+            })?;
+            entry.value_mut().blockchain.add_block(block.clone());
+        }
+
+        // Distribute to archivars (propagate gossip)
+        let _ = self.block_services.distribute_to_archivers(&block).await;
 
         Ok(())
     }
@@ -674,7 +731,7 @@ mod tests {
     use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::crypto::BasicHashProvider;
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
-    use pneumatic_core::encoding::deserialize_rmp_to;
+    use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector, ExecutorSet};
     use pneumatic_core::errors::TransactionRiskFactor;
@@ -1631,5 +1688,269 @@ mod tests {
             committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
             1,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Block gossip tests
+    // -----------------------------------------------------------------------
+
+    /// Build a valid block for the given transaction, chained off the current tip.
+    fn make_gossip_block(committer: &Committer, trans_id: &str, proposer_key: Vec<u8>) -> Block {
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            entry.value().blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        let signed = SignedTransaction {
+            transaction_id: trans_id.to_string(),
+            transaction: Transaction {
+                id: trans_id.to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: prev_hash.clone(),
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: proposer_key,
+        };
+
+        let mut block = Block {
+            signed_trans: signed,
+            token_metadata: HashMap::new(),
+            previous_hash: prev_hash,
+            current_hash: vec![],
+            timestamp: 0,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+        block
+    }
+
+    /// Build a wire Message for a BlockConfirmed gossip event.
+    fn make_block_confirmed_message(block: Block) -> Message {
+        let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
+        Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body,
+            signature: vec![],
+            public_key: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_appends_valid_block() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and create a genesis block
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let original_chain_len = committer.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+        assert_eq!(original_chain_len, 1); // genesis only
+
+        // Build a valid next block chained off the current tip
+        let block = make_gossip_block(&committer, "gossip_tx", b"mallory".to_vec());
+        let message = make_block_confirmed_message(block);
+
+        // Should succeed and append the block
+        let result = committer.handle_block_confirmed(message).await;
+        assert!(result.is_ok());
+
+        // Chain should have grown by 1
+        let new_chain_len = committer.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+        assert_eq!(new_chain_len, original_chain_len + 1);
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_ignores_orphan_block() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let original_chain_len = committer.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+
+        // Build a block with wrong previous_hash (orphaned)
+        let signed = SignedTransaction {
+            transaction_id: "orphan".to_string(),
+            transaction: Transaction {
+                id: "orphan".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: vec![42u8; 32],
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: b"orphan".to_vec(),
+        };
+
+        let mut block = Block {
+            signed_trans: signed,
+            token_metadata: HashMap::new(),
+            previous_hash: vec![99, 99, 99], // doesn't match tip
+            current_hash: vec![],
+            timestamp: 0,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+
+        let message = make_block_confirmed_message(block);
+
+        // Should return Ok (non-fatal), but block not appended
+        let result = committer.handle_block_confirmed(message).await;
+        assert!(result.is_ok());
+
+        // Chain length unchanged
+        let chain_len = committer.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+        assert_eq!(chain_len, original_chain_len);
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_rejects_tampered_block() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // Build a validly-chained block, then tamper the current_hash
+        let block = make_gossip_block(&committer, "tampered", b"tampered".to_vec());
+        // Tamper the hash so validation fails
+        let block = Block {
+            signed_trans: block.signed_trans,
+            token_metadata: block.token_metadata,
+            previous_hash: block.previous_hash,
+            current_hash: vec![0xAA, 0xBB, 0xCC], // tampered
+            timestamp: block.timestamp,
+            finality_status: block.finality_status,
+            proposer_key: block.proposer_key,
+            epoch_number: block.epoch_number,
+        };
+
+        let message = make_block_confirmed_message(block);
+
+        let result = committer.handle_block_confirmed(message).await;
+        assert!(matches!(result, Err(CommitterError::InvalidBlockHash)));
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_unknown_token_returns_error() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        let signed = SignedTransaction {
+            transaction_id: "unknown".to_string(),
+            transaction: Transaction {
+                id: "unknown".to_string(),
+                action: "Process".into(),
+                token_id: vec![99], // not in committer's token cache
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: vec![],
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: b"unknown".to_vec(),
+        };
+
+        let block = Block {
+            signed_trans: signed,
+            token_metadata: HashMap::new(),
+            previous_hash: vec![],
+            current_hash: vec![0xDE, 0xAD],
+            timestamp: 0,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+
+        let message = make_block_confirmed_message(block);
+
+        let result = committer.handle_block_confirmed(message).await;
+        assert!(matches!(result, Err(CommitterError::TokenNotFound(_))));
     }
 }
