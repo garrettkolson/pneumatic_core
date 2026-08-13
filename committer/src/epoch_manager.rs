@@ -310,6 +310,7 @@ mod tests {
             current_hash: vec![],
             finality_status: FinalityStatus::Optimistic,
             proposer_key: vec![],
+            epoch_number: 0,
         };
         block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
         block

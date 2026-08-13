@@ -171,7 +171,7 @@ impl Token {
     }
 
     /// Create a block from a fully signed transaction.
-    pub fn create_block(&self, signed_tx: SignedTransaction) -> Block {
+    pub fn create_block(&self, signed_tx: SignedTransaction, epoch_number: u64) -> Block {
         let prev_hash = match self.blockchain.get_count() {
             0 => signed_tx.leader_hash.clone(),
             _ => self.blockchain.get_current_chain_state().last_hash_in,
@@ -186,6 +186,7 @@ impl Token {
             current_hash: vec![],
             finality_status: crate::blocks::FinalityStatus::Optimistic,
             proposer_key,
+            epoch_number,
         }
     }
 

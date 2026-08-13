@@ -186,6 +186,7 @@ mod tests {
                 timestamp: chrono::Utc::now().timestamp(),
                 finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
                 proposer_key: vec![],
+                epoch_number: 0,
             },
         }
     }

@@ -224,6 +224,73 @@ Resolve these before writing code — choices will ripple through all phases bel
 
 Start with **Phase 1 + 2** together (candidate registry + real fork detection) — build and unit-test in isolation without touching the finalizer's quorum behavior. This gives you a correct detector before changing what "instant" means in Phase 4.
 
+## Phase 5: Deterministic Per-Transaction Routing (2026-08-12)
+
+Each transaction gets its own deterministic finalizer via a stake snapshot — eliminates epoch-wide leader bottleneck, enables parallel transaction processing.
+
+### Phase 0: Snapshot Model (pneumatic_core) ✅ COMPLETE
+
+- [x] P5_00_01 Add `Serialize`/`Deserialize` derives to `StakeSet` — `src/epoch.rs`
+- [x] P5_00_02 Add `StakeSnapshot(u64)` variant to `GetOp` enum — `src/data.rs`
+- [x] P5_00_03 Add `StakeSnapshot(StakeSet)` variant to `SaveOp` enum — `src/data.rs`
+- [x] P5_00_04 Add `get_stake_snapshot`/`save_stake_snapshot` to `DataProvider` trait — `src/data.rs`
+- [x] P5_00_05 Implement in `DefaultDataProvider` via TCP/UDS — `src/data.rs`
+- [x] P5_00_06 Add `stake_snapshots` field + `with_stake_snapshot()` builder to `StubDataProvider` — `src/data.rs`
+- [x] P5_00_07 Add stub implementations to committer's `TestDataProvider` — `committer/src/committer.rs`
+
+### Phase 1: Deterministic Selection Function ✅ COMPLETE
+
+- [x] P5_01_01 Extract `deterministic_select(stakers, seed_bytes, epoch_number)` pure function — `src/epoch.rs:100-158`
+- [x] P5_01_02 Seed = `SHA-256(epoch_number || seed_bytes)` → `StdRng`, sorted stake walk
+- [x] P5_01_03 Refactor `LeaderSelector::select()` to delegate to `deterministic_select` — `src/epoch.rs`
+- [x] P5_01_04 Expose via `pub use epoch::deterministic_select` — `src/lib.rs`
+- [x] P5_01_05 5 unit tests: empty returns none, single staker deterministic, different txs distribute, cross-epoch determinism, zero stake returns none
+
+### Phase 2: Sentinel Stake Snapshot Cache ✅ COMPLETE
+
+- [x] P5_02_01 Create `sentinel/src/stake_snapshot_cache.rs` — `StakeSnapshotCache` struct
+- [x] P5_02_02 Three-tier cache: local `Mutex<HashMap>` → `DataProvider` fallback → peer request (reserved)
+- [x] P5_02_03 Public API: `get(epoch)`, `put(epoch, snapshot)`, `current_epoch()`, `cached_count()`
+- [x] P5_02_04 Add `parking_lot` + `log` dependencies to sentinel `Cargo.toml`
+- [x] P5_02_05 Wire into `Sentinel` constructor — `sentinel/src/sentinel.rs`
+- [x] P5_02_06 Export `StakeSnapshotCache` from sentinel crate lib.rs — `sentinel/src/lib.rs`
+- [x] P5_02_07 4 tests: cache_empty_returns_none, cache_put_and_get, cache_fallback_to_data_provider, cache_independent_epochs
+
+### Phase 3: Deterministic Finalizer Assignment ✅ COMPLETE
+
+- [x] P5_03_01 Add `SentinelError::Routing(String)` variant — `sentinel/src/sentinel.rs`
+- [x] P5_03_02 Implement `assign_finalizer_deterministic()` — uses snapshot + `deterministic_select`
+- [x] P5_03_03 Implement `assign_finalizer_deterministic_retry()` — retry suffix if assigned key matches rejected
+- [x] P5_03_04 Wire into `handle_process_request` — replace empty `finalizer_public_key: vec![]` with deterministic assignment
+- [x] P5_03_05 Wire into `handle_rejection` — replace random `candidates.into_iter().next()` with deterministic + fallback to node registry
+
+### Phase 4: Epoch Number on Block ✅ COMPLETE
+
+- [x] P5_04_01 Add `epoch_number: u64` field to `Block` struct — `src/blocks.rs`
+- [x] P5_04_02 Update `Block::from_transaction()` to accept `epoch_number` param — `src/blocks.rs`
+- [x] P5_04_03 Update `Block::test_block()` to default `epoch_number: 0` — `src/blocks.rs`
+- [x] P5_04_04 Update `Token::create_block()` to accept and propagate `epoch_number` — `src/tokens.rs`
+- [x] P5_04_05 Update `BlockBuilder::create_block()` to accept `epoch_number` — `finalizer/src/block_builder.rs`
+- [x] P5_04_06 Update all Block struct literals across 4 files (8 locations) — `block_builder.rs`, `message_dispatcher.rs`, `committer.rs`, `validation.rs`
+
+### Phase 5: Epoch Boundary Snapshot Persistence ✅ COMPLETE
+
+- [x] P5_05_01 Wire `save_stake_snapshot` into `Committer::handle_epoch_reconcile` — after reconciliation + leader election
+- [x] P5_05_02 Wire `save_stake_snapshot` into `Committer::advance_epoch` — on epoch advance
+- [x] P5_05_03 Use `token_partition_id` as DataProvider partition key
+
+### Phase 6: Finalizer Epoch Verification ✅ COMPLETE
+
+- [x] P5_06_01 Add `current_epoch: u64` field to `Finalizer` struct — `finalizer/src/finalizer.rs`
+- [x] P5_06_02 Update `Finalizer::new()` to accept `current_epoch` param
+- [x] P5_06_03 Wire `self.current_epoch` into `try_finalize` block creation
+- [x] P5_06_04 Add `advance_epoch()` and `current_epoch()` accessors
+- [x] P5_06_05 Update test constructor with epoch=0
+
+**Total tests: 340 passing (17 committer + 256 core + 9 executor + 26 finalizer + 32 sentinel)**
+
+---
+
 ## Phase 5: Refactor pneumatic_committer
 
 ### 5.1 Committer
@@ -254,7 +321,7 @@ Start with **Phase 1 + 2** together (candidate registry + real fork detection) �
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (331 passing across 5 crates — 251 core + 28 sentinel + 26 finalizer + 9 executor + 17 committer)
+## Phase 7: Tests (340 passing across 5 crates — 256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -270,7 +337,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 331 tests across 5 crate targets (251 core + 28 sentinel + 26 finalizer + 9 executor + 17 committer) — +18 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection)
+- [x] T07 Migrate existing tests — all test-bearing files — total 340 tests across 5 crate targets (256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer) — +18 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -482,7 +549,7 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 317 tests across workspace (239 core + 26 finalizer + 9 executor + 28 sentinel + 15 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 340 tests across workspace (256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
@@ -504,7 +571,7 @@ All action branches dispatch and all coordination helpers use protocol-level use
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
 **Current state:** Foundation complete. `TransactionPool` provides per-token deterministic ordering (sorted by sender ASC, sequence_number ASC, timestamp ASC). `LeaderSelector` implements stake-weighted random selection. `BlockProposer` dequeues and wraps transactions in `SignedTransaction` with leader metadata. `EpochBoundaryDetector` detects stale blocks and advances epochs. `resolve_block_conflict()` handles conflicting block proposals with stake-based resolution and hash tie-break. `PendingTransactionRegistry` has `transition_to_validated_and_enqueue()`, `enqueue_to_pool()`, `dequeue_for_leader()`, `get_ordered_transactions()`. Error variants: `PneumaticError::StaleBlock`, `PneumaticError::BlockConflict`, `ValidationFailureReason::StaleEpochBlock`, `ValidationFailureReason::BlockConflict`.
-**Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 9 new tests (3 sentinel + 6 committer). Total: 313 tests passing across 5 crates.
+**Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 9 new tests (3 sentinel + 6 committer). Total: 340 tests passing across 5 crates.
 **Completed (2026-08-12):** Finalizer → Committer commit message path wired. `check_and_commit_transaction_results()` now accepts transactions in both `Finalizing` (standard pipeline) and `Validated` (leader-proposal) state, transitions to `Committed`, and releases the lock. 2 new tests for leader-proposal commit path with gas deduction and overflow saturation.
 **Completed (2026-08-12):** SignatureCollector `reconcile_signatures()` now implements stake-weighted supermajority selection. Sorts candidates by stake descending, accumulates until quorum threshold reached, returns winning set with `conflict_resolved=true`. 4 new tests.
 **Remaining:** `Finalizer.initialize` — gossiper message handler subscription; `Finalizer.try_finalize` — placeholder data for total_stake, total_voters, previous_hash.
@@ -533,7 +600,7 @@ Phase 2: `reconcile_internal()` now uses `CandidateRegistry` for same-chain fork
 #### LeaderSelector — stake-weighted deterministic selection ✓ (DONE — SA_02, 2026-08-11)
 **File:** `src/epoch.rs:154-186`, `committer/src/epoch_manager.rs:220-263`
 Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach. Deterministic seed: `SHA-256(epoch_number.to_be_bytes())` via `ring`, produces `StdRng` — every honest node with same `StakeSet` + `epoch_number` picks same leader. Replaced `HashMap::iter()` with sorted key walk. Trait: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
-**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 239 core + 28 sentinel + 22 finalizer + 9 executor + 15 committer = 313 total.
+**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer = 340 total.
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
@@ -668,11 +735,11 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (313 passing across 5 crates)
+### Tests — Priority 6 (340 passing across 5 crates)
 
 #### Tests added to pneumatic_core — 216 tests
 **Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing), `conns.rs` (7 SA_01 wire framing integration tests), `streams.rs` (9 streams unit tests)
-**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransactionRegistry CRUD + concurrent ops + gas_tracker, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration, TokenFactory minting fee deduction, LeaderSelector stake-weighted selection, BlockProposer, EpochBoundaryDetector, conflict resolution.
+**Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransactionRegistry CRUD + concurrent ops + gas_tracker, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration, TokenFactory minting fee deduction, LeaderSelector stake-weighted selection, BlockProposer, EpochBoundaryDetector, conflict resolution, deterministic_select per-transaction routing (5 tests), epoch_number on Block propagation.
 
 #### Tests added to pneumatic_finalizer — 22 tests
 **Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing

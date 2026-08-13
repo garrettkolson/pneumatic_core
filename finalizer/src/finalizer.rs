@@ -60,6 +60,9 @@ pub struct Finalizer {
     preload_tasks: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     /// Flag: is the finalizer shutting down?
     awaiting_shutdown: Arc<Mutex<bool>>,
+    /// Current epoch number — used when building blocks.
+    /// Updated when blocks from the chain are received.
+    current_epoch: u64,
 }
 
 impl Finalizer {
@@ -70,6 +73,7 @@ impl Finalizer {
     /// `signing_key` is the Ed25519 private key for signing blocks.
     /// `verifying_key` is derived from the signing key.
     /// `leader_address/stake/hash` are from the environment's leader.
+    /// `current_epoch` is the starting epoch number for block building.
     pub fn new(
         env_id: String,
         public_key: Vec<u8>,
@@ -84,6 +88,7 @@ impl Finalizer {
         leader_address: Vec<u8>,
         leader_stake: u64,
         leader_hash: Vec<u8>,
+        current_epoch: u64,
     ) -> Self {
         let signature_collector = SignatureCollector::new(
             signature_registry.clone(),
@@ -120,6 +125,7 @@ impl Finalizer {
             message_dispatcher,
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
+            current_epoch,
         }
     }
 
@@ -263,7 +269,7 @@ impl Finalizer {
         // Step 7: Create the Block
         // In production, get the current chain state's last hash
         let previous_hash = vec![];
-        let block = self.block_builder.create_block(signed_tx.clone(), previous_hash);
+        let block = self.block_builder.create_block(signed_tx.clone(), previous_hash, self.current_epoch);
 
         // Step 8: Send the commit to all Committers
         let block_hash = block.current_hash.clone();
@@ -312,6 +318,17 @@ impl Finalizer {
     /// Get the number of collected signatures for a transaction.
     pub fn signature_count(&self, tx_id: &str) -> usize {
         self.signature_collector.signature_count(tx_id)
+    }
+
+    /// Get the finalizer's current epoch number.
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
+
+    /// Advance to a new epoch. Called when the finalizer receives
+    /// blocks indicating an epoch transition.
+    pub fn advance_epoch(&mut self) {
+        self.current_epoch += 1;
     }
 }
 
@@ -445,14 +462,15 @@ mod tests {
             node_registry,
             pending_registry,
             signature_registry,
-            67.0, // quorum
-            3,    // total voters
+            67.0,   // quorum
+            3,      // total voters
             signing_key,
             verifying_key,
             hash_provider,
             vec![10, 20, 30], // leader address
             100,              // leader stake
             vec![40, 50, 60], // leader hash
+            0,                // current_epoch
         )
     }
 

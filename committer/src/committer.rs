@@ -8,7 +8,7 @@ use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
-use pneumatic_core::epoch::{BlockProposer, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager};
+use pneumatic_core::epoch::{BlockProposer, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::messages::Message;
@@ -330,11 +330,18 @@ impl Committer {
             self.staking_manager.apply_ops(&reconciliation)?;
         }
 
-        // Select new leader for the epoch
+        // Select new leader for the epoch and persist stake snapshot
         let stake_set = self.stake_store.to_stake_set();
         let new_epoch_number = self.current_epoch_number.load(Ordering::SeqCst) + 1;
         let leader_key = self.leader_selector.select(&stake_set, new_epoch_number);
         self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
+
+        // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
+        let _ = self.data_provider.save_stake_snapshot(
+            new_epoch_number,
+            stake_set,
+            &self.env_data.token_partition_id,
+        );
 
         let logger = &self.env_data.logger;
         if !leader_key.is_empty() {
@@ -415,6 +422,14 @@ impl Committer {
         let new_epoch_number = detector.current_epoch.epoch_number;
         self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
         let new_leader = detector.current_epoch.leader_public_key.clone();
+
+        // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
+        let _ = self.data_provider.save_stake_snapshot(
+            new_epoch_number,
+            stake_set,
+            &self.env_data.token_partition_id,
+        );
+
         // Advance may have set previous_leader — that's fine, it stays in the detector.
         Some(new_leader)
     }
@@ -495,6 +510,7 @@ impl Committer {
                     signed,
                     Blockchain::new(),
                     &Token::new(),
+                    0, // epoch_number: placeholder, set by Phase 5
                 ),
             };
             commits.push(commit);
@@ -592,6 +608,14 @@ mod tests {
                 .insert(partition_id.to_string(), user);
             Ok(())
         }
+
+        fn get_stake_snapshot(&self, _epoch: u64, _partition_id: &str) -> Result<StakeSet, DataError> {
+            Ok(StakeSet::default())
+        }
+
+        fn save_stake_snapshot(&self, _epoch: u64, _snapshot: StakeSet, _partition_id: &str) -> Result<(), DataError> {
+            Ok(())
+        }
     }
 
     fn make_test_env_data() -> EnvironmentMetadata {
@@ -665,6 +689,7 @@ mod tests {
             current_hash: vec![],
             finality_status: FinalityStatus::Optimistic,
             proposer_key: vec![],
+            epoch_number: 0,
         };
         block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
         block
@@ -682,6 +707,7 @@ mod tests {
             current_hash: vec![],
             finality_status: FinalityStatus::Optimistic,
             proposer_key: vec![],
+            epoch_number: 0,
         };
         genesis.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis);
 

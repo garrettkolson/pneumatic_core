@@ -729,6 +729,7 @@ mod tests {
                 current_hash: vec![],
                 finality_status: crate::blocks::FinalityStatus::Optimistic,
                 proposer_key: vec![1],
+                epoch_number: 0,
             };
             gen_block.current_hash = BlockFactory::create_hash(&gen_block);
             blockchain.add_block(gen_block);
@@ -742,6 +743,7 @@ mod tests {
             current_hash: vec![],
             finality_status: crate::blocks::FinalityStatus::Optimistic,
             proposer_key,
+            epoch_number: 0,
         };
         block.current_hash = BlockFactory::create_hash(&block);
         block

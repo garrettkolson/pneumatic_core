@@ -174,6 +174,7 @@ impl BlockBuilder {
         &self,
         signed_tx: SignedTransaction,
         previous_hash: Vec<u8>,
+        epoch_number: u64,
     ) -> Block {
         let proposer_key = signed_tx.proposer_key.clone();
         let block = Block {
@@ -184,6 +185,7 @@ impl BlockBuilder {
             timestamp: chrono::Utc::now().timestamp(),
             finality_status: FinalityStatus::Optimistic,
             proposer_key: proposer_key.clone(),
+            epoch_number,
         };
         // Compute the block hash
         let current_hash = BlockFactory::create_hash(&block);
@@ -195,6 +197,7 @@ impl BlockBuilder {
             timestamp: block.timestamp,
             finality_status: FinalityStatus::Optimistic,
             proposer_key,
+            epoch_number,
         }
     }
 }
@@ -348,7 +351,7 @@ mod tests {
             .block_on(async { builder.sign_finalizer_block(&mut signed).await.unwrap() });
         signed.finalizer_sig = finalizer_sig;
 
-        let block = builder.create_block(signed, vec![10, 20, 30]);
+        let block = builder.create_block(signed, vec![10, 20, 30], 0);
 
         assert!(!block.current_hash.is_empty());
         assert_eq!(block.previous_hash, vec![10, 20, 30]);

@@ -29,6 +29,9 @@ pub struct Block {
     pub finality_status: FinalityStatus,
     /// Public key of the proposer who created this block.
     pub proposer_key: Vec<u8>,
+    /// Epoch number at which this block was proposed.
+    /// Used by downstream nodes to verify deterministic routing decisions.
+    pub epoch_number: u64,
 }
 
 impl Block {
@@ -36,6 +39,7 @@ impl Block {
         signed: SignedTransaction,
         blockchain: Blockchain,
         token: &Token,
+        epoch_number: u64,
     ) -> Self {
         let prev_hash = match blockchain.get_count() {
             0 => signed.leader_hash.clone(),
@@ -50,6 +54,7 @@ impl Block {
             current_hash: vec![],
             finality_status: FinalityStatus::Optimistic,
             proposer_key: signed.leader_address.clone(),
+            epoch_number,
         }
     }
 
@@ -63,6 +68,7 @@ impl Block {
             timestamp: Utc::now().timestamp(),
             finality_status: FinalityStatus::Optimistic,
             proposer_key: vec![],
+            epoch_number: 0,
         };
 
         block.current_hash = BlockFactory::create_hash(&block);
@@ -217,7 +223,7 @@ pub mod tests {
         let tx = SignedTransaction::test_transaction();
         let blockchain = Blockchain::new();
         let token = Token::test_token();
-        let block = Block::from_transaction(tx, blockchain, &token);
+        let block = Block::from_transaction(tx, blockchain, &token, 0);
         assert_eq!(block.finality_status, FinalityStatus::Optimistic);
     }
 

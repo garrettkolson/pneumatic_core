@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::errors::PneumaticError;
 use dashmap::DashMap;
 use rand::rngs::StdRng;
@@ -81,7 +82,7 @@ pub struct EpochReconciliation {
 // ---------------------------------------------------------------------------
 
 /// Maps public keys to stake amounts for leader selection and quorum checks.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StakeSet {
     /// Public key -> stake amount
     pub stakers: std::collections::HashMap<Vec<u8>, u64>,
@@ -96,6 +97,47 @@ impl StakeSet {
     pub fn get_stake(&self, key: &[u8]) -> u64 {
         self.stakers.get(key).copied().unwrap_or(0)
     }
+}
+
+/// Deterministic stake-weighted selection from a sorted stake set.
+///
+/// Uses `seed_bytes` to create a reproducible random point in `[0, total_stake)`,
+/// then walks the sorted stakers to find who owns that cumulative range.
+///
+/// Returns `Some(key)` of the selected staker, or `None` if the stake set
+/// has zero total stake.
+pub fn deterministic_select(stakers: &StakeSet, seed_bytes: &[u8], epoch_number: u64) -> Option<Vec<u8>> {
+    let total = stakers.total_stake();
+    if total == 0 {
+        return None;
+    }
+
+    // Deterministic seed: SHA-256(epoch_number || seed_bytes)
+    let mut input = epoch_number.to_be_bytes().to_vec();
+    input.extend_from_slice(seed_bytes);
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let seed = digest.as_ref();
+    let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
+        // SHA-256 produces 32 bytes, exactly fits [u8; 32]
+        unreachable!("ring SHA-256 always produces 32 bytes")
+    }));
+    let target: u64 = rng.gen_range(0..total);
+
+    // Deterministic iteration: sort keys lexicographically
+    let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+    keys.sort();
+
+    let first_key = keys[0].clone(); // backup for fallback
+    let mut cumulative = 0u64;
+    for key in keys {
+        let stake = *stakers.stakers.get(key).unwrap();
+        cumulative += stake;
+        if cumulative >= target {
+            return Some(key.clone());
+        }
+    }
+    // Fallback: return the first staker (shouldn't happen if total > 0)
+    Some(first_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -172,35 +214,8 @@ impl Default for LeaderSelector {
 
 impl IEpochLeaderSelector for LeaderSelector {
     fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
-        let total = stakers.total_stake();
-        if total == 0 {
-            return vec![];
-        }
-
-        // Deterministic seed: SHA-256(epoch_number as big-endian bytes)
-        let digest = ring::digest::digest(&ring::digest::SHA256, &epoch_number.to_be_bytes());
-        let seed = digest.as_ref();
-        let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
-            // SHA-256 produces 32 bytes, exactly fits [u8; 32]
-            unreachable!("ring SHA-256 always produces 32 bytes")
-        }));
-        let target: u64 = rng.gen_range(0..total);
-
-        // Deterministic iteration: sort keys lexicographically
-        let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
-        keys.sort();
-
-        let first_key = keys[0].clone(); // backup for fallback
-        let mut cumulative = 0u64;
-        for key in keys {
-            let stake = *stakers.stakers.get(key).unwrap();
-            cumulative += stake;
-            if cumulative >= target {
-                return key.clone();
-            }
-        }
-        // Fallback: return the first staker (should not happen if total > 0)
-        first_key
+        deterministic_select(stakers, &[], epoch_number)
+            .unwrap_or_default()
     }
 }
 
@@ -915,5 +930,63 @@ mod tests {
         }
 
         assert_eq!(registry.len(), 5);
+    }
+
+    // --- deterministic_select tests ---
+
+    #[test]
+    fn deterministic_select_empty_returns_none() {
+        let stakes = make_stake_set(vec![]);
+        let result = deterministic_select(&stakes, b"tx1", 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn deterministic_select_single_staker_always_same() {
+        let key = vec![1, 2, 3];
+        let stakes = make_stake_set(vec![(key.clone(), 100)]);
+        for _ in 0..20 {
+            assert_eq!(deterministic_select(&stakes, b"tx1", 1), Some(key.clone()));
+        }
+    }
+
+    #[test]
+    fn deterministic_select_different_txs_distribute() {
+        let key_a = vec![1];
+        let key_b = vec![2];
+        let stakes = make_stake_set(vec![(key_a.clone(), 10), (key_b.clone(), 90)]);
+
+        // Pick many different tx_ids — verify distribution roughly matches stake weights
+        let mut a_count = 0u64;
+        let num_trials = 200;
+        for i in 0..num_trials {
+            let tx_id = format!("tx_{}", i);
+            if deterministic_select(&stakes, tx_id.as_bytes(), 1) == Some(key_a.clone()) {
+                a_count += 1;
+            }
+        }
+        // key_a has 10% stake — expect ~10% selections, with some tolerance
+        assert!(a_count <= 30, "expected ≤30 small selections (10%), got {}", a_count);
+        assert!(a_count >= 2, "expected ≥2 small selections (10%), got {}", a_count);
+    }
+
+    #[test]
+    fn deterministic_select_deterministic_across_epochs() {
+        let stakes = make_stake_set(vec![(vec![1], 30), (vec![2], 50), (vec![3], 20)]);
+        let epoch1 = deterministic_select(&stakes, b"tx_alpha", 1);
+        let epoch1_again = deterministic_select(&stakes, b"tx_alpha", 1);
+        assert_eq!(epoch1, epoch1_again); // Same seed + same epoch → same result
+
+        let epoch2 = deterministic_select(&stakes, b"tx_alpha", 2);
+        // Epoch2 may or may not differ — but must be deterministic
+        let epoch2_again = deterministic_select(&stakes, b"tx_alpha", 2);
+        assert_eq!(epoch2, epoch2_again);
+    }
+
+    #[test]
+    fn deterministic_select_zero_stake_returns_none() {
+        let stakes = make_stake_set(vec![(vec![1], 0), (vec![2], 0)]);
+        let result = deterministic_select(&stakes, b"tx1", 1);
+        assert!(result.is_none());
     }
 }

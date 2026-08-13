@@ -18,5 +18,6 @@ pub mod validation;
 pub mod registry;
 pub use registry::{PendingAdminCredit, PendingTransactionRegistry};
 pub mod epoch;
+pub use epoch::deterministic_select;
 pub mod action_router;
 pub mod user;

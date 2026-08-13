@@ -9,6 +9,7 @@ use serde_json::error::Category::Data;
 use crate::conns::{ConnTarget, LocalTarget};
 use crate::conns::factories::{ConnFactory, IsConnFactory};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+use crate::epoch::StakeSet;
 use crate::tokens::Token;
 use crate::user::User;
 
@@ -40,6 +41,12 @@ pub trait DataProvider : Send + Sync {
     fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
         DefaultDataProvider::new().save_user(key, user, partition_id)
     }
+
+    /// Retrieve a stake snapshot for a given epoch and partition.
+    fn get_stake_snapshot(&self, epoch: u64, partition_id: &str) -> Result<StakeSet, DataError>;
+
+    /// Persist a stake snapshot for a given epoch and partition.
+    fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, partition_id: &str) -> Result<(), DataError>;
 }
 
 pub struct DefaultDataProvider {
@@ -159,6 +166,14 @@ impl DataProvider for DefaultDataProvider {
     fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
         self.save_data_internal::<Vec<u8>>(key, DataOp::Save(SaveOp::Data(data)), partition_id)
     }
+
+    fn get_stake_snapshot(&self, epoch: u64, partition_id: &str) -> Result<StakeSet, DataError> {
+        self.get_data_internal::<StakeSet>(&epoch.to_be_bytes().to_vec(), DataOp::Get(GetOp::StakeSnapshot(epoch)), partition_id)
+    }
+
+    fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, partition_id: &str) -> Result<(), DataError> {
+        self.save_data_internal::<StakeSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::StakeSnapshot(snapshot)), partition_id)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -181,6 +196,7 @@ pub enum GetOp {
     Token,
     Data,
     User,
+    StakeSnapshot(u64),
 }
 
 impl std::fmt::Display for GetOp {
@@ -189,6 +205,7 @@ impl std::fmt::Display for GetOp {
             GetOp::Token => write!(f, "Token"),
             GetOp::Data => write!(f, "Data"),
             GetOp::User => write!(f, "User"),
+            GetOp::StakeSnapshot(epoch) => write!(f, "StakeSnapshot({})", epoch),
         }
     }
 }
@@ -198,6 +215,7 @@ pub enum SaveOp {
     Token(Token),
     Data(Vec<u8>),
     User(User),
+    StakeSnapshot(StakeSet),
 }
 
 impl std::fmt::Display for SaveOp {
@@ -206,6 +224,7 @@ impl std::fmt::Display for SaveOp {
             SaveOp::Token(_) => write!(f, "Token"),
             SaveOp::Data(_) => write!(f, "Data"),
             SaveOp::User(_) => write!(f, "User"),
+            SaveOp::StakeSnapshot(_) => write!(f, "StakeSnapshot"),
         }
     }
 }
@@ -299,6 +318,7 @@ mod tests {
 pub struct StubDataProvider {
     tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
     users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
+    stake_snapshots: std::sync::Mutex<std::collections::HashMap<u64, StakeSet>>,
 }
 
 impl StubDataProvider {
@@ -306,6 +326,7 @@ impl StubDataProvider {
         StubDataProvider {
             tokens: std::collections::HashMap::new(),
             users: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stake_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -321,6 +342,15 @@ impl StubDataProvider {
             .entry(key)
             .or_default()
             .insert(partition_id, user);
+        self
+    }
+
+    /// Add a stake snapshot for a given epoch.
+    pub fn with_stake_snapshot(mut self, epoch: u64, snapshot: StakeSet) -> Self {
+        self.stake_snapshots
+            .lock()
+            .unwrap()
+            .insert(epoch, snapshot);
         self
     }
 }
@@ -369,6 +399,23 @@ impl DataProvider for StubDataProvider {
             .entry(key.clone())
             .or_default()
             .insert(partition_id.to_string(), user);
+        Ok(())
+    }
+
+    fn get_stake_snapshot(&self, epoch: u64, _partition_id: &str) -> Result<StakeSet, DataError> {
+        self.stake_snapshots
+            .lock()
+            .unwrap()
+            .get(&epoch)
+            .cloned()
+            .ok_or(DataError::DataNotFound)
+    }
+
+    fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, _partition_id: &str) -> Result<(), DataError> {
+        self.stake_snapshots
+            .lock()
+            .unwrap()
+            .insert(epoch, snapshot);
         Ok(())
     }
 }

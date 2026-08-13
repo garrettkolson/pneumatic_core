@@ -12,6 +12,8 @@ use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, registry::Node
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::transactions::{Transaction, TransactionState};
 
+use super::stake_snapshot_cache::StakeSnapshotCache;
+
 /// Sentinel — the gatekeeper node type in the pneumatic pipeline.
 ///
 /// Responsibilities:
@@ -30,6 +32,9 @@ pub struct Sentinel {
     transaction_notifier: Arc<super::transaction_notifier::TransactionNotifier>,
     transaction_validator: Arc<super::transaction_validator::TransactionValidator>,
     data_provider: Arc<dyn DataProvider>,
+    /// Stake snapshot cache for deterministic per-transaction routing.
+    /// Loaded from local cache → DataProvider → (reserved) peer fallback.
+    stake_snapshot_cache: Arc<StakeSnapshotCache>,
     /// The environment this sentinel operates on.
     env_data: Arc<EnvironmentMetadata>,
 }
@@ -52,6 +57,10 @@ impl Sentinel {
             super::transaction_notifier::TransactionNotifier::new(config, Arc::clone(&node_registry))
         );
         let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), Arc::clone(&data_provider));
+        let partition_id = env_data.environment_id.clone();
+        let stake_snapshot_cache = Arc::new(
+            StakeSnapshotCache::new(data_provider.clone(), partition_id)
+        );
 
         Sentinel {
             node_registry,
@@ -60,6 +69,7 @@ impl Sentinel {
             transaction_notifier,
             transaction_validator: Arc::new(validator),
             data_provider,
+            stake_snapshot_cache,
             env_data,
         }
     }
@@ -263,34 +273,37 @@ impl Sentinel {
             )));
         }
 
-        // Extract the transaction from Finalizing state, then pick a new finalizer.
-        let node_registry = Arc::clone(&self.node_registry);
-        let new_finalizer_key = {
-            let Some(nodes) = node_registry.get_nodes(&NodeRegistryType::Finalizer) else {
-                return Err(SentinelError::NoTarget(NodeRegistryType::Finalizer));
-            };
+        // Assign a new finalizer deterministically using the current stake snapshot.
+        // Falls back to random candidate selection if the snapshot is unavailable.
+        let new_key = match self.assign_finalizer_deterministic_retry(&tx_id, 1, &rejected_key) {
+            Ok(key) => key,
+            Err(_) => {
+                // Fallback: pick the first non-rejected candidate from the node registry.
+                let Some(nodes) = self.node_registry.get_nodes(&NodeRegistryType::Finalizer) else {
+                    let _ = self.registry.release_transaction(&tx_id);
+                    return Err(SentinelError::NoTarget(NodeRegistryType::Finalizer));
+                };
 
-            // Collect keys excluding the rejected finalizer.
-            let mut candidates: Vec<Vec<u8>> = Vec::new();
-            for entry in nodes.iter() {
-                let key = entry.key();
-                if key != &rejected_key {
-                    candidates.push(key.clone());
+                let fallback_keys: Vec<Vec<u8>> = nodes.iter()
+                    .filter_map(|entry| {
+                        let entry_key = entry.key();
+                        if entry_key != &rejected_key {
+                            Some(entry_key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                match fallback_keys.into_iter().next() {
+                    Some(k) => k,
+                    None => {
+                        let _ = self.registry.release_transaction(&tx_id);
+                        return Err(SentinelError::Registry(format!(
+                            "No alternative finalizer available for tx {} after rejection", tx_id
+                        )));
+                    }
                 }
-            }
-
-            candidates.into_iter().next()
-        };
-
-        let new_key = match new_finalizer_key {
-            Some(k) => k,
-            None => {
-                // Restore the original state since we can't reassign.
-                // Note: release_transaction will decrement lock; caller should remove.
-                let _ = self.registry.release_transaction(&tx_id);
-                return Err(SentinelError::Registry(format!(
-                    "No alternative finalizer available for tx {} after rejection", tx_id
-                )));
             }
         };
 
@@ -386,6 +399,53 @@ impl Sentinel {
         tx.action.clone()
     }
 
+    /// Deterministically assign a finalizer for a transaction using the current
+    /// stake snapshot. Returns the assigned finalizer's public key.
+    ///
+    /// Uses the sentinel's `StakeSnapshotCache` to load the snapshot for the
+    /// given epoch, then delegates to `pneumatic_core::deterministic_select`.
+    ///
+    /// If the snapshot is not cached and the DataProvider call fails, returns
+    /// a `Routing` error.
+    pub fn assign_finalizer_deterministic(
+        &self,
+        tx_id: &str,
+        epoch_number: u64,
+    ) -> Result<Vec<u8>, SentinelError> {
+        let snapshot = self.stake_snapshot_cache.get(epoch_number)
+            .ok_or_else(|| SentinelError::Routing(format!("No snapshot for epoch {}", epoch_number)))?;
+
+        if snapshot.total_stake() == 0 {
+            return Err(SentinelError::Routing("Stake set is empty".into()));
+        }
+
+        let finalizer_key = pneumatic_core::deterministic_select(&snapshot, tx_id.as_bytes(), epoch_number)
+            .ok_or_else(|| SentinelError::Routing("Selection returned none for non-empty stake set".into()))?;
+
+        if snapshot.get_stake(&finalizer_key) == 0 {
+            return Err(SentinelError::Routing("Assigned finalizer has zero stake".into()));
+        }
+
+        Ok(finalizer_key)
+    }
+
+    /// Assign a finalizer deterministically, with a retry suffix if the
+    /// initial assignment matches a rejected finalizer.
+    pub fn assign_finalizer_deterministic_retry(
+        &self,
+        tx_id: &str,
+        epoch_number: u64,
+        rejected_key: &[u8],
+    ) -> Result<Vec<u8>, SentinelError> {
+        let key = self.assign_finalizer_deterministic(tx_id, epoch_number)?;
+        if key == rejected_key {
+            // Try with a "retry" suffix to shift the selection
+            let retry_tx_id = format!("{}_retry", tx_id);
+            return self.assign_finalizer_deterministic(&retry_tx_id, epoch_number);
+        }
+        Ok(key)
+    }
+
     /// Transition a transaction to Failed state with error reasons.
     fn transition_to_failed(&self, tx_id: &str, tx: Transaction, error: PneumaticError) {
         match error {
@@ -424,6 +484,8 @@ pub enum SentinelError {
     NoTarget(NodeRegistryType),
     /// Unknown action type in incoming message
     UnknownAction(String),
+    /// Deterministic routing failure (no snapshot, empty stake set, etc.)
+    Routing(String),
 }
 
 impl From<std::io::Error> for SentinelError {
