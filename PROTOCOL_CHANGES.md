@@ -50,14 +50,17 @@ Wiring conflict detection into the optimistic path itself (before block dispatch
 
 ## Phase 5 — Block awareness gossip (formerly "Networking additions")
 
-**Original scope:** Add vote/dispute message types for distributed consensus on conflicts.
+**Status: Complete.**
 
-**Revised scope:** The original plan assumed all executors see every transaction, making distributed vote/dispute protocol necessary for conflict awareness. With executor sharding (only one shard processes each tx) and epoch rotation (executors reshuffle each epoch), conflicts are so rare that a full vote protocol is unnecessary.
+The original plan assumed all executors see every transaction, making distributed vote/dispute protocol necessary for conflict awareness. With executor sharding (only one shard processes each tx) and epoch rotation (executors reshuffle each epoch), conflicts are so rare that a full vote protocol is unnecessary.
 
-Instead, what's useful is a simple block announcement gossip:
+Instead, a simple block announcement gossip was implemented:
 
-- **Add `BlockConfirmed` message type** in `src/messages.rs` — the finalizer broadcasts the `TransactionCommit` after optimistic commit so other nodes can advance their local chain state without fetching from an archiver.
-- **No vote/aggregation protocol** — conflict detection is local to each node's `CandidateRegistry`, resolution uses the existing `StakeSet` via `resolve_block_conflict` at epoch boundaries.
+- **`BlockConfirmed` message** in `finalizer/src/message_dispatcher.rs` — serializes `Block` and broadcasts to both Committers and Archivars after optimistic commit
+- **`handle_block_confirmed` in Committer** (`committer/src/committer.rs`) — validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), appends to blockchain, propagates to archivars
+- **Wired into `try_finalize_optimistic`** — called after `send_to_committers`
+- **5 tests** — 4 committer (valid append, orphan ignored, tampered rejected, unknown token error) + 1 dispatcher serialization
+- **No vote/aggregation protocol** — conflict detection is local to each node's `CandidateRegistry`, resolution uses the existing `StakeSet` via `resolve_block_conflict` at epoch boundaries
 
 This is a notification, not a consensus mechanism. Nodes still converge independently at epoch reconciliation if they missed a block announcement.
 
@@ -67,15 +70,15 @@ This is a notification, not a consensus mechanism. Nodes still converge independ
 
 - **Unit tests:** `CandidateRegistry` concurrent inserts (done), `resolve_block_conflict` tie-breaking (done), optimistic commit path (done via existing finalizer tests)
 - **Happy path e2e:** optimistic commit succeeds, finality status = `Optimistic`, then confirmed after quorum or epoch boundary
-- **Block awareness:** `BlockConfirmed` gossip arrives, local chain state advances (after Phase 5 is implemented)
+- **Block awareness:** `BlockConfirmed` gossip arrives, local chain state advances (Phase 5 implemented, 5 tests passing)
 - **Epoch-boundary conflict:** reconciler detects competing candidates at chain tip, applies `DiscardLoser` or `SameProposerSlash` (existing tests in `epoch_manager.rs` cover the happy/conflict cases)
 - **Not needed:** distributed vote/dispute tests (no protocol), near-simultaneous competing block tests at the network level (sharding makes this effectively impossible — only one shard per tx)
 
 ## Phase 7 — Docs
 
-**Status: Partial.**
+**Status: Complete.**
 
-TASKS.md updated with executor sharding + optimistic commit phases. README.md updated with ADR-009 (Executor Sharding) and ADR-010 (Optimistic Commit). This document should be updated to reflect the revised Phase 5/6 scope above.
+TASKS.md updated with executor sharding + optimistic commit phases. README.md updated with ADR-009 (Executor Sharding) and ADR-010 (Optimistic Commit). This document updated to reflect revised Phase 5/6 scope with block gossip completion.
 
 ---
 
@@ -87,4 +90,4 @@ The original Phase 5/6 assumed a flat executor registry where every node process
 2. **Epoch rotation reshuffles executors** — stable cartels can't form.
 3. **Optimistic commit doesn't wait for quorum** — conflicts that escape the finalizer are resolved at epoch boundaries, not during transaction processing.
 
-The conflict resolution machinery (`CandidateRegistry`, `resolve_block_conflict`, `StakingOp::Slash`) exists and is tested. It operates as a slower-path safety net, not as a real-time consensus protocol. The only missing piece is the block announcement gossip that would let other nodes learn about committed blocks without polling an archiver.
+The conflict resolution machinery (`CandidateRegistry`, `resolve_block_conflict`, `StakingOp::Slash`) exists and is tested. It operates as a slower-path safety net, not as a real-time consensus protocol. The block announcement gossip is now implemented, letting other nodes learn about committed blocks without polling an archiver.

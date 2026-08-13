@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 369 tests across 5 crate targets
+cargo test --workspace --lib   # Run 374 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -264,7 +264,7 @@ Decomposed from a monolithic C# design into three focused components:
 
 Optimistic commit: `handle_signature()` dispatches first valid signature to `try_finalize_optimistic()` for immediate block creation. Subsequent signatures acknowledged for stake accumulation. Epoch tracking: `Finalizer` tracks `current_epoch` for block creation. `BlockBuilder::create_block()` accepts `epoch_number` for hash-chain integrity.
 
-**Test count**: 27
+**Test count**: 28
 
 ### pneumatic_committer
 
@@ -307,7 +307,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 369 tests: 272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer
+# 374 tests: 272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer
 ```
 
 ---
@@ -318,7 +318,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 369 tests passing across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer), all core types and traits implemented.
+**Status: COMPLETE** — 374 tests passing across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -417,9 +417,9 @@ This roadmap tracks the work from current foundation state through a production-
 
 ---
 
-### Phase 5: Optimistic Finality (Priority: HIGH)
+### Phase 5: Optimistic Finality + Block Gossip (Priority: HIGH)
 
-**Goal:** Replace per-transaction blocking quorum with conflict-only voting; enable instant finality in the happy path.
+**Goal:** Replace per-transaction blocking quorum with conflict-only voting; enable instant finality in the happy path. Broadcast committed blocks via gossip so nodes advance without polling an archiver.
 
 | Task | Description | Estimate | Status |
 |------|-------------|----------|--------|
@@ -466,6 +466,17 @@ This roadmap tracks the work from current foundation state through a production-
 | Wiring fixes | `CandidateRegistry` in committer `main.rs`, borrow/lifetime fixes | 2h | **DONE** |
 
 **Sub-total**: 42h / ~1 week — **COMPLETE**
+
+### Phase 5d: Block Awareness Gossip (NEW — Completed)
+
+| Task | Description | Estimate | Status |
+|------|-------------|----------|--------|
+| `send_block_confirmed` | MessageDispatcher method — serializes `Block`, broadcasts to Committers + Archivars | 4h | **DONE** |
+| Wire into `try_finalize_optimistic` | Called after `send_to_committers` in optimistic commit path | 1h | **DONE** |
+| `handle_block_confirmed` | Committer handler — validates chain linkage, validates hash, appends block, distributes to archivars | 4h | **DONE** |
+| Unit tests | 4 committer (valid append, orphan ignored, tampered rejected, unknown token) + 1 dispatcher serialization | 4h | **DONE** |
+
+**Sub-total**: 13h / ~1 day — **COMPLETE**
 
 ---
 
@@ -554,9 +565,10 @@ This roadmap tracks the work from current foundation state through a production-
 | 2. Executor Execution | ~3 days | Phase 1 (Partial — can run in parallel with Sentinel wiring) |
 | 3. Finalizer Completion | ~3 days (3 tasks left) | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
-| 5. Optimistic Finality | ~2 weeks remaining | Phase 1-4 |
+| 5. Optimistic Finality + Block Gossip | ~2 weeks remaining | Phase 1-4 |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
 | 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
+| 5d. Block Awareness Gossip | ✅ Done (13h, ~1 day) | Phase 5c |
 | 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
 | 7. Test Coverage | ~1 week | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |

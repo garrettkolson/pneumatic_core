@@ -221,7 +221,16 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [x] Add `handle_block_confirmed` to Committer — deserializes Block, validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), appends to blockchain, distributes to archivars — `committer/src/committer.rs`
 - [x] 5 new tests: 4 committer unit tests (valid append, orphan ignored, tampered rejected, unknown token error) + 1 dispatcher serialization test
 
-### Phase 6 — Testing
+### Phase 6 — Testing ✅ COMPLETE
+
+- [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
+- [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
+- [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
+- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
+
+### Implementation Order Recommendation
+
+Start with **Phase 1 + 2** together (candidate registry + real fork detection) — build and unit-test in isolation without touching the finalizer's quorum behavior. This gives you a correct detector before changing what "instant" means in Phase 4.
 
 - [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
 - [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
@@ -349,7 +358,7 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_E_04 Add `invalidate_all()` to `StakeSnapshotCache` — cleared on epoch transition — `sentinel/src/stake_snapshot_cache.rs`
 - [x] P6_E_05 2 tests: `cache_invalidate_all_clears_snapshots`, `advance_epoch_invalidates_caches`
 
-**Total tests: 369 passing (21 committer + 272 core + 9 executor + 27 finalizer + 40 sentinel)**
+**Total tests: 374 passing (25 committer + 272 core + 9 executor + 28 finalizer + 40 sentinel)**
 
 ---
 
@@ -383,7 +392,7 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (369 passing across 5 crates — 272 core + 40 sentinel + 27 finalizer + 9 executor + 21 committer)
+## Phase 7: Tests (374 passing across 5 crates — 272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -399,7 +408,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 374 tests across 5 crate targets (272 core + 40 sentinel + 27 finalizer + 9 executor + 26 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +5 tests from Phase 5b block gossip (4 committer + 1 dispatcher)
+- [x] T07 Migrate existing tests — all test-bearing files — total 374 tests across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +5 tests from Phase 5d block gossip (4 committer + 1 dispatcher)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -667,7 +676,7 @@ Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range
 #### Conflict Resolution — wired into commit path ✓ (DONE — 2026-08-13)
 **File:** `src/epoch.rs:393-430` (ConflictResolution enum + enriched resolve_block_conflict), `committer/src/committer.rs:380-487` (handle_conflict_at_commit), `committer/src/committer.rs:78-84` (CandidateRegistry field)
 `resolve_block_conflict()` now returns `ConflictResolution` enum: `DiscardLoser` (different proposers, network race), `SameProposerSlash` (same proposer double-signed), `TieFlagBoth` (equal stakes, hash tie-break). The Committer's `handle_conflict_at_commit()` checks `CandidateRegistry` at commit time before `commit_block()`. On conflict, resolves with real stakes from `StakeStore`. `SameProposerSlash` emits `StakingOp::Slash` via `StakingManager.apply_ops()`.
-**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 369 tests (across 5 crates with executor sharding + optimistic commit additions).
+**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 374 tests (across 5 crates with executor sharding + optimistic commit + block gossip additions).
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
