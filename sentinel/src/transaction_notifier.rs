@@ -40,6 +40,46 @@ impl TransactionNotifier {
         self.send_to_nodes(NodeRegistryType::Executor, payload)
     }
 
+    /// Send a transaction to specific Executors for data preloading (shard-aware).
+    pub fn send_to_shard_executors_for_preload(
+        &self,
+        tx: &Transaction,
+        executor_keys: &[Vec<u8>],
+        env: &EnvironmentMetadata,
+    ) -> Result<(), NotifyError> {
+        let msg = Message {
+            chain_id: env.token_partition_id.clone(),
+            action: String::from("Preload"),
+            body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
+            signature: vec![],
+            public_key: self.config.public_key.clone(),
+        };
+
+        let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
+        let registry = Arc::clone(&self.node_registry);
+        let payload_clone = payload.clone();
+
+        // Send to each executor key in the shard
+        for key in executor_keys {
+            let key_clone = key.clone();
+            let payload_inner = payload_clone.clone();
+            let reg = Arc::clone(&registry);
+            let _ = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("could not build mini runtime for shard preload send");
+                rt.block_on(async {
+                    let Some(nodes) = reg.get_nodes(&NodeRegistryType::Executor) else { return };
+                    if let Some(entry) = nodes.get(&key_clone) {
+                        let _ = entry.value().conn.send(&payload_inner).await;
+                    };
+                });
+            });
+        }
+        Ok(())
+    }
+
     /// Send a validated transaction to the assigned Finalizer for execution preloading.
     pub fn send_to_finalizer_for_preload(
         &self,

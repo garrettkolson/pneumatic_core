@@ -9,7 +9,7 @@ use serde_json::error::Category::Data;
 use crate::conns::{ConnTarget, LocalTarget};
 use crate::conns::factories::{ConnFactory, IsConnFactory};
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
-use crate::epoch::StakeSet;
+use crate::epoch::{ExecutorSet, StakeSet};
 use crate::tokens::Token;
 use crate::user::User;
 
@@ -47,6 +47,12 @@ pub trait DataProvider : Send + Sync {
 
     /// Persist a stake snapshot for a given epoch and partition.
     fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, partition_id: &str) -> Result<(), DataError>;
+
+    /// Retrieve an executor set for a given epoch and partition.
+    fn get_executor_set(&self, epoch: u64, partition_id: &str) -> Result<ExecutorSet, DataError>;
+
+    /// Persist an executor set for a given epoch and partition.
+    fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError>;
 }
 
 pub struct DefaultDataProvider {
@@ -174,6 +180,14 @@ impl DataProvider for DefaultDataProvider {
     fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, partition_id: &str) -> Result<(), DataError> {
         self.save_data_internal::<StakeSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::StakeSnapshot(snapshot)), partition_id)
     }
+
+    fn get_executor_set(&self, epoch: u64, partition_id: &str) -> Result<ExecutorSet, DataError> {
+        self.get_data_internal::<ExecutorSet>(&epoch.to_be_bytes().to_vec(), DataOp::Get(GetOp::ExecutorSet(epoch)), partition_id)
+    }
+
+    fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError> {
+        self.save_data_internal::<ExecutorSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::ExecutorSet(set)), partition_id)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -197,6 +211,7 @@ pub enum GetOp {
     Data,
     User,
     StakeSnapshot(u64),
+    ExecutorSet(u64),
 }
 
 impl std::fmt::Display for GetOp {
@@ -206,6 +221,7 @@ impl std::fmt::Display for GetOp {
             GetOp::Data => write!(f, "Data"),
             GetOp::User => write!(f, "User"),
             GetOp::StakeSnapshot(epoch) => write!(f, "StakeSnapshot({})", epoch),
+            GetOp::ExecutorSet(epoch) => write!(f, "ExecutorSet({})", epoch),
         }
     }
 }
@@ -216,6 +232,7 @@ pub enum SaveOp {
     Data(Vec<u8>),
     User(User),
     StakeSnapshot(StakeSet),
+    ExecutorSet(ExecutorSet),
 }
 
 impl std::fmt::Display for SaveOp {
@@ -225,6 +242,7 @@ impl std::fmt::Display for SaveOp {
             SaveOp::Data(_) => write!(f, "Data"),
             SaveOp::User(_) => write!(f, "User"),
             SaveOp::StakeSnapshot(_) => write!(f, "StakeSnapshot"),
+            SaveOp::ExecutorSet(_) => write!(f, "ExecutorSet"),
         }
     }
 }
@@ -319,6 +337,7 @@ pub struct StubDataProvider {
     tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
     users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
     stake_snapshots: std::sync::Mutex<std::collections::HashMap<u64, StakeSet>>,
+    executor_sets: std::sync::Mutex<std::collections::HashMap<u64, ExecutorSet>>,
 }
 
 impl StubDataProvider {
@@ -327,6 +346,7 @@ impl StubDataProvider {
             tokens: std::collections::HashMap::new(),
             users: std::sync::Mutex::new(std::collections::HashMap::new()),
             stake_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
+            executor_sets: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -351,6 +371,15 @@ impl StubDataProvider {
             .lock()
             .unwrap()
             .insert(epoch, snapshot);
+        self
+    }
+
+    /// Add an executor set for a given epoch.
+    pub fn with_executor_set(mut self, epoch: u64, set: ExecutorSet) -> Self {
+        self.executor_sets
+            .lock()
+            .unwrap()
+            .insert(epoch, set);
         self
     }
 }
@@ -416,6 +445,23 @@ impl DataProvider for StubDataProvider {
             .lock()
             .unwrap()
             .insert(epoch, snapshot);
+        Ok(())
+    }
+
+    fn get_executor_set(&self, epoch: u64, _partition_id: &str) -> Result<ExecutorSet, DataError> {
+        self.executor_sets
+            .lock()
+            .unwrap()
+            .get(&epoch)
+            .cloned()
+            .ok_or(DataError::DataNotFound)
+    }
+
+    fn save_executor_set(&self, epoch: u64, set: ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
+        self.executor_sets
+            .lock()
+            .unwrap()
+            .insert(epoch, set);
         Ok(())
     }
 }

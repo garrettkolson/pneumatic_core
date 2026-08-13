@@ -108,6 +108,9 @@ async fn main() {
     let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
     let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
 
+    // 10.5. Create CandidateRegistry for conflict detection
+    let candidate_registry = Arc::new(CandidateRegistry::new());
+
     // 10. Create BlockServices
     let block_services = Arc::new(BlockServices::new(
         tokens.clone(),
@@ -136,6 +139,7 @@ async fn main() {
         block_proposer,
         epoch_duration,
         5000, // proposal_interval_ms: check every 5 seconds
+        candidate_registry,
     ));
 
     // 12. Wire up gossiper message handler

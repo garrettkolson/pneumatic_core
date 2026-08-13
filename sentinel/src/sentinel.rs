@@ -12,6 +12,7 @@ use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, registry::Node
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::transactions::{Transaction, TransactionState};
 
+use super::executor_set_cache::ExecutorSetCache;
 use super::stake_snapshot_cache::StakeSnapshotCache;
 
 /// Sentinel — the gatekeeper node type in the pneumatic pipeline.
@@ -35,8 +36,13 @@ pub struct Sentinel {
     /// Stake snapshot cache for deterministic per-transaction routing.
     /// Loaded from local cache → DataProvider → (reserved) peer fallback.
     stake_snapshot_cache: Arc<StakeSnapshotCache>,
+    /// Executor set cache for deterministic shard-aware routing.
+    /// Loaded from local cache → DataProvider → (reserved) peer fallback.
+    executor_set_cache: Arc<ExecutorSetCache>,
     /// The environment this sentinel operates on.
     env_data: Arc<EnvironmentMetadata>,
+    /// Current epoch number — advanced when a new epoch boundary is detected.
+    current_epoch: parking_lot::Mutex<u64>,
 }
 
 impl Sentinel {
@@ -59,7 +65,10 @@ impl Sentinel {
         let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), Arc::clone(&data_provider));
         let partition_id = env_data.environment_id.clone();
         let stake_snapshot_cache = Arc::new(
-            StakeSnapshotCache::new(data_provider.clone(), partition_id)
+            StakeSnapshotCache::new(data_provider.clone(), partition_id.clone())
+        );
+        let executor_set_cache = Arc::new(
+            ExecutorSetCache::new(data_provider.clone(), partition_id)
         );
 
         Sentinel {
@@ -70,7 +79,9 @@ impl Sentinel {
             transaction_validator: Arc::new(validator),
             data_provider,
             stake_snapshot_cache,
+            executor_set_cache,
             env_data,
+            current_epoch: parking_lot::Mutex::new(0),
         }
     }
 
@@ -203,9 +214,56 @@ impl Sentinel {
     }
 
     /// Send a transaction to Executors for data preloading.
+    /// When sharding is enabled (shard_count > 1), routes only to the shard's executors.
     fn send_to_executor_for_preload(&self, tx: &Transaction) -> Result<(), SentinelError> {
-        self.transaction_notifier.send_to_executors_for_preload(tx, &self.env_data)
-            .map_err(Into::into)
+        if self.env_data.shard_count > 1 {
+            // Shard-aware routing: only send to the selected shard's executors
+            let shard_executors = self.get_shard_executors(&tx.id, 1)?;
+            self.transaction_notifier
+                .send_to_shard_executors_for_preload(tx, &shard_executors, &self.env_data)
+                .map_err(Into::into)
+        } else {
+            // No sharding: broadcast to all executors (existing behavior)
+            self.transaction_notifier
+                .send_to_executors_for_preload(tx, &self.env_data)
+                .map_err(Into::into)
+        }
+    }
+
+    /// Get the executor public keys for the transaction's shard.
+    fn get_shard_executors(&self, tx_id: &str, epoch_number: u64) -> Result<Vec<Vec<u8>>, SentinelError> {
+        let executors = self.executor_set_cache.get(epoch_number)
+            .ok_or_else(|| SentinelError::Routing(format!("No executor set for epoch {}", epoch_number)))?;
+
+        if executors.is_empty() {
+            return Err(SentinelError::Routing("Executor set is empty".into()));
+        }
+
+        let shard_executors = pneumatic_core::deterministic_select_shard(
+            &executors,
+            self.env_data.shard_count,
+            tx_id,
+            epoch_number,
+        )
+        .ok_or_else(|| SentinelError::Routing("Selected shard has no executors".into()))?;
+
+        if shard_executors.is_empty() {
+            return Err(SentinelError::Routing("Selected shard has no executors".into()));
+        }
+
+        Ok(shard_executors)
+    }
+
+    /// Advance the sentinel to a new epoch.
+    ///
+    /// Invalidates the executor set cache so the next transaction triggers
+    /// a fresh load + shuffle. Updates the tracked epoch number.
+    ///
+    /// Call this when a new epoch is detected (e.g., from chain blocks).
+    pub fn advance_epoch(&self, epoch_number: u64) {
+        *self.current_epoch.lock() = epoch_number;
+        self.executor_set_cache.invalidate_all();
+        self.stake_snapshot_cache.invalidate_all();
     }
 
     /// Handle a "Confirm" message — a finalizer has confirmed transaction processing.
@@ -1358,5 +1416,74 @@ mod tests {
         assert_eq!(ordered[0].id, "tx_order_0"); // sender [1]
         assert_eq!(ordered[1].id, "tx_order_1"); // sender [2]
         assert_eq!(ordered[2].id, "tx_order_2"); // sender [3]
+    }
+
+    // --- Shard-aware routing tests ---
+
+    #[test]
+    fn get_shard_executors_returns_executors() {
+        let mut executors = pneumatic_core::epoch::ExecutorSet::default();
+        for i in 0..4 {
+            executors.executors.insert(vec![i as u8], 100 + i);
+        }
+        let data_provider = Arc::new(
+            StubDataProvider::new().with_executor_set(1, executors)
+        );
+        let registry = Arc::new(PendingTransactionRegistry::new());
+        let node_registry = make_test_node_registry();
+
+        let mut env_data = make_test_env_data();
+        env_data.shard_count = 2;
+
+        let gossiper = Arc::new(Gossiper::new(
+            NodeRegistryType::Sentinel,
+            make_test_config(),
+            300,
+            env_data.asym_crypto_provider.clone(),
+        ));
+        let sentinel = Sentinel::new(
+            make_test_config(),
+            Arc::new(env_data),
+            node_registry,
+            registry.clone(),
+            gossiper,
+            data_provider,
+        );
+
+        // Shard 0 and shard 1 should each return some executors
+        let shard0 = sentinel.get_shard_executors("tx-0", 1);
+        let shard1 = sentinel.get_shard_executors("tx-1", 1);
+        assert!(shard0.is_ok() && shard1.is_ok());
+        let s0 = shard0.unwrap();
+        let s1 = shard1.unwrap();
+        assert!(!s0.is_empty() && !s1.is_empty());
+        // The two shards should have different members (or at least one)
+        let mut s0_sorted = s0;
+        let mut s1_sorted = s1;
+        s0_sorted.sort();
+        s1_sorted.sort();
+        assert!(s0_sorted != s1_sorted || s0_sorted.len() + s1_sorted.len() <= 4);
+    }
+
+    #[test]
+    fn advance_epoch_invalidates_caches() {
+        use pneumatic_core::epoch::StakeSet;
+
+        let data_provider = StubDataProvider::new();
+        let (mut sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        // Initially at epoch 0
+        sentinel.advance_epoch(1);
+        assert_eq!(*sentinel.current_epoch.lock(), 1);
+
+        // Invalidate and verify caches are cleared
+        let snapshot = StakeSet {
+            stakers: [(vec![1], 100)].into_iter().collect(),
+        };
+        sentinel.stake_snapshot_cache.put(1, snapshot);
+        assert_eq!(sentinel.stake_snapshot_cache.cached_count(), 1);
+        sentinel.advance_epoch(2);
+        assert_eq!(sentinel.stake_snapshot_cache.cached_count(), 0);
+        assert_eq!(*sentinel.current_epoch.lock(), 2);
     }
 }

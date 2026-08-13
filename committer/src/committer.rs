@@ -8,7 +8,7 @@ use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
-use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, ConflictResolution, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet, resolve_block_conflict};
+use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, ConflictResolution, EpochBoundaryDetector, ExecutorSet, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet, resolve_block_conflict};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::messages::Message;
@@ -346,7 +346,16 @@ impl Committer {
         // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
         let _ = self.data_provider.save_stake_snapshot(
             new_epoch_number,
-            stake_set,
+            stake_set.clone(),
+            &self.env_data.token_partition_id,
+        );
+
+        // Persist the executor set for this epoch (shard assignment).
+        // Active stakers become the executor pool, shuffled per-epoch for rotation.
+        let executor_set = stake_set.to_executor_set();
+        let _ = self.data_provider.save_executor_set(
+            new_epoch_number,
+            executor_set,
             &self.env_data.token_partition_id,
         );
 
@@ -667,7 +676,7 @@ mod tests {
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::deserialize_rmp_to;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
-    use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
+    use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector, ExecutorSet};
     use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::gossiper::Gossiper;
     use pneumatic_core::messages::Message;
@@ -735,6 +744,14 @@ mod tests {
         }
 
         fn save_stake_snapshot(&self, _epoch: u64, _snapshot: StakeSet, _partition_id: &str) -> Result<(), DataError> {
+            Ok(())
+        }
+
+        fn get_executor_set(&self, _epoch: u64, _partition_id: &str) -> Result<ExecutorSet, DataError> {
+            Ok(ExecutorSet::default())
+        }
+
+        fn save_executor_set(&self, _epoch: u64, _set: ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
             Ok(())
         }
     }

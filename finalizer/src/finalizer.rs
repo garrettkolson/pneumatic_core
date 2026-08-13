@@ -163,11 +163,12 @@ impl Finalizer {
 
     /// Handle a Signature message from an Executor.
     ///
-    /// Adds the executor's signature to the signature collector.
-    /// If quorum is reached, triggers `try_finalize`.
+    /// OPTIMISTIC: First valid signature triggers immediate optimistic finalize.
+    /// Subsequent signatures accumulate stake and are acknowledged.
+    /// If quorum is eventually reached, the transaction is upgraded to confirmed.
     ///
-    /// Returns an acknowledgement if added, or the result of `try_finalize`
-    /// if this signature completed quorum.
+    /// Returns an acknowledgement if added, or the result of optimistic finalize
+    /// if this signature completed the optimistic path.
     pub async fn handle_signature(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
         // Deserialize the executor signature
         let sig: TransactionSignature = deserialize_rmp_to(&message.body)
@@ -181,15 +182,15 @@ impl Finalizer {
 
         // Add the signature to the collector
         self.signature_collector
-            .add_signature(&tx_id, executor_key, sig.clone())?;
+            .add_signature(&tx_id, executor_key.clone(), sig.clone())?;
 
-        // Check if quorum is now reached
-        if self.signature_collector.check_quorum(&tx_id)? {
-            // Quorum reached — finalize the transaction
-            return self.try_finalize(&tx_id).await;
+        // OPTIMISTIC: First valid signature → try optimistic finalize immediately
+        if self.signature_collector.signature_count(&tx_id) == 1 {
+            return self.try_finalize_optimistic(&tx_id, &sig, &executor_key).await;
         }
 
-        // Quorum not yet reached — acknowledge
+        // Subsequent signatures — just acknowledge (stake accumulates in background)
+        // If quorum is eventually reached, the transaction will be confirmed
         Ok(pneumatic_core::messages::acknowledge())
     }
 
@@ -285,6 +286,101 @@ impl Finalizer {
         self.message_dispatcher.send_clear_to_sentinels(tx_id).await?;
 
         // Step 10: Transition to Committed state
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            entry.transition_to_committed(transaction, block_hash);
+        }
+
+        // Clean up preload tasks
+        self.preload_tasks.lock().await.remove(tx_id);
+
+        // Clean up signature registry
+        let _ = self.signature_registry.try_remove_transaction(tx_id);
+
+        // Acknowledge success
+        Ok(serialize_to_bytes_rmp(&tx_id.as_bytes().to_vec())
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?)
+    }
+
+    /// Attempt to finalize a transaction optimistically (first executor signature).
+    ///
+    /// This is the fast path — no quorum waiting, no signature reconciliation.
+    /// The single executor's honest signature is proof enough for optimistic commit.
+    /// Subsequent signatures accumulate stake in the background.
+    async fn try_finalize_optimistic(
+        &self,
+        tx_id: &str,
+        single_sig: &TransactionSignature,
+        executor_key: &[u8],
+    ) -> Result<Vec<u8>, PneumaticError> {
+        // Step 1: Load the transaction from pending registry
+        let entry = self.pending_registry.get_transaction_mut(tx_id)?;
+        let transaction = match entry.state {
+            TransactionState::Preloaded { ref transaction }
+            | TransactionState::Validated { ref transaction, .. }
+            | TransactionState::Executing { ref transaction } => {
+                transaction.clone()
+            }
+            _ => {
+                return Err(PneumaticError::Registry(format!(
+                    "Transaction {} not in executable state for finalization",
+                    tx_id
+                )));
+            }
+        };
+        drop(entry);
+
+        // Step 2: Get the finalizer key from the transaction state
+        let finalizer_key = match self.pending_registry.get_transaction_mut(tx_id) {
+            Ok(entry) => match &entry.state {
+                TransactionState::Validated { validation, .. } => {
+                    validation.finalizer_public_key.clone()
+                }
+                TransactionState::Finalizing { finalizer_key, .. } => {
+                    finalizer_key.clone()
+                }
+                _ => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        // Step 3: Build SignedTransaction using the single executor's signature
+        let mut signed_tx = self.block_builder.build_signed_transaction_optimistic(
+            single_sig,
+            &transaction,
+            executor_key,
+        );
+
+        // Step 4: Sign the finalizer's portion
+        let finalizer_sig = self.block_builder.sign_finalizer_block(&mut signed_tx).await?;
+        signed_tx.finalizer_sig = finalizer_sig;
+
+        // Step 5: Transition to Finalizing state
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+            entry.transition_to_finalizing(transaction.clone(), finalizer_key);
+        }
+
+        // Step 6: Create the Block with optimistic finality
+        let previous_hash = vec![];
+        let block = self.block_builder.create_block_optimistic(
+            signed_tx.clone(),
+            previous_hash,
+            self.current_epoch,
+        );
+
+        // Step 7: Send the commit to all Committers
+        let block_hash = block.current_hash.clone();
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: transaction.token_id.clone(),
+            env_id: self.env_id.clone(),
+            proposed_block: block,
+        };
+        self.message_dispatcher.send_to_committers(commit).await?;
+
+        // Step 8: Send clear to all Sentinels
+        self.message_dispatcher.send_clear_to_sentinels(tx_id).await?;
+
+        // Step 9: Transition to Committed state
         if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
             entry.transition_to_committed(transaction, block_hash);
         }
@@ -536,8 +632,36 @@ mod tests {
         };
 
         let result = finalizer.handle_signature(&message).await;
+        // OPTIMISTIC: First signature triggers immediate optimistic finalize,
+        // which cleans up the signature registry. Count is 0 after finalize.
         assert!(result.is_ok());
-        assert_eq!(finalizer.signature_count("test_tx_001"), 1);
+        assert_eq!(finalizer.signature_count("test_tx_001"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_signature_optimistic_first_sig() {
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer(pending_registry);
+
+        let sig = TransactionSignature {
+            transaction_id: b"test_tx_001".to_vec(),
+            env_id: b"test_env".to_vec(),
+            transaction_hash: vec![1, 2, 3],
+            signature: vec![4, 5, 6, 7],
+            current_stake: 10,
+        };
+        let body = serialize_to_bytes_rmp(&sig).unwrap();
+        let message = Message {
+            chain_id: "test_env".to_string(),
+            action: String::from("Sign"),
+            body,
+            signature: vec![],
+            public_key: b"executor_1".to_vec(),
+        };
+
+        let result = finalizer.handle_signature(&message).await;
+        // First signature → optimistic finalize succeeds
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

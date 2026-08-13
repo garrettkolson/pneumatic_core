@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Epoch — represents a single epoch in the blockchain
@@ -97,15 +98,123 @@ impl StakeSet {
     pub fn get_stake(&self, key: &[u8]) -> u64 {
         self.stakers.get(key).copied().unwrap_or(0)
     }
+
+    /// Convert to an ExecutorSet — active stakers become the executor pool.
+    /// Used at epoch boundary to persist the executor set for shard assignment.
+    pub fn to_executor_set(&self) -> ExecutorSet {
+        ExecutorSet {
+            executors: self.stakers.clone(),
+        }
+    }
 }
 
-/// Deterministic stake-weighted selection from a sorted stake set.
-///
-/// Uses `seed_bytes` to create a reproducible random point in `[0, total_stake)`,
-/// then walks the sorted stakers to find who owns that cumulative range.
-///
-/// Returns `Some(key)` of the selected staker, or `None` if the stake set
-/// has zero total stake.
+// ---------------------------------------------------------------------------
+// ExecutorSet — shard-aware executor pool
+// ---------------------------------------------------------------------------
+
+/// Maps executor public keys to their stakes. Used for deterministic shard
+/// assignment: the sentinel computes `f(tx_id, epoch, shard_count) → shard`
+/// then routes the transaction only to executors in that shard.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ExecutorSet {
+    /// Executor public key → stake amount
+    pub executors: HashMap<Vec<u8>, u64>,
+}
+
+impl ExecutorSet {
+    pub fn total_stake(&self) -> u64 {
+        self.executors.values().sum()
+    }
+
+    pub fn len(&self) -> usize {
+        self.executors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.executors.is_empty()
+    }
+
+    pub fn get_stake(&self, key: &[u8]) -> u64 {
+        self.executors.get(key).copied().unwrap_or(0)
+    }
+
+    /// Convert to a StakeSet — for leader/finalizer selection.
+    pub fn to_stake_set(&self) -> StakeSet {
+        StakeSet {
+            stakers: self.executors.clone(),
+        }
+    }
+
+    /// Create a deterministic shuffler for this executor set at a given epoch.
+    /// The shuffle is used for per-epoch shard reassignment (rotation).
+    pub fn shuffler(&self, epoch_number: u64) -> Shuffler {
+        let keys: Vec<Vec<u8>> = self.executors.keys().cloned().collect();
+        Shuffler::new(keys, epoch_number)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shuffler — deterministic Fisher-Yates shuffle
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Shuffler — deterministic Fisher-Yates shuffle
+// ---------------------------------------------------------------------------
+
+/// Deterministic permutation of executor keys derived from a seed.
+/// Used for per-epoch shard reassignment (rotation): each epoch, executors
+/// are reshuffled into new shards, preventing stable cartel formation.
+pub struct Shuffler {
+    /// Original items (not mutated).
+    items: Vec<Vec<u8>>,
+    /// The last computed permutation, stored so we can return a reference.
+    last_permutation: Vec<Vec<u8>>,
+}
+
+impl Shuffler {
+    /// Create a new shuffler from `items` seeded by `epoch_number`.
+    ///
+    /// The seed is `SHA-256(epoch_number)`, which guarantees per-epoch
+    /// determinism. The shuffled result is computed at construction time
+    /// and returned by `shuffle()`.
+    pub fn new(items: Vec<Vec<u8>>, epoch_number: u64) -> Self {
+        let seed_bytes = epoch_number.to_be_bytes();
+        let mut input = Vec::with_capacity(8 + 32);
+        input.extend_from_slice(&seed_bytes);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+        let seed = digest.as_ref();
+        let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
+            unreachable!("ring SHA-256 always produces 32 bytes")
+        }));
+
+        let n = items.len();
+        if n == 0 {
+            return Shuffler {
+                items,
+                last_permutation: vec![],
+            };
+        }
+
+        // Fisher-Yates shuffle
+        let mut indices: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = rng.gen_range(0..=i);
+            indices.swap(i, j);
+        }
+
+        let last_permutation: Vec<Vec<u8>> = indices.iter()
+            .map(|&i| items[i].clone())
+            .collect();
+
+        Shuffler { items, last_permutation }
+    }
+
+    /// Return the shuffled executor keys for this epoch.
+    /// For the same epoch_number, always returns the same order.
+    pub fn shuffle(&self) -> &[Vec<u8>] {
+        &self.last_permutation
+    }
+}
+
 pub fn deterministic_select(stakers: &StakeSet, seed_bytes: &[u8], epoch_number: u64) -> Option<Vec<u8>> {
     let total = stakers.total_stake();
     if total == 0 {
@@ -138,6 +247,76 @@ pub fn deterministic_select(stakers: &StakeSet, seed_bytes: &[u8], epoch_number:
     }
     // Fallback: return the first staker (shouldn't happen if total > 0)
     Some(first_key)
+}
+
+// ---------------------------------------------------------------------------
+// Executor sharding — deterministic shard selection per transaction
+// ---------------------------------------------------------------------------
+
+/// Select which executors in a shard should handle a transaction.
+///
+/// 1. Seed = SHA-256(epoch || tx_id) — same tx + epoch → same seed
+/// 2. Shuffle executors deterministically
+/// 3. Stake-balanced round-robin partition into `shard_count` shards
+/// 4. `shard_index = SHA-256(epoch || tx_id) mod shard_count`
+/// 5. Return executor public keys in the selected shard
+pub fn deterministic_select_shard(
+    executors: &ExecutorSet,
+    shard_count: u32,
+    tx_id: &str,
+    epoch_number: u64,
+) -> Option<Vec<Vec<u8>>> {
+    if executors.is_empty() {
+        return None;
+    }
+    if shard_count == 0 {
+        return None;
+    }
+    if shard_count == 1 {
+        // No sharding: return all executors
+        return Some(executors.executors.keys().cloned().collect());
+    }
+
+    // Deterministic seed: SHA-256(epoch_number || tx_id_bytes)
+    let mut input = epoch_number.to_be_bytes().to_vec();
+    input.extend_from_slice(tx_id.as_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let seed = digest.as_ref();
+
+    // Deterministic shard index
+    let mut shard_rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
+        unreachable!("ring SHA-256 always produces 32 bytes")
+    }));
+    let shard_index: u32 = shard_rng.gen_range(0..shard_count);
+
+    // Shuffle executors deterministically
+    let shuffler = executors.shuffler(epoch_number);
+    let shuffled = shuffler.shuffle();
+    if shuffled.is_empty() {
+        return None;
+    }
+
+    // Stake-balanced round-robin: assign each executor to the shard
+    // with the lowest current total stake
+    let mut shard_stakes: Vec<u64> = vec![0; shard_count as usize];
+    let mut shard_executors: Vec<Vec<Vec<u8>>> = vec![vec![]; shard_count as usize];
+
+    for key in shuffled {
+        let stake = executors.get_stake(key);
+        // Find shard with lowest current stake
+        let target_shard = (0..shard_count as usize)
+            .min_by_key(|&i| shard_stakes[i])
+            .unwrap_or(0);
+        shard_stakes[target_shard] += stake;
+        shard_executors[target_shard].push(key.clone());
+    }
+
+    // Return executors for the selected shard
+    let idx = shard_index as usize;
+    if shard_executors[idx].is_empty() {
+        return None;
+    }
+    Some(shard_executors[idx].clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,5 +1218,131 @@ mod tests {
         let stakes = make_stake_set(vec![(vec![1], 0), (vec![2], 0)]);
         let result = deterministic_select(&stakes, b"tx1", 1);
         assert!(result.is_none());
+    }
+
+    // --- ExecutorSet tests ---
+
+    #[test]
+    fn executor_set_empty_on_creation() {
+        let es = ExecutorSet::default();
+        assert!(es.is_empty());
+        assert_eq!(es.len(), 0);
+        assert_eq!(es.total_stake(), 0);
+    }
+
+    #[test]
+    fn executor_set_total_stake_returns_sum() {
+        let es = ExecutorSet {
+            executors: [(b"a".to_vec(), 10), (b"b".to_vec(), 20), (b"c".to_vec(), 30)]
+                .into_iter().collect(),
+        };
+        assert_eq!(es.total_stake(), 60);
+        assert_eq!(es.len(), 3);
+    }
+
+    #[test]
+    fn executor_set_get_stake_returns_zero_for_missing_key() {
+        let es = ExecutorSet {
+            executors: [(b"a".to_vec(), 100)].into_iter().collect(),
+        };
+        assert_eq!(es.get_stake(&b"z".to_vec()), 0);
+    }
+
+    #[test]
+    fn executor_set_to_stake_set_converts() {
+        let es = ExecutorSet {
+            executors: [(b"a".to_vec(), 100)].into_iter().collect(),
+        };
+        let ss = es.to_stake_set();
+        assert_eq!(ss.total_stake(), 100);
+    }
+
+    // --- Shuffler tests ---
+
+    #[test]
+    fn shuffler_empty_returns_empty() {
+        let shuffler = Shuffler::new(vec![], 1);
+        let shuffled = shuffler.shuffle();
+        assert!(shuffled.is_empty());
+    }
+
+    #[test]
+    fn shuffler_single_item_same_order() {
+        let shuffler = Shuffler::new(vec![b"executor_1".to_vec()], 1);
+        let shuffled = shuffler.shuffle();
+        assert_eq!(shuffled.len(), 1);
+        assert_eq!(shuffled[0], b"executor_1".to_vec());
+    }
+
+    #[test]
+    fn shuffler_deterministic_same_epoch_same_order() {
+        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let shuffler1 = Shuffler::new(keys.clone(), 42);
+        let shuffler2 = Shuffler::new(keys, 42);
+        let result1 = shuffler1.shuffle();
+        let result2 = shuffler2.shuffle();
+        assert_eq!(result1.len(), result2.len());
+        for (a, b) in result1.iter().zip(result2.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn shuffler_different_epochs_different_order() {
+        let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()];
+        let shuffler1 = Shuffler::new(keys.clone(), 1);
+        let shuffler2 = Shuffler::new(keys.clone(), 2);
+        let result1 = shuffler1.shuffle();
+        let result2 = shuffler2.shuffle();
+        // Different seeds must produce different full permutations.
+        assert_ne!(result1.to_vec(), result2.to_vec());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Deterministic shard selection tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn deterministic_select_shard_empty_returns_none() {
+        let executors = ExecutorSet::default();
+        let result = deterministic_select_shard(&executors, 2, "tx1", 1);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn deterministic_select_shard_single_shard_returns_all() {
+        let mut executors = ExecutorSet::default();
+        executors.executors.insert(b"exec1".to_vec(), 100);
+        executors.executors.insert(b"exec2".to_vec(), 200);
+        let result = deterministic_select_shard(&executors, 1, "any-tx", 1);
+        assert!(result.is_some());
+        let keys = result.unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn deterministic_select_shard_distributes_across_shards() {
+        let mut executors = ExecutorSet::default();
+        for i in 0..6 {
+            executors.executors.insert(format!("exec{}", i).into_bytes(), 100);
+        }
+        // With 6 executors and 3 shards, each shard should get ~2 executors
+        let result = deterministic_select_shard(&executors, 3, "tx-42", 1);
+        assert!(result.is_some());
+        let shard = result.unwrap();
+        assert!(shard.len() >= 1 && shard.len() <= 4,
+            "shard size {} should be between 1 and 4", shard.len());
+    }
+
+    #[test]
+    fn deterministic_select_shard_deterministic_across_calls() {
+        let mut executors = ExecutorSet::default();
+        for i in 0..4 {
+            executors.executors.insert(format!("exec{}", i).into_bytes(), 100 + i);
+        }
+        let result1 = deterministic_select_shard(&executors, 2, "same-tx", 5);
+        let result2 = deterministic_select_shard(&executors, 2, "same-tx", 5);
+        assert!(result1.is_some() && result2.is_some());
+        assert_eq!(result1.unwrap(), result2.unwrap());
     }
 }

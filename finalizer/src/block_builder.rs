@@ -200,6 +200,66 @@ impl BlockBuilder {
             epoch_number,
         }
     }
+
+    /// Build a SignedTransaction from a single executor's optimistic signature.
+    ///
+    /// Used for the fast-path optimistic commit: one executor's honest signature
+    /// is proof enough. No reconciliation needed.
+    pub fn build_signed_transaction_optimistic(
+        &self,
+        sig: &TransactionSignature,
+        transaction: &Transaction,
+        executor_key: &[u8],
+    ) -> SignedTransaction {
+        // Single executor signature in the map
+        let executor_sigs: HashMap<Vec<u8>, TransactionSignature> = [(
+            executor_key.to_vec(),
+            TransactionSignature {
+                transaction_id: transaction.id.as_bytes().to_vec(),
+                env_id: transaction.token_id.clone(),
+                transaction_hash: sig.signature.clone(),
+                signature: sig.signature.clone(),
+                current_stake: sig.current_stake,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        // Placeholder finalizer signature — filled by sign_finalizer_block
+        let placeholder_sig = TransactionSignature {
+            transaction_id: transaction.id.as_bytes().to_vec(),
+            env_id: transaction.token_id.clone(),
+            transaction_hash: vec![], // filled by sign_finalizer_block
+            signature: vec![],
+            current_stake: 0,
+        };
+
+        SignedTransaction {
+            transaction_id: transaction.id.clone(),
+            transaction: transaction.clone(),
+            total_stake: sig.current_stake,
+            total_voters: 1,
+            leader_address: self.leader_address.clone(),
+            leader_stake: self.leader_stake,
+            leader_hash: self.leader_hash.clone(),
+            finalizer_addr: self.finalizer_addr.clone(),
+            finalizer_sig: placeholder_sig,
+            executor_sigs,
+            proposer_key: self.leader_address.clone(),
+        }
+    }
+
+    /// Create a Block with optimistic finality from a SignedTransaction.
+    ///
+    /// This is an alias for `create_block` — both set `FinalityStatus::Optimistic`.
+    pub fn create_block_optimistic(
+        &self,
+        signed_tx: SignedTransaction,
+        previous_hash: Vec<u8>,
+        epoch_number: u64,
+    ) -> Block {
+        self.create_block(signed_tx, previous_hash, epoch_number)
+    }
 }
 
 // ---------------------------------------------------------------------------

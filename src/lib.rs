@@ -19,5 +19,7 @@ pub mod registry;
 pub use registry::{PendingAdminCredit, PendingTransactionRegistry};
 pub mod epoch;
 pub use epoch::deterministic_select;
+pub use epoch::deterministic_select_shard;
+pub use epoch::ExecutorSet;
 pub mod action_router;
 pub mod user;

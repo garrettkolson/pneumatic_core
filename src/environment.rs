@@ -120,6 +120,11 @@ pub struct EnvironmentMetadata {
     /// rmp-serde (MsgPack) is the wire format; serde_json for config files.
     pub serialization_provider: String,
     pub logger: Arc<dyn Logger>,
+    /// Number of executor shards. Default 1 = no sharding.
+    pub shard_count: u32,
+    /// Quorum percentage within a shard (e.g. 67.0 = 2/3).
+    /// Used by the signature collector when accumulating stake.
+    pub shard_quorum_percentage: f32,
 }
 
 impl EnvironmentMetadata {
@@ -204,6 +209,8 @@ impl EnvironmentMetadata {
             sym_crypto_provider,
             serialization_provider,
             logger,
+            shard_count: spec.shard_count,
+            shard_quorum_percentage: spec.shard_quorum_percentage,
         }
     }
 }
@@ -225,7 +232,16 @@ pub struct EnvironmentMetadataSpec {
     trans_validation_specs: Vec<String>,
     block_validation_specs: Vec<String>,
     log_file: String,
+    /// Number of executor shards. Default 1 = no sharding.
+    #[serde(default = "default_shard_count")]
+    pub shard_count: u32,
+    /// Quorum percentage within a shard. Default 67.0 (2/3).
+    #[serde(default = "default_shard_quorum_percentage")]
+    pub shard_quorum_percentage: f32,
 }
+
+fn default_shard_count() -> u32 { 1 }
+fn default_shard_quorum_percentage() -> f32 { 67.0 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
 pub enum EnvironmentPartitionType {

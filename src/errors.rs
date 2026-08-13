@@ -211,6 +211,47 @@ pub struct ExecutorSignature {
 pub use crate::tokens::BlockValidationError;
 
 // ---------------------------------------------------------------------------
+// Executor routing — shard-aware dispatch errors
+// ---------------------------------------------------------------------------
+
+/// Errors that occur when selecting executors for a transaction shard.
+/// Pure validation errors — never network or data-provider failures.
+#[derive(Debug, Clone)]
+pub enum ExecutorRoutingError {
+    /// No executors configured for this epoch
+    EmptyExecutorSet,
+    /// Shard count must be at least 1
+    ShardCountZero,
+    /// Shard index {0} out of range [0, {1})
+    ShardOutOfBounds(u32, u32),
+    /// Selected shard has no executors assigned
+    NoExecutorsInShard(u32),
+}
+
+impl std::fmt::Display for ExecutorRoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutorRoutingError::EmptyExecutorSet => write!(f, "EmptyExecutorSet"),
+            ExecutorRoutingError::ShardCountZero => write!(f, "ShardCountZero"),
+            ExecutorRoutingError::ShardOutOfBounds(shard, max) => {
+                write!(f, "ShardOutOfBounds({}, {})", shard, max)
+            }
+            ExecutorRoutingError::NoExecutorsInShard(shard) => {
+                write!(f, "NoExecutorsInShard({})", shard)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecutorRoutingError {}
+
+impl From<ExecutorRoutingError> for PneumaticError {
+    fn from(e: ExecutorRoutingError) -> Self {
+        PneumaticError::Epoch(e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -220,6 +261,7 @@ mod tests {
     use crate::conns::ConnError;
     use crate::user::User;
     use crate::tokens::Token;
+    use crate::errors::ExecutorRoutingError;
 
     // --- From implementations ---
 
@@ -354,6 +396,30 @@ mod tests {
         match pneumatic_err {
             PneumaticError::Network(msg) => assert!(msg.contains("bad nonce")),
             _ => panic!("expected Network variant"),
+        }
+    }
+
+    // --- ExecutorRoutingError ---
+
+    #[test]
+    fn executor_routing_error_display_empty_set() {
+        let err = ExecutorRoutingError::EmptyExecutorSet;
+        assert_eq!(err.to_string(), "EmptyExecutorSet");
+    }
+
+    #[test]
+    fn executor_routing_error_display_shard_out_of_bounds() {
+        let err = ExecutorRoutingError::ShardOutOfBounds(5, 3);
+        assert_eq!(err.to_string(), "ShardOutOfBounds(5, 3)");
+    }
+
+    #[test]
+    fn executor_routing_error_converts_to_pneumatic_epoch() {
+        let routing_err = ExecutorRoutingError::EmptyExecutorSet;
+        let pneumatic_err: PneumaticError = routing_err.into();
+        match pneumatic_err {
+            PneumaticError::Epoch(msg) => assert!(msg.contains("EmptyExecutorSet")),
+            _ => panic!("expected Epoch variant"),
         }
     }
 }

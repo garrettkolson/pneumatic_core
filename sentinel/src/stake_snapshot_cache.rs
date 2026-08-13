@@ -37,6 +37,10 @@ impl LocalCache {
     fn len(&self) -> usize {
         self.cache.lock().len()
     }
+
+    fn invalidate_all(&self) {
+        self.cache.lock().clear();
+    }
 }
 
 /// Three-tier stake snapshot cache for sentinel routing.
@@ -103,6 +107,14 @@ impl StakeSnapshotCache {
     /// Returns the number of cached epochs.
     pub fn cached_count(&self) -> usize {
         self.local.len()
+    }
+
+    /// Invalidate all cached snapshots.
+    ///
+    /// Called on epoch transition to force a fresh DataProvider fetch
+    /// for the next epoch's stake snapshot.
+    pub fn invalidate_all(&self) {
+        self.local.invalidate_all();
     }
 }
 
@@ -175,5 +187,28 @@ mod tests {
         assert_eq!(cache.get(1).unwrap().total_stake(), 100);
         assert_eq!(cache.get(2).unwrap().total_stake(), 200);
         assert_eq!(cache.cached_count(), 2);
+    }
+
+    #[test]
+    fn cache_invalidate_all_clears_snapshots() {
+        let data_provider = Arc::new(
+            StubDataProvider::new()
+                .with_stake_snapshot(1, make_stake_set(vec![(vec![1], 100)]))
+                .with_stake_snapshot(2, make_stake_set(vec![(vec![2], 200)])),
+        );
+        let cache = StakeSnapshotCache::new(data_provider, "test".into());
+
+        cache.put(1, make_stake_set(vec![(vec![1], 100)]));
+        cache.put(2, make_stake_set(vec![(vec![2], 200)]));
+        assert_eq!(cache.cached_count(), 2);
+
+        cache.invalidate_all();
+        assert_eq!(cache.cached_count(), 0);
+
+        // After invalidation, get falls back to DataProvider
+        let result = cache.get(1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().total_stake(), 100);
+        assert_eq!(cache.cached_count(), 1); // Re-cached from DataProvider
     }
 }
