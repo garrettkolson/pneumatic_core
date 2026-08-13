@@ -9,54 +9,82 @@ These choices will ripple through everything below, so they're worth deciding ex
 - **Is voting weight for conflict resolution the same global `StakeSet` used for epoch leader election** (`committer/src/epoch_manager.rs`), or a logically separate "representative" set? Nano keeps these distinct (delegated voting weight vs. block production); you currently only have one pool. Worth deciding on purpose rather than by default.
 - **What happens to a losing block/proposer?** Just discarded, or slashed via the existing (currently unwired) `StakingOp::Slash`? Real forks are usually evidence of either a race condition or bad-faith double-proposing — worth punishing the latter.
 
+**Resolutions (all four are implemented):**
+
+| Decision | Resolution | Evidence |
+|---|---|---|
+| Conflict definition | Two valid `Block`s, same `(token_id, previous_hash)` | `CandidateRegistry` keyed by `(token_id, previous_hash)` in `src/epoch.rs` |
+| 2/3 quorum | Replaced by optimistic commit — first executor sig = immediate finalize | `Finalizer::try_finalize_optimistic()` in `finalizer/src/finalizer.rs` |
+| Voting weight | Same `StakeSet` used for leader election and conflict resolution | `resolve_block_conflict()` reads from `StakeSet` in `src/epoch.rs` |
+| Losing proposer | Discarded; slashed only when same proposer double-signed | `resolve_block_conflict()` → `ConflictResolution::SameProposerSlash` |
+
 ## Phase 1 — Data model: represent "competing candidates," not just "the chain"
 
-`Blockchain.chain: VecDeque<Block>` assumes one canonical linear history — there's nowhere to put a second, competing block for the same slot. Add:
+**Status: Complete.**
 
-- A `CandidateRegistry` (DashMap-backed, matching your existing style in `registry.rs`) keyed by `(token_id, previous_hash)` → `Vec<Block>` (or `Vec<(Block, proposer_key)>`), holding not-yet-final proposals.
-- A `finality_status` concept per block — `Optimistic` vs `Confirmed` — so downstream consumers (Archiver, wallets, whatever reads chain state) know whether a block could still be superseded.
-- Extend `Block` (or the `SignedTransaction` it wraps) to carry the proposer's public key explicitly if it isn't already recoverable from `signed_trans`, since conflict resolution needs to look up stake per proposer.
+`CandidateRegistry` (DashMap-backed, keyed by `(token_id, previous_hash)` → `Vec<(Block, proposer_key)>`), `FinalityStatus` enum (`Optimistic` / `Confirmed`), and `SignedTransaction.proposer_key` all exist in `src/epoch.rs` and `src/transactions.rs`.
 
 ## Phase 2 — Replace the conflict-detection logic
 
-`EpochReconciler::reconcile_internal()` in `committer/src/epoch_manager.rs` currently compares block hashes at matching indices **across different tokens** — that never validly matches and isn't the fork case you care about. Replace it with same-chain detection:
+**Status: Complete.**
 
-- On receiving/appending a candidate block for a token, check the `CandidateRegistry` for existing entries at the same `(token_id, previous_hash)` key. If one exists with a different `current_hash`, that's a conflict — build the existing `Conflict { block_a, block_b, stake_a, stake_b }` struct from it.
-- This needs to run **at ingestion time in the Committer**, not just at epoch boundaries — epoch-boundary-only detection can't deliver "instant" finality, since blocks would sit unconfirmed for a whole epoch before anyone checks. Epoch-boundary reconciliation can stay as a slower-path safety net for anything missed (e.g., a node that was offline).
-- Fill in `stake_a`/`stake_b` for real by querying `StakeStore::get_stake()` for each proposer instead of the current hardcoded `0`.
+`EpochReconciler::reconcile_internal()` in `committer/src/epoch_manager.rs` checks the `CandidateRegistry` for 2+ candidates at the same `(token_id, previous_hash)`, resolves real stakes via `StakeStore`, and builds `Conflict` structs. Tested in `epoch_manager.rs` tests.
 
 ## Phase 3 — Wire `resolve_block_conflict` into the commit path
 
-This function already exists and already works — it's just never called outside its unit tests. Once Phase 2 produces real `Conflict` data:
+**Status: Implemented but not wired into the optimistic path.**
 
-- On detection, call `resolve_block_conflict()` with the real stakes.
-- Commit the winning block to the token's actual `Blockchain`; drop the losing candidate from the `CandidateRegistry`.
-- If you decided in Phase 0 to slash double-proposers, emit a `StakingOp::Slash` for whichever proposer(s) get discarded — but only when the same proposer signed both competing blocks (an honest node relaying a race isn't the culprit).
-- Broadcast the resolution outcome via the existing `gossiper`/`MessageDispatcher` machinery so all nodes converge, not just the Committer that happened to detect it first.
+`resolve_block_conflict()` is fully implemented in `src/epoch.rs` with all three outcomes (`DiscardLoser`, `SameProposerSlash`, `TieFlagBoth`), and fully tested. The optimistic commit path does not call it — which is intentional:
+
+- The happy path (no conflict) should be as fast as possible; the optimistic path achieves this by bypassing quorum entirely.
+- Conflict detection at the finalizer would add latency to the hot path.
+- Epoch-boundary reconciliation (`EpochReconciler::reconcile`) already detects and resolves conflicts as a slower-path safety net.
+
+Wiring conflict detection into the optimistic path itself (before block dispatch) is a future optimization but not a blocker.
 
 ## Phase 4 — Make the default path actually optimistic
 
-This is the biggest behavioral change and the one most in tension with the current code:
+**Status: Complete.**
 
-- For standard (non-self-signed) tokens, replace "wait for 2/3 executor quorum before finalizing" with something like: one Executor executes, one Finalizer signs and dispatches immediately, Committer commits it as `Optimistic`. No blocking supermajority vote in the common path.
-- The quorum/voting machinery in `SignatureCollector` doesn't disappear — it gets repurposed as the *conflict-resolution* voting mechanism from Phase 3, invoked only when the `CandidateRegistry` shows a genuine fork, rather than gating every single transaction.
-- Decide what "confirmed" means for a client-facing guarantee — e.g., "final after N seconds with no observed conflict" — and expose that via `finality_status`.
+`Finalizer::handle_signature` calls `try_finalize_optimistic` on the first executor signature. The quorum path (`try_finalize`) still exists for when subsequent signatures accumulate and quorum is reached.
 
-## Phase 5 — Networking additions
+## Phase 5 — Block awareness gossip (formerly "Networking additions")
 
-- Add a vote/dispute message type in `messages.rs` so nodes can broadcast "I saw this candidate block for this slot" and "I vote for block X in this conflict," reusing the dedup/fan-out patterns already in `gossiper.rs`.
-- Add conflict-vote aggregation, structurally similar to `SignatureCollector` but scoped to conflicts rather than per-transaction quorum.
+**Original scope:** Add vote/dispute message types for distributed consensus on conflicts.
+
+**Revised scope:** The original plan assumed all executors see every transaction, making distributed vote/dispute protocol necessary for conflict awareness. With executor sharding (only one shard processes each tx) and epoch rotation (executors reshuffle each epoch), conflicts are so rare that a full vote protocol is unnecessary.
+
+Instead, what's useful is a simple block announcement gossip:
+
+- **Add `BlockConfirmed` message type** in `src/messages.rs` — the finalizer broadcasts the `TransactionCommit` after optimistic commit so other nodes can advance their local chain state without fetching from an archiver.
+- **No vote/aggregation protocol** — conflict detection is local to each node's `CandidateRegistry`, resolution uses the existing `StakeSet` via `resolve_block_conflict` at epoch boundaries.
+
+This is a notification, not a consensus mechanism. Nodes still converge independently at epoch reconciliation if they missed a block announcement.
 
 ## Phase 6 — Testing
 
-- Unit tests simulating two proposers submitting valid, differently-signed blocks against the same `previous_hash` for one token — verify the `CandidateRegistry` catches it and `resolve_block_conflict` picks correctly by stake, then by hash tie-break.
-- Concurrency tests (you already do this well elsewhere, e.g. `registry.rs`'s `std::thread::spawn` + `Arc`-shared DashMap pattern) for near-simultaneous candidate submission.
-- An end-to-end pipeline test: submit → optimistic commit → no conflict → confirmed, alongside submit → optimistic commit → conflict injected → resolved → slashing applied (if you built that).
+**Revised scope:** The original plan included distributed conflict vote tests and near-simultaneous competing block tests. With sharding, the conflict scenario is much narrower:
+
+- **Unit tests:** `CandidateRegistry` concurrent inserts (done), `resolve_block_conflict` tie-breaking (done), optimistic commit path (done via existing finalizer tests)
+- **Happy path e2e:** optimistic commit succeeds, finality status = `Optimistic`, then confirmed after quorum or epoch boundary
+- **Block awareness:** `BlockConfirmed` gossip arrives, local chain state advances (after Phase 5 is implemented)
+- **Epoch-boundary conflict:** reconciler detects competing candidates at chain tip, applies `DiscardLoser` or `SameProposerSlash` (existing tests in `epoch_manager.rs` cover the happy/conflict cases)
+- **Not needed:** distributed vote/dispute tests (no protocol), near-simultaneous competing block tests at the network level (sharding makes this effectively impossible — only one shard per tx)
 
 ## Phase 7 — Docs
 
-Given the project already tracks work in `TASKS.md` with C#-reference-style entries, I'd add a new section there (`Consensus Rearchitecture`) mirroring the existing Phase 1–7 production roadmap format, so this doesn't get lost alongside the sentinel/executor/finalizer/committer completion work already tracked.
+**Status: Partial.**
+
+TASKS.md updated with executor sharding + optimistic commit phases. README.md updated with ADR-009 (Executor Sharding) and ADR-010 (Optimistic Commit). This document should be updated to reflect the revised Phase 5/6 scope above.
 
 ---
 
-A natural place to start, if you want to keep it incremental and testable: **Phase 1 + 2** together (candidate registry + real fork detection) can be built and unit-tested in isolation without touching the finalizer's quorum behavior at all — that gives you a correct detector before you change what "instant" means for the happy path in Phase 4, which is the riskier change to get right.
+## Summary: what changed and why
+
+The original Phase 5/6 assumed a flat executor registry where every node processes every transaction, making distributed vote/dispute protocol necessary for conflict resolution. Executor sharding + optimistic commit changes the conflict landscape fundamentally:
+
+1. **Each tx goes to only one shard** — a proposer can only win in their shard, not globally.
+2. **Epoch rotation reshuffles executors** — stable cartels can't form.
+3. **Optimistic commit doesn't wait for quorum** — conflicts that escape the finalizer are resolved at epoch boundaries, not during transaction processing.
+
+The conflict resolution machinery (`CandidateRegistry`, `resolve_block_conflict`, `StakingOp::Slash`) exists and is tested. It operates as a slower-path safety net, not as a real-time consensus protocol. The only missing piece is the block announcement gossip that would let other nodes learn about committed blocks without polling an archiver.
