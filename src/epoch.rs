@@ -387,31 +387,59 @@ impl EpochBoundaryDetector {
 // Conflict resolution
 // ---------------------------------------------------------------------------
 
+/// Resolution outcome from a block conflict — determines how the system responds.
+#[derive(Debug, Clone)]
+pub enum ConflictResolution {
+    /// Different proposers — network race. Commit the winner, discard the loser.
+    DiscardLoser(Vec<u8>),
+    /// Same proposer signed both blocks — double-signed. Commit the winner, slash the proposer.
+    SameProposerSlash(Vec<u8>, Vec<u8>), // (winner_hash, proposer_key_to_slash)
+    /// Equal stakes and identical hashes (theoretical) — commit winner, flag both for review.
+    TieFlagBoth(Vec<u8>),
+}
+
 /// Resolve a conflict between two block proposals at the same height.
-/// Returns the winning block hash.
-/// Tie-break: lexicographic comparison of block hashes (smaller wins).
+/// Returns a `ConflictResolution` that determines the system response:
+/// - **DiscardLoser**: different proposers, network race. Commit winner, discard loser.
+/// - **SameProposerSlash**: same proposer double-signed. Commit winner, slash proposer.
+/// - **TieFlagBoth**: equal stakes + equal hashes (theoretical). Flag both for review.
+///
+/// Tie-break for equal stakes and different proposers: lexicographic comparison of
+/// block hashes (smaller wins).
 pub fn resolve_block_conflict(
     block_a_hash: &[u8],
     block_b_hash: &[u8],
     proposer_a: &[u8],
     proposer_b: &[u8],
     stake_set: &StakeSet,
-) -> Result<Vec<u8>, PneumaticError> {
+) -> Result<ConflictResolution, PneumaticError> {
     let stake_a = stake_set.get_stake(proposer_a);
     let stake_b = stake_set.get_stake(proposer_b);
 
+    // Different stakes — higher stake wins (network race between honest nodes)
     if stake_a > stake_b {
-        return Ok(block_a_hash.to_vec());
+        return Ok(ConflictResolution::DiscardLoser(block_a_hash.to_vec()));
     }
     if stake_b > stake_a {
-        return Ok(block_b_hash.to_vec());
+        return Ok(ConflictResolution::DiscardLoser(block_b_hash.to_vec()));
     }
 
-    // Tie-break: lexicographic comparison (smaller hash wins)
+    // Equal stakes — check proposer identity
+    let same_proposer = proposer_a == proposer_b;
+
+    if same_proposer {
+        // Same proposer double-signed — protocol violation, slash them
+        return Ok(ConflictResolution::SameProposerSlash(
+            block_a_hash.to_vec(),
+            proposer_a.to_vec(),
+        ));
+    }
+
+    // Equal stakes, different proposers — hash tie-break
     if block_a_hash <= block_b_hash {
-        Ok(block_a_hash.to_vec())
+        Ok(ConflictResolution::DiscardLoser(block_a_hash.to_vec()))
     } else {
-        Ok(block_b_hash.to_vec())
+        Ok(ConflictResolution::DiscardLoser(block_b_hash.to_vec()))
     }
 }
 
@@ -779,25 +807,48 @@ mod tests {
     // --- resolve_block_conflict tests ---
 
     #[test]
-    fn conflict_resolution_stake_difference_selects_higher() {
+    fn conflict_resolution_stake_difference_returns_discard_loser() {
         let stakes = make_stake_set(vec![(vec![1], 100), (vec![2], 200)]);
-        let winner = resolve_block_conflict(
+        let result = resolve_block_conflict(
             b"hash_a", b"hash_b",
             &vec![1], &vec![2],
             &stakes,
         ).unwrap();
-        assert_eq!(winner, b"hash_b");
+        match result {
+            ConflictResolution::DiscardLoser(winner) => assert_eq!(winner, b"hash_b"),
+            _ => panic!("Expected DiscardLoser"),
+        }
     }
 
     #[test]
-    fn conflict_resolution_tie_break_by_hash() {
+    fn conflict_resolution_tie_break_by_hash_returns_discard_loser() {
         let stakes = make_stake_set(vec![(vec![1], 100), (vec![2], 100)]);
-        let winner = resolve_block_conflict(
+        let result = resolve_block_conflict(
             b"aa", b"bb",
             &vec![1], &vec![2],
             &stakes,
         ).unwrap();
-        assert_eq!(winner, b"aa");
+        match result {
+            ConflictResolution::DiscardLoser(winner) => assert_eq!(winner, b"aa"),
+            _ => panic!("Expected DiscardLoser"),
+        }
+    }
+
+    #[test]
+    fn conflict_resolution_same_proposer_returns_slash() {
+        let stakes = make_stake_set(vec![(vec![1], 100)]);
+        let result = resolve_block_conflict(
+            b"hash_a", b"hash_b",
+            &vec![1], &vec![1],
+            &stakes,
+        ).unwrap();
+        match result {
+            ConflictResolution::SameProposerSlash(winner, slashed) => {
+                assert_eq!(winner, b"hash_a");
+                assert_eq!(slashed, vec![1]);
+            }
+            _ => panic!("Expected SameProposerSlash"),
+        }
     }
 
     // --- CandidateRegistry tests ---

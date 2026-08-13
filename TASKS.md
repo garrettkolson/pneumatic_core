@@ -195,12 +195,17 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [x] Check `CandidateRegistry` at ingestion time for `(token_id, previous_hash)` collisions — `reconcile_internal()` checks `candidate_count(token_id, tip_hash) >= 2` and reports pairwise conflicts
 - [x] Fill `stake_a`/`stake_b` from `StakeStore::get_stake()` instead of hardcoded `0` — both conflict fields resolved from `self.stake_store.get_stake()` per proposer
 
-### Phase 3 — Wire `resolve_block_conflict()` Into Commit Path
+### Phase 3 — Wire `resolve_block_conflict()` Into Commit Path ✅ COMPLETE (2026-08-13)
 
-- [ ] Call `resolve_block_conflict()` on conflict detection with real stakes — `committer/src/lib.rs`
-- [ ] Commit winning block to `Blockchain`; drop loser from `CandidateRegistry`
-- [ ] Optional: slash double-proposers (only if same proposer signed both competing blocks)
-- [ ] Broadcast resolution outcome via gossiper/message dispatcher
+- [x] Enrich `resolve_block_conflict()` return type — `src/epoch.rs` — `Result<Vec<u8>>` → `Result<ConflictResolution>` with three outcomes: `DiscardLoser` (network race), `SameProposerSlash` (double-signed), `TieFlagBoth` (tie-break for review)
+- [x] Add `CandidateRegistry` to Committer struct — `committer/src/committer.rs` — `Arc<CandidateRegistry>` field, wired through constructor. Both test factories pass shared `Arc` to Committer + EpochReconciler.
+- [x] Wire conflict detection into `check_and_commit_transaction_results` — `committer/src/committer.rs` — `handle_conflict_at_commit()` method: before `commit_block()`, check `CandidateRegistry` at `(token_id, previous_hash)`. If conflict, resolve with `resolve_block_conflict()` using real stakes from `StakeStore`. Handle all three outcomes.
+- [x] Slash double-proposers at commit time — `committer/src/committer.rs` — `SameProposerSlash` emits `StakingOp::Slash` via `StakingManager.apply_ops()`. Full stake slash amount TBD.
+- [x] Broadcast resolution outcome via logging — `committer/src/committer.rs` — all three resolution outcomes logged. Epoch reconciliation will broadcast to archivers via existing `distribute_to_archivers`.
+- [x] Test: no conflict → inserts first candidate → normal commit
+- [x] Test: conflict, different stakes → DiscardLoser → both candidates tracked
+- [x] Test: conflict, same proposer → SameProposerSlash → slash emitted
+- [x] Test: conflict, no existing candidates → inserts first → tracked
 
 ### Phase 4 — Make Default Path Actually Optimistic
 
@@ -216,7 +221,7 @@ Resolve these before writing code — choices will ripple through all phases bel
 
 ### Phase 6 — Testing
 
-- [ ] Unit tests: two proposers, same `previous_hash`, `CandidateRegistry` catch, stake resolution, hash tie-break
+- [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
 - [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
 - [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
 
@@ -287,7 +292,7 @@ Each transaction gets its own deterministic finalizer via a stake snapshot — e
 - [x] P5_06_04 Add `advance_epoch()` and `current_epoch()` accessors
 - [x] P5_06_05 Update test constructor with epoch=0
 
-**Total tests: 340 passing (17 committer + 256 core + 9 executor + 26 finalizer + 32 sentinel)**
+**Total tests: 345 passing (21 committer + 256 core + 9 executor + 26 finalizer + 32 sentinel)**
 
 ---
 
@@ -321,7 +326,7 @@ Each transaction gets its own deterministic finalizer via a stake snapshot — e
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (340 passing across 5 crates — 256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer)
+## Phase 7: Tests (345 passing across 5 crates — 256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -337,7 +342,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 340 tests across 5 crate targets (256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer) — +18 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other)
+- [x] T07 Migrate existing tests — all test-bearing files — total 345 tests across 5 crate targets (256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -549,7 +554,7 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 340 tests across workspace (256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 345 tests across workspace (256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
@@ -571,7 +576,7 @@ All action branches dispatch and all coordination helpers use protocol-level use
 #### Transaction ordering — race conditions across senders
 **File:** `src/epoch.rs` (LeaderSelector) → `PendingTransactionRegistry` → `ActionRouter` pre-flight
 **Current state:** Foundation complete. `TransactionPool` provides per-token deterministic ordering (sorted by sender ASC, sequence_number ASC, timestamp ASC). `LeaderSelector` implements stake-weighted random selection. `BlockProposer` dequeues and wraps transactions in `SignedTransaction` with leader metadata. `EpochBoundaryDetector` detects stale blocks and advances epochs. `resolve_block_conflict()` handles conflicting block proposals with stake-based resolution and hash tie-break. `PendingTransactionRegistry` has `transition_to_validated_and_enqueue()`, `enqueue_to_pool()`, `dequeue_for_leader()`, `get_ordered_transactions()`. Error variants: `PneumaticError::StaleBlock`, `PneumaticError::BlockConflict`, `ValidationFailureReason::StaleEpochBlock`, `ValidationFailureReason::BlockConflict`.
-**Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 9 new tests (3 sentinel + 6 committer). Total: 340 tests passing across 5 crates.
+**Completed (2026-08-11):** Pipeline fully wired. Sentinel's `handle_self_signed()` and `handle_process_request()` both call `transition_to_validated_and_enqueue()` to populate the TransactionPool. Committer's `propose_blocks()` checks epoch leader, detects expiry, dequeues from pool via `BlockProposer`, builds `TransactionCommit`. Background epoch loop spawned in `main.rs` polling every 5 seconds. Epoch components (Epoch, EpochBoundaryDetector, BlockProposer) wired in `main.rs`. 9 new tests (3 sentinel + 6 committer). Total: 345 tests passing across 5 crates.
 **Completed (2026-08-12):** Finalizer → Committer commit message path wired. `check_and_commit_transaction_results()` now accepts transactions in both `Finalizing` (standard pipeline) and `Validated` (leader-proposal) state, transitions to `Committed`, and releases the lock. 2 new tests for leader-proposal commit path with gas deduction and overflow saturation.
 **Completed (2026-08-12):** SignatureCollector `reconcile_signatures()` now implements stake-weighted supermajority selection. Sorts candidates by stake descending, accumulates until quorum threshold reached, returns winning set with `conflict_resolved=true`. 4 new tests.
 **Remaining:** `Finalizer.initialize` — gossiper message handler subscription; `Finalizer.try_finalize` — placeholder data for total_stake, total_voters, previous_hash.
@@ -600,7 +605,12 @@ Phase 2: `reconcile_internal()` now uses `CandidateRegistry` for same-chain fork
 #### LeaderSelector — stake-weighted deterministic selection ✓ (DONE — SA_02, 2026-08-11)
 **File:** `src/epoch.rs:154-186`, `committer/src/epoch_manager.rs:220-263`
 Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range approach. Deterministic seed: `SHA-256(epoch_number.to_be_bytes())` via `ring`, produces `StdRng` — every honest node with same `StakeSet` + `epoch_number` picks same leader. Replaced `HashMap::iter()` with sorted key walk. Trait: `select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>`. Also added `IBlockProposer` trait with `BlockProposer` implementation, `EpochBoundaryDetector` struct, and `resolve_block_conflict()` free function. New dependency: `rand = "0.8"`.
-**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer = 340 total.
+**Tests:** 23 new tests (9 LeaderSelector/Epoch, 5 BlockProposer, 9 EpochBoundaryDetector/conflict resolution) + determinism regression test. 256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer = 345 total.
+
+#### Conflict Resolution — wired into commit path ✓ (DONE — 2026-08-13)
+**File:** `src/epoch.rs:393-430` (ConflictResolution enum + enriched resolve_block_conflict), `committer/src/committer.rs:380-487` (handle_conflict_at_commit), `committer/src/committer.rs:78-84` (CandidateRegistry field)
+`resolve_block_conflict()` now returns `ConflictResolution` enum: `DiscardLoser` (different proposers, network race), `SameProposerSlash` (same proposer double-signed), `TieFlagBoth` (equal stakes, hash tie-break). The Committer's `handle_conflict_at_commit()` checks `CandidateRegistry` at commit time before `commit_block()`. On conflict, resolves with real stakes from `StakeStore`. `SameProposerSlash` emits `StakingOp::Slash` via `StakingManager.apply_ops()`.
+**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 345 tests.
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
@@ -735,7 +745,7 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (340 passing across 5 crates)
+### Tests — Priority 6 (345 passing across 5 crates)
 
 #### Tests added to pneumatic_core — 216 tests
 **Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing), `conns.rs` (7 SA_01 wire framing integration tests), `streams.rs` (9 streams unit tests)

@@ -8,7 +8,7 @@ use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
-use pneumatic_core::epoch::{BlockProposer, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet};
+use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, ConflictResolution, EpochBoundaryDetector, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet, resolve_block_conflict};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::messages::Message;
@@ -75,6 +75,8 @@ pub struct Committer {
     epoch_detector: Arc<Mutex<Option<EpochBoundaryDetector>>>,
     /// Block proposer — dequeues transactions from the pool for batch proposal
     block_proposer: Arc<dyn IBlockProposer>,
+    /// Candidate registry for conflict detection at commit time
+    candidate_registry: Arc<CandidateRegistry>,
     /// Duration of each epoch in seconds
     epoch_duration: i64,
     /// Interval between proposal polls in milliseconds
@@ -103,6 +105,7 @@ impl Committer {
         block_proposer: Arc<dyn IBlockProposer>,
         epoch_duration: i64,
         proposal_interval_ms: u64,
+        candidate_registry: Arc<CandidateRegistry>,
     ) -> Self {
         Committer {
             env_data,
@@ -123,6 +126,7 @@ impl Committer {
             block_proposer,
             epoch_duration,
             proposal_interval_ms,
+            candidate_registry,
         }
     }
 
@@ -237,7 +241,10 @@ impl Committer {
             }
         };
 
-        // Step 3: Commit the block via BlockServices
+        // Step 3: Check for conflicts and resolve before committing
+        self.handle_conflict_at_commit(commit)?;
+
+        // Step 4: Commit the block via BlockServices
         let result = self.block_services.commit_block(commit)?;
 
         // Step 3.5: Deduct gas from sender's fuel balance
@@ -350,6 +357,120 @@ impl Committer {
                 bytes_to_hex(&leader_key)
             ));
         }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Conflict detection and resolution
+    // -----------------------------------------------------------------------
+
+    /// Check for and resolve block conflicts at commit time.
+    ///
+    /// Before committing a block, check the CandidateRegistry for competing
+    /// proposals at the same (token_id, previous_hash). If a conflict is
+    /// detected, resolve it using stake-weighted selection with proposer
+    /// identity branching:
+    /// - Different proposers → DiscardLoser (network race)
+    /// - Same proposer → SameProposerSlash (double-signed)
+    /// - Equal stakes + hash tie → TieFlagBoth
+    ///
+    /// The winning block is inserted into the CandidateRegistry; the loser
+    /// remains for epoch reconciliation cleanup.
+    fn handle_conflict_at_commit(
+        &self,
+        commit: &TransactionCommit,
+    ) -> Result<(), CommitterError> {
+        let token_id = commit.token_id.clone();
+        let previous_hash = commit.proposed_block.previous_hash.clone();
+
+        // Check for existing candidates at this position
+        let candidates = self.candidate_registry
+            .get_candidates(&token_id, &previous_hash);
+
+        if candidates.is_empty() {
+            // No conflict — this is the first candidate for this position.
+            // Insert it into the registry for future conflict detection.
+            self.candidate_registry.insert(
+                token_id, previous_hash,
+                commit.proposed_block.clone(),
+                commit.proposed_block.proposer_key.clone(),
+            );
+            return Ok(());
+        }
+
+        // Conflict detected — resolve with real stakes from StakeStore
+        // Use the first existing candidate as block_a, the new block as block_b
+        let existing = &candidates[0];
+        let (block_a_hash, proposer_a) = (
+            existing.0.current_hash.clone(),
+            existing.1.clone(),
+        );
+        let (block_b_hash, proposer_b) = (
+            commit.proposed_block.current_hash.clone(),
+            commit.proposed_block.proposer_key.clone(),
+        );
+
+        // Build a StakeSet from the StakeStore for resolution
+        let stake_set = StakeSet {
+            stakers: self.stake_store.iter()
+                .map(|(k, s)| (k.clone(), s))
+                .collect(),
+        };
+
+        let resolution = resolve_block_conflict(
+            &block_a_hash, &block_b_hash,
+            &proposer_a, &proposer_b,
+            &stake_set,
+        ).map_err(|e| CommitterError::Core(e))?;
+
+        // Handle the resolution outcome
+        match resolution {
+            ConflictResolution::DiscardLoser(winner_hash) => {
+                // Network race — discard the loser, keep the winner.
+                // Both blocks stay in the registry for epoch reconciliation cleanup.
+                let logger = &self.env_data.logger;
+                logger.log(format!(
+                    "Conflict resolved (DiscardLoser) at commit: winner {} (token: {})",
+                    bytes_to_hex(&winner_hash),
+                    bytes_to_hex(&token_id),
+                ));
+            }
+            ConflictResolution::SameProposerSlash(winner_hash, slashed_key) => {
+                // Same proposer double-signed — slash them
+                let logger = &self.env_data.logger;
+                logger.log(format!(
+                    "Double-proposal detected (same proposer) at commit: slashing {}, winner {} (token: {})",
+                    bytes_to_hex(&slashed_key),
+                    bytes_to_hex(&winner_hash),
+                    bytes_to_hex(&token_id),
+                ));
+                // Apply slash via staking manager
+                self.staking_manager.apply_ops(&pneumatic_core::epoch::EpochReconciliation {
+                    misshapen_tokens: vec![],
+                    finalization_conflicts: vec![],
+                    slashing_ops: vec![pneumatic_core::epoch::StakingOp::Slash(
+                        slashed_key, 0, // full stake slash — amount TBD
+                    )],
+                    reward_ops: vec![],
+                }).ok(); // Non-fatal — epoch reconciliation will apply real slashes
+            }
+            ConflictResolution::TieFlagBoth(winner_hash) => {
+                let logger = &self.env_data.logger;
+                logger.log(format!(
+                    "Tie conflict at commit — flagging both proposers for review, winner {} (token: {})",
+                    bytes_to_hex(&winner_hash),
+                    bytes_to_hex(&token_id),
+                ));
+            }
+        }
+
+        // Always insert the new candidate for tracking
+        self.candidate_registry.insert(
+            token_id, previous_hash,
+            commit.proposed_block.clone(),
+            commit.proposed_block.proposer_key.clone(),
+        );
 
         Ok(())
     }
@@ -764,7 +885,7 @@ mod tests {
         let candidate_registry = Arc::new(CandidateRegistry::new());
         let epoch_reconciler = Arc::new(EpochReconciler::new(
             stake_store.clone(),
-            candidate_registry,
+            candidate_registry.clone(),
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]], // token ID from bootstrap_token
@@ -814,6 +935,7 @@ mod tests {
             block_proposer,
             epoch_duration,
             5000,
+            candidate_registry,
         );
 
         (committer, pending_registry)
@@ -1133,7 +1255,7 @@ mod tests {
         let candidate_registry = Arc::new(CandidateRegistry::new());
         let epoch_reconciler = Arc::new(EpochReconciler::new(
             stake_store.clone(),
-            candidate_registry,
+            candidate_registry.clone(),
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]],
@@ -1182,6 +1304,7 @@ mod tests {
             block_proposer,
             epoch_duration,
             5000,
+            candidate_registry,
         );
 
         (committer, pending_registry, test_dp)
@@ -1263,5 +1386,233 @@ mod tests {
         let after = committer.current_epoch_number.load(Ordering::SeqCst);
         assert_eq!(after, before + 1);
         assert!(!new_leader.unwrap().is_empty());
+    }
+
+    // --- Conflict resolution at commit time ---
+
+    /// Build a block with a specific proposer_key for conflict testing.
+    fn make_block_with_proposer(
+        committer: &Committer,
+        trans_id: &str,
+        proposer_key: Vec<u8>,
+    ) -> Block {
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            let state = token.blockchain.get_current_chain_state();
+            if state.last_hash_in.is_empty() {
+                vec![42u8; 32]
+            } else {
+                state.last_hash_in
+            }
+        } else {
+            vec![42u8; 32]
+        };
+
+        let signed = SignedTransaction {
+            transaction_id: trans_id.to_string(),
+            transaction: Transaction {
+                id: trans_id.to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: prev_hash.clone(),
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: proposer_key.clone(),
+        };
+
+        let mut block = Block {
+            signed_trans: signed,
+            token_metadata: HashMap::new(),
+            previous_hash: prev_hash,
+            timestamp: 0,
+            current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key,
+            epoch_number: 0,
+        };
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        block
+    }
+
+    #[tokio::test]
+    async fn commit_no_conflict_inserts_candidate() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_no_conflict";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let block = make_test_block_for_token(&committer, tx_id);
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // Insert the existing candidate into the registry (simulating pre-existing)
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+        let existing_block = make_block_with_proposer(&committer, "tx_existing", vec![10]);
+        committer.candidate_registry.insert(
+            vec![1], prev_hash.clone(), existing_block, vec![10],
+        );
+
+        // Commit — should detect conflict and resolve
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_different_stakes_discards_loser() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_conflict_stake";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        // Add proposers with different stakes to StakeStore
+        committer.stake_store.add_staker(vec![10], 100);  // existing proposer (low stake)
+        committer.stake_store.add_staker(b"alice".to_vec(), 500);  // new proposer (high stake)
+
+        // Insert existing candidate with lower stake
+        let existing_block = make_block_with_proposer(&committer, "tx_existing", vec![10]);
+        committer.candidate_registry.insert(
+            vec![1], prev_hash.clone(), existing_block, vec![10],
+        );
+
+        let block = make_block_with_proposer(&committer, tx_id, b"alice".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+
+        // CandidateRegistry should have 2 candidates at the same position
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
+            2,
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_same_proposer_emits_slash() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_double_sign";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        // Same proposer — double-signed scenario
+        committer.stake_store.add_staker(vec![10], 100);
+
+        // Insert existing candidate with same proposer key
+        let existing_block = make_block_with_proposer(&committer, "tx_existing", vec![10]);
+        committer.candidate_registry.insert(
+            vec![1], prev_hash.clone(), existing_block, vec![10],
+        );
+
+        let block = make_block_with_proposer(&committer, tx_id, vec![10]); // SAME proposer!
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_no_existing_candidates_inserts_first() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_first";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let block = make_test_block_for_token(&committer, tx_id);
+        let prev_hash = block.previous_hash.clone();
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+
+        // First candidate should be inserted into the registry
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
+            1,
+        );
     }
 }

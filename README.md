@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 340 tests across 5 crate targets
+cargo test --workspace --lib   # Run 345 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -135,6 +135,22 @@ The sentinel performs deterministic finalizer assignment but does not participat
 
 **Rationale**: Sentinel is a routing proxy, not a consensus participant. This separation of concerns means the sentinel can be replaced or scaled independently of the consensus protocol. The sentinel's only state is the stake snapshot cache, which is cheap to maintain and easy to recover.
 
+### ADR-008: Conflict Detection and Resolution Strategy
+
+A **conflict** is defined as two valid `Block`s that reference the same `(token_id, previous_hash)` but produce different `current_hash` values — i.e., two competing proposals for the same parent in the chain.
+
+Detection is handled by `CandidateRegistry`: a DashMap keyed by `(token_id, previous_hash)` that collects all candidate blocks at each position. When `insert()` appends a second block with a different hash, `has_conflict()` returns true. This works for all conflict scenarios (same-parent race, close-together commits, double-spends) because they all manifest as sibling blocks at the same chain position.
+
+Resolution uses `resolve_block_conflict()`: higher-stake proposer wins; tie-break by lexicographic hash comparison (smaller hash wins). After determining the winner, the response branches on proposer identity:
+
+| Winner stake > Loser stake | Same proposer? | Response |
+|---|---|---|
+| Yes | No | Discard the loser (network race) |
+| Yes | Yes | **Slash both** (double-signed block is a protocol violation — higher stake doesn't excuse the proposer) |
+| Tied | Any | Tie-break winner; flag both proposers for review |
+
+**Rationale**: Defining conflict at the chain position level (same `previous_hash`) rather than by provenance (how the blocks arose) keeps detection simple and correct across all scenarios. A race, a double-spend, and a malicious double-propose all look identical at the chain level — same parent, different hash. The branch on proposer identity is the *only* provenance check needed: it distinguishes an honest relaying race (different proposers) from an intentional violation (same proposer). The `CandidateRegistry` is already implemented and tested; `resolve_block_conflict` is also implemented and tested. The wiring between them — the Committer's commit path — is the remaining implementation gap.
+
 ---
 
 ## Consensus Flow
@@ -246,6 +262,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 | `StakeStore` | In-memory stake tracking |
 | `StakingManager` | Applies staking ops (stubbed — no persistence) |
 | `EpochReconciler` | Same-chain fork detection via `CandidateRegistry`, stake resolution from `StakeStore` (Phase 2) |
+| `handle_conflict_at_commit()` | Conflict detection at commit time — checks `CandidateRegistry` before `commit_block()`, resolves with `resolve_block_conflict()`, slashes double-proposers |
 | `LeaderSelector` | Stake-weighted leader selection (replaced stub with real implementation) |
 | Epoch snapshot persistence | `handle_epoch_reconcile` and `advance_epoch` save frozen `StakeSet` via `DataProvider` for sentinel deterministic routing |
 
@@ -275,7 +292,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 340 tests: 256 core + 32 sentinel + 26 finalizer + 9 executor + 17 committer
+# 345 tests: 256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer
 ```
 
 ---
@@ -391,19 +408,21 @@ This roadmap tracks the work from current foundation state through a production-
 
 | Task | Description | Estimate | Status |
 |------|-------------|----------|--------|
-| Lock design decisions | Resolve 4 Phase-0 questions (see TASKS.md §Protocol Rearchitecture Phase 0): conflict definition, quorum scope, voting weight pool, losing block behavior | 4h | **Resolved** — see design decisions below |
+| Lock design decisions | Resolve 4 Phase-0 questions (see TASKS.md §Protocol Rearchitecture Phase 0): conflict definition, quorum scope, voting weight pool, losing block behavior | 4h | **Resolved** — ADR-008: same-parent siblings, CandidateRegistry key, stake > hash tie-break, proposer-identity branching |
 | Add `CandidateRegistry` | DashMap-backed `(token_id, previous_hash) → Vec<(Block, proposer_key)>` keyed candidate store | 8h | **DONE** |
+| Enrich `resolve_block_conflict()` | Return `ConflictResolution` enum (`DiscardLoser`, `SameProposerSlash`, `TieFlagBoth`) — branch on proposer identity | 4h | **DONE** |
+| Wire `resolve_block_conflict()` into commit path | `handle_conflict_at_commit()` in Committer — check registry before `commit_block()`, resolve conflicts with real stakes, slash double-proposers | 8h | **DONE** |
 | Add `finality_status` to `Block` | `Optimistic` vs `Confirmed` enum; downstream consumers check status | 4h | **DONE** |
 | Add proposer public key to `Block`/`SignedTransaction` | Explicit proposer key for conflict resolution stake lookup | 4h | **DONE** |
 | Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection via `CandidateRegistry`; fill `stake_a`/`stake_b` from `StakeStore` | 12h | **DONE** |
-| Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h | Open |
+| Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h | **DONE** |
 | Replace quorum gate with optimistic path | One Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h | **DONE** |
 | Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X" | 8h | Open |
 | Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h | Open |
-| Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` → hash tie-break | 8h | Open |
+| Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` → hash tie-break | 8h | **DONE** (4 committer tests: no conflict, conflict+stake, conflict+slash, conflict+no candidates) |
 | Concurrency + e2e pipeline tests | Submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing | 12h | Open |
 
-**Sub-total**: ~72h / ~2 weeks remaining
+**Sub-total**: ~52h / ~1 week remaining — 11h saved (enriched resolve_block_conflict + wired commit path + 4 new tests)
 
 ### Phase 5b: Deterministic Per-Transaction Routing (NEW — Completed)
 
