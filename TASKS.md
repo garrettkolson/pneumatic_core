@@ -213,22 +213,35 @@ Resolve these before writing code — choices will ripple through all phases bel
 
 - [x] For standard tokens: one Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic` — `try_finalize_optimistic()` triggers on first valid signature; `build_signed_transaction_optimistic` + `create_block_optimistic` build block with `FinalityStatus::Optimistic`
 - [x] Quorum/voting in `SignatureCollector` repurposed for conflict-resolution only — `reconcile_signatures()` uses stake-weighted supermajority for conflict paths; optimistic path proceeds with single signature, no quorum wait
-- [ ] Define "confirmed" guarantee (e.g., "final after N seconds with no conflict") — `FinalityStatus::Confirmed` variant exists but no code transitions Optimistic → Confirmed
+- [x] Define "confirmed" guarantee — Quorum gossip protocol: nodes accumulate stake-weighted votes, transition Optimistic → Confirmed at supermajority (67%); `handle_block_finalized` caches stake set, `handle_block_confirmed_vote` accumulates votes, `handle_block_quorum_reached` transitions block status — `committer/src/committer.rs`, `finalizer/src/message_dispatcher.rs` — 7 new tests
 - [ ] Expose via `finality_status` — all `try_finalize()` standard path uses placeholder data: `total_stake=0, total_voters=0`, `previous_hash=vec![]`
 
-### Phase 5 — Block Awareness Gossip ✅ COMPLETE (2026-08-13)
+### Phase 5 — Quorum Gossip Protocol ✅ COMPLETE (2026-08-14, updated from Block Awareness Gossip)
 
-- [x] Add `BlockConfirmed` message action in finalizer `MessageDispatcher` — serializes `Block`, broadcasts to both Committers and Archivars — `finalizer/src/message_dispatcher.rs`
-- [x] Wire `send_block_confirmed` into `try_finalize_optimistic` — called after `send_to_committers` — `finalizer/src/finalizer.rs`
-- [x] Add `handle_block_confirmed` to Committer — deserializes Block, validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), appends to blockchain, distributes to archivars — `committer/src/committer.rs`
-- [x] 5 new tests: 4 committer unit tests (valid append, orphan ignored, tampered rejected, unknown token error) + 1 dispatcher serialization test
+Original `BlockConfirmed` renamed to `BlockFinalized`. Full stake-weighted quorum gossip protocol added: `FinalityStatus::Confirmed` transitions from `Optimistic` when 67%+ stake validates a block.
+
+- [x] Add `stake_set: Option<StakeSet>` to `Message` struct — populated only on `BlockFinalized`; enables stake-weighted vote processing — `src/messages.rs`
+- [x] Rename `send_block_confirmed` → `send_block_finalized(block, stake_set)` — finalizer includes stake set in broadcast — `finalizer/src/message_dispatcher.rs`
+- [x] Wire `send_block_finalized` into `try_finalize_optimistic` with `stake_set` from `Finalizer.stake_set` — `finalizer/src/finalizer.rs`
+- [x] Add `send_block_confirmed_vote(block_hash)` — vote broadcast: (block_hash, node_key) to all peer types — `finalizer/src/message_dispatcher.rs`
+- [x] Add `send_block_quorum_reached(block_hash)` — status broadcast: (block_hash) to all peer types — `finalizer/src/message_dispatcher.rs`
+- [x] Add `Finalizer.set_stake_set()` / `get_stake_set()` — stake data wiring (production fetch from DataProvider deferred) — `finalizer/src/finalizer.rs`
+- [x] Rename `handle_block_confirmed` → `handle_block_finalized` — deserializes Block, validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), caches stake_set, appends blockchain, broadcasts self-vote, distributes to archivars — `committer/src/committer.rs`
+- [x] Add `handle_block_confirmed_vote` — deserializes vote (block_hash, voter_key), looks up voter stake from cached stake_set, accumulates per-block (dedup by key, saturating-add), checks quorum threshold, broadcasts `BlockQuorumReached` if met — `committer/src/committer.rs`
+- [x] Add `handle_block_quorum_reached` — deserializes block_hash, finds block by hash (DashMap-deadlock-safe: iter then get_mut), calls `Blockchain.set_finality_status(Confirmed)` — `committer/src/committer.rs`
+- [x] Add `broadcast_vote` / `broadcast_quorum_reached` helpers — serialize and fan-out to Committer/Archiver/Executor/Sentinel types — `committer/src/committer.rs`
+- [x] Add `confirmation_votes` + `stake_set_cache` state to Committer — per-block tracking via `Mutex<HashMap>` — `committer/src/committer.rs`
+- [x] Add `Blockchain::get_block_at()` + `Blockchain::set_finality_status()` — core helpers for quorum handler — `src/blocks.rs`
+- [x] Wire `stake_set: None` into all existing Message struct literals across 12 locations in 6 files — `committer`, `executor`, `sentinel`, `action_router`, `gossiper`, `block_services`, `transaction_notifier`
+- [x] 7 new tests: 4 renamed `handle_block_finalized*` (valid append, orphan ignored, unknown token, tampered), 2 vote tracking (`accumulates_stake`, `skips_missing_stake_set`), 1 standalone Confirmed transition test — `committer/src/committer.rs`
 
 ### Phase 6 — Testing
 
 - [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
 - [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
 - [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap) — only unit-level stress tests exist in `epoch.rs`, no concurrent committer commit tests
-- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline or the `send_block_confirmed` → `handle_block_confirmed` gossip path
+- [x] Quorum gossip path: `send_block_finalized` → `handle_block_finalized` → `send_block_confirmed_vote` → `handle_block_confirmed_vote` → `send_block_quorum_reached` → `handle_block_quorum_reached` unit-tested (7 tests across all three handlers)
+- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline (no integration test spanning sentinel → executor → finalizer → committer)
 
 ### Implementation Order Recommendation
 
@@ -351,7 +364,7 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_E_04 Add `invalidate_all()` to `StakeSnapshotCache` — cleared on epoch transition — `sentinel/src/stake_snapshot_cache.rs`
 - [x] P6_E_05 2 tests: `cache_invalidate_all_clears_snapshots`, `advance_epoch_invalidates_caches`
 
-**Total tests: 374 passing (25 committer + 272 core + 9 executor + 28 finalizer + 40 sentinel)**
+**Total tests: 377 passing (28 committer + 272 core + 9 executor + 28 finalizer + 40 sentinel)**
 
 ---
 
@@ -385,7 +398,7 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (374 passing across 5 crates — 272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer)
+## Phase 7: Tests (377 passing across 5 crates — 272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -399,9 +412,9 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 30 tests (Phase 7 originals: From impls 2, creation 1, spec name routing 2, action dispatch 2, self-signed integration 1, compute_gas_used 3, TransactionNotifier 4, handle_confirmation 3, handle_rejection 3, handle_register_request 3, pool enqueue 2, pool ordering 1, shard routing 1, epoch advance 1) + 5 stake_snapshot_cache tests + 5 executor_set_cache tests = **40 total**
 - [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 8 tests: add_success, add_duplicate_fails, add_multiple, check_quorum_met, check_quorum_not_met, reconcile_stake_weighted_supermajority, reconcile_single_sets_winner, reconcile_zero_stake_empty, reconcile_all_needed, plus 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
-- [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 2 tests: send_to_committers, send_clear_to_sentinels
+- [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 3 tests: send_to_committers, send_clear_to_sentinels, block_finalized_serializes
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 374 tests across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +5 tests from Phase 5d block gossip (4 committer + 1 dispatcher)
+- [x] T07 Migrate existing tests — all test-bearing files — total 377 tests across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +7 tests from Phase 5d quorum gossip (4 renamed BlockFinalized handlers + 2 vote tracking + 1 Confirmed transition)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -669,7 +682,7 @@ Replaced `StubLeaderSelector` with `LeaderSelector` using cumulative stake range
 #### Conflict Resolution — wired into commit path ✓ (DONE — 2026-08-13)
 **File:** `src/epoch.rs:393-430` (ConflictResolution enum + enriched resolve_block_conflict), `committer/src/committer.rs:380-487` (handle_conflict_at_commit), `committer/src/committer.rs:78-84` (CandidateRegistry field)
 `resolve_block_conflict()` now returns `ConflictResolution` enum: `DiscardLoser` (different proposers, network race), `SameProposerSlash` (same proposer double-signed), `TieFlagBoth` (equal stakes, hash tie-break). The Committer's `handle_conflict_at_commit()` checks `CandidateRegistry` at commit time before `commit_block()`. On conflict, resolves with real stakes from `StakeStore`. `SameProposerSlash` emits `StakingOp::Slash` via `StakingManager.apply_ops()`.
-**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 374 tests (across 5 crates with executor sharding + optimistic commit + block gossip additions).
+**Tests:** 4 new committer tests (no conflict → inserts first candidate, conflict + different stakes → DiscardLoser, conflict + same proposer → SameProposerSlash, no existing candidates → inserts first). Plus 1 new core test (conflict_resolution_same_proposer_returns_slash). Total: 374 tests (across 5 crates with executor sharding + optimistic commit + block gossip additions, pre-quorum-gossip).
 
 #### Registry — finalizer_public_key propagation — DONE
 **File:** `src/registry.rs:131-132`
@@ -722,17 +735,17 @@ Added `NoOpConnection` placeholder impl for registrations without live connectio
 **File:** `src/epoch.rs` (implemented)
 DashMap-backed registry keyed by `(token_id, previous_hash)` holding competing block proposals. Phase 2 consumes it in `EpochReconciler::reconcile_internal()` for same-chain fork detection. 8 tests (6 unit + 2 concurrent).
 
-#### Block finality_status — DONE (Phase 1, 2026-08-12)
+#### Block finality_status — DONE (Phase 1, 2026-08-12; Confirmed wired 2026-08-14)
 **File:** `src/blocks.rs` (implemented)
-`FinalityStatus` enum (`Optimistic`, `Confirmed`) on `Block`. Blocks created via `from_transaction`, `test_block`, `create_block` default to `Optimistic`. Serialization round-trip tests pass. 4 tests.
+`FinalityStatus` enum (`Optimistic`, `Confirmed`) on `Block`. Blocks created via `from_transaction`, `test_block`, `create_block` default to `Optimistic`. Serialization round-trip tests pass. 4 tests. Quorum gossip protocol transitions blocks from `Optimistic` → `Confirmed` when stake-weighted quorum (67%) is reached via `handle_block_quorum_reached` calling `Blockchain::set_finality_status()`.
 
 #### Proposer key on Block/SignedTransaction — DONE (Phase 1, 2026-08-12)
 **File:** `src/transactions.rs` (SignedTransaction.proposer_key), `src/blocks.rs` (Block.proposer_key)
 Explicit proposer public key for conflict-resolution stake lookup. Propagated from leader_address in BlockProposer and BlockBuilder.
 
-#### Vote/Dispute messages — DONE (Phase 5, replaced with gossip)
-**File:** `finalizer/src/message_dispatcher.rs`
-Replaced with `BlockConfirmed` message action. The finalizer broadcasts committed blocks to Committers and Archivars via `send_block_confirmed()` — no vote/dispute protocol needed due to executor sharding architecture.
+#### Vote/Dispute messages — DONE (Phase 5, replaced with quorum gossip)
+**File:** `finalizer/src/message_dispatcher.rs`, `committer/src/committer.rs`
+Original `BlockConfirmed` (block propagation) renamed to `BlockFinalized`. Full quorum gossip: `BlockConfirmed` is now a per-node vote (block_hash + sender_key); `BlockQuorumReached` is the quorum status broadcast. Stake-weighted accumulation via `confirmation_votes` HashMap in Committer. `Finalizer.set_stake_set()` exists but no production caller fetches stake from DataProvider yet — external orchestrator wiring deferred.
 
 #### Conflict-vote aggregation — NOT NEEDED (executor sharding)
 Conflict detection operates locally at epoch boundaries via `CandidateRegistry` + `resolve_block_conflict()`. Distributed voting protocol removed from scope.
@@ -819,9 +832,9 @@ Stubbed within implemented methods:
 **Files:** `executor/src/executor.rs`
 **Covered:** Execution result validation, capacity checks, full backpressure cycle.
 
-#### Tests in pneumatic_committer — 10 tests (7 inline + 3 doc, 3 ignored)
-**Files:** `committer/src/epoch_manager.rs` (7 inline: StakeStore concurrent add, StakingManager ops, EpochReconciler conflict detection; 3 doc tests in committer.rs)
-**Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow).
+#### Tests in pneumatic_committer — 28 tests (21 committer core + 7 quorum gossip)
+**Files:** `committer/src/committer.rs` (21: epoch advance, check_and_commit ×4, commit_conflict ×4, propose_blocks ×2, handle_block_* ×7, plus handle_epoch_reconcile ×2, block distribution, token distribution, serialize/deserialize helpers); `committer/src/epoch_manager.rs` (7: StakeStore concurrent add, StakingManager ops, EpochReconciler conflict detection; 3 doc tests in committer.rs); `finalizer/src/signature_collector.rs` (28: add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior); `finalizer/src/block_builder.rs` (2: build_signed_transaction, create_block); `finalizer/src/message_dispatcher.rs` (2: send_to_committers, send_clear_to_sentinels + 1 block_finalized_serializes test)
+**Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow). Quorum gossip: block finalized (valid append, orphan ignored, tampered rejected, unknown token error), vote tracking (accumulates_stake, skips_missing_stake_set), quorum reached (Confimed transition).
 
 #### Remaining test gaps
 **Files:** `config.rs` (unit tests), `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (process_registration, send_to_all)

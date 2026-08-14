@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 374 tests across 5 crate targets
+cargo test --workspace --lib   # Run 377 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -310,7 +310,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 374 tests: 272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer
+# 377 tests: 272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer
 ```
 
 ---
@@ -321,7 +321,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 374 tests passing across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 25 committer), all core types and traits implemented.
+**Status: COMPLETE** — 377 tests passing across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -439,7 +439,7 @@ This roadmap tracks the work from current foundation state through a production-
 | ~~Add vote/dispute message types~~ | Replaced with `BlockConfirmed` gossip message (executor sharding eliminates need for distributed voting) | — | **DONE** (replaced by gossip) |
 | ~~Conflict-vote aggregation~~ | Conflict detection operates locally at epoch boundaries via `CandidateRegistry` + `resolve_block_conflict()` | — | **DONE** (replaced by local detection) |
 | Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` → hash tie-break | 8h | **DONE** (4 committer tests: no conflict, conflict+stake, conflict+slash, conflict+no candidates) |
-| **Define "confirmed" guarantee** | `FinalityStatus::Confirmed` variant exists but no code transitions Optimistic → Confirmed | 8h | **Open** |
+| **Define "confirmed" guarantee** | Quorum gossip: nodes accumulate stake-weighted votes, transition Optimistic → Confirmed at supermajority | 8h | **DONE** (2026-08-14) |
 | **Concurrency + e2e pipeline tests** | Near-simultaneous candidate submission (Arc-shared DashMap); full pipeline (submit → optimistic → confirmed; submit → conflict → resolved → slashing) | 12h | **Open** |
 
 **Sub-total**: ~52h / ~1 week remaining — 11h saved (enriched resolve_block_conflict + wired commit path + 4 new tests)
@@ -472,16 +472,49 @@ This roadmap tracks the work from current foundation state through a production-
 
 **Sub-total**: 42h / ~1 week — **COMPLETE**
 
-### Phase 5d: Block Awareness Gossip (NEW — Completed)
+### Phase 5d: Quorum Gossip Protocol (Completed — updated 2026-08-14)
+
+The original `BlockConfirmed` message (block propagation gossip) was renamed to `BlockFinalized`. A full **stake-weighted quorum gossip protocol** was added on top of it. Blocks transition from `Optimistic` → `Confirmed` when a supermajority (67% default) of stake-holders validate and vote on them.
+
+**Message flow:**
+```
+Finalizer                     Committer A              Committer B              Archiver
+   |                             |                        |                       |
+   |--- BlockFinalized --------->| (block + stake_set)    |                       |
+   |   action: "BlockFinalized"  |                        |                       |
+   |                             |                        |                       |
+   |                             |-- BlockConfirmed ----->|                       |
+   |                             |   action: "BlockConfirmed"                    |
+   |                             |   (block_hash, node_key)                      |
+   |                             |                        |                       |
+   |                             |  quorum met? ─────YES─|──► BlockQuorumReached─|──►
+   |                             |                        |   action: "BlockQuorumReached"
+   |                             |                        |   (block_hash, status=Confirmed)
+   |                             |                        |                       |
+   |                             |-- BlockQuorumReached--|──► (all nodes transition)
+```
+
+Three message types: `BlockFinalized` (finalizer broadcasts block + full stake set), `BlockConfirmed` (peer vote with block_hash + sender_key), `BlockQuorumReached` (quorum status broadcast). Each node independently accumulates stake-weighted votes, broadcasts its own vote, and cascades confirmation when quorum is reached.
 
 | Task | Description | Estimate | Status |
 |------|-------------|----------|--------|
-| `send_block_confirmed` | MessageDispatcher method — serializes `Block`, broadcasts to Committers + Archivars | 4h | **DONE** |
-| Wire into `try_finalize_optimistic` | Called after `send_to_committers` in optimistic commit path | 1h | **DONE** |
-| `handle_block_confirmed` | Committer handler — validates chain linkage, validates hash, appends block, distributes to archivars | 4h | **DONE** |
-| Unit tests | 4 committer (valid append, orphan ignored, tampered rejected, unknown token) + 1 dispatcher serialization | 4h | **DONE** |
+| Add `stake_set` to `Message` | `Option<StakeSet>` field — populated only for `BlockFinalized` | 2h | **DONE** |
+| Rename `BlockConfirmed` → `BlockFinalized` | Update MessageDispatcher, finalizer wiring, test names | 2h | **DONE** |
+| Add `send_block_confirmed_vote()` | Vote broadcast — (block_hash, node_key) to all peer types | 2h | **DONE** |
+| Add `send_block_quorum_reached()` | Status broadcast — (block_hash) to all peer types | 2h | **DONE** |
+| Add `stake_set` to Finalizer | `set_stake_set()` / `get_stake_set()` — wired into `BlockFinalized` call | 2h | **DONE** |
+| `handle_block_finalized()` | Validate, append block, cache stake_set, broadcast self-vote, distribute to archivars | 4h | **DONE** |
+| `handle_block_confirmed_vote()` | Deserializes vote, looks up sender stake, accumulates per-block, checks quorum | 4h | **DONE** |
+| `handle_block_quorum_reached()` | Finds block by hash, transitions `finality_status = Confirmed` (DashMap-deadlock-safe) | 3h | **DONE** |
+| `broadcast_vote()` / `broadcast_quorum_reached()` | Committer helpers — serialize and fan-out to all peer node types | 2h | **DONE** |
+| Add confirmation tracking state | `confirmation_votes: Mutex<HashMap<hash, (HashSet<keys>, stake)>>`, `stake_set_cache` | 2h | **DONE** |
+| Add `Blockchain::get_block_at()` / `set_finality_status()` | Core helpers for quorum handler to update block status | 2h | **DONE** |
+| Wire `stake_set: None` | All existing `Message` struct literals across 12 locations in 6 files | 2h | **DONE** |
+| Unit tests | 7 tests (4 renamed handlers, 2 vote tracking, 1 standalone Confirmed transition) | 4h | **DONE** |
 
-**Sub-total**: 13h / ~1 day — **COMPLETE**
+**Sub-total**: ~33h / ~4 days — **COMPLETE**
+
+**Remaining**: `Finalizer.set_stake_set()` exists but no production caller fetches the stake set from DataProvider — external orchestrator needs to wire this. Other node types (Archivars, Sentinels, Executors) don't yet handle the 3 new gossip actions.
 
 ---
 
@@ -570,10 +603,10 @@ This roadmap tracks the work from current foundation state through a production-
 | 2. Executor Execution | ~1-2 days (stub + action bug) | Phase 1 |
 | 3. Finalizer Completion | ~1 day (gossiper wire + placeholder data) | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
-| 5. Optimistic Finality + Block Gossip | ~2 days remaining (confirmed guarantee + concurrency/E2E tests) | Phase 1-4 |
+| 5. Optimistic Finality + Block Gossip | ~1 day remaining (concurrency + E2E pipeline tests) | Phase 1-5d |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
 | 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
-| 5d. Block Awareness Gossip | ✅ Done (13h, ~1 day) | Phase 5c |
+| 5d. Quorum Gossip Protocol | ✅ Done (~33h, ~4 days) | Phase 5d |
 | 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
 | 7. Test Coverage | ~1 week (concurrency + E2E) | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |
