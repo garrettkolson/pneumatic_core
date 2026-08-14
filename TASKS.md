@@ -180,16 +180,16 @@ Audited by external review (`PROTOCOL_CHANGES.md`). Maps to README.md Phase 5.
 
 Resolve these before writing code — choices will ripple through all phases below.
 
-- [ ] **What exactly triggers "a conflict"?** Formal invariant: two different valid `Block`s that both reference the same `previous_hash` for the same token (i.e., two proposers building on the same parent). Nothing in current code can represent this state yet.
-- [ ] **Does the mandatory 2/3 executor quorum go away for standard tokens, or shrink to a minimal-validity check?** Full optimistic finality means most tokens shouldn't need any quorum in the happy path — this is the biggest thing blocking "instant by default."
-- [ ] **Is voting weight for conflict resolution the same global `StakeSet` used for epoch leader election, or a logically separate "representative" set?** Nano keeps these distinct (delegated voting weight vs. block production). Currently only have one pool — worth deciding on purpose.
-- [ ] **What happens to a losing block/proposer?** Just discarded, or slashed via existing (currently unwired) `StakingOp::Slash`? Real forks often indicate bad-faith double-proposing — worth punishing the latter.
+- [x] **What exactly triggers "a conflict"?** Formal invariant: two different valid `Block`s that both reference the same `previous_hash` for the same token (ADR-008: same-parent siblings, CandidateRegistry key)
+- [x] **Does the mandatory 2/3 executor quorum go away for standard tokens, or shrink to a minimal-validity check?** Full optimistic finality means most tokens shouldn't need any quorum in the happy path — this is the biggest thing blocking "instant by default." — **Resolved**: quorum repurposed for conflict-only resolution; happy path needs 1 signature
+- [x] **Is voting weight for conflict resolution the same global `StakeSet` used for epoch leader election, or a logically separate "representative" set?** Nano keeps these distinct (delegated voting weight vs. block production). Currently only have one pool — worth deciding on purpose. — **Resolved**: same `StakeSet` used via `StakeStore`; per-proposer stake resolved from `StakeStore::get_stake()`
+- [x] **What happens to a losing block/proposer?** Just discarded, or slashed via existing (currently unwired) `StakingOp::Slash`? Real forks often indicate bad-faith double-proposing — worth punishing the latter. — **Resolved**: `DiscardLoser` for network races, `SameProposerSlash` for double-proposal (emits `StakingOp::Slash`)
 
-### Phase 1 — Data Model: Represent "Competing Candidates"
+### Phase 1 — Data Model: Represent "Competing Candidates" ✅ COMPLETE
 
-- [ ] Add `CandidateRegistry` (DashMap-backed, keyed by `(token_id, previous_hash) → Vec<(Block, proposer_key)>`) — `src/epoch.rs`
-- [ ] Add `finality_status` enum (`Optimistic`, `Confirmed`) to `Block` struct — `src/blocks.rs`
-- [ ] Add proposer public key to `Block`/`SignedTransaction` if not recoverable from signatures — `src/transactions.rs`, `src/blocks.rs`
+- [x] Add `CandidateRegistry` (DashMap-backed, keyed by `(token_id, previous_hash) → Vec<(Block, proposer_key)>`) — `src/epoch.rs` — DashMap-based concurrent store, 8 tests (6 unit + 2 concurrent)
+- [x] Add `finality_status` enum (`Optimistic`, `Confirmed`) to `Block` struct — `src/blocks.rs` — serialization round-trip tests pass; 4 tests
+- [x] Add proposer public key to `Block`/`SignedTransaction` if not recoverable from signatures — `src/transactions.rs` (`SignedTransaction.proposer_key`), `src/blocks.rs` (`Block.proposer_key`) — propagated from leader_address in BlockProposer and BlockBuilder
 
 ### Phase 2 — Replace Conflict Detection Logic ✅ COMPLETE (2026-08-12)
 
@@ -211,10 +211,10 @@ Resolve these before writing code — choices will ripple through all phases bel
 
 ### Phase 4 — Make Default Path Actually Optimistic
 
-- [ ] For standard tokens: one Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic`
-- [ ] Quorum/voting in `SignatureCollector` repurposed for conflict-resolution only
-- [ ] Define "confirmed" guarantee (e.g., "final after N seconds with no conflict")
-- [ ] Expose via `finality_status`
+- [x] For standard tokens: one Executor executes → one Finalizer signs/dispatches → Committer commits as `Optimistic` — `try_finalize_optimistic()` triggers on first valid signature; `build_signed_transaction_optimistic` + `create_block_optimistic` build block with `FinalityStatus::Optimistic`
+- [x] Quorum/voting in `SignatureCollector` repurposed for conflict-resolution only — `reconcile_signatures()` uses stake-weighted supermajority for conflict paths; optimistic path proceeds with single signature, no quorum wait
+- [ ] Define "confirmed" guarantee (e.g., "final after N seconds with no conflict") — `FinalityStatus::Confirmed` variant exists but no code transitions Optimistic → Confirmed
+- [ ] Expose via `finality_status` — all `try_finalize()` standard path uses placeholder data: `total_stake=0, total_voters=0`, `previous_hash=vec![]`
 
 ### Phase 5 — Block Awareness Gossip ✅ COMPLETE (2026-08-13)
 
@@ -223,21 +223,12 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [x] Add `handle_block_confirmed` to Committer — deserializes Block, validates chain linkage (non-fatal if behind), validates block hash (fatal if tampered), appends to blockchain, distributes to archivars — `committer/src/committer.rs`
 - [x] 5 new tests: 4 committer unit tests (valid append, orphan ignored, tampered rejected, unknown token error) + 1 dispatcher serialization test
 
-### Phase 6 — Testing ✅ COMPLETE
+### Phase 6 — Testing
 
 - [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
 - [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
-- [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
-- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
-
-### Implementation Order Recommendation
-
-Start with **Phase 1 + 2** together (candidate registry + real fork detection) — build and unit-test in isolation without touching the finalizer's quorum behavior. This gives you a correct detector before changing what "instant" means in Phase 4.
-
-- [x] Unit tests: conflict detected at commit time, winner by stake, same-proposer slash, equal-stakes tie-break, no-conflict normal path (4 new tests in committer.rs)
-- [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
-- [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap)
-- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing
+- [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap) — only unit-level stress tests exist in `epoch.rs`, no concurrent committer commit tests
+- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline or the `send_block_confirmed` → `handle_block_confirmed` gossip path
 
 ### Implementation Order Recommendation
 
@@ -779,32 +770,30 @@ Conflict detection operates locally at epoch boundaries via `CandidateRegistry` 
 ### pneumatic_executor — Priority 3 (Started — Phase 3 complete, ~560 lines, 6 tests)
 
 #### Executor — stub contract execution
-**File:** `executor/src/executor.rs:298-304`
-`execute_contract()` serializes the transaction as "execution output" instead of invoking contract bytecode.
+**File:** `executor/src/executor.rs:369-381`
+`execute_contract()` serializes the transaction as "execution output" instead of invoking contract bytecode. Comment reads `// TODO: decode and execute contract bytecode`.
 **Action:** Replace stub with actual contract execution logic.
 
-#### Executor — stub finalizer networking
-**File:** `executor/src/executor.rs:141-162`
-`send_to_finalizer()` broadcasts `Message(action="Execute")` with serialized body, but doesn't build proper execution result or compute result hash.
-**Action:** Build proper execution result, hash with `hash_provider`, include in message.
+#### Executor — finalizer networking has action bug
+**File:** `executor/src/executor.rs:141-181, 344-356`
+`send_to_finalizer()` is wired into `run_execution()` but uses `Message(action="Execute")` while the Finalizer's `handle_signature` method (line 172) expects action `"Sign"`. The Finalizer will never receive these messages — hits `UnknownAction` error path. Method is duplicated in both `Executor` and `ExecutorHandle` (lines 418-445).
+**Action:** Fix action string from `"Execute"` to `"Sign"`; deduplicate between Executor and ExecutorHandle.
 
-#### Executor — `validate_execution_result` never called
+#### ~~Executor — `validate_execution_result` never called~~
 **File:** `executor/src/executor.rs:184-193`
-Checks `result_hash` non-empty but never invoked in the pipeline (execution task calls `preload_cleanup` directly).
-**Action:** Call after `execute_contract`, use result to transition to Finalizing state.
+**FIXED:** Now called in `ExecutorHandle::run_execution` at line 321. Unit tests exist (lines 797-873).
 
-#### Executor — `get_finalizer_key` never called
+#### ~~Executor — `get_finalizer_key` never called~~
 **File:** `executor/src/executor.rs:203-208`
-Returns finalizer key from registry but never used.
-**Action:** Use to send execution result to the correct finalizer.
+**FIXED:** Now called in `ExecutorHandle::run_execution` at line 334. Duplicate between Executor and ExecutorHandle.
 
 ### pneumatic_finalizer — Priority 4 (Complete: 26 tests pass)
 
 Stubbed within implemented methods:
 - `SignatureCollector.reconcile_signatures` — Now fully implemented: sorts candidates by stake descending, accumulates until quorum threshold (2/3) reached, returns winning supermajority set. Sets `winning_finalizer` to the executor that crossed quorum. `conflict_resolved` = true when quorum-crossing signature found. 4 new tests added.
-- `Finalizer.initialize` — Message handler subscription via gossiper stubbed (closure parameter accepted but not wired)
-- `Finalizer.try_finalize` — Steps 5, 7 use placeholder data (total_stake=0, total_voters=0, previous_hash=[])
-- `MessageDispatcher.send_to_all` — Uses NodeRegistry stub, not registered connections (see node/registry.rs:165)
+- `Finalizer.initialize` — Message handler subscription via gossiper stubbed (closure parameter accepted but not wired; no Gossiper field in Finalizer struct)
+- `Finalizer.try_finalize` — Standard (non-optimistic) path uses placeholder data: `total_stake=0, total_voters=0`, `previous_hash=vec![]` (see lines 246, 272). Optimistic path (`try_finalize_optimistic`) has same `previous_hash=vec![]` issue at line 363.
+- ~~`MessageDispatcher.send_to_all` — Uses NodeRegistry stub~~ — **DONE** — now uses `NodeRegistry.send_to_all()` which uses registered `Connection` objects via `futures::future::join_all` (see node/registry.rs fix)
 
 ### pneumatic_committer — Priority 5 (Complete: compiles, Phase 5 tasks done)
 

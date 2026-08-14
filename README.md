@@ -248,7 +248,8 @@ Contract execution with configurable backpressure. Receives preloaded transactio
 
 - **Backpressure**: `max_in_flight` limits concurrent executions; rejects when at capacity
 - **Execution task**: Fetches contract/user data → executes contract → hashes result → transitions to Finalizing → sends to Finalizer
-- **Stub**: Contract execution currently returns serialized transaction as output
+- **Stub**: Contract execution returns serialized transaction as output (line 369)
+- **Bug**: `send_to_finalizer()` uses `action="Execute"` but Finalizer expects `"Sign"` (line 169) — messages are silently dropped
 
 **Test count**: 9
 
@@ -263,6 +264,8 @@ Decomposed from a monolithic C# design into three focused components:
 | `MessageDispatcher` | Sends blocks to committers, clear notifications to sentinels |
 
 Optimistic commit: `handle_signature()` dispatches first valid signature to `try_finalize_optimistic()` for immediate block creation. Subsequent signatures acknowledged for stake accumulation. Epoch tracking: `Finalizer` tracks `current_epoch` for block creation. `BlockBuilder::create_block()` accepts `epoch_number` for hash-chain integrity.
+
+**Stubs**: `initialize()` accepts gossiper closure but doesn't wire it; standard `try_finalize()` uses placeholder data (`total_stake=0`, `total_voters=0`, `previous_hash=vec![]`).
 
 **Test count**: 28
 
@@ -368,15 +371,16 @@ This roadmap tracks the work from current foundation state through a production-
 
 **Goal**: Replace stub contract execution with real computation.
 
-| Task | Description | Estimate |
-|------|-------------|----------|
-| Execute contract bytecode | Decode contract data (bytecode/ABI), run with transaction payload, return computed output | 12h |
-| Build execution result | Proper result structure with transaction id, computed data, result hash | 4h |
-| Wire `validate_execution_result` | Call after `execute_contract`; use result to transition to Finalizing state | 4h |
-| Wire `get_finalizer_key` | Use assigned finalizer key from validation result when sending to finalizer | 2h |
-| Result serialization | Define wire format for execution result (MsgPack struct) | 4h |
+| Task | Description | Estimate | Status |
+|------|-------------|----------|--------|
+| Execute contract bytecode | Decode contract data (bytecode/ABI), run with transaction payload, return computed output | 12h | **Stub** — returns serialized tx body (line 369) |
+| Fix `send_to_finalizer` action | `Message(action="Execute")` should be `"Sign"` — current value causes Finalizer to drop messages | 2h | **Bug** |
+| Wire `validate_execution_result` | Call after `execute_contract`; use result to transition to Finalizing state | 4h | **DONE** — called in `ExecutorHandle::run_execution` (line 321) |
+| Wire `get_finalizer_key` | Use assigned finalizer key from validation result when sending to finalizer | 2h | **DONE** — called in `ExecutorHandle::run_execution` (line 334) |
+| Result serialization | Define wire format for execution result (MsgPack struct) | 4h | **Stub** |
+| Deduplicate Executor/ExecutorHandle | `send_to_finalizer`, `validate_execution_result`, `get_finalizer_key` duplicated between types | 2h | **Technical debt** |
 
-**Sub-total**: 26h / ~3 days
+**Sub-total**: 26h / ~3 days — 2 tasks remaining (contract execution + action bug fix)
 
 ---
 
@@ -388,13 +392,13 @@ This roadmap tracks the work from current foundation state through a production-
 |------|-------------|----------|--------|
 | Wire `initialize()` | Subscribe to "Preload" and "Sign" actions via Gossiper message router | 4h | Open |
 | Fill `try_finalize` stake/voter fields | Get `total_stake`/`total_voters` from `EnvironmentMetadata` instead of hardcoded 0 | 2h | Open |
-| Wire `previous_hash` | Get actual chain state's last hash from token's blockchain | 4h | Open |
+| Wire `previous_hash` | Get actual chain state's last hash from token's blockchain | 4h | Open — affects both `try_finalize` and `try_finalize_optimistic` |
 | `SignatureCollector.reconcile_signatures` | Implement stake-weighted conflict resolution (supermajority vote) | 6h | **DONE** |
 | Message dispatcher | Use registered connections instead of `NodeRegistry.send_to_all` stub | 4h | **DONE** |
 | Shutdown handling | Proper drain of in-flight tasks on shutdown | 2h | **DONE** |
 | Epoch tracking | `Finalizer.current_epoch` field, `advance_epoch()` accessor, wire into block creation | 4h | **DONE** (Phase 5) |
 
-**Sub-total**: 26h / ~3 days — 2 tasks remaining
+**Sub-total**: 26h / ~3 days — 2 tasks remaining (gossiper init + placeholder data for standard path)
 
 ---
 
@@ -432,10 +436,11 @@ This roadmap tracks the work from current foundation state through a production-
 | Replace `EpochReconciler::reconcile_internal()` | Same-chain conflict detection via `CandidateRegistry`; fill `stake_a`/`stake_b` from `StakeStore` | 12h | **DONE** |
 | Wire `resolve_block_conflict()` into commit path | On detection, commit winner, drop loser, optionally slash double-proposers, broadcast via gossiper | 8h | **DONE** |
 | Replace quorum gate with optimistic path | One Executor executes (shard-aware) → one Finalizer signs/dispatches → Committer commits as `Optimistic`; quorum machinery repurposed for conflict-only resolution | 16h | **DONE** |
-| Add vote/dispute message types | New `Message` variant for "I saw candidate block" and "I vote for block X" | 8h | Open |
-| Conflict-vote aggregation | `SignatureCollector`-like struct scoped to conflicts rather than per-transaction quorum | 8h | Open |
+| ~~Add vote/dispute message types~~ | Replaced with `BlockConfirmed` gossip message (executor sharding eliminates need for distributed voting) | — | **DONE** (replaced by gossip) |
+| ~~Conflict-vote aggregation~~ | Conflict detection operates locally at epoch boundaries via `CandidateRegistry` + `resolve_block_conflict()` | — | **DONE** (replaced by local detection) |
 | Conflict scenario tests | Two proposers, same `previous_hash` → `CandidateRegistry` catch → `resolve_block_conflict` → hash tie-break | 8h | **DONE** (4 committer tests: no conflict, conflict+stake, conflict+slash, conflict+no candidates) |
-| Concurrency + e2e pipeline tests | Submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing | 12h | Open |
+| **Define "confirmed" guarantee** | `FinalityStatus::Confirmed` variant exists but no code transitions Optimistic → Confirmed | 8h | **Open** |
+| **Concurrency + e2e pipeline tests** | Near-simultaneous candidate submission (Arc-shared DashMap); full pipeline (submit → optimistic → confirmed; submit → conflict → resolved → slashing) | 12h | **Open** |
 
 **Sub-total**: ~52h / ~1 week remaining — 11h saved (enriched resolve_block_conflict + wired commit path + 4 new tests)
 
@@ -562,15 +567,15 @@ This roadmap tracks the work from current foundation state through a production-
 |-------|--------|------------------------|
 | 0. Foundation | ✅ Done | — |
 | 1. Sentinel Integration | ✅ Done (40 tests, ~8h) | Phase 0 |
-| 2. Executor Execution | ~3 days | Phase 1 (Partial — can run in parallel with Sentinel wiring) |
-| 3. Finalizer Completion | ~3 days (3 tasks left) | Phase 1, 2 |
+| 2. Executor Execution | ~1-2 days (stub + action bug) | Phase 1 |
+| 3. Finalizer Completion | ~1 day (gossiper wire + placeholder data) | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
-| 5. Optimistic Finality + Block Gossip | ~2 weeks remaining | Phase 1-4 |
+| 5. Optimistic Finality + Block Gossip | ~2 days remaining (confirmed guarantee + concurrency/E2E tests) | Phase 1-4 |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
 | 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
 | 5d. Block Awareness Gossip | ✅ Done (13h, ~1 day) | Phase 5c |
 | 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
-| 7. Test Coverage | ~1 week | Phase 1-5 |
+| 7. Test Coverage | ~1 week (concurrency + E2E) | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |
 
 **MVP Total**: ~14 weeks (with parallel work: ~9 weeks)
