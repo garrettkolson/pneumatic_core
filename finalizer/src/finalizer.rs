@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use pneumatic_core::blocks::Block;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::HashProvider;
+use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
 use pneumatic_core::epoch::StakeSet;
@@ -22,6 +23,7 @@ use pneumatic_core::transactions::{
 use crate::block_builder::BlockBuilder;
 use crate::message_dispatcher::MessageDispatcher;
 use crate::signature_collector::SignatureCollector;
+use crate::stake_snapshot_cache::StakeSnapshotCache;
 
 // ---------------------------------------------------------------------------
 // Finalizer — quorum checking, block formation, and distribution
@@ -64,8 +66,12 @@ pub struct Finalizer {
     /// Current epoch number — used when building blocks.
     /// Updated when blocks from the chain are received.
     current_epoch: u64,
+    /// Stake snapshot cache — fetches the current epoch's stake set from the
+    /// DataProvider (with local caching) for quorum gossip.
+    stake_cache: StakeSnapshotCache,
     /// Current stake set for quorum gossip.
-    /// Set by the caller before the finalizer begins finalizing transactions.
+    /// Manual override via `set_stake_set` — used by tests. In production this
+    /// stays `None` and `get_stake_set_for_epoch` uses the cache instead.
     stake_set: Option<StakeSet>,
 }
 
@@ -78,6 +84,9 @@ impl Finalizer {
     /// `verifying_key` is derived from the signing key.
     /// `leader_address/stake/hash` are from the environment's leader.
     /// `current_epoch` is the starting epoch number for block building.
+    /// `data_provider` is used to fetch the current epoch's stake snapshot
+    /// for quorum gossip (`BlockFinalized` messages).
+    /// `partition_id` is the token partition ID used as the DataProvider key.
     pub fn new(
         env_id: String,
         public_key: Vec<u8>,
@@ -93,6 +102,8 @@ impl Finalizer {
         leader_stake: u64,
         leader_hash: Vec<u8>,
         current_epoch: u64,
+        data_provider: Arc<dyn DataProvider>,
+        partition_id: String,
     ) -> Self {
         let signature_collector = SignatureCollector::new(
             signature_registry.clone(),
@@ -130,6 +141,7 @@ impl Finalizer {
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
             current_epoch,
+            stake_cache: StakeSnapshotCache::new(data_provider, partition_id),
             stake_set: None,
         }
     }
@@ -143,9 +155,20 @@ impl Finalizer {
         self.stake_set = Some(stake_set);
     }
 
-    /// Get the current stake set, if set.
+    /// Get the current stake set, if set manually.
     pub fn get_stake_set(&self) -> Option<&StakeSet> {
         self.stake_set.as_ref()
+    }
+
+    /// Get the stake set for the current epoch.
+    ///
+    /// Priority: (1) manually set via `set_stake_set` (test override),
+    /// (2) cached/fetched from DataProvider (production path).
+    fn get_stake_set_for_epoch(&self) -> Option<StakeSet> {
+        if let Some(s) = &self.stake_set {
+            return Some(s.clone());
+        }
+        self.stake_cache.get(self.current_epoch)
     }
 
     /// Initialize the finalizer — subscribe to message handlers.
@@ -396,8 +419,10 @@ impl Finalizer {
         };
         self.message_dispatcher.send_to_committers(commit).await?;
 
-        // Step 7.5: Broadcast block finalized to all committers and archivars via gossip
-        let stake_set = self.stake_set.clone();
+        // Step 7.5: Broadcast block finalized to all committers and archivars via gossip.
+        // Fetches the current epoch's stake set (cached) so receiving nodes
+        // can perform stake-weighted confirmation tracking.
+        let stake_set = self.get_stake_set_for_epoch();
         self.message_dispatcher
             .send_block_finalized(block, stake_set)
             .await?;
@@ -448,8 +473,12 @@ impl Finalizer {
 
     /// Advance to a new epoch. Called when the finalizer receives
     /// blocks indicating an epoch transition.
+    ///
+    /// Invalidates the stake snapshot cache so the new epoch's stake set
+    /// is freshly fetched from the DataProvider on next use.
     pub fn advance_epoch(&mut self) {
         self.current_epoch += 1;
+        self.stake_cache.invalidate_all();
     }
 }
 
@@ -463,6 +492,7 @@ mod tests {
     use dashmap::DashMap;
     use pneumatic_core::config::Config;
     use pneumatic_core::crypto::BasicHashProvider;
+    use pneumatic_core::data::StubDataProvider;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::node::{NodeRegistryType, NodeType};
     use pneumatic_core::transactions::{PendingTransaction, TransactionState};
@@ -592,6 +622,41 @@ mod tests {
             100,              // leader stake
             vec![40, 50, 60], // leader hash
             0,                // current_epoch
+            Arc::new(StubDataProvider::new()),
+            "test_env".to_string(),
+        )
+    }
+
+    /// Factory that wires a DataProvider with a pre-seeded stake snapshot
+    /// for the given epoch, so stake fetching tests can verify the
+    /// `BlockFinalized` gossip path.
+    fn make_finalizer_with_data_provider(
+        pending_registry: Arc<PendingTransactionRegistry>,
+        data_provider: Arc<StubDataProvider>,
+    ) -> Finalizer {
+        let node_registry = make_test_node_registry();
+        let signature_registry = Arc::new(TransactionSignatureRegistry::new());
+        let hash_provider = Arc::new(BasicHashProvider::new());
+
+        let (signing_key, verifying_key) = make_test_signing_key();
+
+        Finalizer::new(
+            "test_env".to_string(),
+            vec![1, 2, 3, 4],
+            node_registry,
+            pending_registry,
+            signature_registry,
+            67.0,   // quorum
+            3,      // total voters
+            signing_key,
+            verifying_key,
+            hash_provider,
+            vec![10, 20, 30], // leader address
+            100,              // leader stake
+            vec![40, 50, 60], // leader hash
+            0,                // current_epoch
+            data_provider,
+            "test_env".to_string(),
         )
     }
 
@@ -701,5 +766,64 @@ mod tests {
 
         finalizer.initiate_shutdown().await;
         assert!(finalizer.is_shutting_down().await);
+    }
+
+    fn make_stake_set(stakes: Vec<(Vec<u8>, u64)>) -> StakeSet {
+        StakeSet {
+            stakers: stakes.into_iter().collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stake_cache_fetched_from_data_provider() {
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new().with_stake_snapshot(0, make_stake_set(vec![(b"executor_1".to_vec(), 100)])),
+        );
+        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        // First call — DataProvider fallback, result cached locally
+        let fetched = finalizer.get_stake_set_for_epoch().unwrap();
+        assert_eq!(fetched.total_stake(), 100);
+        assert_eq!(finalizer.stake_cache.cached_count(), 1);
+
+        // Second call — local cache hit, same stake set
+        let fetched = finalizer.get_stake_set_for_epoch().unwrap();
+        assert_eq!(fetched.total_stake(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_stake_cache_invalidated_on_advance_epoch() {
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new()
+                .with_stake_snapshot(0, make_stake_set(vec![(vec![1], 100)]))
+                .with_stake_snapshot(1, make_stake_set(vec![(vec![2], 200)])),
+        );
+        let mut finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        // Prime the cache with epoch 0's snapshot
+        assert_eq!(finalizer.get_stake_set_for_epoch().unwrap().total_stake(), 100);
+        assert_eq!(finalizer.stake_cache.cached_count(), 1);
+
+        finalizer.advance_epoch();
+        assert_eq!(finalizer.stake_cache.cached_count(), 0);
+
+        // Next fetch pulls the new epoch's snapshot fresh from the DataProvider
+        assert_eq!(finalizer.get_stake_set_for_epoch().unwrap().total_stake(), 200);
+        assert_eq!(finalizer.stake_cache.cached_count(), 1);
+    }
+
+    #[test]
+    fn test_get_stake_set_falls_back_to_manual_override() {
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new().with_stake_snapshot(0, make_stake_set(vec![(vec![1], 100)])),
+        );
+        let mut finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        // Manual override takes priority over the cache (backward compat for tests)
+        finalizer.set_stake_set(make_stake_set(vec![(vec![9], 50)]));
+        assert_eq!(finalizer.get_stake_set_for_epoch().unwrap().total_stake(), 50);
     }
 }

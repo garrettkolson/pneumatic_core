@@ -953,6 +953,8 @@ dependencies = [
  "chrono",
  "dashmap",
  "ed25519-dalek",
+ "log",
+ "parking_lot",
  "pneumatic_core",
  "rand",
  "serde",

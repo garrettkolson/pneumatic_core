@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 377 tests across 5 crate targets
+cargo test --workspace --lib   # Run 385 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -310,7 +310,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 377 tests: 272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer
+# 385 tests: 272 core + 40 sentinel + 36 finalizer + 9 executor + 28 committer
 ```
 
 ---
@@ -321,7 +321,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 377 tests passing across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer), all core types and traits implemented.
+**Status: COMPLETE** — 385 tests passing across 5 crate targets (272 core + 40 sentinel + 36 finalizer + 9 executor + 28 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -503,6 +503,7 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 | Add `send_block_confirmed_vote()` | Vote broadcast — (block_hash, node_key) to all peer types | 2h | **DONE** |
 | Add `send_block_quorum_reached()` | Status broadcast — (block_hash) to all peer types | 2h | **DONE** |
 | Add `stake_set` to Finalizer | `set_stake_set()` / `get_stake_set()` — wired into `BlockFinalized` call | 2h | **DONE** |
+| Internal stake fetching in Finalizer | `StakeSnapshotCache` (local → DataProvider) wired into `Finalizer::new`; `get_stake_set_for_epoch()` resolves manual override → cache; cache invalidated on `advance_epoch` — `BlockFinalized` now carries real stakes | 4h | **DONE** |
 | `handle_block_finalized()` | Validate, append block, cache stake_set, broadcast self-vote, distribute to archivars | 4h | **DONE** |
 | `handle_block_confirmed_vote()` | Deserializes vote, looks up sender stake, accumulates per-block, checks quorum | 4h | **DONE** |
 | `handle_block_quorum_reached()` | Finds block by hash, transitions `finality_status = Confirmed` (DashMap-deadlock-safe) | 3h | **DONE** |
@@ -512,9 +513,9 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 | Wire `stake_set: None` | All existing `Message` struct literals across 12 locations in 6 files | 2h | **DONE** |
 | Unit tests | 7 tests (4 renamed handlers, 2 vote tracking, 1 standalone Confirmed transition) | 4h | **DONE** |
 
-**Sub-total**: ~33h / ~4 days — **COMPLETE**
+**Sub-total**: ~37h / ~4.5 days — **COMPLETE**
 
-**Remaining**: `Finalizer.set_stake_set()` exists but no production caller fetches the stake set from DataProvider — external orchestrator needs to wire this. Other node types (Archivars, Sentinels, Executors) don't yet handle the 3 new gossip actions.
+**Remaining**: Other node types (Archivars, Sentinels, Executors) don't yet handle the 3 new gossip actions. (Stake fetching is now internal to the Finalizer — no external orchestration needed; `set_stake_set()` remains as a test override.)
 
 ---
 
