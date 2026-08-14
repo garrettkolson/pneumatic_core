@@ -3,6 +3,7 @@ use std::sync::Arc;
 use pneumatic_core::blocks::Block;
 use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::errors::PneumaticError;
+use pneumatic_core::epoch::StakeSet;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
@@ -60,6 +61,7 @@ impl MessageDispatcher {
             body: msg_body,
             signature: self.finalizer_signature.clone(),
             public_key: self.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&message)
@@ -87,6 +89,7 @@ impl MessageDispatcher {
             body: msg_body,
             signature: self.finalizer_signature.clone(),
             public_key: self.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&message)
@@ -98,11 +101,16 @@ impl MessageDispatcher {
         Ok(())
     }
 
-    /// Broadcast a BlockConfirmed message to all Committers and Archivars.
+    /// Broadcast a BlockFinalized message to all Committers and Archivars.
     ///
-    /// Sent after an optimistic commit so that other nodes can learn about
-    /// the committed block without fetching from an archiver.
-    pub async fn send_block_confirmed(&self, block: Block) -> Result<(), PneumaticError> {
+    /// Sent after an optimistic commit to inform peer nodes that a block
+    /// has been finalized. Includes the stake set (if available) so
+    /// receiving nodes can perform stake-weighted confirmation tracking.
+    pub async fn send_block_finalized(
+        &self,
+        block: Block,
+        stake_set: Option<StakeSet>,
+    ) -> Result<(), PneumaticError> {
         // Serialize the block as the message body
         let msg_body = serialize_to_bytes_rmp(&block)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -110,10 +118,11 @@ impl MessageDispatcher {
         // Package as a wire message
         let message = Message {
             chain_id: self.env_id.clone(),
-            action: String::from("BlockConfirmed"),
+            action: String::from("BlockFinalized"),
             body: msg_body,
             signature: self.finalizer_signature.clone(),
             public_key: self.public_key.clone(),
+            stake_set,
         };
 
         let payload = serialize_to_bytes_rmp(&message)
@@ -126,6 +135,77 @@ impl MessageDispatcher {
         // Broadcast to all archivars
         self.node_registry
             .send_to_all(payload, &NodeRegistryType::Archiver).await;
+
+        Ok(())
+    }
+
+    /// Broadcast a BlockConfirmed vote from this node.
+    ///
+    /// Sent by any node that has received and validated a BlockFinalized message.
+    /// Contains the block hash and this node's public key as a vote.
+    pub async fn send_block_confirmed_vote(&self, block_hash: &[u8]) -> Result<(), PneumaticError> {
+        // Serialize block hash + node key as body
+        let body = serialize_to_bytes_rmp(&(block_hash.to_vec(), self.public_key.clone()))
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Package as a wire message
+        let message = Message {
+            chain_id: self.env_id.clone(),
+            action: String::from("BlockConfirmed"),
+            body,
+            signature: vec![],
+            public_key: self.public_key.clone(),
+            stake_set: None,
+        };
+
+        let payload = serialize_to_bytes_rmp(&message)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Broadcast to all other nodes of each type
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Committer).await;
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Archiver).await;
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Executor).await;
+        self.node_registry
+            .send_to_all(payload, &NodeRegistryType::Sentinel).await;
+
+        Ok(())
+    }
+
+    /// Broadcast a BlockQuorumReached status update.
+    ///
+    /// Sent by the node that first reaches quorum, telling all peers
+    /// that a block has been confirmed.
+    pub async fn send_block_quorum_reached(
+        &self,
+        block_hash: &[u8],
+    ) -> Result<(), PneumaticError> {
+        let body = serialize_to_bytes_rmp(&block_hash.to_vec())
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        let message = Message {
+            chain_id: self.env_id.clone(),
+            action: String::from("BlockQuorumReached"),
+            body,
+            signature: vec![],
+            public_key: self.public_key.clone(),
+            stake_set: None,
+        };
+
+        let payload = serialize_to_bytes_rmp(&message)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Broadcast to all other node types
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Committer).await;
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Archiver).await;
+        self.node_registry
+            .send_to_all(payload.clone(), &NodeRegistryType::Executor).await;
+        self.node_registry
+            .send_to_all(payload, &NodeRegistryType::Sentinel).await;
 
         Ok(())
     }
@@ -257,8 +337,8 @@ mod tests {
     }
 
     #[test]
-    fn test_block_confirmed_serializes() {
-        // Verify BlockConfirmed serialization produces a valid MsgPack message
+    fn test_block_finalized_serializes() {
+        // Verify BlockFinalized serialization produces a valid MsgPack message
         let block = Block {
             signed_trans: SignedTransaction::test_transaction(),
             token_metadata: HashMap::new(),
@@ -273,17 +353,18 @@ mod tests {
         let body = serialize_to_bytes_rmp(&block).expect("Block serialization should succeed");
         let message = Message {
             chain_id: "test_env".to_string(),
-            action: String::from("BlockConfirmed"),
+            action: String::from("BlockFinalized"),
             body,
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&message).expect("Message serialization should succeed");
 
         // Verify round-trip deserialization
         let recovered: Message = deserialize_rmp_to(&payload).expect("Round-trip should succeed");
-        assert_eq!(recovered.action, "BlockConfirmed");
+        assert_eq!(recovered.action, "BlockFinalized");
         assert_eq!(recovered.chain_id, "test_env");
 
         let recovered_block: Block = deserialize_rmp_to(&recovered.body).expect("Block deserialization should succeed");

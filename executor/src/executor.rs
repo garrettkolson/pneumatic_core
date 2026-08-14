@@ -170,6 +170,7 @@ impl Executor {
             body: msg_body,
             signature: finalizer_key.to_vec(),
             public_key: self.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
@@ -434,6 +435,7 @@ impl ExecutorHandle {
             body: msg_body,
             signature: finalizer_key.to_vec(),
             public_key: self.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;

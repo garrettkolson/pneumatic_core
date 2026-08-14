@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::epoch::StakeSet;
+
 /// Wire-format message between services.
 /// `chain_id` identifies the environment/token blockchain.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -14,6 +16,10 @@ pub struct Message {
     pub signature: Vec<u8>,
     /// Public key of the sender
     pub public_key: Vec<u8>,
+    /// Stake set for quorum gossip — populated only on "BlockFinalized" messages.
+    /// Enables receiving nodes to perform stake-weighted confirmation tracking.
+    #[serde(default)]
+    pub stake_set: Option<StakeSet>,
 }
 
 /// Generic typed message body for parameterized actions.

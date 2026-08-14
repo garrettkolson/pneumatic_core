@@ -34,6 +34,7 @@ impl TransactionNotifier {
             body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -53,6 +54,7 @@ impl TransactionNotifier {
             body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -93,6 +95,7 @@ impl TransactionNotifier {
             body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
             signature: finalizer_key.to_vec(),
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -108,6 +111,7 @@ impl TransactionNotifier {
             body,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -123,6 +127,7 @@ impl TransactionNotifier {
             body,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -141,6 +146,7 @@ impl TransactionNotifier {
             body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
@@ -161,6 +167,7 @@ impl TransactionNotifier {
             body: serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?,
             signature: vec![],
             public_key: self.config.public_key.clone(),
+            stake_set: None,
         };
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;

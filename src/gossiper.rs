@@ -173,6 +173,7 @@ mod tests {
             body,
             signature: sig,
             public_key: pk,
+            stake_set: None,
         }
     }
 

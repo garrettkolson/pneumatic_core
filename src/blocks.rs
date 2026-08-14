@@ -165,6 +165,27 @@ impl Blockchain {
                 && BlockFactory::create_hash(next_block) == next_block.current_hash,
         }
     }
+
+    /// Get a block by index. Returns None if out of range.
+    pub fn get_block_at(&self, index: usize) -> Option<&Block> {
+        self.chain.get(index)
+    }
+
+    /// Set the finality status of a block by hash.
+    /// Returns Ok(()) if found, Err(()) if block hash not in chain.
+    pub fn set_finality_status(
+        &mut self,
+        block_hash: &[u8],
+        status: FinalityStatus,
+    ) -> Result<(), ()> {
+        for block in self.chain.iter_mut() {
+            if block.current_hash == block_hash {
+                block.finality_status = status;
+                return Ok(());
+            }
+        }
+        Err(())
+    }
 }
 
 pub struct ChainState {

@@ -760,6 +760,7 @@ mod tests {
             body: vec![],
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -790,6 +791,7 @@ mod tests {
             }).unwrap(),
             signature: vec![1, 2, 3],
             public_key: vec![4, 5, 6],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -814,6 +816,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_clear".to_string()).unwrap(),
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1041,6 +1044,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_confirm".to_string()).unwrap(),
             signature: vec![],
             public_key: finalizer_key,
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1064,6 +1068,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_bad_confirm".to_string()).unwrap(),
             signature: vec![],
             public_key: vec![1, 2, 3], // wrong key
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1086,6 +1091,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_no_finalizer".to_string()).unwrap(),
             signature: vec![],
             public_key: vec![99],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1108,6 +1114,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_reject".to_string()).unwrap(),
             signature: vec![],
             public_key: rejected_key,
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1131,6 +1138,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_bad_reject".to_string()).unwrap(),
             signature: vec![],
             public_key: vec![5, 6, 7],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1165,6 +1173,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&"tx_terminal".to_string()).unwrap(),
             signature: vec![],
             public_key: vec![1],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1199,6 +1208,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&req).unwrap(),
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1239,6 +1249,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&req).unwrap(),
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);
@@ -1272,6 +1283,7 @@ mod tests {
             body: serialize_to_bytes_rmp(&req).unwrap(),
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
         let raw = serialize_to_bytes_rmp(&msg).unwrap();
         let result = sentinel.on_data_received(raw);

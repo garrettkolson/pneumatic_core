@@ -30,6 +30,8 @@ pub enum CommitterError {
     UnknownAction(String),
     /// Underlying PneumaticError from core
     Core(pneumatic_core::errors::PneumaticError),
+    /// Internal serialization failure (gossip protocol)
+    InternalSerialization,
 }
 
 impl From<io::Error> for CommitterError {

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -5,14 +6,16 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use pneumatic_core::data::DataProvider;
-use pneumatic_core::encoding::deserialize_rmp_to;
+use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
+
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, ConflictResolution, EpochBoundaryDetector, ExecutorSet, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet, resolve_block_conflict};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::tokens::Token;
 use pneumatic_core::transactions::{SignedTransaction, TransactionCommit, TransactionState};
@@ -81,6 +84,12 @@ pub struct Committer {
     epoch_duration: i64,
     /// Interval between proposal polls in milliseconds
     proposal_interval_ms: u64,
+    /// Per-block confirmation tracking: block_hash -> (confirmed keys, cumulative stake)
+    /// Used for quorum gossip to track which nodes have confirmed which blocks.
+    confirmation_votes: Mutex<HashMap<Vec<u8>, (HashSet<Vec<u8>>, u64)>>,
+    /// Cache of stake sets received via BlockFinalized messages, keyed by block hash.
+    /// Used to look up sender stakes when processing BlockConfirmed votes.
+    stake_set_cache: Mutex<HashMap<Vec<u8>, StakeSet>>,
 }
 
 impl Committer {
@@ -127,6 +136,8 @@ impl Committer {
             epoch_duration,
             proposal_interval_ms,
             candidate_registry,
+            confirmation_votes: Mutex::new(HashMap::new()),
+            stake_set_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -168,7 +179,9 @@ impl Committer {
             "DistributeToken" => self.handle_token_distribution(message).await,
             "DistributeBlock" => self.handle_block_distribution(message).await,
             "EpochReconcile" => self.handle_epoch_reconcile().await,
-            "BlockConfirmed" => self.handle_block_confirmed(message).await,
+            "BlockFinalized" => self.handle_block_finalized(message).await,
+            "BlockConfirmed" => self.handle_block_confirmed_vote(message).await,
+            "BlockQuorumReached" => self.handle_block_quorum_reached(message).await,
             action => Err(CommitterError::UnknownAction(action.to_string())),
         }
     }
@@ -320,19 +333,26 @@ impl Committer {
     }
 
     // -----------------------------------------------------------------------
-    // Block confirmation gossip handling
+    // Block quorum gossip handling
     // -----------------------------------------------------------------------
 
-    /// Handle "BlockConfirmed" gossip from the finalizer.
+    /// Handle "BlockFinalized" gossip from the finalizer.
     ///
-    /// This is a notification path — the block was already committed by
-    /// the primary committer. This handler updates local chain state
-    /// so other committers stay in sync.
-    async fn handle_block_confirmed(&self, message: Message) -> Result<(), CommitterError> {
+    /// This is the entry point for quorum gossip — the finalizer has
+    /// committed a block and is broadcasting it to all nodes.
+    /// Receivers validate the block, append it, and broadcast a vote.
+    async fn handle_block_finalized(&self, message: Message) -> Result<(), CommitterError> {
         let block: Block = deserialize_rmp_to(&message.body)
             .map_err(CommitterError::Deserialization)?;
 
+        let block_hash = block.current_hash.clone();
         let token_id = &block.signed_trans.transaction.token_id;
+
+        // Cache the stake set for later vote processing
+        if let Some(ref stake_set) = message.stake_set {
+            let mut cache = self.stake_set_cache.lock().await;
+            cache.insert(block_hash.clone(), stake_set.clone());
+        }
 
         // Check token exists, get chain tip for validation
         let tip = {
@@ -345,7 +365,7 @@ impl Committer {
         // Validate chain linkage (non-fatal if node is behind)
         if block.previous_hash != tip.last_hash_in {
             self.env_data.logger.log(format!(
-                "BlockConfirmed: previous_hash mismatch for token [{}], ignoring",
+                "BlockFinalized: previous_hash mismatch for token [{}], ignoring",
                 bytes_to_hex(token_id)
             ));
             return Ok(());
@@ -355,7 +375,7 @@ impl Committer {
         let expected_hash = BlockFactory::create_hash(&block);
         if expected_hash != block.current_hash {
             self.env_data.logger.log(format!(
-                "BlockConfirmed: invalid hash for token [{}], rejecting",
+                "BlockFinalized: invalid hash for token [{}], rejecting",
                 bytes_to_hex(token_id)
             ));
             return Err(CommitterError::InvalidBlockHash);
@@ -372,7 +392,157 @@ impl Committer {
         // Distribute to archivars (propagate gossip)
         let _ = self.block_services.distribute_to_archivers(&block).await;
 
+        // Broadcast our own vote: we've received and validated this block
+        self.broadcast_vote(&block_hash).await;
+
         Ok(())
+    }
+
+    /// Handle "BlockConfirmed" vote from peers.
+    ///
+    /// Each node that validates a BlockFinalized message broadcasts a vote.
+    /// This handler accumulates votes and checks for quorum.
+    async fn handle_block_confirmed_vote(&self, message: Message) -> Result<(), CommitterError> {
+        // Deserialize vote: (block_hash, voter_public_key)
+        let (block_hash, voter_key): (Vec<u8>, Vec<u8>) =
+            deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
+
+        // Look up stake set for this block
+        let cumulative_stake = {
+            let cache = self.stake_set_cache.lock().await;
+            let stake_set = match cache.get(&block_hash) {
+                Some(ss) => ss,
+                None => {
+                    // Vote received before BlockFinalized — ignore
+                    return Ok(());
+                }
+            };
+
+            let voting_stake = stake_set.get_stake(&voter_key);
+
+            // Skip our own vote (we already voted via handle_block_finalized)
+            if voter_key == self.public_key {
+                return Ok(());
+            }
+
+            // Accumulate vote
+            let mut votes = self.confirmation_votes.lock().await;
+            let entry = votes.entry(block_hash.clone()).or_insert_with(|| {
+                (HashSet::new(), 0u64)
+            });
+
+            // Count stake only once per key
+            if !entry.0.insert(voter_key) {
+                // Already counted
+                return Ok(());
+            }
+
+            entry.1 = entry.1.saturating_add(voting_stake);
+            entry.1
+        };
+
+        // Check if quorum reached
+        if cumulative_stake > 0 {
+            let total_stake = {
+                let cache = self.stake_set_cache.lock().await;
+                cache.get(&block_hash).map(|ss| ss.total_stake())
+            };
+
+            if let Some(total) = total_stake {
+                let quorum_threshold = total as f64 * (self.env_data.quorum_percentage as f64) / 100.0;
+                if cumulative_stake as f64 >= quorum_threshold {
+                    // Quorum reached — broadcast status to all peers
+                    let _ = self.broadcast_quorum_reached(&block_hash).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle "BlockQuorumReached" status update.
+    ///
+    /// All nodes that receive this transition the block to Confirmed.
+    /// No further quorum check needed — the broadcaster verified quorum.
+    async fn handle_block_quorum_reached(&self, message: Message) -> Result<(), CommitterError> {
+        let block_hash: Vec<u8> =
+            deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
+
+        // Find matching token id without holding a read lock across mutation.
+        let mut matched_token_id: Option<Vec<u8>> = None;
+        for token_entry in self.tokens.iter() {
+            let token = token_entry.value();
+            let count = token.blockchain.get_count();
+            if count == 0 {
+                continue;
+            }
+            if let Some(tip) = token.blockchain.get_block_at(count - 1) {
+                if tip.current_hash == block_hash {
+                    matched_token_id = Some(token.id.clone());
+                    break;
+                }
+            }
+        }
+
+        if let Some(token_id) = matched_token_id {
+            let mut entry = self.tokens.get_mut(&token_id).ok_or_else(|| {
+                CommitterError::TokenNotFound(bytes_to_hex(&token_id))
+            })?;
+            let _ = entry.value_mut().blockchain.set_finality_status(&block_hash, FinalityStatus::Confirmed);
+        }
+
+        Ok(())
+    }
+
+    /// Broadcast BlockQuorumReached to all peer node types.
+    async fn broadcast_quorum_reached(&self, block_hash: &[u8]) -> Result<(), CommitterError> {
+        let body = serialize_to_bytes_rmp(&block_hash.to_vec())
+            .map_err(|_| CommitterError::InternalSerialization)?;
+
+        let message = Message {
+            chain_id: self.env_data.environment_id.clone(),
+            action: String::from("BlockQuorumReached"),
+            body,
+            signature: vec![],
+            public_key: self.public_key.clone(),
+            stake_set: None,
+        };
+
+        let payload = serialize_to_bytes_rmp(&message)
+            .map_err(|_| CommitterError::InternalSerialization)?;
+
+        // Broadcast to all other node types
+        let _ = self.node_registry.send_to_all(payload.clone(), &NodeRegistryType::Committer).await;
+        let _ = self.node_registry.send_to_all(payload.clone(), &NodeRegistryType::Archiver).await;
+        let _ = self.node_registry.send_to_all(payload.clone(), &NodeRegistryType::Executor).await;
+        let _ = self.node_registry.send_to_all(payload, &NodeRegistryType::Sentinel).await;
+
+        Ok(())
+    }
+
+    /// Broadcast a BlockConfirmed vote from this committer.
+    /// Called after handle_block_finalized to vote on a block.
+    async fn broadcast_vote(&self, block_hash: &[u8]) {
+        // Serialize vote: (block_hash, this node's public key)
+        let body = serialize_to_bytes_rmp(&(block_hash.to_vec(), self.public_key.clone()))
+            .map_err(|_| ());
+
+        let payload = serialize_to_bytes_rmp(&Message {
+            chain_id: self.env_data.environment_id.clone(),
+            action: String::from("BlockConfirmed"),
+            body: body.unwrap_or_default(),
+            signature: vec![],
+            public_key: self.public_key.clone(),
+            stake_set: None,
+        })
+        .map_err(|_| ());
+
+        if let Ok(p) = payload {
+            let _ = self.node_registry.send_to_all(p.clone(), &NodeRegistryType::Committer).await;
+            let _ = self.node_registry.send_to_all(p.clone(), &NodeRegistryType::Archiver).await;
+            let _ = self.node_registry.send_to_all(p.clone(), &NodeRegistryType::Executor).await;
+            let _ = self.node_registry.send_to_all(p, &NodeRegistryType::Sentinel).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1747,20 +1917,21 @@ mod tests {
         block
     }
 
-    /// Build a wire Message for a BlockConfirmed gossip event.
-    fn make_block_confirmed_message(block: Block) -> Message {
+    /// Build a wire Message for a BlockFinalized gossip event.
+    fn make_block_finalized_message(block: Block) -> Message {
         let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
         Message {
             chain_id: "test".to_string(),
-            action: String::from("BlockConfirmed"),
+            action: String::from("BlockFinalized"),
             body,
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         }
     }
 
     #[tokio::test]
-    async fn handle_block_confirmed_appends_valid_block() {
+    async fn handle_block_finalized_appends_valid_block() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
@@ -1779,10 +1950,10 @@ mod tests {
 
         // Build a valid next block chained off the current tip
         let block = make_gossip_block(&committer, "gossip_tx", b"mallory".to_vec());
-        let message = make_block_confirmed_message(block);
+        let message = make_block_finalized_message(block);
 
         // Should succeed and append the block
-        let result = committer.handle_block_confirmed(message).await;
+        let result = committer.handle_block_finalized(message).await;
         assert!(result.is_ok());
 
         // Chain should have grown by 1
@@ -1795,7 +1966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_block_confirmed_ignores_orphan_block() {
+    async fn handle_block_finalized_ignores_orphan_block() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
@@ -1855,10 +2026,10 @@ mod tests {
         };
         block.current_hash = BlockFactory::create_hash(&block);
 
-        let message = make_block_confirmed_message(block);
+        let message = make_block_finalized_message(block);
 
         // Should return Ok (non-fatal), but block not appended
-        let result = committer.handle_block_confirmed(message).await;
+        let result = committer.handle_block_finalized(message).await;
         assert!(result.is_ok());
 
         // Chain length unchanged
@@ -1871,7 +2042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_block_confirmed_rejects_tampered_block() {
+    async fn handle_block_finalized_rejects_tampered_block() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
@@ -1895,14 +2066,14 @@ mod tests {
             epoch_number: block.epoch_number,
         };
 
-        let message = make_block_confirmed_message(block);
+        let message = make_block_finalized_message(block);
 
-        let result = committer.handle_block_confirmed(message).await;
+        let result = committer.handle_block_finalized(message).await;
         assert!(matches!(result, Err(CommitterError::InvalidBlockHash)));
     }
 
     #[tokio::test]
-    async fn handle_block_confirmed_unknown_token_returns_error() {
+    async fn handle_block_finalized_unknown_token_returns_error() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
@@ -1948,9 +2119,169 @@ mod tests {
             epoch_number: 0,
         };
 
-        let message = make_block_confirmed_message(block);
+        let message = make_block_finalized_message(block);
 
-        let result = committer.handle_block_confirmed(message).await;
+        let result = committer.handle_block_finalized(message).await;
         assert!(matches!(result, Err(CommitterError::TokenNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn handle_block_quorum_reached_updates_finality_status() {
+        // Direct test of Blockchain::set_finality_status.
+        // The handler's job is to find the block by hash and call this.
+        let mut blockchain = pneumatic_core::blocks::Blockchain::new();
+
+        // Build a block the same way the other tests do
+        let block = make_test_block_for_token_internal(&blockchain);
+        let block_hash = block.current_hash.clone();
+        blockchain.add_block(block);
+
+        // Verify initial status
+        let tip = blockchain.get_block_at(0).unwrap();
+        assert_eq!(tip.finality_status, FinalityStatus::Optimistic);
+
+        // Transition to Confirmed
+        let result = blockchain.set_finality_status(&block_hash, FinalityStatus::Confirmed);
+        assert!(result.is_ok());
+
+        // Verify final status
+        let tip = blockchain.get_block_at(0).unwrap();
+        assert_eq!(tip.finality_status, FinalityStatus::Confirmed);
+    }
+
+    /// Helper to build a test block with a valid hash.
+    fn make_test_block_for_token_internal(blockchain: &pneumatic_core::blocks::Blockchain) -> Block {
+        let prev_hash: Vec<u8> = if blockchain.get_count() == 0 {
+            vec![42u8; 32]
+        } else {
+            blockchain.get_current_chain_state().last_hash_in
+        };
+
+        let signed = SignedTransaction {
+            transaction_id: "test".to_string(),
+            transaction: Transaction {
+                id: "test".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: prev_hash.clone(),
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![],
+        };
+
+        let mut block = Block {
+            signed_trans: signed,
+            token_metadata: HashMap::new(),
+            previous_hash: prev_hash,
+            timestamp: 0,
+            current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+        block
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_vote_skips_missing_stake_set() {
+        // When a vote arrives before BlockFinalized, it should be silently ignored
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // No BlockFinalized was received, so no stake set is cached
+        let body = serialize_to_bytes_rmp(&(vec![1, 2, 3], vec![4, 5, 6]))
+            .expect("Vote serialization");
+        let message = Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+
+        // Should not error, just ignore
+        let result = committer.handle_block_confirmed_vote(message).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_block_confirmed_vote_accumulates_stake() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // Build block and cache stake set
+        let block = make_gossip_block(&committer, "vote_test", b"vote".to_vec());
+        let block_hash = block.current_hash.clone();
+
+        // Cache a stake set: alice=100, bob=50, charlie=50 (total=200)
+        let mut stake_set = StakeSet::default();
+        stake_set.stakers.insert(b"alice".to_vec(), 100);
+        stake_set.stakers.insert(b"bob".to_vec(), 50);
+        stake_set.stakers.insert(b"charlie".to_vec(), 50);
+
+        // Manually cache the stake set
+        committer.stake_set_cache.lock().await
+            .insert(block_hash.clone(), stake_set.clone());
+
+        // First vote: alice (stake=100, should be below 67% quorum of 200 = 134)
+        let body1 = serialize_to_bytes_rmp(&(block_hash.clone(), b"alice".to_vec()))
+            .expect("Vote serialization");
+        let msg1 = Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body: body1,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let result = committer.handle_block_confirmed_vote(msg1).await;
+        assert!(result.is_ok());
+
+        // Second vote: bob (cumulative=150, should cross quorum threshold)
+        let body2 = serialize_to_bytes_rmp(&(block_hash.clone(), b"bob".to_vec()))
+            .expect("Vote serialization");
+        let msg2 = Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body: body2,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let result = committer.handle_block_confirmed_vote(msg2).await;
+        assert!(result.is_ok());
+
+        // Verify cumulative stake reached quorum (150 >= 134)
+        let votes = committer.confirmation_votes.lock().await;
+        let (keys, cumulative) = votes.get(&block_hash).expect("block_hash should have votes");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(*cumulative, 150);
     }
 }

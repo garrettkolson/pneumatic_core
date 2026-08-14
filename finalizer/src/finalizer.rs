@@ -9,6 +9,7 @@ use pneumatic_core::config::Config;
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
+use pneumatic_core::epoch::StakeSet;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
@@ -63,6 +64,9 @@ pub struct Finalizer {
     /// Current epoch number — used when building blocks.
     /// Updated when blocks from the chain are received.
     current_epoch: u64,
+    /// Current stake set for quorum gossip.
+    /// Set by the caller before the finalizer begins finalizing transactions.
+    stake_set: Option<StakeSet>,
 }
 
 impl Finalizer {
@@ -126,7 +130,22 @@ impl Finalizer {
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
             current_epoch,
+            stake_set: None,
         }
+    }
+
+    /// Set the stake set for this finalizer.
+    ///
+    /// This is used for quorum gossip: the finalizer includes the stake set
+    /// in `BlockFinalized` messages so receiving nodes can perform
+    /// stake-weighted confirmation tracking.
+    pub fn set_stake_set(&mut self, stake_set: StakeSet) {
+        self.stake_set = Some(stake_set);
+    }
+
+    /// Get the current stake set, if set.
+    pub fn get_stake_set(&self) -> Option<&StakeSet> {
+        self.stake_set.as_ref()
     }
 
     /// Initialize the finalizer — subscribe to message handlers.
@@ -377,8 +396,11 @@ impl Finalizer {
         };
         self.message_dispatcher.send_to_committers(commit).await?;
 
-        // Step 7.5: Broadcast block to all committers and archivars via gossip
-        self.message_dispatcher.send_block_confirmed(block).await?;
+        // Step 7.5: Broadcast block finalized to all committers and archivars via gossip
+        let stake_set = self.stake_set.clone();
+        self.message_dispatcher
+            .send_block_finalized(block, stake_set)
+            .await?;
 
         // Step 8: Send clear to all Sentinels
         self.message_dispatcher.send_clear_to_sentinels(tx_id).await?;
@@ -606,6 +628,7 @@ mod tests {
             body,
             signature: vec![],
             public_key: vec![9, 8, 7],
+            stake_set: None,
         };
 
         let result = finalizer.handle_preload(&message).await;
@@ -632,6 +655,7 @@ mod tests {
             body,
             signature: vec![],
             public_key: b"executor_1".to_vec(),
+            stake_set: None,
         };
 
         let result = finalizer.handle_signature(&message).await;
@@ -660,6 +684,7 @@ mod tests {
             body,
             signature: vec![],
             public_key: b"executor_1".to_vec(),
+            stake_set: None,
         };
 
         let result = finalizer.handle_signature(&message).await;

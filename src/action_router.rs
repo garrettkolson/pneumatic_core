@@ -365,6 +365,7 @@ mod tests {
             body: vec![],
             signature: vec![],
             public_key,
+            stake_set: None,
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
             body,
             signature: vec![],
             public_key,
+            stake_set: None,
         }
     }
 
@@ -699,6 +701,7 @@ mod tests {
             body: vec![0xFF, 0xFF, 0xFF], // invalid MsgPack
             signature: vec![],
             public_key: vec![1, 2, 3],
+            stake_set: None,
         };
         let result = router.route(msg).await;
         assert!(result.is_err());

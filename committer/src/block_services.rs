@@ -110,6 +110,7 @@ impl BlockServices {
             body: payload,
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
 
         let message_payload = serialize_to_bytes_rmp(&message)?;
@@ -144,6 +145,7 @@ impl BlockServices {
             body: payload,
             signature: vec![],
             public_key: vec![],
+            stake_set: None,
         };
 
         let message_payload = serialize_to_bytes_rmp(&message)?;
