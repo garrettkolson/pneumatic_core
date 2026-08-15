@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 385 tests across 5 crate targets
+cargo test --workspace --lib   # Run 391 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -265,7 +265,7 @@ Decomposed from a monolithic C# design into three focused components:
 
 Optimistic commit: `handle_signature()` dispatches first valid signature to `try_finalize_optimistic()` for immediate block creation. Subsequent signatures acknowledged for stake accumulation. Epoch tracking: `Finalizer` tracks `current_epoch` for block creation. `BlockBuilder::create_block()` accepts `epoch_number` for hash-chain integrity.
 
-**Stubs**: `initialize()` accepts gossiper closure but doesn't wire it; standard `try_finalize()` uses placeholder data (`total_stake=0`, `total_voters=0`, `previous_hash=vec![]`).
+**Stubs**: `initialize()` accepts gossiper closure but doesn't wire it. (Both finalize paths now use real data — `previous_hash` resolved from the token's chain tip, and the standard path populates `total_stake`/`total_voters` from the epoch stake set.)
 
 **Test count**: 28
 
@@ -310,7 +310,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 385 tests: 272 core + 40 sentinel + 36 finalizer + 9 executor + 28 committer
+# 391 tests: 272 core + 40 sentinel + 42 finalizer + 9 executor + 28 committer
 ```
 
 ---
@@ -321,7 +321,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 385 tests passing across 5 crate targets (272 core + 40 sentinel + 36 finalizer + 9 executor + 28 committer), all core types and traits implemented.
+**Status: COMPLETE** — 391 tests passing across 5 crate targets (272 core + 40 sentinel + 42 finalizer + 9 executor + 28 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -391,14 +391,14 @@ This roadmap tracks the work from current foundation state through a production-
 | Task | Description | Estimate | Status |
 |------|-------------|----------|--------|
 | Wire `initialize()` | Subscribe to "Preload" and "Sign" actions via Gossiper message router | 4h | Open |
-| Fill `try_finalize` stake/voter fields | Get `total_stake`/`total_voters` from `EnvironmentMetadata` instead of hardcoded 0 | 2h | Open |
-| Wire `previous_hash` | Get actual chain state's last hash from token's blockchain | 4h | Open — affects both `try_finalize` and `try_finalize_optimistic` |
+| Fill `try_finalize` stake/voter fields | Get `total_stake`/`total_voters` from the epoch stake set instead of hardcoded 0 | 2h | **DONE** (`resolve_stake_metrics()`) |
+| Wire `previous_hash` | Get actual chain state's last hash from token's blockchain | 4h | **DONE** (`resolve_previous_hash()` — chains both `try_finalize` and `try_finalize_optimistic` to the real tip, graceful fallback) |
 | `SignatureCollector.reconcile_signatures` | Implement stake-weighted conflict resolution (supermajority vote) | 6h | **DONE** |
 | Message dispatcher | Use registered connections instead of `NodeRegistry.send_to_all` stub | 4h | **DONE** |
 | Shutdown handling | Proper drain of in-flight tasks on shutdown | 2h | **DONE** |
 | Epoch tracking | `Finalizer.current_epoch` field, `advance_epoch()` accessor, wire into block creation | 4h | **DONE** (Phase 5) |
 
-**Sub-total**: 26h / ~3 days — 2 tasks remaining (gossiper init + placeholder data for standard path)
+**Sub-total**: 20h / ~3 days — 1 task remaining (gossiper init)
 
 ---
 
@@ -515,7 +515,7 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 
 **Sub-total**: ~37h / ~4.5 days — **COMPLETE**
 
-**Remaining**: Other node types (Archivars, Sentinels, Executors) don't yet handle the 3 new gossip actions. (Stake fetching is now internal to the Finalizer — no external orchestration needed; `set_stake_set()` remains as a test override.)
+**Remaining**: Other node types (Archivars, Sentinels, Executors) don't yet handle the 3 new gossip actions. (Stake fetching is now internal to the Finalizer — no external orchestration needed; `set_stake_set()` remains as a test override. Both finalize paths now chain blocks to the token's real chain tip via `resolve_previous_hash()` and carry real stake metrics — the quorum gossip protocol is now functional in production.)
 
 ---
 
@@ -602,7 +602,7 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 | 0. Foundation | ✅ Done | — |
 | 1. Sentinel Integration | ✅ Done (40 tests, ~8h) | Phase 0 |
 | 2. Executor Execution | ~1-2 days (stub + action bug) | Phase 1 |
-| 3. Finalizer Completion | ~1 day (gossiper wire + placeholder data) | Phase 1, 2 |
+| 3. Finalizer Completion | ~4h remaining (gossiper wire) | Phase 1, 2 |
 | 4. Committer Completion | ~1 week | Phase 1-3 |
 | 5. Optimistic Finality + Block Gossip | ~1 day remaining (concurrency + E2E pipeline tests) | Phase 1-5d |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |

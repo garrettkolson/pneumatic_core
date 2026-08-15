@@ -25,6 +25,11 @@ use crate::message_dispatcher::MessageDispatcher;
 use crate::signature_collector::SignatureCollector;
 use crate::stake_snapshot_cache::StakeSnapshotCache;
 
+/// Convert a byte slice to a hex string (lowercase, no prefix).
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Finalizer — quorum checking, block formation, and distribution
 // ---------------------------------------------------------------------------
@@ -73,6 +78,11 @@ pub struct Finalizer {
     /// Manual override via `set_stake_set` — used by tests. In production this
     /// stays `None` and `get_stake_set_for_epoch` uses the cache instead.
     stake_set: Option<StakeSet>,
+    /// DataProvider — used to look up a token's chain tip when building
+    /// blocks (`resolve_previous_hash`).
+    data_provider: Arc<dyn DataProvider>,
+    /// Token partition ID — DataProvider key for token lookups.
+    partition_id: String,
 }
 
 impl Finalizer {
@@ -85,7 +95,8 @@ impl Finalizer {
     /// `leader_address/stake/hash` are from the environment's leader.
     /// `current_epoch` is the starting epoch number for block building.
     /// `data_provider` is used to fetch the current epoch's stake snapshot
-    /// for quorum gossip (`BlockFinalized` messages).
+    /// for quorum gossip (`BlockFinalized` messages) and a token's chain tip
+    /// for block `previous_hash` resolution.
     /// `partition_id` is the token partition ID used as the DataProvider key.
     pub fn new(
         env_id: String,
@@ -141,8 +152,10 @@ impl Finalizer {
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
             current_epoch,
-            stake_cache: StakeSnapshotCache::new(data_provider, partition_id),
+            stake_cache: StakeSnapshotCache::new(data_provider.clone(), partition_id.clone()),
             stake_set: None,
+            data_provider,
+            partition_id,
         }
     }
 
@@ -169,6 +182,42 @@ impl Finalizer {
             return Some(s.clone());
         }
         self.stake_cache.get(self.current_epoch)
+    }
+
+    /// Resolve the chain tip (`previous_hash`) for the token a transaction targets.
+    ///
+    /// Reads `last_hash_in` from the token's current chain state. On an empty
+    /// chain (or an invalid one — `ChainState::invalid()` also yields `vec![]`)
+    /// this is `vec![]`, which is the correct genesis prev-hash for the
+    /// committer's strict linkage check. On lookup failure we fall back to
+    /// `vec![]` rather than failing finalization: a stale/empty prev-hash is
+    /// dropped non-fatally by committers anyway, while a hard error would
+    /// permanently stall the transaction (signatures are already collected).
+    ///
+    /// Note: `get_token` clones the full token (chain length is bounded by the
+    /// token's `security_level`), which is acceptable at once-per-finalize.
+    fn resolve_previous_hash(&self, token_id: &Vec<u8>) -> Vec<u8> {
+        match self.data_provider.get_token(token_id, &self.partition_id) {
+            Ok(token) => token.blockchain.get_current_chain_state().last_hash_in,
+            Err(e) => {
+                log::warn!(
+                    "resolve_previous_hash: failed to load token for previous_hash lookup ({}): {}; falling back to empty prev-hash",
+                    bytes_to_hex(token_id),
+                    e
+                );
+                vec![]
+            }
+        }
+    }
+
+    /// Resolve `(total_stake, total_voters)` for the standard finalize path
+    /// from the current epoch's stake set (manual override or DataProvider
+    /// cache). Falls back to `(0, 0)` when no stake set is available.
+    fn resolve_stake_metrics(&self) -> (u64, u32) {
+        match self.get_stake_set_for_epoch() {
+            Some(set) => (set.total_stake(), set.stakers.len() as u32),
+            None => (0, 0),
+        }
     }
 
     /// Initialize the finalizer — subscribe to message handlers.
@@ -280,17 +329,9 @@ impl Finalizer {
             Err(_) => vec![],
         };
 
-        // Step 4: Build SignedTransaction from reconciled data
-        let (total_stake, total_voters) = match self.pending_registry.get_transaction_mut(tx_id) {
-            Ok(entry) => match &entry.state {
-                TransactionState::Validated { .. } => {
-                    // In production, get from environment metadata
-                    (0, 0)
-                }
-                _ => (0, 0),
-            },
-            Err(_) => (0, 0),
-        };
+        // Step 4: Build SignedTransaction from reconciled data, using the
+        // current epoch's stake set for the voter metrics.
+        let (total_stake, total_voters) = self.resolve_stake_metrics();
 
         let mut signed_tx = self.block_builder.build_signed_transaction(
             &reconciled,
@@ -309,9 +350,8 @@ impl Finalizer {
             entry.transition_to_finalizing(transaction.clone(), finalizer_key);
         }
 
-        // Step 7: Create the Block
-        // In production, get the current chain state's last hash
-        let previous_hash = vec![];
+        // Step 7: Create the Block, chained to the token's current chain tip.
+        let previous_hash = self.resolve_previous_hash(&transaction.token_id);
         let block = self.block_builder.create_block(signed_tx.clone(), previous_hash, self.current_epoch);
 
         // Step 8: Send the commit to all Committers
@@ -401,8 +441,9 @@ impl Finalizer {
             entry.transition_to_finalizing(transaction.clone(), finalizer_key);
         }
 
-        // Step 6: Create the Block with optimistic finality
-        let previous_hash = vec![];
+        // Step 6: Create the Block with optimistic finality, chained to the
+        // token's current chain tip.
+        let previous_hash = self.resolve_previous_hash(&transaction.token_id);
         let block = self.block_builder.create_block_optimistic(
             signed_tx.clone(),
             previous_hash,
@@ -494,7 +535,9 @@ mod tests {
     use pneumatic_core::crypto::BasicHashProvider;
     use pneumatic_core::data::StubDataProvider;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+    use pneumatic_core::blocks::{BlockFactory, FinalityStatus};
     use pneumatic_core::node::{NodeRegistryType, NodeType};
+    use pneumatic_core::tokens::Token;
     use pneumatic_core::transactions::{PendingTransaction, TransactionState};
     use rand::RngCore;
 
@@ -774,6 +817,24 @@ mod tests {
         }
     }
 
+    /// Build a block with a real `current_hash` (computed via
+    /// `BlockFactory`) so a token's chain validates as a normal (non-empty,
+    /// valid) chain.
+    fn make_hashed_block(previous_hash: Vec<u8>) -> Block {
+        let mut block = Block {
+            signed_trans: SignedTransaction::test_transaction(),
+            token_metadata: HashMap::new(),
+            previous_hash,
+            current_hash: vec![],
+            timestamp: 1000,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+        block
+    }
+
     #[tokio::test]
     async fn test_stake_cache_fetched_from_data_provider() {
         let pending_registry = make_test_pending_registry();
@@ -825,5 +886,110 @@ mod tests {
         // Manual override takes priority over the cache (backward compat for tests)
         finalizer.set_stake_set(make_stake_set(vec![(vec![9], 50)]));
         assert_eq!(finalizer.get_stake_set_for_epoch().unwrap().total_stake(), 50);
+    }
+
+    #[test]
+    fn test_resolve_previous_hash_returns_chain_tip() {
+        let pending_registry = make_test_pending_registry();
+        let expected;
+        let token = {
+            let mut token = Token::new().with_id(vec![0, 1, 2]);
+            token.blockchain.add_block(make_hashed_block(vec![]));
+            expected = token.blockchain.get_current_chain_state().last_hash_in;
+            token
+        };
+        assert!(!expected.is_empty());
+        let data_provider = Arc::new(
+            StubDataProvider::new().with_token(vec![0, 1, 2], "test_env".to_string(), token),
+        );
+        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        assert_eq!(finalizer.resolve_previous_hash(&vec![0, 1, 2]), expected);
+    }
+
+    #[test]
+    fn test_resolve_previous_hash_empty_chain() {
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new()
+                .with_token(vec![0, 1, 2], "test_env".to_string(), Token::new().with_id(vec![0, 1, 2])),
+        );
+        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        // Empty chain → last_hash_in is vec![] (natural genesis value)
+        assert_eq!(finalizer.resolve_previous_hash(&vec![0, 1, 2]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_resolve_previous_hash_missing_token_falls_back() {
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer(pending_registry); // empty DataProvider
+
+        // Token not in the provider → graceful fallback to empty prev-hash
+        assert_eq!(finalizer.resolve_previous_hash(&vec![0, 1, 2]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_resolve_previous_hash_invalid_chain_falls_back() {
+        let pending_registry = make_test_pending_registry();
+        let token = {
+            let mut token = Token::new().with_id(vec![0, 1, 2]);
+            let mut block = make_hashed_block(vec![]);
+            // Deliberately corrupt the hash so the chain validates as invalid
+            block.current_hash = vec![9, 9, 9];
+            token.blockchain.add_block(block);
+            token
+        };
+        let data_provider = Arc::new(
+            StubDataProvider::new().with_token(vec![0, 1, 2], "test_env".to_string(), token),
+        );
+        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        // ChainState::invalid() → last_hash_in is vec![]
+        assert_eq!(finalizer.resolve_previous_hash(&vec![0, 1, 2]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_resolve_stake_metrics() {
+        let pending_registry = make_test_pending_registry();
+        let mut finalizer = make_finalizer(pending_registry);
+
+        // No stake data → (0, 0)
+        assert_eq!(finalizer.resolve_stake_metrics(), (0, 0));
+
+        // Stake set with two stakers → (300, 2)
+        finalizer.set_stake_set(make_stake_set(vec![(vec![1], 100), (vec![2], 200)]));
+        assert_eq!(finalizer.resolve_stake_metrics(), (300, 2));
+    }
+
+    #[tokio::test]
+    async fn test_optimistic_finalize_with_seeded_token() {
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new()
+                .with_token(vec![0, 1, 2], "test_env".to_string(), Token::new().with_id(vec![0, 1, 2])),
+        );
+        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+
+        let sig = TransactionSignature {
+            transaction_id: b"test_tx_001".to_vec(),
+            env_id: b"test_env".to_vec(),
+            transaction_hash: vec![1, 2, 3],
+            signature: vec![4, 5, 6, 7],
+            current_stake: 10,
+        };
+        let body = serialize_to_bytes_rmp(&sig).unwrap();
+        let message = Message {
+            chain_id: "test_env".to_string(),
+            action: String::from("Sign"),
+            body,
+            signature: vec![],
+            public_key: b"executor_1".to_vec(),
+            stake_set: None,
+        };
+
+        // First signature → optimistic finalize, now with a real previous_hash
+        // lookup against the seeded token
+        assert!(finalizer.handle_signature(&message).await.is_ok());
     }
 }
