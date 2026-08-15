@@ -688,8 +688,8 @@ mod tests {
 
     fn make_valid_block(signed_tx: SignedTransaction, blockchain: &mut Blockchain) -> crate::blocks::Block {
         let proposer_key = signed_tx.proposer_key.clone();
-        // Pre-populate chain with a genesis block so validate_next_block works
-        // (validate_next_block returns false for empty chains)
+        // Pre-seed a genesis block so these tests exercise the
+        // non-empty-chain path
         if blockchain.get_count() == 0 {
             let genesis = SignedTransaction {
                 transaction_id: String::from("genesis"),

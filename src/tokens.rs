@@ -151,7 +151,7 @@ impl Token {
         env_data: &EnvironmentMetadata,
     ) -> BlockValidationResult {
         if !self.blockchain.validate_next_block(block) {
-            return BlockValidationResult::Err(BlockValidationError::InvalidFinalizerSignature);
+            return BlockValidationResult::Err(BlockValidationError::ChainLinkage);
         }
 
         // Look up the validation spec by name
@@ -173,7 +173,8 @@ impl Token {
     /// Create a block from a fully signed transaction.
     pub fn create_block(&self, signed_tx: SignedTransaction, epoch_number: u64) -> Block {
         let prev_hash = match self.blockchain.get_count() {
-            0 => signed_tx.leader_hash.clone(),
+            // Genesis convention: block 1 has an empty previous_hash.
+            0 => Vec::<u8>::new(),
             _ => self.blockchain.get_current_chain_state().last_hash_in,
         };
         let proposer_key = signed_tx.proposer_key.clone();
@@ -199,6 +200,12 @@ impl Token {
         is_archiver: bool,
         env_data: &EnvironmentMetadata,
     ) -> Result<TokenCommitResult, BlockCommitError> {
+        // Compute the block's hash before validation: validate_next_block
+        // checks the self-hash, and fresh blocks arrive with
+        // current_hash = vec![]. (create_hash does not include current_hash
+        // in its input, so this is a no-op for already-hashed blocks.)
+        block.current_hash = crate::blocks::BlockFactory::create_hash(&block);
+
         // Validate the block before committing
         let validation_result = self.validate_block(&block, env_data);
         match validation_result {
@@ -212,9 +219,6 @@ impl Token {
         if !is_archiver && self.has_reached_max_chain_length() {
             self.blockchain.remove_block();
         }
-
-        // Compute the block's current hash
-        block.current_hash = crate::blocks::BlockFactory::create_hash(&block);
 
         // Add block to the chain
         self.blockchain.add_block(block);
@@ -447,7 +451,7 @@ mod tests {
 
     use crate::data::StubDataProvider;
     use crate::registry::PendingTransactionRegistry;
-    use crate::environment::CostModel;
+    use crate::environment::{CostModel, EnvironmentMetadataSpec};
     use crate::user::User;
     use super::*;
 
@@ -478,6 +482,21 @@ mod tests {
 
     fn make_test_user_key() -> Vec<u8> {
         vec![0xCA, 0xFE]
+    }
+
+    fn make_test_env() -> EnvironmentMetadata {
+        let json = r#"{"environment_id":"test","environment_name":"test",
+            "partitions":[{"id":"token","partition_type":"Token"},
+            {"id":"slush","partition_type":"Slush"}],
+            "asym_crypto_provider":{"Ed25519":null},"sym_crypto_provider":"sym",
+            "serialization_provider":"rmp","quorum_percentage":67.0,
+            "override_quorum_percentage":0.0,"max_risk":1.0,
+            "cost_model":{"base_cost":1,"global_min_stake":10,"admin_public_key":[],"admin_tax_percentage":0.0,
+            "amount_multiplier":{"Process":1.0,"Preload":2.0,"Sign":1.5}},
+            "allowed_token_types":[],"trans_validation_specs":[],
+            "block_validation_specs":[],"log_file":"test.log"}"#;
+        let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
+        EnvironmentMetadata::load_from_spec(spec)
     }
 
     // --- Basic mint_token (backward compatibility) ---
@@ -781,6 +800,55 @@ mod tests {
         let result: Option<User> = token.update_asset(|_user: &mut User| {});
         assert!(result.is_none());
     }
+
+    // --- commit_block genesis convention ---
+
+    #[test]
+    fn commit_block_first_block_on_empty_chain_succeeds() {
+        let env = make_test_env();
+        let mut token = Token::test_token();
+
+        // Fresh block via the standard constructor: empty previous_hash
+        // (genesis convention) and current_hash not yet computed.
+        let block = Block::from_transaction(
+            SignedTransaction::test_transaction(),
+            token.blockchain.clone(),
+            &token,
+            0,
+        );
+        assert!(block.previous_hash.is_empty());
+        assert!(block.current_hash.is_empty());
+
+        let result = token.commit_block(block, false, &env).unwrap();
+
+        assert_eq!(result.new_chain_length, 1);
+        assert_eq!(result.sequence_number, 1);
+        // commit_block must have computed the hash before validation
+        let stored = token.blockchain.get_block_at(0).unwrap();
+        assert!(!stored.current_hash.is_empty());
+    }
+
+    #[test]
+    fn commit_block_empty_chain_rejects_nonempty_prev_hash() {
+        let env = make_test_env();
+        let mut token = Token::test_token();
+
+        let mut block = Block::from_transaction(
+            SignedTransaction::test_transaction(),
+            token.blockchain.clone(),
+            &token,
+            0,
+        );
+        // Violates the genesis convention: block 1 must have an empty
+        // previous_hash.
+        block.previous_hash = vec![1, 2, 3];
+
+        let err = token.commit_block(block, false, &env).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockCommitError::BlockValidationError(BlockValidationError::ChainLinkage)
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +901,7 @@ pub enum BlockValidationError {
     IncorrectExecutorTransactionSignature,
     FinalizedTransactionDataWasModified,
     InvalidFinalizerSignature,
+    ChainLinkage,
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -844,6 +913,7 @@ impl std::fmt::Display for BlockValidationError {
             BlockValidationError::IncorrectExecutorTransactionSignature => write!(f, "IncorrectExecutorTransactionSignature"),
             BlockValidationError::FinalizedTransactionDataWasModified => write!(f, "FinalizedTransactionDataWasModified"),
             BlockValidationError::InvalidFinalizerSignature => write!(f, "InvalidFinalizerSignature"),
+            BlockValidationError::ChainLinkage => write!(f, "ChainLinkage"),
         }
     }
 }

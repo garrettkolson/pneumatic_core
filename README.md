@@ -12,7 +12,7 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 391 tests across 5 crate targets
+cargo test --workspace --lib   # Run 398 tests across 5 crate targets
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -310,7 +310,7 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 391 tests: 272 core + 40 sentinel + 42 finalizer + 9 executor + 28 committer
+# 398 tests: 278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer
 ```
 
 ---
@@ -321,7 +321,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 391 tests passing across 5 crate targets (272 core + 40 sentinel + 42 finalizer + 9 executor + 28 committer), all core types and traits implemented.
+**Status: COMPLETE** — 398 tests passing across 5 crate targets (278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer), all core types and traits implemented.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution

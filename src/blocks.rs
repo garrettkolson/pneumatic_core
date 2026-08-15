@@ -42,7 +42,8 @@ impl Block {
         epoch_number: u64,
     ) -> Self {
         let prev_hash = match blockchain.get_count() {
-            0 => signed.leader_hash.clone(),
+            // Genesis convention: block 1 has an empty previous_hash.
+            0 => Vec::<u8>::new(),
             _ => blockchain.get_current_chain_state().last_hash_in,
         };
 
@@ -159,11 +160,15 @@ impl Blockchain {
             return false;
         }
 
-        match current_state.last_hash_in.len() {
-            0 => false,
-            _ => current_state.last_hash_in == next_block.previous_hash
-                && BlockFactory::create_hash(next_block) == next_block.current_hash,
-        }
+        // Genesis convention: block 1 has an empty previous_hash, matching
+        // ChainState::empty().last_hash_in (which is also vec![]).
+        let linkage_ok = if current_state.last_hash_in.is_empty() {
+            next_block.previous_hash.is_empty()
+        } else {
+            current_state.last_hash_in == next_block.previous_hash
+        };
+
+        linkage_ok && BlockFactory::create_hash(next_block) == next_block.current_hash
     }
 
     /// Get a block by index. Returns None if out of range.
@@ -255,6 +260,18 @@ pub mod tests {
     }
 
     #[test]
+    fn from_transaction_empty_blockchain_yields_empty_previous_hash() {
+        let tx = SignedTransaction::test_transaction();
+        let blockchain = Blockchain::new();
+        let token = Token::test_token();
+
+        let block = Block::from_transaction(tx, blockchain, &token, 0);
+
+        // Genesis convention: block 1 has an empty previous_hash
+        assert!(block.previous_hash.is_empty());
+    }
+
+    #[test]
     fn get_current_chain_state_with_empty_chain() {
         let blockchain = Blockchain::new();
 
@@ -337,5 +354,34 @@ pub mod tests {
         invalid_next_block.current_hash = vec![1, 2, 3];
 
         assert!(!blockchain.validate_next_block(&invalid_next_block));
+    }
+
+    #[test]
+    fn validate_next_block_empty_chain_accepts_genesis_block() {
+        let blockchain = Blockchain::new();
+
+        // Genesis convention: block 1 has an empty previous_hash
+        let genesis_block = Block::test_block(Vec::<u8>::new());
+
+        assert!(blockchain.validate_next_block(&genesis_block));
+    }
+
+    #[test]
+    fn validate_next_block_empty_chain_rejects_nonempty_previous_hash() {
+        let blockchain = Blockchain::new();
+
+        let block = Block::test_block(vec![1, 2, 3]);
+
+        assert!(!blockchain.validate_next_block(&block));
+    }
+
+    #[test]
+    fn validate_next_block_empty_chain_rejects_invalid_block_hash() {
+        let blockchain = Blockchain::new();
+
+        let mut genesis_block = Block::test_block(Vec::<u8>::new());
+        genesis_block.current_hash = vec![1, 2, 3];
+
+        assert!(!blockchain.validate_next_block(&genesis_block));
     }
 }

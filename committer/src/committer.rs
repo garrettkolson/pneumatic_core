@@ -1001,18 +1001,18 @@ mod tests {
         committer: &Committer,
         trans_id: &str,
     ) -> Block {
-        // Get the chain's last hash (or genesis leader hash for empty chain)
+        // Get the chain's last hash (empty previous_hash at genesis)
         let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
             let token = entry.value();
             let state = token.blockchain.get_current_chain_state();
             if state.last_hash_in.is_empty() {
-                // Empty chain — use a fixed leader hash
-                vec![42u8; 32]
+                // Genesis convention: block 1 has an empty previous_hash
+                Vec::<u8>::new()
             } else {
                 state.last_hash_in
             }
         } else {
-            vec![42u8; 32]
+            Vec::<u8>::new()
         };
 
         let signed = SignedTransaction {
@@ -1061,7 +1061,8 @@ mod tests {
     }
 
     fn bootstrap_token_chain(committer: &Committer) {
-        // Create a genesis block so validate_next_block has a previous_hash
+        // Pre-seed a genesis block so these tests exercise the
+        // non-empty-chain path
         let prev_hash = vec![42u8; 32];
         let signed = SignedTransaction::test_transaction();
         let mut genesis = Block {
@@ -1640,16 +1641,17 @@ mod tests {
         trans_id: &str,
         proposer_key: Vec<u8>,
     ) -> Block {
+        // Genesis convention: block 1 has an empty previous_hash
         let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
             let token = entry.value();
             let state = token.blockchain.get_current_chain_state();
             if state.last_hash_in.is_empty() {
-                vec![42u8; 32]
+                Vec::<u8>::new()
             } else {
                 state.last_hash_in
             }
         } else {
-            vec![42u8; 32]
+            Vec::<u8>::new()
         };
 
         let signed = SignedTransaction {
@@ -1734,6 +1736,38 @@ mod tests {
         // Commit — should detect conflict and resolve
         let result = committer.check_and_commit_transaction_results(&commit).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_first_block_on_fresh_token_without_bootstrap() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp);
+
+        // Bootstrap the token only — the chain stays empty
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+
+        let tx_id = "tx_first_block";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        // On an empty chain the helper emits previous_hash = vec![]
+        // (genesis convention)
+        let block = make_test_block_for_token(&committer, tx_id);
+        assert!(block.previous_hash.is_empty());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // Block 1 must commit through the standard path
+        let result = committer.check_and_commit_transaction_results(&commit).await;
+        assert!(result.is_ok());
+
+        let entry = committer.tokens.get(&vec![1]).unwrap();
+        assert_eq!(entry.value().blockchain.get_count(), 1);
     }
 
     #[tokio::test]
