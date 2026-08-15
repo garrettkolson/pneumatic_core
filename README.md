@@ -20,7 +20,7 @@ cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 
 ```
 pneumatic_core/
-├── src/                        # pneumatic_core crate — core library (21 modules)
+├── src/                        # pneumatic_core crate — core library (20 modules)
 ├── sentinel/                   # pneumatic_sentinel crate — transaction validation & routing
 ├── executor/                   # pneumatic_executor crate — contract execution
 ├── finalizer/                  # pneumatic_finalizer crate — quorum & block building
@@ -66,7 +66,7 @@ pneumatic_core/
 | `data` | `DataProvider` trait — abstracts external data store via MsgPack over TCP/UDS; `get_stake_snapshot`/`save_stake_snapshot` for epoch boundary stake snapshots; `StubDataProvider` for unit testing |
 | `crypto` | `AsymCryptoProvider` (Ed25519 sign/verify, hybrid AES-GCM encrypt), `HashProvider` (SHA-256) |
 | `encoding` | JSON and MsgPack serialization helpers |
-| `tokens` | `Token`, `BlockValidator` trait, `TokenFactory` (minting), `Blockchain` |
+| `tokens` | `Token`, `BlockValidator` trait, `TokenFactory` (minting) |
 | `blocks` | `Block` and `Blockchain` — append-only chain with hash chaining |
 | `transactions` | `Transaction`, `SignedTransaction`, `TransactionCommit`, `TransactionPool`, explicit state machine, proposer_key for conflict resolution |
 | `validation` | `TransactionValidationSpec` and `BlockValidatorSpec` traits, SelfSigned/Executed specs, spec registries |
@@ -121,7 +121,7 @@ Each transaction is routed to a specific finalizer via `deterministic_select(sta
 
 Standard tokens commit immediately after single-executor execution + single-finalizer signature. The 2/3 quorum machinery is repurposed for conflict resolution only — invoked when `CandidateRegistry` detects a genuine fork (two proposers building on the same parent).
 
-**Rationale**: In the vast majority of cases, no fork occurs. Requiring 2/3 quorum in the happy path wastes bandwidth and latency. The quorum protocol remains available to resolve genuine conflicts, where its safety guarantees matter. Blocks start as `Optimistic` and are upgraded to `Confirmed` after a time-based or depth-based guarantee with no observed conflict.
+**Rationale**: In the vast majority of cases, no fork occurs. Requiring 2/3 quorum in the happy path wastes bandwidth and latency. The quorum protocol remains available to resolve genuine conflicts, where its safety guarantees matter. Blocks start as `Optimistic` and are upgraded to `Confirmed` once stake-weighted quorum is reached — the Committer accumulates `voting_stake` per unique voter against `total_stake × quorum %` and broadcasts `BlockQuorumReached`.
 
 ### ADR-006: Stake Snapshots Persisted in DataProvider (Not Blocks)
 
@@ -149,7 +149,7 @@ Resolution uses `resolve_block_conflict()`: higher-stake proposer wins; tie-brea
 | Yes | Yes | **Slash both** (double-signed block is a protocol violation — higher stake doesn't excuse the proposer) |
 | Tied | Any | Tie-break winner; flag both proposers for review |
 
-**Rationale**: Defining conflict at the chain position level (same `previous_hash`) rather than by provenance (how the blocks arose) keeps detection simple and correct across all scenarios. A race, a double-spend, and a malicious double-propose all look identical at the chain level — same parent, different hash. The branch on proposer identity is the *only* provenance check needed: it distinguishes an honest relaying race (different proposers) from an intentional violation (same proposer). The `CandidateRegistry` is already implemented and tested; `resolve_block_conflict` is also implemented and tested. The wiring between them — the Committer's commit path — is the remaining implementation gap.
+**Rationale**: Defining conflict at the chain position level (same `previous_hash`) rather than by provenance (how the blocks arose) keeps detection simple and correct across all scenarios. A race, a double-spend, and a malicious double-propose all look identical at the chain level — same parent, different hash. The branch on proposer identity is the *only* provenance check needed: it distinguishes an honest relaying race (different proposers) from an intentional violation (same proposer). The `CandidateRegistry`, `resolve_block_conflict`, and the Committer's commit-path wiring (`handle_conflict_at_commit`) are all implemented and tested.
 
 ### ADR-009: Executor Sharding with Per-Epoch Rotation
 
@@ -161,7 +161,7 @@ Executors are partitioned into disjoint shards per epoch. `deterministic_select_
 
 The first valid executor signature triggers immediate block finalization. The 2/3 quorum machinery is repurposed for conflict resolution only — invoked when `CandidateRegistry` detects a genuine fork.
 
-**Rationale**: Requiring 2/3 quorum in the happy path wastes bandwidth and latency. In normal operation, one honest executor's signature is sufficient proof. The quorum protocol remains available to resolve genuine forks where multiple executors produce conflicting results. Blocks start as `Optimistic` and are upgraded to `Confirmed` after a time-based or depth-based guarantee with no observed conflict. The optimistic path uses a dedicated `try_finalize_optimistic()` code path that bypasses signature reconciliation; subsequent signatures accumulate stake and acknowledge, with quorum eventually triggering reconfirmation.
+**Rationale**: Requiring 2/3 quorum in the happy path wastes bandwidth and latency. In normal operation, one honest executor's signature is sufficient proof. The quorum protocol remains available to resolve genuine forks where multiple executors produce conflicting results. Blocks start as `Optimistic` and are upgraded to `Confirmed` once stake-weighted quorum is reached — the Committer accumulates `voting_stake` per unique voter against `total_stake × quorum %` and broadcasts `BlockQuorumReached`. The optimistic path uses a dedicated `try_finalize_optimistic()` code path that bypasses signature reconciliation; subsequent signatures accumulate stake and acknowledge, with quorum eventually triggering reconfirmation.
 
 ---
 
@@ -196,7 +196,7 @@ Each state transition is explicit via the `TransactionState` enum. A `PendingTra
 - Leader selected via **stake-weighted deterministic** selection — `SHA-256(epoch_number)` seeds `StdRng`, sorted stake walk
 - `EpochBoundaryDetector` detects expired epochs and stale blocks
 - `resolve_block_conflict()` resolves conflicting proposals: higher stake wins; tie-break by lexicographic hash comparison
-- **Optimistic finality:** Standard tokens commit immediately after single-executor execution + single-finalizer signature. The 2/3 quorum requirement is repurposed for conflict-resolution only — invoked when `CandidateRegistry` detects a genuine fork. Blocks start as `Optimistic` and become `Confirmed` after N seconds with no observed conflict.
+- **Optimistic finality:** Standard tokens commit immediately after single-executor execution + single-finalizer signature. The 2/3 quorum requirement is repurposed for conflict-resolution only — invoked when `CandidateRegistry` detects a genuine fork. Blocks start as `Optimistic` and become `Confirmed` when the Committer observes stake-weighted quorum (voting stake ≥ total stake × quorum %).
 - **Executor sharding:** Executors partitioned into disjoint shards per epoch via `deterministic_select_shard()` (SHA-256 seeded Fisher-Yates shuffle + stake-balanced round-robin). Each tx routed only to its shard, increasing throughput. Epoch boundary triggers reshuffle via `advance_epoch()` cache invalidation.
 
 ### Deterministic Per-Transaction Routing
@@ -215,7 +215,7 @@ A stake snapshot frozen at each epoch boundary enables each transaction to be ro
 
 - `CostModel` defines `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`
 - `verify_gas()` checks user `fuel_balance` against gas cost before execution
-- Per-action multipliers are planned (currently flat `base_cost`)
+- Per-action multipliers are implemented via `CostModel.amount_multiplier` (defaults: Process 1.0, Preload 2.0, Sign 1.5)
 
 ### Cryptography
 
@@ -267,7 +267,7 @@ Optimistic commit: `handle_signature()` dispatches first valid signature to `try
 
 **Stubs**: `initialize()` accepts gossiper closure but doesn't wire it. (Both finalize paths now use real data — `previous_hash` resolved from the token's chain tip, and the standard path populates `total_stake`/`total_voters` from the epoch stake set.)
 
-**Test count**: 28
+**Test count**: 42
 
 ### pneumatic_committer
 
@@ -351,19 +351,19 @@ This roadmap tracks the work from current foundation state through a production-
 |------|-------------|----------|--------|
 | Wire `initialize()` | Create closure calling `self.on_data_received(raw)` and pass to `gossiper.initialize()` | 2h | **DONE** |
 | `handle_process_request` | Implement preload → validate → assign finalizer flow (refs: C# Sentinel.cs:131-175) | 8h | **DONE** |
-| `process_transaction` | Full transaction processing: register → preload → spec validation → route | 8h | Open |
+| `process_transaction` | Full transaction processing: register → preload → spec validation → route | 8h | **DONE** — integrated into `handle_process_request` (sentinel.rs:132) |
 | `handle_confirmation` | Acquire transaction, verify finalizer, transition to Committed, notify sentinels | 4h | **DONE** |
 | `handle_rejection` | Check awaiting_finalizer state, pick new finalizer via deterministic assignment, reassign | 4h | **DONE** |
 | `handle_register_request` | Deserialize `NodeRegistryRequest`, validate stake, register node | 4h | **DONE** |
 | `handle_clear_request` | Already implemented — deserialize tx_id, remove from registry | 0h | **DONE** |
-| Risk-based routing | Route higher-risk transactions to more finalizers; adjust quorum dynamically | 6h | Open |
+| Risk-based routing | Route higher-risk transactions to more finalizers; adjust quorum dynamically | 6h | **DONE** — `route_finalizers` (sentinel/src/transaction_validator.rs:89) |
 | `send_to_executor_for_preload` | Use `TransactionNotifier` to send Preload action to Executor nodes | 4h | **DONE** |
 | `TransactionValidator` | Implement `validate_transaction` with spec lookup, `calculate_risk` concrete impl | 6h | **DONE** |
 | `TransactionNotifier` | Create module; implement `send_to_nodes` using `NodeRegistry` to look up + send to target type | 6h | **DONE** |
 | `StakeSnapshotCache` | Three-tier stake snapshot cache for sentinel deterministic routing | 4h | **DONE** (Phase 5) |
 | `assign_finalizer_deterministic` | Deterministic finalizer assignment with retry suffix for rejection | 2h | **DONE** (Phase 5) |
 
-**Sub-total**: 64h / ~1 week — 8 tasks remaining (can continue in parallel with Phase 2)
+**Sub-total**: 64h / ~1 week — complete (0 tasks remaining)
 
 ---
 
@@ -417,7 +417,7 @@ This roadmap tracks the work from current foundation state through a production-
 | `NodeRegistry.process_registration` | Iterate Add/Remove batch, insert/remove from DashMap, validate entries | 4h |
 | `check_and_commit_transaction_results` | Add Result propagation (no silent logger.log failures) | 2h |
 
-**Sub-total**: 50h / ~1 week
+**Sub-total**: 50h / ~1 week — 7 of 8 tasks done; 1 remaining (StakingManager persistence — `StubStakingManager` logs but doesn't persist)
 
 ---
 
@@ -525,14 +525,14 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 
 | Task | Description | Estimate |
 |------|-------------|----------|
-| Server worker loop | Remove `return` in `Worker::get_sync_thread` — loop must continue processing jobs | 2h |
-| Async poison test | Fix hanging test — needs `catch_unwind` or separate tokio runtime | 4h |
-| TcpConnection Drop impl | Cancel `listening_thread` and join with timeout on drop | 4h |
-| Config node type selection | Parse config spec for node type selection and stake requirements | 4h |
-| EnvironmentMetadataSpec wire-up | Wire `allowed_token_types`, `trans_validation_specs`, `block_validation_specs`, `sym_crypto_provider` fields | 6h |
-| Token.get_asset_mut | Return `&mut Option<Vec<u8>>` or add `set_asset` method | 2h |
+| ~~Server worker loop~~ | Remove `return` in `Worker::get_sync_thread` — loop must continue processing jobs | 2h |
+| ~~Async poison test~~ | Fix hanging test — needs `catch_unwind` or separate tokio runtime | 4h |
+| ~~TcpConnection Drop impl~~ | Cancel `listening_thread` and join with timeout on drop | 4h |
+| ~~Config node type selection~~ | Parse config spec for node type selection and stake requirements | 4h |
+| ~~EnvironmentMetadataSpec wire-up~~ | Wire `allowed_token_types`, `trans_validation_specs`, `block_validation_specs`, `sym_crypto_provider` fields | 6h |
+| ~~Token.get_asset_mut~~ | Return `&mut Option<Vec<u8>>` or add `set_asset` method | 2h |
 
-**Sub-total**: 22h / ~3 days
+**Sub-total**: 22h / ~3 days — **COMPLETE**
 
 ---
 
@@ -542,15 +542,15 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 
 | Module | Current | Target | Gap |
 |--------|---------|--------|-----|
-| `crypto.rs` | Partial | Full | HashProvider tests, crypto round-trip encrypt/decrypt | 6h |
-| `blocks.rs` | 6 tests | 10+ | Chain validation edge cases, BlockFactory hash determinism | 4h |
+| `crypto.rs` | 19 tests | Full | HashProvider tests, crypto round-trip encrypt/decrypt | 6h |
+| `blocks.rs` | 14 tests | 10+ | Chain validation edge cases, BlockFactory hash determinism | 4h |
 | `config.rs` | 0 tests | 5+ | Config loading, environment spec parsing | 4h |
-| `data.rs` | Stub only | 8+ | DefaultDataProvider wire format, StubDataProvider scenarios | 4h |
-| `tokens.rs` | 0 tests | 8+ | Token creation, comparison, minting | 4h |
-| `server.rs` | 1 (broken) | 5+ | ThreadPool lifecycle, async job handling, shutdown | 6h |
-| `epoch.rs` | 23 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 done) | 4h |
-| `registry.rs` | 33 core + 11 concurrent | 50+ | More concurrent stress tests | 6h |
-| `validation.rs` | 17 tests | 25+ | Custom spec registration, multi-token validation | 4h |
+| `data.rs` | 4 tests | 8+ | DefaultDataProvider wire format, StubDataProvider scenarios | 4h |
+| `tokens.rs` | 16 tests | 8+ | Token creation, comparison, minting | 4h |
+| `server.rs` | 9 tests | 5+ | ThreadPool lifecycle, async job handling, shutdown | 6h |
+| `epoch.rs` | 49 tests | 30+ | EpochReconciler integration, StakeSet edge cases, deterministic leader (SA_02 done) | 4h |
+| `registry.rs` | 39 tests | 50+ | More concurrent stress tests | 6h |
+| `validation.rs` | 26 tests | 25+ | Custom spec registration, multi-token validation | 4h |
 | Integration | 1 (self-signed) | 5+ | Full pipeline: process → validate → execute → finalize → commit; ~~wire framing socket round-trip (SA_01 companion)~~ 6 more conns integration tests added | 10h |
 
 **Sub-total**: 56h / ~1 week
@@ -603,12 +603,12 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 | 1. Sentinel Integration | ✅ Done (40 tests, ~8h) | Phase 0 |
 | 2. Executor Execution | ~1-2 days (stub + action bug) | Phase 1 |
 | 3. Finalizer Completion | ~4h remaining (gossiper wire) | Phase 1, 2 |
-| 4. Committer Completion | ~1 week | Phase 1-3 |
+| 4. Committer Completion | ~8h remaining (StakingManager persistence) | Phase 1-3 |
 | 5. Optimistic Finality + Block Gossip | ~1 day remaining (concurrency + E2E pipeline tests) | Phase 1-5d |
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
 | 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
-| 5d. Quorum Gossip Protocol | ✅ Done (~33h, ~4 days) | Phase 5d |
-| 6. Server & Infra | ~3 days | Can run in parallel with 1-3 |
+| 5d. Quorum Gossip Protocol | ✅ Done (~33h, ~4 days) | Phase 5c |
+| 6. Server & Infra | ✅ Done (~22h, ~3 days) | Can run in parallel with 1-3 |
 | 7. Test Coverage | ~1 week (concurrency + E2E) | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |
 

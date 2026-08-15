@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**pneumatic_core** is a Rust library (edition 2021) — the core module for worker node processes operating the "pneumatic" blockchain protocol. There is no binary target.
+This is a Rust workspace for the "pneumatic" blockchain protocol: the root `pneumatic_core` crate is a library (no binary target) with the core protocol modules, and `sentinel`, `executor`, `finalizer`, and `committer` are the four worker-node crates that depend on it.
 
 ## Build & Test Commands
 
 ```bash
 cargo check              # Quick compilation check
 cargo build              # Build the library
-cargo test               # Run all 158 tests
+cargo test               # Run all 398 tests (5-crate workspace)
 cargo test <filter>      # Run a single test, e.g. cargo test blocks::tests::get_current_chain_state_with_empty_chain
 ```
 
@@ -19,7 +19,7 @@ cargo test <filter>      # Run a single test, e.g. cargo test blocks::tests::get
 
 ### Top-level modules (lib.rs)
 
-The library is flat — 13 modules declared in `src/lib.rs`:
+The library is flat — 20 modules declared in `src/lib.rs`:
 
 | Module | Responsibility |
 |--------|---------------|
@@ -36,6 +36,12 @@ The library is flat — 13 modules declared in `src/lib.rs`:
 | `data` | `DataProvider` trait — abstracts external data store; `DefaultDataProvider` communicates via TCP/UDS to a local data service using MsgPack |
 | `crypto` | `AsymCryptoProvider` trait — `Ed25519Provider` (sign/verify/public_key via ed25519-dalek, encrypt/decrypt for self-encryption, encrypt_to/decrypt_from for cross-recipient encryption via AES-256-GCM + X25519 DH; `x25519_public_key()` accessor), `HashProvider` trait with `BasicHashProvider` (SHA-256 via ring) |
 | `encoding` | JSON and MsgPack (rmp-serde) serialization/deserialization helpers |
+| `errors` | `PneumaticError` — workspace-wide error type |
+| `gossiper` | `Gossiper` — fan-out of messages to connected nodes with dedup |
+| `validation` | `TransactionValidationSpec` / `BlockValidatorSpec` traits, spec registries, nonce validation |
+| `registry` | `PendingTransactionRegistry` — DashMap of in-flight transactions |
+| `epoch` | `Epoch`, `StakeSet`, `ExecutorSet`, `LeaderSelector`, `BlockProposer`, `CandidateRegistry`, `IStakingManager` / `IEpochReconciler` (with stubs) |
+| `action_router` | `ActionRouter` — nonce/gas/stake checks and per-transaction routing |
 | `tokens` | `Token` — contains metadata, blockchain, optional asset data; `BlockValidator` trait for per-token block validation |
 | `blocks` | `Block` and `Blockchain` — append-only chain with hash chaining; `BlockFactory` for hash computation |
 | `transactions` | `Transaction`, `SignedTransaction`, `TransactionCommit` — models the signed transaction structure with leader/finalizer/executor signatures |
@@ -57,9 +63,8 @@ Data frames consist of a 4-byte big-endian length header followed by the MsgPack
 
 ## Important notes
 
-- Several modules contain `todo!()` stubs: `tokens.rs` (`get_asset_mut`), `blocks.rs` (`BlockFactory::create_hash` should actually hash), `messages.rs` (`MessageBody` struct empty)
-- The `server.rs` ThreadPool has a commented-out async poison test (`#[should_panic]` test at line 252-275) that hangs and needs fixing
-- The ThreadPool's sync worker processes one job then exits (not a proper loop) — see `Worker::get_sync_thread` line 118
-- `config.rs` line 37-47 has `// todo` comments for node registry type selection, connection count calculation, and minimum stake
+- Former `todo!()` stubs are resolved: `BlockFactory::create_hash` (blocks.rs:85) computes SHA-256 over `previous_hash || timestamp || signed_trans || token_metadata`; `Token::get_asset_mut` was removed; `MessageBody<T>` (messages.rs:28) is `{action, body}`
+- The ThreadPool's sync worker loops properly (server.rs:118), and the zero-thread panic test is an active, passing `#[should_panic]` (server.rs:169-173)
 - `data.rs` uses Unix domain sockets on Unix platforms, falling back to TCP loopback (port 55555) on non-Unix
-- `node::registry.rs` line 165 has a TODO to use registered connections instead of creating senders on the fly for `send_to_all`
+- `NodeRegistry::send_to_all` (node/registry.rs:167) sends over registered connections; one TODO remains at node/registry.rs:74 (placeholder public node address)
+- Staking persistence is still stubbed — `StubStakingManager` (epoch.rs:363) logs `StakingOp`s without persisting them

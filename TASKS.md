@@ -401,7 +401,7 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (377 passing across 5 crates — 272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer)
+## Phase 7: Tests (398 passing across 5 crates — 278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -413,11 +413,11 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P1_Add tests for Gossiper — `gossiper.rs` — 9 tests: accept first, ignore duplicate, accept different, capacity, fan-out invokes-all, fan-out receives-copy, fan-out dedup-skips-all, fan-out three-handlers, fan-out concurrent-invocation
 - [x] P1_Add tests for ValidationSpec — `validation.rs` — 17 tests: SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec, ValidationSpecRegistry, nonce validation
 - [x] P2_Add tests for Sentinel message routing — `sentinel/src/sentinel.rs` — 30 tests (Phase 7 originals: From impls 2, creation 1, spec name routing 2, action dispatch 2, self-signed integration 1, compute_gas_used 3, TransactionNotifier 4, handle_confirmation 3, handle_rejection 3, handle_register_request 3, pool enqueue 2, pool ordering 1, shard routing 1, epoch advance 1) + 5 stake_snapshot_cache tests + 5 executor_set_cache tests = **40 total**
-- [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 8 tests: add_success, add_duplicate_fails, add_multiple, check_quorum_met, check_quorum_not_met, reconcile_stake_weighted_supermajority, reconcile_single_sets_winner, reconcile_zero_stake_empty, reconcile_all_needed, plus 3 concurrent tests: multi-thread add, duplicate rejection, quorum during concurrent adds
+- [x] P4_Add tests for SignatureCollector quorum logic — `finalizer/src/signature_collector.rs` — 16 tests (13 basic + 3 concurrent): add_signature_success, add_duplicate_signature_fails, add_multiple_signatures, check_quorum_met, check_quorum_not_met, reconcile_signatures, reconcile_single_signature_sets_winner, reconcile_stake_weighted_supermajority, reconcile_all_needed_for_quorum, reconcile_zero_stake_returns_empty, reconcile_nonexistent_tx_fails, has_signatures, quorum_with_high_quorum_percentage; concurrent: concurrent_add_signature_same_tx, concurrent_add_duplicate_signature, concurrent_check_quorum_while_adding
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 3 tests: send_to_committers, send_clear_to_sentinels, block_finalized_serializes
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 377 tests across 5 crate targets (272 core + 40 sentinel + 28 finalizer + 9 executor + 28 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +7 tests from Phase 5d quorum gossip (4 renamed BlockFinalized handlers + 2 vote tracking + 1 Confirmed transition)
+- [x] T07 Migrate existing tests — all test-bearing files — total 398 tests across 5 crate targets (278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +7 tests from Phase 5d quorum gossip (4 renamed BlockFinalized handlers + 2 vote tracking + 1 Confirmed transition) — +14 tests from finalizer real block data (2026-08-14) — +7 tests from genesis convention fix (2026-08-15)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -748,7 +748,7 @@ Explicit proposer public key for conflict-resolution stake lookup. Propagated fr
 
 #### Vote/Dispute messages — DONE (Phase 5, replaced with quorum gossip)
 **File:** `finalizer/src/message_dispatcher.rs`, `committer/src/committer.rs`
-Original `BlockConfirmed` (block propagation) renamed to `BlockFinalized`. Full quorum gossip: `BlockConfirmed` is now a per-node vote (block_hash + sender_key); `BlockQuorumReached` is the quorum status broadcast. Stake-weighted accumulation via `confirmation_votes` HashMap in Committer. `Finalizer.set_stake_set()` exists but no production caller fetches stake from DataProvider yet — external orchestrator wiring deferred.
+Original `BlockConfirmed` (block propagation) renamed to `BlockFinalized`. Full quorum gossip: `BlockConfirmed` is now a per-node vote (block_hash + sender_key); `BlockQuorumReached` is the quorum status broadcast. Stake-weighted accumulation via `confirmation_votes` HashMap in Committer. Stake fetching is internal to the Finalizer via `StakeSnapshotCache` (fetched from `DataProvider` at epoch boundaries); `set_stake_set()` remains a test-only override.
 
 #### Conflict-vote aggregation — NOT NEEDED (executor sharding)
 Conflict detection operates locally at epoch boundaries via `CandidateRegistry` + `resolve_block_conflict()`. Distributed voting protocol removed from scope.
@@ -792,7 +792,7 @@ Conflict detection operates locally at epoch boundaries via `CandidateRegistry` 
 
 #### Executor — finalizer networking has action bug
 **File:** `executor/src/executor.rs:141-181, 344-356`
-`send_to_finalizer()` is wired into `run_execution()` but uses `Message(action="Execute")` while the Finalizer's `handle_signature` method (line 172) expects action `"Sign"`. The Finalizer will never receive these messages — hits `UnknownAction` error path. Method is duplicated in both `Executor` and `ExecutorHandle` (lines 418-445).
+`send_to_finalizer()` is wired into `run_execution()` but uses `Message(action="Execute")` while the Finalizer's `handle_signature` method (line 263) expects action `"Sign"`. The Finalizer will never receive these messages — hits `UnknownAction` error path. Method is duplicated in both `Executor` and `ExecutorHandle` (lines 418-445).
 **Action:** Fix action string from `"Execute"` to `"Sign"`; deduplicate between Executor and ExecutorHandle.
 
 #### ~~Executor — `validate_execution_result` never called~~
@@ -803,7 +803,7 @@ Conflict detection operates locally at epoch boundaries via `CandidateRegistry` 
 **File:** `executor/src/executor.rs:203-208`
 **FIXED:** Now called in `ExecutorHandle::run_execution` at line 334. Duplicate between Executor and ExecutorHandle.
 
-### pneumatic_finalizer — Priority 4 (Complete: 26 tests pass)
+### pneumatic_finalizer — Priority 4 (Complete: 42 tests pass)
 
 Stubbed within implemented methods:
 - `SignatureCollector.reconcile_signatures` — Now fully implemented: sorts candidates by stake descending, accumulates until quorum threshold (2/3) reached, returns winning supermajority set. Sets `winning_finalizer` to the executor that crossed quorum. `conflict_resolved` = true when quorum-crossing signature found. 4 new tests added.
@@ -817,27 +817,27 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (345 passing across 5 crates)
+### Tests — Priority 6 (398 passing across 5 crates)
 
-#### Tests added to pneumatic_core — 216 tests
-**Files:** `errors.rs` (10), `transactions.rs` (14), `registry.rs` (33 incl. 11 concurrent + 2 gas_tracker), `gossiper.rs` (9), `validation.rs` (17 + 1 integration), `tokens.rs` (7 mint_token_full fee tests), `epoch.rs` (22 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers), `data.rs` (StubDataProvider), `action_router.rs` (18), `crypto.rs` (hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (pre-existing), `messages.rs` (pre-existing), `conns.rs` (7 SA_01 wire framing integration tests), `streams.rs` (9 streams unit tests)
+#### Tests added to pneumatic_core — 278 tests
+**Files:** `errors.rs` (16), `transactions.rs` (27), `registry.rs` (39 incl. concurrent + gas_tracker), `gossiper.rs` (9), `validation.rs` (26 incl. integration), `tokens.rs` (16), `epoch.rs` (49 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers only), `data.rs` (4), `action_router.rs` (28), `crypto.rs` (19: hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (14), `server.rs` (9), `logging.rs` (1), `conns.rs` (9), `conns/senders.rs` (5), `conns/streams.rs` (8)
 **Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransactionRegistry CRUD + concurrent ops + gas_tracker, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration, TokenFactory minting fee deduction, LeaderSelector stake-weighted selection, BlockProposer, EpochBoundaryDetector, conflict resolution, deterministic_select per-transaction routing (5 tests), epoch_number on Block propagation.
 
-#### Tests added to pneumatic_finalizer — 22 tests
-**Files:** `signature_collector.rs` (12 incl. 3 concurrent), `block_builder.rs` (2), `message_dispatcher.rs` (2), plus pre-existing
+#### Tests added to pneumatic_finalizer — 42 tests
+**Files:** `finalizer.rs` (14), `signature_collector.rs` (16 incl. 3 concurrent), `block_builder.rs` (4), `stake_snapshot_cache.rs` (5), `message_dispatcher.rs` (3)
 **Covered:** Signature add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior.
 
-#### Tests added to pneumatic_sentinel — 25 tests
-**Files:** `sentinel/src/sentinel.rs`
+#### Tests added to pneumatic_sentinel — 40 tests
+**Files:** `sentinel/src/sentinel.rs` (30), `executor_set_cache.rs` (5), `stake_snapshot_cache.rs` (5)
 **Covered:** SentinelError From impls, construction, spec name routing, action dispatch (process, register, clear), self-signed token flow, compute_gas_used (3: zero amount, preload multiplier, unknown action default), TransactionNotifier send methods (4: executors, finalizer, notify_clear, notify_delete — all verify no-panic with no runtime), handle_confirmation (3: valid finalizer → Committed, unassigned finalizer → error, non-Finalizing state → error), handle_rejection (3: no alternative finalizer → error, unassigned finalizer → error, terminal state → error), handle_register_request (3: sufficient stake → success with registry verification, already registered → error, insufficient stake → error).
 
 #### Tests added to pneumatic_executor — 9 tests
 **Files:** `executor/src/executor.rs`
 **Covered:** Execution result validation, capacity checks, full backpressure cycle.
 
-#### Tests in pneumatic_committer — 28 tests (21 committer core + 7 quorum gossip)
-**Files:** `committer/src/committer.rs` (21: epoch advance, check_and_commit ×4, commit_conflict ×4, propose_blocks ×2, handle_block_* ×7, plus handle_epoch_reconcile ×2, block distribution, token distribution, serialize/deserialize helpers); `committer/src/epoch_manager.rs` (7: StakeStore concurrent add, StakingManager ops, EpochReconciler conflict detection; 3 doc tests in committer.rs); `finalizer/src/signature_collector.rs` (28: add/remove, quorum detection, conflict reconciliation, concurrent safety, block building, message dispatch, shutdown behavior); `finalizer/src/block_builder.rs` (2: build_signed_transaction, create_block); `finalizer/src/message_dispatcher.rs` (2: send_to_committers, send_clear_to_sentinels + 1 block_finalized_serializes test)
-**Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow). Quorum gossip: block finalized (valid append, orphan ignored, tampered rejected, unknown token error), vote tracking (accumulates_stake, skips_missing_stake_set), quorum reached (Confimed transition).
+#### Tests in pneumatic_committer — 29 tests (20 committer.rs + 9 epoch_manager.rs)
+**Files:** `committer/src/committer.rs` (20: check_and_commit ×5, commit-path ×5 incl. genesis regression, propose_blocks ×2, advance_epoch ×1, handle_block_* ×7); `committer/src/epoch_manager.rs` (9, all reconcile_*)
+**Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow). Quorum gossip: block finalized (valid append, orphan ignored, tampered rejected, unknown token error), vote tracking (accumulates_stake, skips_missing_stake_set), quorum reached (Confirmed transition).
 
 #### Remaining test gaps
 **Files:** `config.rs` (unit tests), `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (process_registration, send_to_all)
