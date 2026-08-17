@@ -91,6 +91,11 @@ impl NodeIdentity {
         self.ed25519.sign_data(&payload)
     }
 
+    /// Sign an arbitrary message with this node's Ed25519 key.
+    pub fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, PneumaticError> {
+        self.ed25519.sign_data(message)
+    }
+
     /// Verify a peer's binding signature against its Ed25519 public key.
     pub fn verify_binding(
         ed25519_public_key: &[u8],

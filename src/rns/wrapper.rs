@@ -16,7 +16,7 @@
 
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -24,9 +24,11 @@ use dashmap::DashMap;
 use rns_core::packet::RawPacket;
 use rns_crypto::identity::Identity;
 use rns_net::{
-    AnnouncedIdentity, Callbacks, DestHash, Destination, IdentityHash, InterfaceId, NodeConfig,
+    Callbacks, DestHash, Destination, IdentityHash, InterfaceId, NodeConfig,
     PacketHash, ProofStrategy, RnsNode,
 };
+
+pub use rns_net::AnnouncedIdentity;
 
 use crate::config::BootstrapPeer;
 use crate::conns::MAX_FRAME_SIZE;
@@ -59,6 +61,9 @@ pub struct RnsNetwork {
     destinations: Arc<DashMap<[u8; 16], AnnouncedIdentity>>,
     stopped: Arc<AtomicBool>,
     handler: Arc<RwLock<Option<PacketHandler>>>,
+    announce_handler: Arc<RwLock<Option<Arc<dyn Fn(AnnouncedIdentity) + Send + Sync>>>>,
+    announce_rx: Mutex<Option<mpsc::Receiver<AnnouncedIdentity>>>,
+    announce_worker: Mutex<Option<JoinHandle<()>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -69,12 +74,16 @@ struct NetworkCallbacks {
     txs: Vec<mpsc::Sender<Vec<u8>>>,
     next: AtomicUsize,
     destinations: Arc<DashMap<[u8; 16], AnnouncedIdentity>>,
+    announce_tx: mpsc::Sender<AnnouncedIdentity>,
 }
 
 impl Callbacks for NetworkCallbacks {
     fn on_announce(&mut self, announced: AnnouncedIdentity) {
         let rhash = rhash_from_public_key(&announced.public_key);
-        self.destinations.insert(rhash, announced);
+        self.destinations.insert(rhash, announced.clone());
+        if self.announce_tx.send(announced).is_err() {
+            eprintln!("[pneumatic] rns: announce handler channel closed; dropping announce");
+        }
     }
 
     fn on_local_delivery(&mut self, _dest_hash: DestHash, raw: Vec<u8>, _packet_hash: PacketHash) {
@@ -143,10 +152,12 @@ impl RnsNetwork {
 
         let (txs, rxs): (Vec<_>, Vec<_>) =
             (0..WORKER_THREADS).map(|_| mpsc::channel::<Vec<u8>>()).unzip();
+        let (announce_tx, announce_rx) = mpsc::channel::<AnnouncedIdentity>();
         let callbacks = NetworkCallbacks {
             txs,
             next: AtomicUsize::new(0),
             destinations: Arc::clone(&destinations),
+            announce_tx,
         };
 
         let node = RnsNode::start(node_config, Box::new(callbacks))
@@ -182,6 +193,9 @@ impl RnsNetwork {
             destinations,
             stopped,
             handler,
+            announce_handler: Arc::new(RwLock::new(None)),
+            announce_rx: Mutex::new(Some(announce_rx)),
+            announce_worker: Mutex::new(None),
             workers,
         })
     }
@@ -212,11 +226,38 @@ impl RnsNetwork {
         *self.handler.write().unwrap() = Some(handler);
     }
 
+    /// Install the announce handler for discovered peers.
+    ///
+    /// Announce callbacks run on an RNS driver thread, so this consumes a
+    /// dedicated non-blocking channel and dispatches on a worker thread.
+    pub fn on_announce(&self, handler: Arc<dyn Fn(AnnouncedIdentity) + Send + Sync>) {
+        *self.announce_handler.write().unwrap() = Some(handler);
+        let Some(rx) = self.announce_rx.lock().unwrap().take() else {
+            return;
+        };
+        let handler = Arc::clone(&self.announce_handler);
+        let worker = thread::spawn(move || {
+            loop {
+                let Ok(announced) = rx.recv() else {
+                    return;
+                };
+                let Some(handler) = handler.read().unwrap().clone() else {
+                    continue;
+                };
+                handler(announced);
+            }
+        });
+        *self.announce_worker.lock().unwrap() = Some(worker);
+    }
+
     /// Clean shutdown: stop the workers, then unwrap and shut down the node
     /// (the spike verified no lingering worker refs).
     pub fn stop(self) {
         self.stopped.store(true, Ordering::SeqCst);
         for worker in self.workers {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.announce_worker.lock().unwrap().take() {
             let _ = worker.join();
         }
         // RnsNode is not Debug, so no `.expect()` here.

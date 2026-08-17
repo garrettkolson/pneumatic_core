@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures::future::join_all;
@@ -7,6 +8,7 @@ use strum::IntoEnumIterator;
 
 use crate::conns::{ConnError, Connection};
 use crate::config::Config;
+use crate::crypto::{AsymCryptoProvider, Ed25519Provider};
 use crate::encoding::serialize_to_bytes_rmp;
 use crate::errors::PneumaticError;
 use crate::node::*;
@@ -30,6 +32,7 @@ pub struct NodeRegistry {
     /// `register_peer` with a `NullConnection`.
     network: Option<Arc<RnsNetwork>>,
     stake_check: StakeCheck,
+    evictor: Option<JoinHandle<()>>,
 }
 
 impl NodeRegistry {
@@ -38,15 +41,50 @@ impl NodeRegistry {
         network: Option<Arc<RnsNetwork>>,
         stake_check: StakeCheck,
     ) -> Self {
-        NodeRegistry {
+        let registry = NodeRegistry {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
             archivers: Arc::new(DashMap::new()),
             config,
-            network,
+            network: network.clone(),
             stake_check,
+            evictor: None,
+        };
+        let mut registry = registry;
+        if network.is_some() {
+            registry.start_eviction();
+        }
+        registry
+    }
+
+    /// Spawn the eviction loop: remove entries not seen for 30 seconds.
+    fn start_eviction(&mut self) {
+        let committers = Arc::clone(&self.committers);
+        let sentinels = Arc::clone(&self.sentinels);
+        let executors = Arc::clone(&self.executors);
+        let finalizers = Arc::clone(&self.finalizers);
+        let archivers = Arc::clone(&self.archivers);
+        let handle = std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                evict_expired(&[
+                    Arc::clone(&committers),
+                    Arc::clone(&sentinels),
+                    Arc::clone(&executors),
+                    Arc::clone(&finalizers),
+                    Arc::clone(&archivers),
+                ]);
+            }
+        });
+        self.evictor = Some(handle);
+    }
+
+    /// Stop the eviction loop (called before the registry is dropped).
+    pub fn stop_eviction(&mut self) {
+        if let Some(handle) = self.evictor.take() {
+            let _ = handle.join();
         }
     }
 
@@ -172,12 +210,81 @@ impl NodeRegistry {
                 );
                 Ok(())
             }
-            NodeRequestType::Request => Err(PneumaticError::Registry(
-                "directory sync lands in stage 2".to_string(),
-            )),
-            NodeRequestType::Heartbeat => Err(PneumaticError::Registry(
-                "heartbeat handling lands in stage 2".to_string(),
-            )),
+            NodeRequestType::Request => {
+                self.handle_request(&request);
+                Ok(())
+            }
+            NodeRequestType::Heartbeat => {
+                self.handle_heartbeat(&request);
+                Ok(())
+            }
+        }
+    }
+
+    /// Respond to a directory request with our entries for `requested_type`.
+    fn handle_request(&self, request: &NodeRequest) {
+        let requested_type = request.requested_type.clone();
+        let requester_rhash = request.requester_rhash;
+
+        let entries = self
+            .get_nodes(&requested_type)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|e| NodeRegistryEntry {
+                        node_key: e.key().clone(),
+                        node_rhash: e.value().rhash,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let Ok(entries_bytes) = serialize_to_bytes_rmp(&entries) else {
+            eprintln!("[pneumatic] failed to serialize directory entries; dropping response");
+            return;
+        };
+
+        let Ok(signature) = self.config.identity.sign_message(&entries_bytes) else {
+            eprintln!("[pneumatic] failed to sign directory response; dropping response");
+            return;
+        };
+
+        let response = NodeRegistryResponse {
+            responder_key: self.config.public_key.clone(),
+            responder_rhash: self.config.rhash,
+            registry_type: requested_type.clone(),
+            entries,
+            signature,
+        };
+
+        let Some(network) = &self.network else {
+            return;
+        };
+
+        let Ok(packet_bytes) = serialize_to_bytes_rmp(&NetworkPacket {
+            control: Some(NodeRequest {
+                requester_key: self.config.public_key.clone(),
+                requester_rhash: self.config.rhash,
+                request_type: NodeRequestType::Request,
+                requester_types: self.config.node_registry_types.clone(),
+                requested_type: requested_type.clone(),
+                binding_signature: vec![],
+            }),
+            data: Some(serialize_to_bytes_rmp(&response).unwrap_or_default()),
+        }) else {
+            eprintln!("[pneumatic] failed to serialize directory response; dropping response");
+            return;
+        };
+
+        if packet_bytes.is_empty() {
+            return;
+        }
+
+        if let Err(e) = network.send_to(requester_rhash, &packet_bytes) {
+            eprintln!(
+                "[pneumatic] directory response delivery to {:02x?} failed: {}",
+                requester_rhash, e
+            );
         }
     }
 
@@ -360,6 +467,51 @@ impl NodeRegistry {
         }
     }
 
+    /// Apply a directory response: verify its signature, then upsert each
+    /// entry under the response's registry type (entries are hints, so we
+    /// re-check capacity and do not clobber live connections).
+    pub fn handle_directory_response(
+        &self,
+        response: &NodeRegistryResponse,
+    ) -> Result<(), PneumaticError> {
+        let entries_bytes = serialize_to_bytes_rmp(&response.entries)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        let valid = Ed25519Provider::generate()
+            .check_signature(
+                &response.signature,
+                &response.responder_key,
+                &entries_bytes,
+            )
+            .unwrap_or(false);
+        if !valid {
+            return Err(PneumaticError::Registry(
+                "directory response signature invalid".to_string(),
+            ));
+        }
+
+        for entry in &response.entries {
+            let conn: Box<dyn Connection> = match &self.network {
+                Some(network) => Box::new(RnsConnection::new(entry.node_rhash, Arc::clone(network))),
+                None => Box::new(NullConnection),
+            };
+            self.register_peer(
+                entry.node_key.clone(),
+                entry.node_rhash,
+                &response.registry_type,
+                conn,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn handle_heartbeat(&self, request: &NodeRequest) {
+        if let Some(existing_type) = self.find_registered_type(&request.requester_key) {
+            self.refresh_last_seen(&request.requester_key, &existing_type);
+        }
+    }
+
     fn refresh_last_seen(&self, key: &Vec<u8>, node_type: &NodeRegistryType) {
         if let Some(nodes) = self.get_nodes(node_type) {
             if let Some(mut entry) = nodes.get_mut(key) {
@@ -419,6 +571,21 @@ pub struct NullConnection;
 impl Connection for NullConnection {
     async fn send(&self, _data: &Vec<u8>) -> Result<(), ConnError> {
         Ok(())
+    }
+}
+
+fn evict_expired(notes: &[Arc<DashMap<Vec<u8>, NodeRegistryNode>>]) {
+    let cutoff = Instant::now() - Duration::from_secs(30);
+    for nodes in notes {
+        let mut expired = Vec::new();
+        for entry in nodes.iter() {
+            if entry.value().last_seen < cutoff {
+                expired.push(entry.key().clone());
+            }
+        }
+        for key in expired {
+            nodes.remove(&key);
+        }
     }
 }
 
@@ -534,5 +701,46 @@ mod tests {
         assert!(!reg.register_peer(vec![3], [3u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
         // ...but an existing peer can still refresh its entry.
         assert!(reg.register_peer(vec![1], [1u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
+    }
+
+    #[test]
+    fn directory_response_registers_valid_entries() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let responder = NodeIdentity::generate_in_memory();
+        let responder_pub = responder.ed25519.public_key().unwrap();
+        let entries = vec![NodeRegistryEntry {
+            node_key: vec![42],
+            node_rhash: [7u8; 16],
+        }];
+        let entries_bytes = serialize_to_bytes_rmp(&entries).unwrap();
+        let signature = responder.ed25519.sign_data(&entries_bytes).unwrap();
+        let response = NodeRegistryResponse {
+            responder_key: responder_pub,
+            responder_rhash: responder.rhash,
+            registry_type: NodeRegistryType::Finalizer,
+            entries,
+            signature,
+        };
+        reg.handle_directory_response(&response).unwrap();
+        assert!(reg.get_nodes(&NodeRegistryType::Finalizer).unwrap().contains_key(&vec![42]));
+    }
+
+    #[test]
+    fn directory_response_rejects_invalid_signature() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let entries = vec![NodeRegistryEntry {
+            node_key: vec![42],
+            node_rhash: [7u8; 16],
+        }];
+        let responder = Ed25519Provider::default();
+        let entries_bytes = serialize_to_bytes_rmp(&entries).unwrap();
+        let response = NodeRegistryResponse {
+            responder_key: responder.public_key().unwrap(),
+            responder_rhash: [0u8; 16],
+            registry_type: NodeRegistryType::Finalizer,
+            entries,
+            signature: vec![0u8; 64],
+        };
+        assert!(reg.handle_directory_response(&response).is_err());
     }
 }

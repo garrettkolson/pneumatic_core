@@ -4,15 +4,17 @@ use dashmap::DashMap;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::BasicHashProvider;
 use pneumatic_core::data::{DataProvider, DefaultDataProvider};
-use pneumatic_core::encoding::deserialize_rmp_to;
+use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
-use pneumatic_core::node::{NetworkPacket, NodeRegistryType};
+use pneumatic_core::node::{NetworkPacket, NodeRequest, NodeRegistryResponse, NodeRegistryType};
+use pneumatic_core::node::NodeRequestType;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::config_builder::RnsNodeConfigBuilder;
-use pneumatic_core::rns::wrapper::RnsNetwork;
+use pneumatic_core::rns::identity::NodeIdentity;
+use pneumatic_core::rns::wrapper::{AnnouncedIdentity, RnsNetwork};
 
 use pneumatic_committer::block_services::BlockServices;
 use pneumatic_committer::committer::Committer;
@@ -101,7 +103,9 @@ async fn main() {
 
     // 5. Bridge the transport to the control/data planes: control packets go
     //    to the node registry, data packets to the gossiper.
-    if let Some(network) = &network {
+    if let Some(network_ref) = &network {
+        let network = network_ref.clone();
+        let send_net = network.clone();
         let registry = node_registry.clone();
         let gossip = gossiper.clone();
         network.on_packet(Arc::new(move |raw: Vec<u8>| {
@@ -113,12 +117,43 @@ async fn main() {
                         }
                     }
                     if let Some(data) = packet.data {
-                        gossip.handle_message(data);
+                        if let Ok(response) = deserialize_rmp_to::<NodeRegistryResponse>(&data) {
+                            if let Err(e) = registry.handle_directory_response(&response) {
+                                eprintln!("[pneumatic] directory response error: {}", e);
+                            }
+                        } else {
+                            let _ = gossip.handle_message(data);
+                        }
                     }
                 }
                 Err(e) => {
                     eprintln!("[pneumatic] dropping undecodable transport packet: {}", e);
                 }
+            }
+        }));
+
+        // 6. Discovery: when RNS announces a new peer, request its directory.
+        let dir_cfg = config.clone();
+        network.on_announce(Arc::new(move |announced: AnnouncedIdentity| {
+            let rhash = announced.identity_hash.0;
+            let payload = serialize_to_bytes_rmp(&NodeRequest {
+                requester_key: dir_cfg.public_key.clone(),
+                requester_rhash: dir_cfg.rhash,
+                request_type: NodeRequestType::Request,
+                requester_types: dir_cfg.node_registry_types.clone(),
+                requested_type: NodeRegistryType::Committer,
+                binding_signature: NodeIdentity::sign_binding(
+                    &dir_cfg.identity,
+                    &rhash,
+                    &NodeRegistryType::Committer,
+                    &dir_cfg.node_registry_types,
+                ).unwrap_or_default(),
+            }).unwrap_or_else(|e| { eprintln!("[pneumatic] directory request serialize failed: {}", e); vec![] });
+            if payload.is_empty() {
+                return;
+            }
+            if let Err(e) = send_net.send_to(rhash, &payload) {
+                eprintln!("[pneumatic] directory request to {:02x?} failed: {}", rhash, e);
             }
         }));
     }
