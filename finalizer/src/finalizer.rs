@@ -532,7 +532,7 @@ mod tests {
     use super::*;
     use dashmap::DashMap;
     use pneumatic_core::config::Config;
-    use pneumatic_core::crypto::BasicHashProvider;
+    use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider};
     use pneumatic_core::data::StubDataProvider;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::blocks::{BlockFactory, FinalityStatus};
@@ -578,8 +578,11 @@ mod tests {
     }
 
     fn make_test_config() -> Config {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let public_key = identity.ed25519.public_key().unwrap_or_default();
+        let rhash = identity.rhash;
         Config {
-            public_key: vec![1, 2, 3, 4],
+            public_key,
             ip_address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             rest_api_version: 1,
             node_type: NodeType::Full,
@@ -588,18 +591,21 @@ mod tests {
             reconciliation_partition_id: "reconciliation".to_string(),
             environment_metadata: make_test_env_data(),
             type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+            transport_enabled: false,
         }
     }
 
     fn make_test_node_registry() -> Arc<NodeRegistry> {
         let config = make_test_config();
-        Arc::new(
-            NodeRegistry::init(
-                Arc::new(config),
-                Box::new(pneumatic_core::conns::factories::ConnFactory::new()),
-                Arc::new(|_| {}),
-            )
-        )
+        Arc::new(NodeRegistry::init(
+            Arc::new(config),
+            None,
+            Arc::new(|_, _| true),
+        ))
     }
 
     fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {

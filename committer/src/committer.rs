@@ -898,7 +898,6 @@ mod tests {
 
     use pneumatic_core::blocks::Block;
     use pneumatic_core::config::Config;
-    use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::crypto::BasicHashProvider;
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
@@ -1086,6 +1085,8 @@ mod tests {
         data_provider: Arc<TestDataProvider>,
     ) -> (Committer, Arc<PendingTransactionRegistry>) {
         let env_data = Arc::new(make_test_env_data());
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let rhash = identity.rhash;
         let config = Config {
             public_key: vec![1],
             ip_address: "127.0.0.1".parse().unwrap(),
@@ -1096,15 +1097,20 @@ mod tests {
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
             type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+            transport_enabled: false,
         };
-        let conn_factory = ConnFactory::new();
-        let on_received = Arc::new(|_data: Vec<u8>| {});
         let node_registry = Arc::new(NodeRegistry::init(
             Arc::new(config),
-            Box::new(conn_factory),
-            on_received,
+            None,
+            Arc::new(|_, _| true),
         ));
 
+        let gossiper_identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let gossiper_rhash = gossiper_identity.rhash;
         let gossiper = Arc::new(Gossiper::new(
             NodeRegistryType::Committer,
             Config {
@@ -1117,6 +1123,11 @@ mod tests {
                 reconciliation_partition_id: "recon".to_string(),
                 environment_metadata: Arc::new(DashMap::new()),
                 type_configs: Arc::new(DashMap::new()),
+                identity: Arc::new(gossiper_identity),
+                rhash: gossiper_rhash,
+                bootstrap_peers: Vec::new(),
+                rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+                transport_enabled: false,
             },
             60,
             env_data.asym_crypto_provider.clone(),
@@ -1456,6 +1467,8 @@ mod tests {
         leader_key: Vec<u8>,
     ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<TestDataProvider>) {
         let env_data = Arc::new(make_test_env_data());
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let rhash = identity.rhash;
         let config = Config {
             public_key: committer_key.clone(),
             ip_address: "127.0.0.1".parse().unwrap(),
@@ -1466,15 +1479,20 @@ mod tests {
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
             type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+            transport_enabled: false,
         };
-        let conn_factory = ConnFactory::new();
-        let on_received = Arc::new(|_data: Vec<u8>| {});
         let node_registry = Arc::new(NodeRegistry::init(
             Arc::new(config),
-            Box::new(conn_factory),
-            on_received,
+            None,
+            Arc::new(|_, _| true),
         ));
 
+        let gossiper_identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let gossiper_rhash = gossiper_identity.rhash;
         let gossiper = Arc::new(Gossiper::new(
             NodeRegistryType::Committer,
             Config {
@@ -1487,6 +1505,11 @@ mod tests {
                 reconciliation_partition_id: "recon".to_string(),
                 environment_metadata: Arc::new(DashMap::new()),
                 type_configs: Arc::new(DashMap::new()),
+                identity: Arc::new(gossiper_identity),
+                rhash: gossiper_rhash,
+                bootstrap_peers: Vec::new(),
+                rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+                transport_enabled: false,
             },
             60,
             env_data.asym_crypto_provider.clone(),

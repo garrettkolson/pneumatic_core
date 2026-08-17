@@ -129,11 +129,16 @@ mod tests {
     use crate::config::Config;
     use crate::crypto::Ed25519Provider;
     use crate::node::{NodeRegistryType, NodeType};
+    use crate::rns::config_builder::DEFAULT_UDP_PORT;
+    use crate::rns::identity::NodeIdentity;
     use dashmap::DashMap;
 
     fn make_test_config() -> Config {
+        let identity = NodeIdentity::generate_in_memory();
+        let rhash = identity.rhash;
+        let public_key = identity.ed25519.public_key().unwrap_or_default();
         Config {
-            public_key: vec![1],
+            public_key,
             ip_address: "127.0.0.1".parse().unwrap(),
             rest_api_version: 1,
             node_type: NodeType::Full,
@@ -142,6 +147,11 @@ mod tests {
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
             type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: DEFAULT_UDP_PORT,
+            transport_enabled: false,
         }
     }
 

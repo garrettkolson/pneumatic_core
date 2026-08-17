@@ -1,11 +1,15 @@
 use std::fs;
 use std::io::Error;
 use std::net::{IpAddr, Ipv6Addr};
+use std::path::Path;
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use crate::crypto::AsymCryptoProvider;
 use crate::encoding;
 use crate::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+use crate::rns::config_builder::DEFAULT_UDP_PORT;
+use crate::rns::identity::NodeIdentity;
 use strum::IntoEnumIterator;
 use crate::node::{NodeBootstrapError, NodeRegistryType, NodeType, NodeTypeConfig};
 
@@ -13,6 +17,18 @@ pub trait IsConfiguration {
     fn is_for_testing(&self) -> bool;
 }
 
+/// A bootstrap peer: a node we start with a direct link to. The 64-byte
+/// RNS public key is given in hex; the rhash (16-byte truncated SHA-256 of
+/// the public key) is derived, never configured.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BootstrapPeer {
+    /// Hex-encoded 64-byte RNS public key of the peer.
+    pub public_key: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub public_key: Vec<u8>,
     pub ip_address: IpAddr,
@@ -22,7 +38,18 @@ pub struct Config {
     pub main_environment_id: String,
     pub reconciliation_partition_id: String,
     pub environment_metadata: Arc<DashMap<String, EnvironmentMetadata>>,
-    pub type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>
+    pub type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>,
+    /// Persistent node identity (RNS keypair + Ed25519 signing key).
+    pub identity: Arc<NodeIdentity>,
+    /// Transport rhash of this node (truncated hash of its RNS public key).
+    pub rhash: [u8; 16],
+    /// Peers to link at boot (one UDP interface per peer).
+    pub bootstrap_peers: Vec<BootstrapPeer>,
+    /// Own listen UDP port for the RNS transport.
+    pub rns_port: u16,
+    /// Relay/gateway mode: re-announce and forward traffic for transitive
+    /// discovery. `false` for leaves.
+    pub transport_enabled: bool
 }
 
 impl Config {
@@ -50,8 +77,35 @@ impl Config {
         // may refine them at runtime.
         let type_configs = Arc::new(Self::default_type_configs());
 
+        // Load (or create) the persistent identity keystore. A corrupt
+        // keystore is a hard error — silently regenerating would orphan
+        // the node's stake under a new identity.
+        let identity_path = spec.identity_path.clone().unwrap_or_else(|| "node_identity.json".to_string());
+        let identity = Arc::new(match NodeIdentity::load_or_create(Path::new(&identity_path)) {
+            Ok(identity) => identity,
+            Err(e) => {
+                return Err(NodeBootstrapError {
+                    message: format!("failed to load node identity from {}: {}", identity_path, e),
+                })
+            }
+        });
+        let public_key = identity
+            .ed25519
+            .public_key()
+            .map_err(|e| NodeBootstrapError {
+                message: format!("failed to read ed25519 public key: {}", e),
+            })?;
+
+        eprintln!(
+            "[pneumatic] node identity rhash={:02x?} ed25519={:?} rns_public_key={:?}",
+            identity.rhash,
+            hex::encode(&public_key),
+            hex::encode(identity.rns.get_public_key().unwrap_or([0u8; 64]))
+        );
+
+        let rhash = identity.rhash;
         Ok(Config {
-            public_key: vec![],
+            public_key,
             ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             rest_api_version: spec.rest_api_version,
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
@@ -60,6 +114,11 @@ impl Config {
             main_environment_id: spec.main_env_id,
             reconciliation_partition_id: spec.reconciliation_partition_id,
             type_configs,
+            identity,
+            rhash,
+            bootstrap_peers: spec.bootstrap_peers.clone(),
+            rns_port: spec.rns_port.unwrap_or(DEFAULT_UDP_PORT),
+            transport_enabled: spec.transport_enabled,
         })
     }
 
@@ -163,14 +222,18 @@ impl Config {
         10
     }
 
-    /// Build a Config for unit tests without reading from disk.
+    /// Build a Config for unit tests without reading from disk. Uses an
+    /// ephemeral in-memory identity (no keystore file).
     pub fn new_for_testing(
         main_environment_id: String,
         environment_metadata: Arc<DashMap<String, EnvironmentMetadata>>,
         type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>,
     ) -> Self {
+        let identity = NodeIdentity::generate_in_memory();
+        let public_key = identity.ed25519.public_key().unwrap_or_default();
+        let rhash = identity.rhash;
         Config {
-            public_key: vec![],
+            public_key,
             ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             rest_api_version: 1,
             node_type: NodeType::Full,
@@ -179,17 +242,35 @@ impl Config {
             reconciliation_partition_id: String::from("default"),
             environment_metadata,
             type_configs,
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: DEFAULT_UDP_PORT,
+            transport_enabled: false,
         }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ConfigSpec {
+    #[serde(default)]
     public_key: Vec<u8>,
     is_full_node: bool,
     rest_api_version: usize,
     balance: u64,
     environments: Vec<String>,
     main_env_id: String,
-    reconciliation_partition_id: String
+    reconciliation_partition_id: String,
+    /// Keystore file path (default `node_identity.json`).
+    #[serde(default)]
+    identity_path: Option<String>,
+    /// Peers to link at boot.
+    #[serde(default)]
+    bootstrap_peers: Vec<BootstrapPeer>,
+    /// Own listen UDP port (default 4242).
+    #[serde(default)]
+    rns_port: Option<u16>,
+    /// Relay/gateway mode (default false = leaf).
+    #[serde(default)]
+    transport_enabled: bool
 }

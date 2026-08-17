@@ -3,18 +3,32 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::BasicHashProvider;
-use pneumatic_core::data::DefaultDataProvider;
+use pneumatic_core::data::{DataProvider, DefaultDataProvider};
+use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::{NetworkPacket, NodeRegistryType};
 use pneumatic_core::registry::PendingTransactionRegistry;
+use pneumatic_core::rns::config_builder::RnsNodeConfigBuilder;
+use pneumatic_core::rns::wrapper::RnsNetwork;
 
 use pneumatic_committer::block_services::BlockServices;
 use pneumatic_committer::committer::Committer;
 use pneumatic_committer::epoch_manager::{
     EpochReconciler, LeaderSelector, StakeStore, StakingManager,
 };
+
+/// RNS listen IP: the configured node address, or all interfaces when the
+/// config leaves it unspecified.
+fn rns_listen_ip(config: &Config) -> String {
+    if config.ip_address.is_unspecified() {
+        "0.0.0.0".to_string()
+    } else {
+        config.ip_address.to_string()
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -37,27 +51,77 @@ async fn main() {
         }
     };
 
-    // 2. Initialize NodeRegistry (consumes config)
-    let conn_factory = pneumatic_core::conns::factories::ConnFactory::new();
-    let on_received = Arc::new(|_data: Vec<u8>| {
-        // TODO: handle incoming raw data
-    });
+    // 2. Start the RNS transport. The node still boots if the transport can't
+    //    come up (e.g. port conflict) — it just can't register or gossip.
+    let mut builder = RnsNodeConfigBuilder::new()
+        .with_listen_ip(rns_listen_ip(&config))
+        .with_udp_port(config.rns_port)
+        .with_transport_enabled(config.transport_enabled);
+    for peer in &config.bootstrap_peers {
+        builder = builder.add_peer(&peer.ip, peer.port);
+    }
+    let node_config = builder.build(&config.identity.rns);
+    let network: Option<Arc<RnsNetwork>> =
+        match RnsNetwork::start(node_config, &config.identity, &config.bootstrap_peers) {
+            Ok(network) => Some(Arc::new(network)),
+            Err(e) => {
+                eprintln!(
+                    "Failed to start RNS transport: {} — booting node without transport",
+                    e
+                );
+                None
+            }
+        };
+
+    // 3. Initialize NodeRegistry with a stake gate backed by the data service.
+    let data_provider = Arc::new(DefaultDataProvider::new());
+    let stake_check = {
+        let provider = data_provider.clone();
+        let cfg = config.clone();
+        Arc::new(move |key: &[u8], node_type: &NodeRegistryType| {
+            provider
+                .get_user(&key.to_vec(), &cfg.main_environment_id)
+                .map(|user| user.stake >= cfg.get_min_type_stake(node_type))
+                .unwrap_or(false)
+        })
+    };
     let node_registry = Arc::new(NodeRegistry::init(
-        Arc::new(config),
-        Box::new(conn_factory),
-        on_received,
+        Arc::new(config.clone()),
+        network.clone(),
+        stake_check,
     ));
 
-    // 3. Create Gossiper — build a fresh config since NodeRegistry consumed the original
+    // 4. Create Gossiper (Config is Clone — no second build)
     let gossiper = Arc::new(Gossiper::new(
-        pneumatic_core::node::NodeRegistryType::Committer,
-        Config::build().unwrap_or_else(|e| {
-            eprintln!("Failed to build config for gossiper: {:?}", e);
-            std::process::exit(1);
-        }),
+        NodeRegistryType::Committer,
+        config.clone(),
         60, // 60s TTL
         env_data.asym_crypto_provider.clone(),
     ));
+
+    // 5. Bridge the transport to the control/data planes: control packets go
+    //    to the node registry, data packets to the gossiper.
+    if let Some(network) = &network {
+        let registry = node_registry.clone();
+        let gossip = gossiper.clone();
+        network.on_packet(Arc::new(move |raw: Vec<u8>| {
+            match deserialize_rmp_to::<NetworkPacket>(&raw) {
+                Ok(packet) => {
+                    if let Some(control) = packet.control {
+                        if let Err(e) = registry.handle_control(control) {
+                            eprintln!("[pneumatic] control-plane error: {}", e);
+                        }
+                    }
+                    if let Some(data) = packet.data {
+                        gossip.handle_message(data);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[pneumatic] dropping undecodable transport packet: {}", e);
+                }
+            }
+        }));
+    }
 
     // 4. Create shared env_data Arc (clone for shared ownership)
     let env_data = Arc::new(env_data);
@@ -73,7 +137,6 @@ async fn main() {
     ));
 
     // 7. Create EpochReconciler and LeaderSelector
-    let data_provider = Arc::new(DefaultDataProvider::new());
     let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         stake_store.clone(),
@@ -123,7 +186,7 @@ async fn main() {
     // 11. Create Committer
     let committer = Arc::new(Committer::new(
         env_data.clone(),
-        vec![], // public_key: not yet available without crypto impl
+        config.public_key.clone(),
         gossiper,
         block_services,
         node_registry,

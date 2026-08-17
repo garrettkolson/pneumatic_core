@@ -1,62 +1,74 @@
 pub mod registry;
 
-use std::io::Read;
-use std::net::{IpAddr};
 use std::sync::Arc;
+use std::time::Instant;
+
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use crate::conns::{Connection};
-use crate::conns::factories::IsConnFactory;
-use crate::conns::streams::Stream;
-use crate::data::{DataProvider};
 
+use crate::conns::Connection;
+
+#[derive(Clone)]
 pub enum NodeType {
     Full,
-    Light
+    Light,
 }
 
+#[derive(Clone)]
 pub struct NodeTypeConfig {
     pub min: usize,
     pub max: usize,
-    pub min_stake: u64
+    pub min_stake: u64,
 }
 
+/// Control-plane request types carried in `NodeRequest`.
 #[derive(Serialize, Deserialize)]
 pub enum NodeRequestType {
     Register,
     Request,
-    Heartbeat
+    Heartbeat,
+    /// Reply to a `Register`. `responder_key` is mandatory on accept: it is
+    /// the responder's Ed25519 public key, which the requester stores in its
+    /// own directory. `reason` is empty on accept and explains the rejection
+    /// otherwise.
+    RegisterAck {
+        accepted: bool,
+        node_type: NodeRegistryType,
+        responder_key: Vec<u8>,
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum RegistrationBatch {
     Add(Vec<Registration>),
-    Remove(Vec<Registration>)
+    Remove(Vec<Registration>),
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Registration {
     pub node_key: Vec<u8>,
-    pub ip_addr: Option<IpAddr>,
-    pub node_types: Vec<NodeRegistryType>
+    /// Transport address (rhash) of the registered node.
+    pub rhash: [u8; 16],
+    pub node_types: Vec<NodeRegistryType>,
 }
 
 impl Registration {
-    pub fn for_add(key: Vec<u8>, addr: IpAddr, types: Vec<NodeRegistryType>) -> Self {
+    pub fn for_add(key: Vec<u8>, rhash: [u8; 16], types: Vec<NodeRegistryType>) -> Self {
         Registration {
             node_key: key,
-            ip_addr: Some(addr),
-            node_types: types
+            rhash,
+            node_types: types,
         }
     }
 
-    pub fn for_removal(key: Vec<u8>, types: Vec<NodeRegistryType>) -> Self {
+    pub fn for_removal(key: Vec<u8>, rhash: [u8; 16], types: Vec<NodeRegistryType>) -> Self {
         Registration {
             node_key: key,
-            ip_addr: None,
-            node_types: types
+            rhash,
+            node_types: types,
         }
     }
 }
@@ -64,21 +76,25 @@ impl Registration {
 #[derive(Serialize, Deserialize)]
 pub enum RegistrationBatchResult {
     Success,
-    Failure(NodeRegistrationError)
+    Failure(NodeRegistrationError),
 }
 
 pub type Nodes = Arc<DashMap<Vec<u8>, NodeRegistryNode>>;
 
 pub struct NodeRegistryNode {
-    pub ip: IpAddr,
-    pub conn: Box<dyn Connection>
+    /// Transport address (rhash) of the connected node.
+    pub rhash: [u8; 16],
+    pub conn: Box<dyn Connection>,
+    /// Last time any inbound packet was seen from this node (heartbeat/eviction).
+    pub last_seen: Instant,
 }
 
 impl NodeRegistryNode {
-    fn new(ip: IpAddr, conn: Box<dyn Connection>) -> Self {
+    pub fn new(rhash: [u8; 16], conn: Box<dyn Connection>) -> Self {
         NodeRegistryNode {
-            ip,
-            conn
+            rhash,
+            conn,
+            last_seen: Instant::now(),
         }
     }
 }
@@ -94,44 +110,73 @@ pub enum NodeRegistryType {
     Sentinel,
     Executor,
     Finalizer,
-    Archiver
+    Archiver,
 }
 
+/// A control-plane request.
+///
+/// RNS is destination-encrypted: the transport guarantees the packet was
+/// addressed to *us* (only our RNS key can decrypt it) and ratchets
+/// authenticate the immediate link neighbor, but multi-hop paths hide the
+/// original sender and rns-net's delivery callback exposes no sender
+/// identity. So the sender's transport address is *claimed* in the payload
+/// — `requester_rhash` — and bound to the Ed25519 on-chain key
+/// (`requester_key`) by `binding_signature`, an Ed25519 signature over
+/// `(requester_rhash, requested_type, requester_types)`. Forging the claim
+/// requires the victim's Ed25519 private key, and actually receiving data
+/// addressed to the claimed rhash requires the victim's RNS private key.
 #[derive(Serialize, Deserialize)]
 pub struct NodeRequest {
     pub requester_key: Vec<u8>,
-    pub requester_ip: IpAddr,
+    /// Claimed transport address (rhash) of the sender; covered by the
+    /// binding signature.
+    pub requester_rhash: [u8; 16],
     pub request_type: NodeRequestType,
     pub requester_types: Vec<NodeRegistryType>,
-    pub requested_type: NodeRegistryType
+    pub requested_type: NodeRegistryType,
+    pub binding_signature: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct NodeRegistryResponse {
     pub responder_key: Vec<u8>,
-    pub responder_ip: IpAddr,
+    pub responder_rhash: [u8; 16],
     pub registry_type: NodeRegistryType,
-    pub entries: Vec<NodeRegistryEntry>
+    pub entries: Vec<NodeRegistryEntry>,
+    /// Ed25519 signature over the rmp serialization of `entries`, made by
+    /// the responder. Directory entries are hints, not authority — the
+    /// receiver re-checks them.
+    pub signature: Vec<u8>,
 }
 
+/// Legacy data-plane registration request (sentinel). Kept for the
+/// existing sentinel handler; registration is migrating to the control
+/// plane (`NodeRequest` + `RegisterAck`).
 #[derive(Serialize, Deserialize)]
 pub struct NodeRegistryRequest {
     pub requester_key: Vec<u8>,
-    pub requester_ip: IpAddr,
+    /// Transport address (rhash) of the requester, authenticated by the
+    /// RNS transport.
+    pub rhash: [u8; 16],
     pub requester_types: Vec<NodeRegistryType>,
-    pub requested_type: NodeRegistryType
+    pub requested_type: NodeRegistryType,
+    pub binding_signature: Vec<u8>,
 }
 
 impl NodeRegistryRequest {
-    pub fn new(key: Vec<u8>,
-               addr: IpAddr,
-               requester_types: Vec<NodeRegistryType>,
-               requested_type: NodeRegistryType) -> Self {
+    pub fn new(
+        key: Vec<u8>,
+        rhash: [u8; 16],
+        binding_signature: Vec<u8>,
+        requester_types: Vec<NodeRegistryType>,
+        requested_type: NodeRegistryType,
+    ) -> Self {
         NodeRegistryRequest {
             requester_key: key,
-            requester_ip: addr,
+            rhash,
+            binding_signature,
             requester_types,
-            requested_type
+            requested_type,
         }
     }
 }
@@ -139,14 +184,182 @@ impl NodeRegistryRequest {
 #[derive(Serialize, Deserialize)]
 pub struct NodeRegistryEntry {
     pub node_key: Vec<u8>,
-    pub node_ip: IpAddr
+    pub node_rhash: [u8; 16],
+}
+
+/// Top-level wire packet from the RNS data plane: either a control-plane
+/// `NodeRequest` or raw data-plane message bytes. The explicit split
+/// removes the old dual-deserialize guessing.
+#[derive(Serialize, Deserialize)]
+pub struct NetworkPacket {
+    pub control: Option<NodeRequest>,
+    pub data: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+
+    #[test]
+    fn node_request_register_round_trip() {
+        let req = NodeRequest {
+            requester_key: vec![1, 2, 3],
+            requester_rhash: [9u8; 16],
+            request_type: NodeRequestType::Register,
+            requester_types: vec![NodeRegistryType::Committer, NodeRegistryType::Finalizer],
+            requested_type: NodeRegistryType::Committer,
+            binding_signature: vec![7, 8, 9],
+        };
+        let bytes = serialize_to_bytes_rmp(&req).unwrap();
+        let back: NodeRequest = deserialize_rmp_to(&bytes).unwrap();
+        assert_eq!(back.requester_key, vec![1, 2, 3]);
+        assert_eq!(back.requester_rhash, [9u8; 16]);
+        assert_eq!(back.requester_types, req.requester_types);
+        assert_eq!(back.requested_type, NodeRegistryType::Committer);
+        assert_eq!(back.binding_signature, vec![7, 8, 9]);
+        assert!(matches!(back.request_type, NodeRequestType::Register));
+    }
+
+    #[test]
+    fn node_request_register_ack_round_trip() {
+        let req = NodeRequest {
+            requester_key: vec![1, 2],
+            requester_rhash: [4u8; 16],
+            request_type: NodeRequestType::RegisterAck {
+                accepted: true,
+                node_type: NodeRegistryType::Finalizer,
+                responder_key: vec![3, 4, 5],
+                reason: String::new(),
+            },
+            requester_types: vec![NodeRegistryType::Finalizer],
+            requested_type: NodeRegistryType::Finalizer,
+            binding_signature: vec![6],
+        };
+        let bytes = serialize_to_bytes_rmp(&req).unwrap();
+        let back: NodeRequest = deserialize_rmp_to(&bytes).unwrap();
+        let NodeRequestType::RegisterAck {
+            accepted,
+            node_type,
+            responder_key,
+            reason,
+        } = back.request_type
+        else {
+            panic!("expected RegisterAck");
+        };
+        assert!(accepted);
+        assert_eq!(node_type, NodeRegistryType::Finalizer);
+        assert_eq!(responder_key, vec![3, 4, 5]);
+        assert!(reason.is_empty());
+        assert_eq!(back.requester_rhash, [4u8; 16]);
+        assert_eq!(back.requester_key, vec![1, 2]);
+    }
+
+    #[test]
+    fn node_registry_request_round_trip() {
+        let req = NodeRegistryRequest::new(
+            vec![1, 2, 3, 4],
+            [5u8; 16],
+            vec![9, 9],
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let bytes = serialize_to_bytes_rmp(&req).unwrap();
+        let back: NodeRegistryRequest = deserialize_rmp_to(&bytes).unwrap();
+        assert_eq!(back.requester_key, vec![1, 2, 3, 4]);
+        assert_eq!(back.rhash, [5u8; 16]);
+        assert_eq!(back.requester_types, vec![NodeRegistryType::Sentinel]);
+        assert_eq!(back.requested_type, NodeRegistryType::Sentinel);
+        assert_eq!(back.binding_signature, vec![9, 9]);
+    }
+
+    #[test]
+    fn node_registry_response_round_trip() {
+        let resp = NodeRegistryResponse {
+            responder_key: vec![1],
+            responder_rhash: [2u8; 16],
+            registry_type: NodeRegistryType::Committer,
+            entries: vec![
+                NodeRegistryEntry { node_key: vec![10], node_rhash: [11u8; 16] },
+                NodeRegistryEntry { node_key: vec![12], node_rhash: [13u8; 16] },
+            ],
+            signature: vec![4, 4],
+        };
+        let bytes = serialize_to_bytes_rmp(&resp).unwrap();
+        let back: NodeRegistryResponse = deserialize_rmp_to(&bytes).unwrap();
+        assert_eq!(back.responder_rhash, [2u8; 16]);
+        assert_eq!(back.registry_type, NodeRegistryType::Committer);
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.entries[0].node_key, vec![10]);
+        assert_eq!(back.entries[0].node_rhash, [11u8; 16]);
+        assert_eq!(back.entries[1].node_rhash, [13u8; 16]);
+        assert_eq!(back.signature, vec![4, 4]);
+    }
+
+    #[test]
+    fn registration_batch_round_trip() {
+        let reg = Registration::for_add(vec![1], [2u8; 16], vec![NodeRegistryType::Executor]);
+        let reg2 = Registration::for_add(vec![1], [2u8; 16], vec![NodeRegistryType::Executor]);
+        for batch in [RegistrationBatch::Add(vec![reg]), RegistrationBatch::Remove(vec![reg2])] {
+            let bytes = serialize_to_bytes_rmp(&batch).unwrap();
+            let back: RegistrationBatch = deserialize_rmp_to(&bytes).unwrap();
+            match back {
+                RegistrationBatch::Add(es) | RegistrationBatch::Remove(es) => {
+                    assert_eq!(es.len(), 1);
+                    assert_eq!(es[0].node_key, vec![1]);
+                    assert_eq!(es[0].rhash, [2u8; 16]);
+                    assert_eq!(es[0].node_types, vec![NodeRegistryType::Executor]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_packet_round_trip() {
+        // Control-only
+        let req = NodeRequest {
+            requester_key: vec![1],
+            requester_rhash: [3u8; 16],
+            request_type: NodeRequestType::Heartbeat,
+            requester_types: vec![NodeRegistryType::Committer],
+            requested_type: NodeRegistryType::Committer,
+            binding_signature: vec![],
+        };
+        let req2 = NodeRequest {
+            requester_key: vec![1],
+            requester_rhash: [3u8; 16],
+            request_type: NodeRequestType::Heartbeat,
+            requester_types: vec![NodeRegistryType::Committer],
+            requested_type: NodeRegistryType::Committer,
+            binding_signature: vec![],
+        };
+        let bytes = serialize_to_bytes_rmp(&NetworkPacket { control: Some(req2), data: None }).unwrap();
+        let back: NetworkPacket = deserialize_rmp_to(&bytes).unwrap();
+        assert!(back.data.is_none());
+        let control = back.control.expect("control packet lost control");
+        assert_eq!(control.requester_rhash, [3u8; 16]);
+        assert!(matches!(control.request_type, NodeRequestType::Heartbeat));
+
+        // Data-only
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let bytes = serialize_to_bytes_rmp(&NetworkPacket { control: None, data: Some(payload.clone()) }).unwrap();
+        let back: NetworkPacket = deserialize_rmp_to(&bytes).unwrap();
+        assert!(back.control.is_none());
+        assert_eq!(back.data, Some(payload));
+
+        // Both (defensive: the wire format allows it)
+        let bytes = serialize_to_bytes_rmp(&NetworkPacket { control: Some(req), data: Some(vec![7]) }).unwrap();
+        let back: NetworkPacket = deserialize_rmp_to(&bytes).unwrap();
+        assert!(back.control.is_some());
+        assert_eq!(back.data, Some(vec![7]));
+    }
 }
 
 /////////////////// Errors //////////////////////
 
 #[derive(Debug)]
 pub struct NodeBootstrapError {
-    pub message: String
+    pub message: String,
 }
 
 impl NodeBootstrapError {
@@ -161,5 +374,5 @@ impl NodeBootstrapError {
 #[derive(Serialize, Deserialize)]
 pub enum NodeRegistrationError {
     FromUnderlying(String),
-    Unknown
+    Unknown,
 }

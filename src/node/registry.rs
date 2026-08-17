@@ -1,48 +1,61 @@
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
+
 use dashmap::DashMap;
 use futures::future::join_all;
+use strum::IntoEnumIterator;
+
+use crate::conns::{ConnError, Connection};
 use crate::config::Config;
-use crate::{conns, messages, server};
-use crate::conns::ConnTarget;
-use crate::conns::factories::IsConnFactory;
-use crate::conns::streams::Stream;
-use crate::data::DefaultDataProvider;
-use crate::encoding::deserialize_rmp_to;
+use crate::encoding::serialize_to_bytes_rmp;
+use crate::errors::PneumaticError;
 use crate::node::*;
-use crate::node::RegistrationBatchResult::Success;
-use crate::user::User;
+use crate::rns::conn::RnsConnection;
+use crate::rns::identity::NodeIdentity;
+use crate::rns::wrapper::RnsNetwork;
+
+/// Stake gate injected by the process owner. Production passes a closure
+/// backed by the data service; tests pass a stub. Returns `true` when
+/// `key` holds at least the minimum stake for `node_type`.
+pub type StakeCheck = Arc<dyn Fn(&[u8], &NodeRegistryType) -> bool + Send + Sync>;
 
 pub struct NodeRegistry {
     committers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     sentinels: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     executors: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     finalizers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
+    archivers: Arc<DashMap<Vec<u8>, NodeRegistryNode>>,
     config: Arc<Config>,
-    conn_factory: Arc<Box<dyn IsConnFactory>>,
-    on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>
+    /// RNS transport, when enabled. `None` in tests: peers are seeded via
+    /// `register_peer` with a `NullConnection`.
+    network: Option<Arc<RnsNetwork>>,
+    stake_check: StakeCheck,
 }
 
 impl NodeRegistry {
-    const LISTENER_THREAD_COUNT: usize = 4;
-
-    pub fn init(config: Arc<Config>,
-                conn_factory: Box<dyn IsConnFactory>,
-                on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
-                -> Self {
+    pub fn init(
+        config: Arc<Config>,
+        network: Option<Arc<RnsNetwork>>,
+        stake_check: StakeCheck,
+    ) -> Self {
         NodeRegistry {
             committers: Arc::new(DashMap::new()),
             sentinels: Arc::new(DashMap::new()),
             executors: Arc::new(DashMap::new()),
             finalizers: Arc::new(DashMap::new()),
+            archivers: Arc::new(DashMap::new()),
             config,
-            conn_factory: Arc::new(conn_factory),
-            on_received
+            network,
+            stake_check,
         }
     }
 
     pub fn get_config(&self) -> &Arc<Config> {
         &self.config
+    }
+
+    pub fn get_network(&self) -> Option<Arc<RnsNetwork>> {
+        self.network.as_ref().map(Arc::clone)
     }
 
     pub fn get_nodes(&self, node_type: &NodeRegistryType) -> Option<Nodes> {
@@ -51,95 +64,66 @@ impl NodeRegistry {
             NodeRegistryType::Sentinel => Some(Arc::clone(&self.sentinels)),
             NodeRegistryType::Executor => Some(Arc::clone(&self.executors)),
             NodeRegistryType::Finalizer => Some(Arc::clone(&self.finalizers)),
-            _ => None
+            NodeRegistryType::Archiver => Some(Arc::clone(&self.archivers)),
         }
     }
 
     pub fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> bool {
         match self.get_nodes(node_type) {
             Some(nodes) => nodes.contains_key(key),
-            None => false
+            None => false,
         }
+    }
+
+    /// Find the registry type under which `key` is already registered, if
+    /// any. A node is not necessarily under its `requested_type` — priority
+    /// selection may have placed it under a different type.
+    fn find_registered_type(&self, key: &Vec<u8>) -> Option<NodeRegistryType> {
+        NodeRegistryType::iter().find(|t| {
+            self.get_nodes(t)
+                .map(|nodes| nodes.contains_key(key))
+                .unwrap_or(false)
+        })
     }
 
     fn type_is_maxed_out(&self, node_type: &NodeRegistryType) -> bool {
         match self.get_nodes(node_type) {
             Some(nodes) => nodes.len() >= self.config.get_max_node_number(node_type),
-            None => true
+            None => true,
         }
     }
 
-    pub fn listen_for_conn_requests(registry: Arc<NodeRegistry>, this_func_type: &NodeRegistryType) {
-        let port_num = conns::get_internal_port(this_func_type);
-        // TODO: replace this addr with the actual public addr of this node
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port_num);
+    /// Insert or refresh a directory entry for `key` under `node_type`.
+    /// Idempotent: refreshing an existing entry updates its rhash/connection
+    /// and bumps `last_seen`. Returns `false` when the type has no registry
+    /// or is at capacity (and the entry is new).
+    pub fn register_peer(
+        &self,
+        key: Vec<u8>,
+        rhash: [u8; 16],
+        node_type: &NodeRegistryType,
+        conn: Box<dyn Connection>,
+    ) -> bool {
+        let Some(nodes) = self.get_nodes(node_type) else {
+            return false;
+        };
 
-        let listener = registry.conn_factory.get_listener(ConnTarget::Remote(addr))
-            .expect("Couldn't create listener for incoming connection requests");
-        let thread_pool = server::ThreadPool::build(Self::LISTENER_THREAD_COUNT)
-            .expect("Couldn't establish thread pool for listening for connection requests");
-
-        loop {
-            match listener.accept() {
-                Err(_) => continue,
-                Ok(mut stream) => {
-                    let cloned_registry = registry.clone();
-                    let _ = thread_pool.execute_async(Box::pin(async move {
-                        let Ok(data) = conns::get_data(&mut stream) else { return };
-                        cloned_registry.process_conn_request(data, stream).await
-                    }));
-                }
-            }
+        if let Some(mut entry) = nodes.get_mut(&key) {
+            entry.value_mut().rhash = rhash;
+            entry.value_mut().conn = conn;
+            entry.value_mut().last_seen = Instant::now();
+            return true;
         }
-    }
 
-    async fn process_conn_request(&self, data: Vec<u8>, mut stream: Box<dyn Stream>) {
-        let Ok(request) = deserialize_rmp_to::<NodeRegistryRequest>(&data) else {
-            let _ = stream.write_all(&messages::reject());
-            return
-        };
-
-        let Some(node_type) = self.can_accept_this_connection(&request) else {
-            let _ = stream.write_all(&messages::reject());
-            return;
-        };
-
-        let Some(mut conn) = self.conn_factory.create_connection(stream, self.on_received.clone())
-            else { return };
-
-        if conn.send(&messages::acknowledge()).await.is_err() { return; }
-        self.register_connection(conn, request, node_type)
-    }
-
-    fn register_connection(&self, conn: Box<dyn Connection>,
-                           request: NodeRegistryRequest, node_type: NodeRegistryType) {
-        let node = NodeRegistryNode::new(request.requester_ip, conn);
-        match self.get_nodes(&node_type) {
-            None => return,
-            Some(nodes) => { nodes.insert(request.requester_key, node); }
+        if nodes.len() >= self.config.get_max_node_number(node_type) {
+            return false;
         }
+
+        nodes.insert(key, NodeRegistryNode::new(rhash, conn));
+        true
     }
 
-    fn can_accept_this_connection(&self, request: &NodeRegistryRequest) -> Option<NodeRegistryType> {
-        let node_type = match self.select_registration_node_type(request) {
-            None => return None,
-            Some(t) => t
-        };
-
-        if !Self::check_db_node_user(&request.requester_key,
-                                 &self.config.main_environment_id,
-                                 self.config.get_min_type_stake(&request.requested_type)) { return None; }
-
-        Some(node_type)
-    }
-
-    fn check_db_node_user(user_key: &Vec<u8>, environment_id: &str, min_stake: u64) -> bool {
-        let Ok(user) = DefaultDataProvider::new().get_user(user_key, environment_id)
-            else { return false };
-        user.stake > min_stake
-    }
-
-    fn select_registration_node_type(&self, request: &NodeRegistryRequest) -> Option<NodeRegistryType> {
+    fn select_registration_node_type(&self, request: &NodeRequest) -> Option<NodeRegistryType> {
         if self.can_select_this_type(request, NodeRegistryType::Finalizer) {
             return Some(NodeRegistryType::Finalizer);
         }
@@ -159,8 +143,229 @@ impl NodeRegistry {
         None
     }
 
-    fn can_select_this_type(&self, request: &NodeRegistryRequest, node_type: NodeRegistryType) -> bool {
+    fn can_select_this_type(&self, request: &NodeRequest, node_type: NodeRegistryType) -> bool {
         request.requester_types.contains(&node_type) && !self.type_is_maxed_out(&node_type)
+    }
+
+    /// Handle a control-plane request. The sender's rhash is claimed in
+    /// `request.requester_rhash` and bound to `request.requester_key` by the
+    /// binding signature — RNS is destination-encrypted and its delivery
+    /// callback does not identify the sender.
+    pub fn handle_control(&self, request: NodeRequest) -> Result<(), PneumaticError> {
+        match &request.request_type {
+            NodeRequestType::Register => {
+                self.handle_register(request);
+                Ok(())
+            }
+            NodeRequestType::RegisterAck {
+                accepted,
+                node_type,
+                responder_key,
+                reason,
+            } => {
+                self.handle_register_ack(
+                    &request,
+                    *accepted,
+                    node_type.clone(),
+                    responder_key,
+                    reason,
+                );
+                Ok(())
+            }
+            NodeRequestType::Request => Err(PneumaticError::Registry(
+                "directory sync lands in stage 2".to_string(),
+            )),
+            NodeRequestType::Heartbeat => Err(PneumaticError::Registry(
+                "heartbeat handling lands in stage 2".to_string(),
+            )),
+        }
+    }
+
+    fn handle_register(&self, request: NodeRequest) {
+        let requester_key = request.requester_key.clone();
+        // Claimed transport address; the binding signature below authenticates
+        // that the Ed25519 key is bound to it.
+        let requester_rhash = request.requester_rhash;
+
+        if !NodeIdentity::verify_binding(
+            &requester_key,
+            &requester_rhash,
+            &request.requested_type,
+            &request.requester_types,
+            &request.binding_signature,
+        ) {
+            self.reply_register_ack(requester_rhash, false, request.requested_type, "invalid binding signature");
+            return;
+        }
+
+        // Idempotent re-registration: refresh liveness under the type we
+        // already hold it, re-ack. Checked across all types — the node may
+        // sit under a priority-selected type, not its `requested_type`.
+        if let Some(existing_type) = self.find_registered_type(&requester_key) {
+            self.refresh_last_seen(&requester_key, &existing_type);
+            self.reply_register_ack(requester_rhash, true, existing_type, "");
+            return;
+        }
+
+        let Some(node_type) = self.select_registration_node_type(&request) else {
+            self.reply_register_ack(
+                requester_rhash,
+                false,
+                request.requested_type,
+                "no registry type available",
+            );
+            return;
+        };
+
+        // Stake gate against the type we will actually register it under.
+        if !(self.stake_check)(&requester_key, &node_type) {
+            self.reply_register_ack(requester_rhash, false, node_type, "insufficient stake");
+            return;
+        }
+
+        let conn: Box<dyn Connection> = match &self.network {
+            Some(network) => Box::new(RnsConnection::new(requester_rhash, Arc::clone(network))),
+            None => Box::new(NullConnection),
+        };
+
+        let node = NodeRegistryNode::new(requester_rhash, conn);
+        match self.get_nodes(&node_type) {
+            None => {
+                self.reply_register_ack(requester_rhash, false, node_type, "no registry for type");
+            }
+            Some(nodes) => {
+                nodes.insert(requester_key, node);
+                self.reply_register_ack(requester_rhash, true, node_type, "");
+            }
+        }
+    }
+
+    fn handle_register_ack(
+        &self,
+        request: &NodeRequest,
+        accepted: bool,
+        node_type: NodeRegistryType,
+        responder_key: &Vec<u8>,
+        reason: &String,
+    ) {
+        // The responder's claimed transport address.
+        let responder_rhash = request.requester_rhash;
+
+        if !accepted {
+            eprintln!(
+                "[pneumatic] registration as {:?} rejected by peer {:02x?}: {}",
+                node_type, responder_rhash, reason
+            );
+            return;
+        }
+
+        // On accept the responder_key is mandatory: it is how we address the
+        // peer in our own directory.
+        if responder_key.is_empty() {
+            eprintln!("[pneumatic] RegisterAck accepted but responder_key missing; ignoring");
+            return;
+        }
+
+        // The ack is binding-signed by the responder over
+        // (its rhash, node_type, its types) — the same check we apply to
+        // Register requests. Verified against the ack's own `node_type` so a
+        // responder cannot store us under a type it did not sign.
+        if !NodeIdentity::verify_binding(
+            responder_key,
+            &responder_rhash,
+            &node_type,
+            &request.requester_types,
+            &request.binding_signature,
+        ) {
+            eprintln!(
+                "[pneumatic] RegisterAck from peer {:02x?} failed binding verification; ignoring",
+                responder_rhash
+            );
+            return;
+        }
+
+        let conn: Box<dyn Connection> = match &self.network {
+            Some(network) => Box::new(RnsConnection::new(responder_rhash, Arc::clone(network))),
+            None => Box::new(NullConnection),
+        };
+
+        if !self.register_peer(responder_key.clone(), responder_rhash, &node_type, conn) {
+            eprintln!(
+                "[pneumatic] accepted RegisterAck for peer {:02x?} but directory is full",
+                responder_rhash
+            );
+        }
+    }
+
+    /// Reply to a `Register` with a signed `RegisterAck`. The ack is itself a
+    /// `NodeRequest`, so it carries our own binding signature over
+    /// `(our rhash, node_type, our types)` — the requester verifies it before
+    /// storing us. `node_type` is the type the peer was actually registered
+    /// under, which may differ from its `requested_type` when priority
+    /// selection chose a different type.
+    fn reply_register_ack(
+        &self,
+        peer_rhash: [u8; 16],
+        accepted: bool,
+        node_type: NodeRegistryType,
+        reason: &str,
+    ) {
+        let responder_key = if accepted {
+            self.config.public_key.clone()
+        } else {
+            Vec::new()
+        };
+
+        let Ok(binding) = self.config.identity.sign_binding(
+            &self.config.rhash,
+            &node_type,
+            &self.config.node_registry_types,
+        ) else {
+            eprintln!("[pneumatic] failed to sign RegisterAck binding; dropping ack");
+            return;
+        };
+
+        let ack = NodeRequest {
+            requester_key: self.config.public_key.clone(),
+            requester_rhash: self.config.rhash,
+            request_type: NodeRequestType::RegisterAck {
+                accepted,
+                node_type: node_type.clone(),
+                responder_key,
+                reason: reason.to_string(),
+            },
+            requester_types: self.config.node_registry_types.clone(),
+            requested_type: node_type,
+            binding_signature: binding,
+        };
+
+        let Some(network) = &self.network else {
+            // Test mode: no transport to deliver on.
+            return;
+        };
+
+        let Ok(packet_bytes) = serialize_to_bytes_rmp(&NetworkPacket {
+            control: Some(ack),
+            data: None,
+        }) else {
+            eprintln!("[pneumatic] failed to serialize RegisterAck; dropping ack");
+            return;
+        };
+
+        if let Err(e) = network.send_to(peer_rhash, &packet_bytes) {
+            eprintln!(
+                "[pneumatic] RegisterAck delivery to {:02x?} failed: {}",
+                peer_rhash, e
+            );
+        }
+    }
+
+    fn refresh_last_seen(&self, key: &Vec<u8>, node_type: &NodeRegistryType) {
+        if let Some(nodes) = self.get_nodes(node_type) {
+            if let Some(mut entry) = nodes.get_mut(key) {
+                entry.value_mut().last_seen = Instant::now();
+            }
+        }
     }
 
     /// Send data to all registered nodes of a given type (async, concurrent).
@@ -204,77 +409,130 @@ impl NodeRegistry {
             })
         });
     }
+}
 
-    fn process_registration(&self, registration_batch: RegistrationBatch) -> RegistrationBatchResult {
-        match registration_batch {
-            RegistrationBatch::Add(entries) => {
-                let mut errors = Vec::new();
-                let mut added = Vec::new();
+/// Connection for directory entries with no live transport (test mode, or
+/// peers learned via directory sync that we cannot reach directly).
+pub struct NullConnection;
 
-                for entry in &entries {
-                    // Validate: check stake via DB
-                    if !Self::check_db_node_user(&entry.node_key,
-                                                 &self.config.main_environment_id,
-                                                 entry.node_types.iter()
-                                                     .map(|t| self.config.get_min_type_stake(t))
-                                                     .min()
-                                                     .unwrap_or(u64::MAX)) {
-                        errors.push(entry.node_key.clone());
-                        continue;
-                    }
-
-                    // Validate: check registry not maxed out for each requested type
-                    if entry.node_types.iter().any(|t| self.type_is_maxed_out(t)) {
-                        errors.push(entry.node_key.clone());
-                        continue;
-                    }
-
-                    added.push(entry.clone());
-                }
-
-                if !errors.is_empty() {
-                    return RegistrationBatchResult::Failure(NodeRegistrationError::FromUnderlying(
-                        format!("Rejected {} entries: {:?}", errors.len(), errors)
-                    ));
-                }
-
-                for entry in &added {
-                    for node_type in &entry.node_types {
-                        if let Some(nodes) = self.get_nodes(node_type) {
-                            nodes.insert(entry.node_key.clone(), NodeRegistryNode::new(
-                                entry.ip_addr.unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
-                                // No connection at registration time — placeholder
-                                // Connections are established via process_conn_request
-                                Box::new(NoOpConnection),
-                            ));
-                        }
-                    }
-                }
-
-                RegistrationBatchResult::Success
-            }
-            RegistrationBatch::Remove(entries) => {
-                for entry in &entries {
-                    for node_type in &entry.node_types {
-                        if let Some(nodes) = self.get_nodes(node_type) {
-                            nodes.remove(&entry.node_key);
-                        }
-                    }
-                }
-                RegistrationBatchResult::Success
-            }
-        }
+#[async_trait::async_trait]
+impl Connection for NullConnection {
+    async fn send(&self, _data: &Vec<u8>) -> Result<(), ConnError> {
+        Ok(())
     }
 }
 
-/// Placeholder connection for entries registered without a live connection.
-/// Used as a sentinel until a real connection is established via process_conn_request.
-struct NoOpConnection;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[async_trait::async_trait]
-impl conns::Connection for NoOpConnection {
-    async fn send(&self, _data: &Vec<u8>) -> Result<(), conns::ConnError> {
-        // No-op: placeholder for registrations without live connections
-        Ok(())
+    fn registry_with_capacity(types: &[(NodeRegistryType, usize)]) -> NodeRegistry {
+        let mut type_configs = DashMap::new();
+        for (t, max) in types {
+            type_configs.insert(
+                t.clone(),
+                NodeTypeConfig { min: 0, max: *max, min_stake: 0 },
+            );
+        }
+        let config = Arc::new(Config::new_for_testing(
+            "test_env".to_string(),
+            Arc::new(DashMap::new()),
+            Arc::new(type_configs),
+        ));
+        NodeRegistry::init(config, None, Arc::new(|_, _| true))
+    }
+
+    fn register_request(types: Vec<NodeRegistryType>) -> NodeRequest {
+        NodeRequest {
+            requester_key: vec![1],
+            requester_rhash: [0u8; 16],
+            request_type: NodeRequestType::Register,
+            requester_types: types,
+            requested_type: NodeRegistryType::Committer,
+            binding_signature: vec![],
+        }
+    }
+
+    #[test]
+    fn select_prefers_finalizer_over_lower_types() {
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Finalizer, 5),
+            (NodeRegistryType::Executor, 5),
+            (NodeRegistryType::Sentinel, 5),
+            (NodeRegistryType::Committer, 5),
+        ]);
+        let req = register_request(vec![
+            NodeRegistryType::Committer,
+            NodeRegistryType::Finalizer,
+        ]);
+        assert_eq!(
+            reg.select_registration_node_type(&req),
+            Some(NodeRegistryType::Finalizer)
+        );
+    }
+
+    #[test]
+    fn select_falls_back_to_executor() {
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Executor, 5),
+            (NodeRegistryType::Committer, 5),
+        ]);
+        let req = register_request(vec![
+            NodeRegistryType::Committer,
+            NodeRegistryType::Executor,
+        ]);
+        assert_eq!(
+            reg.select_registration_node_type(&req),
+            Some(NodeRegistryType::Executor)
+        );
+    }
+
+    #[test]
+    fn select_skips_maxed_out_types() {
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Finalizer, 1),
+            (NodeRegistryType::Committer, 1),
+        ]);
+        // Fill the single Finalizer slot.
+        assert!(reg.register_peer(
+            vec![99],
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(NullConnection)
+        ));
+        let req = register_request(vec![
+            NodeRegistryType::Committer,
+            NodeRegistryType::Finalizer,
+        ]);
+        assert_eq!(
+            reg.select_registration_node_type(&req),
+            Some(NodeRegistryType::Committer)
+        );
+    }
+
+    #[test]
+    fn select_returns_none_when_nothing_fits() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 1)]);
+        reg.register_peer(
+            vec![99],
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(NullConnection),
+        );
+        let req = register_request(vec![NodeRegistryType::Finalizer]);
+        assert_eq!(reg.select_registration_node_type(&req), None);
+    }
+
+    #[test]
+    fn capacity_tracks_and_refresh_bypasses_it() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Sentinel, 2)]);
+        assert!(!reg.type_is_maxed_out(&NodeRegistryType::Sentinel));
+        assert!(reg.register_peer(vec![1], [1u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
+        assert!(reg.register_peer(vec![2], [2u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
+        assert!(reg.type_is_maxed_out(&NodeRegistryType::Sentinel));
+        // A new peer cannot be admitted at capacity...
+        assert!(!reg.register_peer(vec![3], [3u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
+        // ...but an existing peer can still refresh its entry.
+        assert!(reg.register_peer(vec![1], [1u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
     }
 }

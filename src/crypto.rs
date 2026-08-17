@@ -72,6 +72,16 @@ impl Ed25519Provider {
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("Failed to generate random seed");
+        Self::from_seed(seed)
+    }
+
+    /// Build a provider from a persisted 32-byte Ed25519 seed.
+    ///
+    /// The X25519 static secret is always freshly generated: it is
+    /// transport key-exchange material, not persisted identity. The
+    /// on-chain identity is the Ed25519 keypair, which is fully
+    /// determined by the seed.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         let x25519_static_key = StaticSecret::random();

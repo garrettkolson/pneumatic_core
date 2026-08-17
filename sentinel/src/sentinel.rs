@@ -403,6 +403,21 @@ impl Sentinel {
         let request: NodeRegistryRequest = deserialize_rmp_to(&message.body)
             .map_err(|e| SentinelError::Encoding(e))?;
 
+        // The binding signature authenticates that the Ed25519 key is bound
+        // to the claimed rhash — the same check the control-plane registry
+        // applies to `NodeRequest` Register messages.
+        if !pneumatic_core::rns::identity::NodeIdentity::verify_binding(
+            &request.requester_key,
+            &request.rhash,
+            &request.requested_type,
+            &request.requester_types,
+            &request.binding_signature,
+        ) {
+            return Err(SentinelError::Registry(
+                "invalid binding signature".to_string(),
+            ));
+        }
+
         // Reject if already registered for the requested type.
         if self.node_registry.node_is_already_registered(&request.requester_key, &request.requested_type) {
             return Err(SentinelError::Registry(format!(
@@ -422,10 +437,10 @@ impl Sentinel {
         // Add node to each requested type's registry.
         for node_type in &request.requester_types {
             if let Some(nodes) = self.node_registry.get_nodes(node_type) {
-                let node_entry = pneumatic_core::node::NodeRegistryNode {
-                    ip: request.requester_ip,
-                    conn: Box::new(NoOpConnection),
-                };
+                let node_entry = pneumatic_core::node::NodeRegistryNode::new(
+                    request.rhash,
+                    Box::new(pneumatic_core::node::registry::NullConnection),
+                );
                 nodes.insert(request.requester_key.clone(), node_entry);
             }
         }
@@ -575,15 +590,6 @@ impl From<super::transaction_notifier::NotifyError> for SentinelError {
     }
 }
 
-// Placeholder connection for nodes registered without a live TCP/UDS connection.
-#[async_trait::async_trait]
-impl pneumatic_core::conns::Connection for NoOpConnection {
-    async fn send(&self, _data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
-        Ok(())
-    }
-}
-struct NoOpConnection;
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -594,9 +600,9 @@ mod tests {
 
     use dashmap::DashMap;
     use pneumatic_core::config::Config;
+    use pneumatic_core::crypto::AsymCryptoProvider;
     use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, NodeType, NodeTypeConfig};
     use pneumatic_core::user::User;
-    use pneumatic_core::conns::factories::ConnFactory;
     use pneumatic_core::conns::ConnError;
     use pneumatic_core::data::{DataError, DefaultDataProvider, StubDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
@@ -616,8 +622,11 @@ mod tests {
     // --- helpers ---
 
     fn make_test_config() -> Config {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let public_key = identity.ed25519.public_key().unwrap_or_default();
+        let rhash = identity.rhash;
         Config {
-            public_key: vec![1],
+            public_key,
             ip_address: "127.0.0.1".parse().unwrap(),
             rest_api_version: 1,
             node_type: NodeType::Full,
@@ -626,15 +635,19 @@ mod tests {
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
             type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(identity),
+            rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+            transport_enabled: false,
         }
     }
 
     fn make_test_node_registry() -> Arc<NodeRegistry> {
-        use pneumatic_core::conns::factories::IsConnFactory;
         Arc::new(NodeRegistry::init(
             Arc::new(make_test_config()),
-            Box::new(ConnFactory::new()),
-            Arc::new(|_| {}),
+            None,
+            Arc::new(|_, _| true),
         ))
     }
 
@@ -1188,17 +1201,22 @@ mod tests {
 
     #[test]
     fn handle_register_request_with_sufficient_stake_succeeds() {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let key = identity.ed25519.public_key().unwrap();
         let mut data_provider = StubDataProvider::new();
         data_provider = data_provider.with_user(
-            b"register_node".to_vec(),
+            key.clone(),
             "test".to_string(),
-            User { public_key: b"register_node".to_vec(), fuel_balance: 1000, stake: 100, nonce: 0 },
+            User { public_key: key.clone(), fuel_balance: 1000, stake: 100, nonce: 0 },
         );
         let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
 
         let req = NodeRegistryRequest::new(
-            b"register_node".to_vec(),
-            "127.0.0.1".parse().unwrap(),
+            key.clone(),
+            identity.rhash,
+            identity
+                .sign_binding(&identity.rhash, &NodeRegistryType::Sentinel, &[NodeRegistryType::Sentinel])
+                .unwrap(),
             vec![NodeRegistryType::Sentinel],
             NodeRegistryType::Sentinel,
         );
@@ -1216,30 +1234,35 @@ mod tests {
 
         // Verify the node was added to the sentinel registry.
         let nodes = sentinel.node_registry.get_nodes(&NodeRegistryType::Sentinel).unwrap();
-        assert!(nodes.contains_key(&b"register_node".to_vec()));
+        assert!(nodes.contains_key(&key));
     }
 
     #[test]
     fn handle_register_request_already_registered_returns_error() {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let key = identity.ed25519.public_key().unwrap();
         let mut data_provider = StubDataProvider::new();
         data_provider = data_provider.with_user(
-            b"already_registered".to_vec(),
+            key.clone(),
             "test".to_string(),
-            User { public_key: b"register_node".to_vec(), fuel_balance: 1000, stake: 100, nonce: 0 },
+            User { public_key: key.clone(), fuel_balance: 1000, stake: 100, nonce: 0 },
         );
         let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
 
         // Pre-register the node.
         let nodes = sentinel.node_registry.get_nodes(&NodeRegistryType::Sentinel).unwrap();
-        nodes.insert(b"already_registered".to_vec(),
-            pneumatic_core::node::NodeRegistryNode {
-                ip: "127.0.0.1".parse().unwrap(),
-                conn: Box::new(NoOpConnection),
-            });
+        nodes.insert(key.clone(),
+            pneumatic_core::node::NodeRegistryNode::new(
+                [0u8; 16],
+                Box::new(pneumatic_core::node::registry::NullConnection),
+            ));
 
         let req = NodeRegistryRequest::new(
-            b"already_registered".to_vec(),
-            "127.0.0.1".parse().unwrap(),
+            key.clone(),
+            identity.rhash,
+            identity
+                .sign_binding(&identity.rhash, &NodeRegistryType::Sentinel, &[NodeRegistryType::Sentinel])
+                .unwrap(),
             vec![NodeRegistryType::Sentinel],
             NodeRegistryType::Sentinel,
         );
@@ -1262,18 +1285,23 @@ mod tests {
 
     #[test]
     fn handle_register_request_insufficient_stake_returns_error() {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let key = identity.ed25519.public_key().unwrap();
         let mut data_provider = StubDataProvider::new();
         // Stake of 1 < default min_stake of 10
         data_provider = data_provider.with_user(
-            b"poor_node".to_vec(),
+            key.clone(),
             "test".to_string(),
-            User { public_key: b"poor_node".to_vec(), fuel_balance: 0, stake: 1, nonce: 0 },
+            User { public_key: key.clone(), fuel_balance: 0, stake: 1, nonce: 0 },
         );
         let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
 
         let req = NodeRegistryRequest::new(
-            b"poor_node".to_vec(),
-            "127.0.0.1".parse().unwrap(),
+            key.clone(),
+            identity.rhash,
+            identity
+                .sign_binding(&identity.rhash, &NodeRegistryType::Sentinel, &[NodeRegistryType::Sentinel])
+                .unwrap(),
             vec![NodeRegistryType::Sentinel],
             NodeRegistryType::Sentinel,
         );
