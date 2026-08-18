@@ -858,6 +858,14 @@ impl Committer {
         let token_id_vec = token_id.to_vec();
         let mut commits = Vec::with_capacity(batch.len());
 
+        // Resolve the real token and its current chain tip before building blocks
+        let token_ref = self.tokens.get(token_id).ok_or_else(|| {
+            CommitterError::TokenNotFound(bytes_to_hex(token_id))
+        })?;
+        let token = token_ref.value();
+        let blockchain = token.blockchain.clone();
+        let epoch_number = self.current_epoch_number.load(Ordering::SeqCst);
+
         for (tx, signed) in batch {
             let commit = TransactionCommit {
                 trans_id: tx.id.into_bytes(),
@@ -865,9 +873,9 @@ impl Committer {
                 env_id: env_id.clone(),
                 proposed_block: Block::from_transaction(
                     signed,
-                    Blockchain::new(),
-                    &Token::new(),
-                    0, // epoch_number: placeholder, set by Phase 5
+                    blockchain.clone(),
+                    token,
+                    epoch_number,
                 ),
             };
             commits.push(commit);

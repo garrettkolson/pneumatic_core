@@ -193,6 +193,7 @@ impl Blockchain {
     }
 }
 
+#[derive(Clone)]
 pub struct ChainState {
     pub is_valid: bool,
     pub last_hash_in: Vec<u8>,
