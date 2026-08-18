@@ -143,7 +143,7 @@ mod senders_tests {
     fn test_uds_sender_echo() {
         let (_temp_dir, path) = temp_uds_path();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        
+
         // Start echo server in a separate thread
         let server_path = path.clone();
         let server_handle = thread::spawn(move || {
@@ -156,7 +156,7 @@ mod senders_tests {
         // Test UdsSender
         let sender = UdsSender::new(path);
         let test_data = b"hello, uds";
-        
+
         let response = sender.get_response(test_data).unwrap();
         assert_eq!(response, test_data);
 
@@ -179,12 +179,12 @@ mod senders_tests {
         let listener = TcpListener::bind(addr).unwrap();
         let local_addr = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        
+
         // Start echo server in a separate thread
         let server_handle = thread::spawn(move || {
             // Notify that the server is ready to accept connections
             let _ = ready_tx.send(());
-            
+
             // Accept a single connection and echo back any data
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buffer = [0; 1024];
@@ -202,10 +202,10 @@ mod senders_tests {
 
         // Test TcpSender with a small delay to ensure server is ready
         std::thread::sleep(Duration::from_millis(100));
-        
+
         let sender = TcpSender::new(local_addr);
         let test_data = b"hello, tcp";
-        
+
         let response = sender.get_response(test_data).unwrap();
         assert_eq!(response, test_data);
 
@@ -229,7 +229,7 @@ mod senders_tests {
         let listener = TcpListener::bind(addr).unwrap();
         let local_addr = listener.local_addr().unwrap();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        
+
         // Start server in a separate thread
         let server_handle = thread::spawn(move || {
             // Notify that the server is ready to accept connections
@@ -242,7 +242,7 @@ mod senders_tests {
             }
         });
 
-        // Wait for server to be ready to accept connections
+        // Wait for server to be ready
         let _ = ready_rx.recv_timeout(TEST_TIMEOUT).unwrap();
 
         // Add a small delay to ensure the server is ready
@@ -251,13 +251,13 @@ mod senders_tests {
         // Test TcpSender with a server that closes the connection
         let sender = TcpSender::new(local_addr);
         let result = sender.get_response(b"test");
-        
+
         // The sender should not panic when the connection closes.
         // Due to OS-level timing races between the server's drop and the
         // sender's write/read, we may get IO error (RST/pipe broken) or
         // Ok([]) (data written before connection closed, EOF on read).
         let _ = result;
-        
+
         // Clean up
         drop(server_handle);
     }

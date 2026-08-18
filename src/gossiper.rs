@@ -2,13 +2,13 @@ use moka::sync::Cache;
 use crate::config::Config;
 use crate::conns::factories::ConnFactory;
 use crate::conns::senders::{RnsSender, Sender};
+use crate::node::NodeRegistryNode;
 use crate::crypto::AsymCryptoProvider;
 use crate::data::DataError;
 use crate::encoding::deserialize_rmp_to;
 use crate::messages::Message;
 use crate::node::NodeRegistryType;
 use crate::node::registry::NodeRegistry;
-use crate::rns::wrapper::RnsNetwork;
 use std::sync::{Arc, RwLock};
 
 /// Gossiper handles message deduplication and fan-out.
@@ -118,21 +118,29 @@ impl Gossiper {
         Ok(())
     }
 
-    /// Send a message to all nodes of a given type via RNS.
-    pub fn send_to_type(
+    /// Send a message to all nodes of a given type via the provided sender factory.
+    ///
+    /// The factory maps each registered node to a `Sender`. This keeps the
+    /// production path (which constructs an `RnsSender` per node) intact while
+    /// allowing tests to inject a recording or scripted sender.
+    pub fn send_to_type<S, F>(
         &self,
         node_registry: &NodeRegistry,
         node_type: &NodeRegistryType,
-        network: &Arc<RnsNetwork>,
+        sender_for: F,
         data: &[u8],
-    ) -> Result<(), DataError> {
+    ) -> Result<(), DataError>
+    where
+        S: Sender,
+        F: Fn(&NodeRegistryNode) -> S,
+    {
         let Some(nodes) = node_registry.get_nodes(node_type) else {
             return Ok(());
         };
         for entry in nodes.iter() {
             // Key is the public key; we use rhash for routing
-            let rns_sender = RnsSender::new(Arc::clone(network), entry.value().rhash);
-            rns_sender
+            let sender = sender_for(entry.value());
+            sender
                 .get_response(data)
                 .map_err(|e| DataError::FromStore(e.to_string()))?;
         }
