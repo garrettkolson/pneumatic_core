@@ -36,8 +36,3 @@ pub struct MessageBody<T> {
 pub fn acknowledge() -> Vec<u8> {
     Vec::from(b"ack")
 }
-
-/// Returns a MsgPack-serialized rejection payload.
-pub fn reject() -> Vec<u8> {
-    Vec::from(b"rej")
-}
