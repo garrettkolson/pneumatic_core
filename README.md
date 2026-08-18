@@ -12,7 +12,8 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 398 tests across 5 crate targets
+cargo test --workspace --lib   # Run 419 tests across 5 crate targets
+cargo test --workspace         # Run 425 tests (419 + 6 integration)
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -20,11 +21,12 @@ cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 
 ```
 pneumatic_core/
-├── src/                        # pneumatic_core crate — core library (20 modules)
+├── src/                        # pneumatic_core crate — core library (21 modules)
 ├── sentinel/                   # pneumatic_sentinel crate — transaction validation & routing
 ├── executor/                   # pneumatic_executor crate — contract execution
 ├── finalizer/                  # pneumatic_finalizer crate — quorum & block building
 ├── committer/                  # pneumatic_committer crate — chain commitment & epochs
+├── tests/                      # Offline integration tests (transport boundary)
 ├── Cargo.toml                  # Workspace root + core crate config
 ├── Cargo.lock
 ├── TASKS.md                    # Detailed implementation checklist
@@ -56,10 +58,15 @@ pneumatic_core/
 | `node` | Node types (Full/Light), registry types (Committer, Sentinel, Executor, Finalizer, Archiver), registration protocol |
 | `node::registry` | `NodeRegistry` — DashMap-backed per-type collections, connection management, broadcast |
 | `conns` | Network traits, TCP/Unix domain socket implementations, length-prefixed framing |
-| `conns::factories` | `ConnFactory` — creates Senders, Listeners, Connections |
+| `conns::factories` | `ConnFactory` — creates Senders, Listeners, Connections (`IsConnFactory` trait: `get_sender`, `get_listener`, `create_connection`; `request_connection` removed as dead code — RNS handles all peer-to-peer transport) |
 | `conns::senders` | `Sender` trait with `TcpSender`/`UdsSender` |
 | `conns::streams` | `Stream` trait (sync) + async `StreamReader`/`StreamWriter` via Tokio |
 | `conns::listeners` | `Listener` trait with `CoreTcpListener`/`CoreUdsListener` |
+| `rns` | Reticulum Network Stack (RNS) transport integration — encrypted peer-to-peer transport with identity keystore, binding signatures, destination routing, 4-thread worker pool, inbound DoS guard |
+| `rns::conn` | `RnsConnection` — `Connection` trait impl wrapping RNS for pneumatic's wire protocol |
+| `rns::identity` | `NodeIdentity` — dual-keystore (RNS transport + Ed25519 on-chain), binding signatures, 0600 mode persistence |
+| `rns::wrapper` | `RnsNetwork` — `RnsNode` wrapper, destination table, announce/callback routing, `send_to` delivery |
+| `rns::config_builder` | `RnsNodeConfigBuilder` — builds `NodeConfig` from pneumatic config; rns-net pinned exactly |
 | `server` | `ThreadPool` — hybrid sync+async worker pool |
 | `config` | `Config` — loads `config.json` + per-environment specs from `/env/` |
 | `environment` | `EnvironmentMetadata` — quorum settings, crypto provider, block validators, gas cost model |
@@ -73,7 +80,7 @@ pneumatic_core/
 | `registry` | `PendingTransactionRegistry` (DashMap-backed tx CRUD + state transitions), `TransactionSignatureRegistry` |
 | `epoch` | `Epoch`, `StakeSet` (serializable), `ExecutorSet`, `Shuffler`, `deterministic_select()` (per-tx routing), `deterministic_select_shard()` (shard-aware), `LeaderSelector`, `BlockProposer`, `EpochBoundaryDetector`, `resolve_block_conflict()`, `CandidateRegistry`, `IEpochReconciler`, `IStakingManager`, `IEpochLeaderSelector`, `IBlockProposer` |
 | `gossiper` | Message deduplication (TTL cache) + fan-out to multiple handlers |
-| `messages` | Wire message format (`Message` struct), ack/reject helpers |
+| `messages` | Wire message format (`Message` struct), `acknowledge()` helper (TCP handshake responses removed — legacy dead code) |
 | `logging` | `Logger` trait with `FileLogger` (file-locked append writes) |
 | `user` | `User` struct with `fuel_balance` and `stake` |
 | `action_router` | `IActionRouter` trait — routes actions (Process, Preload, Sign, Confirm, etc.) with gas/stake/nonce checks |
@@ -310,7 +317,9 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 398 tests: 278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer
+# 419 tests: 299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer
+cargo test --workspace
+# 425 tests: 419 lib + 6 integration (transport boundary, offline)
 ```
 
 ---
@@ -321,7 +330,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 398 tests passing across 5 crate targets (278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer), all core types and traits implemented.
+**Status: COMPLETE** — 419 tests passing across 5 crate targets (299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer), all core types and traits implemented, RNS transport fully integrated.
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -519,6 +528,24 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 
 ---
 
+### Phase 10: Reticulum Transport Integration (Priority: HIGH)
+
+Replace legacy TCP-only peer discovery with encrypted RNS transport: identity keystore, destination routing, announce-based discovery, control/data plane packet splitting, registration over RNS control packets, heartbeat/eviction, and production wiring in all worker crates.
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| **Phase 0**: Compatibility layer | `RnsConnection` stub implementing `Connection` trait; `Gossiper::send_to_type` generic fan-out through `Sender` trait; test-only `RecordingSender`/`ScriptedSender`; `NodeRequest::Register` over RNS control packets; `NetworkPacket` splits into control (registry) + data (directory) branches | **DONE** |
+| **Phase 1**: Foundational structs | `RnsNodeConfigBuilder` (rns-net pinned exactly); `NodeIdentity` dual-keystore (RNS transport key + Ed25519 on-chain key); binding signatures (`sign_binding`/`verify_binding`); `rhash_from_public_key` derivation; keystore persistence with 0600 mode; `RnsNetwork` wrapper with destination table, 4-thread worker pool, inbound DoS guard | **DONE** |
+| **Phase 2**: Control plane | Node registration/discovery over RNS control packets; `handle_register` in NodeRegistry (verification, stake gate, RNS connection creation); heartbeats and node eviction | **DONE** |
+| **Phase 3**: Live message fanouts | `Gossiper::handle_message` processes decrypted RNS plaintext; committer `main.rs` bridges transport to control/data planes; announce-based discovery triggers directory requests | **DONE** |
+| **Phase 4**: `RnsConnection` impl | `Connection` trait for RNS — `send` wraps RNS `send_to`; `TcpConnection` dead code removed (`request_connection` had zero callers) | **DONE** |
+| **Phase 5**: Worker node wiring | Sentry/Executor/Finalizer all use RNS network; `on_packet` routing (control→registry, data→directory or gossiper); `on_announce` triggers `NodeRequest::Request` directory queries | **DONE** |
+| **Phase 6**: Integration tests | Offline transport boundary tests via `RecordingSender`/`ScriptedSender` — fanout correctness, type filtering, empty registry, partial/total failure, concurrent publication | **DONE** |
+
+**Post-Phase 10 cleanup**: Removed dead `request_connection` from `IsConnFactory` trait and `ConnFactory` impl; removed never-called `reject()` helper; removed unused imports (`TcpStream`, `SocketAddr`, `async_trait`, `CoreTcpStream`); `acknowledge()` preserved (still used by finalizer's `handle_preload`/`handle_signature`).
+
+---
+
 ### Phase 6: Server & Infrastructure (Priority: MEDIUM)
 
 **Goal**: Fix server bugs, improve connection management.
@@ -608,11 +635,12 @@ Three message types: `BlockFinalized` (finalizer broadcasts block + full stake s
 | 5b. Deterministic Routing | ✅ Done (34h, 1 week) | Phase 0 |
 | 5c. Executor Sharding + Optimistic Commit | ✅ Done (42h, 1 week) | Phase 5b |
 | 5d. Quorum Gossip Protocol | ✅ Done (~33h, ~4 days) | Phase 5c |
+| 10. Reticulum Transport | ✅ Done (~6 phases, ~10+ days) | Phase 5d |
 | 6. Server & Infra | ✅ Done (~22h, ~3 days) | Can run in parallel with 1-3 |
 | 7. Test Coverage | ~1 week (concurrency + E2E) | Phase 1-5 |
 | 8. Production Readiness | ~4 weeks | Phases 1-7 |
 
-**MVP Total**: ~14 weeks (with parallel work: ~9 weeks)
+**MVP Total**: ~14 weeks (with parallel work: ~9 weeks) + RNS transport (~10+ days, Phase 10 complete)
 **Production Total**: ~18 weeks from MVP
 
 ---

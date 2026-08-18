@@ -216,7 +216,7 @@ Resolve these before writing code — choices will ripple through all phases bel
 - [x] Define "confirmed" guarantee — Quorum gossip protocol: nodes accumulate stake-weighted votes, transition Optimistic → Confirmed at supermajority (67%); `handle_block_finalized` caches stake set, `handle_block_confirmed_vote` accumulates votes, `handle_block_quorum_reached` transitions block status — `committer/src/committer.rs`, `finalizer/src/message_dispatcher.rs` — 7 new tests
 - [x] Real block data in both finalize paths — `previous_hash` resolved from the token's actual chain tip (`resolve_previous_hash` via `DataProvider::get_token`, graceful `vec![]` fallback on lookup failure), and `total_stake`/`total_voters` populated from the epoch stake set on the standard path (`resolve_stake_metrics`) — `finalizer/src/finalizer.rs` — 6 new tests
 - [x] Genesis convention: block 1 can now commit through the standard path — unified on **genesis `previous_hash = vec![]`**: `Blockchain::validate_next_block` accepts an empty `previous_hash` exactly when the chain is empty (was: rejected **any** block on an empty chain), `Block::from_transaction` / `Token::create_block` emit `vec![]` at genesis (were: `leader_hash`), `Token::commit_block` now computes the block hash **before** validation (fresh blocks arrived with `current_hash = vec![]` so the self-hash check always failed), and `validate_block` returns a new `BlockValidationError::ChainLinkage` instead of the misleading `InvalidFinalizerSignature` — `src/blocks.rs`, `src/tokens.rs`, `committer/src/committer.rs` (test helpers) — 7 new tests
-- [ ] `propose_blocks` builds `proposed_block` from a throwaway `Blockchain::new()` / `Token::new()` (committer/src/committer.rs:866-871) — `previous_hash` is wrong once the real chain is non-empty and `token_metadata` is empty; inert today because `run_epoch_loop` discards the result (`let _ =`, committer/src/committer.rs:882). Wire to the real token's tip/metadata before enabling leader-proposal commits
+- [ ] `propose_blocks` builds `proposed_block` from a throwaway `Blockchain::new()` / `Token::new()` (committer/src/committer.rs:866-871) — `previous_hash` is wrong once the real chain is non-empty and `token_metadata` is empty; inert today because `run_epoch_loop` discards the result (`let _ =`, committer/src/committer.rs:882). Wire to the real token's tip/metadata before enabling leader-proposal commits. **RNS status:** Node identity persists to `node_identity.json`; registration uses RNS control packets; no TCP bootstrap addresses in config.
 
 ### Phase 5 — Quorum Gossip Protocol ✅ COMPLETE (2026-08-14, updated from Block Awareness Gossip)
 
@@ -244,7 +244,7 @@ Original `BlockConfirmed` renamed to `BlockFinalized`. Full stake-weighted quoru
 - [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
 - [ ] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap) — only unit-level stress tests exist in `epoch.rs`, no concurrent committer commit tests
 - [x] Quorum gossip path: `send_block_finalized` → `handle_block_finalized` → `send_block_confirmed_vote` → `handle_block_confirmed_vote` → `send_block_quorum_reached` → `handle_block_quorum_reached` unit-tested (7 tests across all three handlers)
-- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline (no integration test spanning sentinel → executor → finalizer → committer)
+- [ ] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline (no integration test spanning sentinel → executor → finalizer → committer). Transport integration tests exist at the boundary layer only (`tests/transport_integration.rs`).
 
 ### Implementation Order Recommendation
 
@@ -401,7 +401,74 @@ Combines executor sharding (per-transaction executor group assignment) with opti
 - [x] P6_04 Implement `encrypt`/`decrypt` stubs (hybrid AES-GCM + X25519 key exchange) — `crypto.rs` — uses `aes-gcm` 0.11.0 + `x25519-dalek` 3.0.0; wire format: `[32-byte ephemeral PK][ciphertext + 16-byte GCM tag]`
 - [x] P6_05 Implement `encrypt_to`/`decrypt_from` for cross-recipient encryption — `crypto.rs` — extend trait with methods accepting recipient's X25519 public key; shared DH via private `dh_encrypt`/`dh_decrypt` helpers; added `x25519_public_key()` accessor
 
-## Phase 7: Tests (398 passing across 5 crates — 278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer)
+## Phase 7: Reticulum Transport Integration
+
+Replace TCP-only peer discovery with encrypted RNS transport: identity keystore, destination routing, announce-based discovery, control/data plane packet splitting, registration over RNS control packets, heartbeat/eviction.
+
+### Phase 0: Compatibility Layer
+
+- [x] P7_00_01 `RnsConnection` stub implementing `Connection` trait — `rns/conn.rs`
+- [x] P7_00_02 `Gossiper::send_to_type` generic fan-out through `Sender` trait — `gossiper.rs`
+- [x] P7_00_03 Test-only `RecordingSender`/`ScriptedSender` — `tests/transport_integration.rs`
+- [x] P7_00_04 `NodeRequest::Register` over RNS control packets — `node.rs`
+- [x] P7_00_05 `NetworkPacket` splits into control (registry) + data (directory) branches — `node.rs`
+- [x] P7_00_06 `handle_directory_response` dispatch — `node/registry.rs`
+
+### Phase 1: Foundational Structs
+
+- [x] P7_01_01 `RnsNodeConfigBuilder` — builds `NodeConfig` from pneumatic config; rns-net pinned exactly — `rns/config_builder.rs`
+- [x] P7_01_02 `NodeIdentity` dual-keystore (RNS transport key + Ed25519 on-chain key) — `rns/identity.rs`
+- [x] P7_01_03 Binding signatures (`sign_binding`/`verify_binding`) — `rns/identity.rs`
+- [x] P7_01_04 `rhash_from_public_key` derivation — `rns/identity.rs`
+- [x] P7_01_05 Keystore persistence with 0600 mode, corrupt-file hard error — `rns/identity.rs`
+- [x] P7_01_06 `RnsNetwork` wrapper — `RnsNode` with destination table, 4-thread worker pool, inbound DoS guard — `rns/wrapper.rs`
+- [x] P7_01_07 Inbound worker pool: decrypt + plaintext-size guard + dispatch to application handler — `rns/wrapper.rs`
+- [x] P7_01_08 Delivery callback: raw-size guard + round-robin enqueue — `rns/wrapper.rs`
+- [x] P7_01_09 Bootstrap peer pre-seeding from config — `rns/wrapper.rs`
+- [x] P7_01_10 `RnsNetwork::send_to` — destination lookup + encrypted RNS packet delivery — `rns/wrapper.rs`
+- [x] P7_01_11 `RnsNetwork::on_packet` / `on_announce` — application and discovery handlers — `rns/wrapper.rs`
+- [x] P7_01_12 `inbound_size_ok` — 16 MB frame cap enforcement — `rns/wrapper.rs`
+
+### Phase 2: Control Plane
+
+- [x] P7_02_01 Node registration/discovery over RNS control packets — `rns/conn.rs`, `node/registry.rs`
+- [x] P7_02_02 `handle_register` in NodeRegistry (verification, stake gate, RNS connection creation) — `node/registry.rs`
+- [x] P7_02_03 Heartbeats and node eviction — `rns/conn.rs`
+
+### Phase 3: Live Message Fanouts
+
+- [x] P7_03_01 `Gossiper::handle_message` processes decrypted RNS plaintext — `gossiper.rs`
+- [x] P7_03_02 Committers `main.rs` bridges transport to control/data planes — `committer/src/main.rs`
+- [x] P7_03_03 Announce-based discovery triggers directory requests — `committer/src/main.rs`
+
+### Phase 4: RnsConnection Impl
+
+- [x] P7_04_01 `Connection` trait impl for RNS — `rns/conn.rs`
+- [x] P7_04_02 `send` wraps RNS `send_to` — `rns/conn.rs`
+
+### Phase 5: Worker Node Wiring
+
+- [x] P7_05_01 Sentry/Executor/Finalizer all use RNS network — `committer/src/main.rs`
+- [x] P7_05_02 `on_packet` routing: control→registry, data→directory or gossiper — `committer/src/main.rs`
+- [x] P7_05_03 `on_announce` triggers `NodeRequest::Request` directory queries — `committer/src/main.rs`
+
+### Phase 6: Integration Tests
+
+- [x] P7_06_01 Offline transport boundary tests via `RecordingSender`/`ScriptedSender` — `tests/transport_integration.rs`
+- [x] P7_06_02 Fanout correctness test — `test_fanout_records_all_peers`
+- [x] P7_06_03 Type filtering test — `test_type_filtering`
+- [x] P7_06_04 Empty registry test — `test_empty_registry_is_ok`
+- [x] P7_06_05 Partial/total transport failure tests — `test_partial_transport_failure`, `test_total_transport_failure`
+- [x] P7_06_06 Concurrent publication test — `test_concurrent_publication`
+
+### Dead Code Removed
+
+- [x] P7_07_01 `request_connection` from `IsConnFactory` trait and `ConnFactory` impl — `conns/factories.rs` (zero callers, RNS handles all peer-to-peer)
+- [x] P7_07_02 `reject()` helper — `messages.rs` (never called)
+- [x] P7_07_03 Unused imports: `TcpStream`, `SocketAddr`, `async_trait`, `CoreTcpStream` — `conns/factories.rs`
+- [x] P7_07_04 `acknowledge()` preserved — still used by finalizer's `handle_preload`/`handle_signature`
+
+## Phase 8: Tests (419 passing across 5 crates — 299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer, + 6 integration)
 
 All tests use inline `#[cfg(test)] mod tests` blocks (no external `tests/` directory).
 Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spawn` with `Arc`-shared DashMaps.
@@ -417,7 +484,7 @@ Factory helpers follow `make_*` pattern. Concurrent tests use `std::thread::spaw
 - [x] P4_Add tests for BlockBuilder — `finalizer/src/block_builder.rs` — 2 tests: build_signed_transaction, create_block
 - [x] P4_Add tests for MessageDispatcher — `finalizer/src/message_dispatcher.rs` — 3 tests: send_to_committers, send_clear_to_sentinels, block_finalized_serializes
 - [x] P3_Add tests for Executor — `executor/src/executor.rs` — 5 tests: validation result, backpressure cycle
-- [x] T07 Migrate existing tests — all test-bearing files — total 398 tests across 5 crate targets (278 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +7 tests from Phase 5d quorum gossip (4 renamed BlockFinalized handlers + 2 vote tracking + 1 Confirmed transition) — +14 tests from finalizer real block data (2026-08-14) — +7 tests from genesis convention fix (2026-08-15)
+- [x] T07 Migrate existing tests — all test-bearing files — total 419 tests across 5 crate targets (299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer) — +22 tests from Protocol Rearchitecture (4 FinalityStatus + 8 CandidateRegistry + 6 Phase 2 conflict detection + 4 Phase 3 conflict wiring) — +18 tests from Phase 5 deterministic routing (5 selection + 4 cache + 2 block_builder + 2 message_dispatcher + 5 other) — +24 tests from Phase 5c executor sharding + optimistic commit (6 selection + 5 executor_set_cache + 2 optimistic + 2 epoch_transition + 1 conflict_resolution + 6 other) — +7 tests from Phase 5d quorum gossip (4 renamed BlockFinalized handlers + 2 vote tracking + 1 Confirmed transition) — +14 tests from finalizer real block data (2026-08-14) — +7 tests from genesis convention fix (2026-08-15) — +6 offline transport integration tests (transport boundary, RecordingSender/ScriptedSender)
 - [x] T08 Self-validated token flow end-to-end — `validation.rs` — integration test exercising full self-signed pipeline (token → spec validate → PendingTransaction → Validated → registry lookup)
 - [x] T09 Backpressure verification — `executor/src/executor.rs` — `full_backpressure_cycle`: preload at capacity → reject → cleanup → retry succeeds
 
@@ -573,7 +640,7 @@ Added `PneumaticError::CryptoError(String)`, `ConnError::DecryptError(String)`, 
 
 **Tests added:** `test_decrypt_short_input_returns_error`, `test_decrypt_from_wrong_recipient_returns_error`, `pneumatic_error_display_crypto_error`, `pneumatic_error_from_conn_error_decrypt`, `data_error_crypto_error_display`, `data_op_display`, `get_op_display`, `save_op_display`, `block_validation_error_display`.
 
-**Verification:** `cargo test --workspace` — 299 passing, 1 ignored.
+**Verification:** `cargo test --workspace` — 299 passing, 1 ignored. (Current: 419 + 6 integration tests)
 
 **Estimate:** 4h → actual ~1h
 
@@ -629,7 +696,10 @@ Hybrid AES-256-GCM + X25519 key exchange. Each `encrypt()` generates a fresh eph
 
 #### ActionRouter — routing + coordination now fully implemented (P1_44)
 **File:** `src/action_router.rs`
-All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 345 tests across workspace (256 core + 32 sentinel + 26 finalizer + 9 executor + 21 committer).
+All action branches dispatch and all coordination helpers use protocol-level users: `check_nonce()` calls `get_user()` from data store, `verify_gas()` calculates `base_cost + (amount × multiplier)` from `CostModel` and returns usage tracking, `check_stake()` verifies both `cost_model.global_min_stake` AND `config.get_min_type_stake()`. Fails with `InvalidNonce`, `InsufficientGas`, or `InsufficientStake`. Returns `GasVerified { gas_used, gas_remaining }` and `StakeChecked { node_type, stake }`. 419 tests across workspace (299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer).
+
+#### RNS Transport — fully integrated (Phase 7)
+**File:** `src/rns/` — 4 modules: `conn` (Connection impl), `config_builder` (NodeConfig builder), `identity` (dual-keystore + binding signatures), `wrapper` (RnsNetwork with worker pool). Worker nodes use RNS for peer discovery and communication. `on_packet` splits control packets to NodeRegistry and data packets to directory response or gossiper. `on_announce` triggers directory requests. Heartbeat/eviction cycle. `request_connection` legacy code removed (zero callers). `acknowledge()` preserved (finalizer uses it). `reject()` removed (never called).
 
 #### Protocol-level User + gas model — FOUNDATION COMPLETE (P1_44 updated)
 **File:** `src/user.rs`, `src/tokens.rs`, `src/data.rs`, `src/environment.rs`, `src/action_router.rs`, `src/node/registry.rs`
@@ -817,9 +887,9 @@ Stubbed within implemented methods:
 **File:** `pneumatic_committer/src/lib.rs`
 **Done:** Phase 5 tasks (P5_01–P5_11) complete — module declarations, `Committer` struct, `BlockServices`, `epoch_manager` single-file module with `StakeStore`, `StakingManager`, `EpochReconciler`, `LeaderSelector`. Gas deduction wired (committer deducts `gas_used` from sender's `fuel_balance` on commit).
 
-### Tests — Priority 6 (398 passing across 5 crates)
+### Tests — Priority 6 (419 passing across 5 crates + 6 integration)
 
-#### Tests added to pneumatic_core — 278 tests
+#### Tests added to pneumatic_core — 299 tests
 **Files:** `errors.rs` (16), `transactions.rs` (27), `registry.rs` (39 incl. concurrent + gas_tracker), `gossiper.rs` (9), `validation.rs` (26 incl. integration), `tokens.rs` (16), `epoch.rs` (49 LeaderSelector/Epoch/BlockProposer/conflict resolution), `config.rs` (test helpers only), `data.rs` (4), `action_router.rs` (28), `crypto.rs` (19: hash, sign/verify, encrypt/decrypt, cross-recipient), `blocks.rs` (14), `server.rs` (9), `logging.rs` (1), `conns.rs` (9), `conns/senders.rs` (5), `conns/streams.rs` (8)
 **Covered:** PneumaticError variants, TransactionRiskFactor scoring, TransactionState transitions, PendingTransactionRegistry CRUD + concurrent ops + gas_tracker, Gossiper fan-out + dedup, SelfSigned/Executed validation specs, nonce validation, block validation result variants, self-signed token flow integration, TokenFactory minting fee deduction, LeaderSelector stake-weighted selection, BlockProposer, EpochBoundaryDetector, conflict resolution, deterministic_select per-transaction routing (5 tests), epoch_number on Block propagation.
 
@@ -840,5 +910,5 @@ Stubbed within implemented methods:
 **Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow). Quorum gossip: block finalized (valid append, orphan ignored, tampered rejected, unknown token error), vote tracking (accumulates_stake, skips_missing_stake_set), quorum reached (Confirmed transition).
 
 #### Remaining test gaps
-**Files:** `config.rs` (unit tests), `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (process_registration, send_to_all)
-**Action:** Tests for Config::new_for_testing, DefaultDataProvider (TCP/UDS communication), ThreadPool async poison, epoch reconciliation stubs, node registration batch processing.
+**Files:** `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (send_to_all), e2e pipeline integration (sentinel → executor → finalizer → committer)
+**Action:** DefaultDataProvider wire format tests, ThreadPool async poison, epoch reconciliation stubs, node registry send_to_all. Config.rs test helpers exist but unit tests for loading/parsing would be useful.
