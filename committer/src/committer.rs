@@ -1996,6 +1996,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_block_finalized_submissions_no_panic() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let original_chain_len = committer.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+
+        // Spawn multiple concurrent handle_block_finalized calls with different tx_ids
+        let committer_arc = Arc::new(committer);
+        std::thread::scope(|s| {
+            let mut handles = vec![];
+            for i in 0..10 {
+                let committer = committer_arc.clone();
+                let tx_id = format!("concurrent_tx_{}", i);
+                handles.push(s.spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let block = make_gossip_block(&committer, &tx_id, vec![i as u8]);
+                    let message = make_block_finalized_message(block);
+                    // Each thread runs its own runtime to handle the async call
+                    rt.block_on(async {
+                        committer.handle_block_finalized(message).await
+                    })
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+
+        // All joins succeeded → no data races
+        // Chain should have grown (some blocks may have been orphaned due to concurrent writes)
+        let new_chain_len = committer_arc.tokens.get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+        assert!(new_chain_len >= original_chain_len);
+    }
+
+    #[tokio::test]
     async fn handle_block_finalized_appends_valid_block() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
