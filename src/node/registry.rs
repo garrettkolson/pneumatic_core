@@ -7,6 +7,7 @@ use futures::future::join_all;
 use strum::IntoEnumIterator;
 
 use crate::conns::{ConnError, Connection};
+use crate::conns::senders::{RnsSender, Sender};
 use crate::config::Config;
 use crate::crypto::{AsymCryptoProvider, Ed25519Provider};
 use crate::encoding::serialize_to_bytes_rmp;
@@ -524,15 +525,30 @@ impl NodeRegistry {
     pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
-        // Collect keys first to release DashMap guards, then send on collected references
-        let keys: Vec<Vec<u8>> = nodes.iter()
-            .filter_map(|entry| Some(entry.key().clone()))
-            .collect();
+        // If RNS transport is available, send via RNS
+        if let Some(network) = &self.network {
+            // Collect rhashes to release DashMap guards
+            let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
+            let mut rhashes = Vec::new();
+            for key in keys {
+                if let Some(entry) = nodes.get(&key) {
+                    rhashes.push(entry.value().rhash);
+                }
+            }
+            for rhash in rhashes {
+                let rns_sender = RnsSender::new(Arc::clone(network), rhash);
+                let _ = rns_sender.get_response(&data);
+            }
+            return;
+        }
 
-        // Use get() + block_on for each connection individually (simpler, avoids lifetime issues)
+        // Collect keys to release DashMap guards, then send
+        let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
+
+        // Use get() for each connection individually (simpler, avoids lifetime issues)
         let send_futs: Vec<_> = keys.into_iter()
             .map(|key| {
-                let nodes_clone = nodes.clone();
+                let nodes_clone = Arc::clone(&nodes);
                 let send_data = data.clone();
                 async move {
                     if let Some(entry) = nodes_clone.get(&key) {
@@ -547,12 +563,28 @@ impl NodeRegistry {
     /// Blocking version for sync contexts (runs async sends sequentially).
     pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
+
+        // If RNS transport is available, send via RNS
+        if let Some(network) = &self.network {
+            // Collect rhashes to release DashMap guards
+            let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
+            let mut rhashes = Vec::new();
+            for key in keys {
+                if let Some(entry) = nodes.get(&key) {
+                    rhashes.push(entry.value().rhash);
+                }
+            }
+            for rhash in rhashes {
+                let rns_sender = RnsSender::new(Arc::clone(network), rhash);
+                let _ = rns_sender.get_response(&data);
+            }
+            return;
+        }
+
         let send_data = data.clone();
         let _ = tokio::task::spawn_blocking(move || {
             futures::executor::block_on(async {
-                let keys: Vec<Vec<u8>> = nodes.iter()
-                    .filter_map(|entry| Some(entry.key().clone()))
-                    .collect();
+                let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
                 for key in keys {
                     if let Some(entry) = nodes.get(&key) {
                         let _ = entry.value().conn.send(&send_data).await;

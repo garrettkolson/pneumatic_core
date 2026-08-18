@@ -1,11 +1,14 @@
 use moka::sync::Cache;
 use crate::config::Config;
 use crate::conns::factories::ConnFactory;
+use crate::conns::senders::{RnsSender, Sender};
 use crate::crypto::AsymCryptoProvider;
 use crate::data::DataError;
 use crate::encoding::deserialize_rmp_to;
 use crate::messages::Message;
 use crate::node::NodeRegistryType;
+use crate::node::registry::NodeRegistry;
+use crate::rns::wrapper::RnsNetwork;
 use std::sync::{Arc, RwLock};
 
 /// Gossiper handles message deduplication and fan-out.
@@ -112,6 +115,27 @@ impl Gossiper {
             handler(raw_data.clone());
         }
 
+        Ok(())
+    }
+
+    /// Send a message to all nodes of a given type via RNS.
+    pub fn send_to_type(
+        &self,
+        node_registry: &NodeRegistry,
+        node_type: &NodeRegistryType,
+        network: &Arc<RnsNetwork>,
+        data: &[u8],
+    ) -> Result<(), DataError> {
+        let Some(nodes) = node_registry.get_nodes(node_type) else {
+            return Ok(());
+        };
+        for entry in nodes.iter() {
+            // Key is the public key; we use rhash for routing
+            let rns_sender = RnsSender::new(Arc::clone(network), entry.value().rhash);
+            rns_sender
+                .get_response(data)
+                .map_err(|e| DataError::FromStore(e.to_string()))?;
+        }
         Ok(())
     }
 }

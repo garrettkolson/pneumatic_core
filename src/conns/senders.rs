@@ -1,8 +1,10 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 use std::time::Duration;
 use crate::conns::ConnError;
+use crate::rns::wrapper::RnsNetwork;
 
 const CONN_TIMEOUT_IN_SECS: u64 = 60;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -72,6 +74,27 @@ impl Sender for TcpSender {
         }
     }
 }
+pub struct RnsSender {
+    network: Arc<RnsNetwork>,
+    rhash: [u8; 16],
+}
+
+impl RnsSender {
+    pub fn new(network: Arc<RnsNetwork>, rhash: [u8; 16]) -> Self {
+        RnsSender { network, rhash }
+    }
+}
+
+impl Sender for RnsSender {
+    fn get_response(&self, data: &[u8]) -> Result<Vec<u8>, ConnError> {
+        // Send payload through RNS; no response expected (async delivery)
+        self.network
+            .send_to(self.rhash, data)
+            .map_err(|e| ConnError::IO(e.to_string()))?;
+        Ok(vec![])
+    }
+}
+
 #[cfg(test)]
 mod senders_tests {
     use super::*;
