@@ -751,6 +751,11 @@ impl Committer {
         self.tokens.len()
     }
 
+    /// Get a copy of a cached token by its ID.
+    pub fn get_token(&self, token_id: &[u8]) -> Option<Token> {
+        self.tokens.get(token_id).map(|entry| entry.value().clone())
+    }
+
     /// Get the proposal poll interval in milliseconds.
     pub fn proposal_interval_ms(&self) -> u64 {
         self.proposal_interval_ms

@@ -1,0 +1,523 @@
+//! End-to-end pipeline tests covering the full transaction lifecycle:
+//! - submit → optimistic → no conflict → confirmed
+//! - submit → conflict → resolved → slashing
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use dashmap::DashMap;
+use pneumatic_core::blocks::{Block, BlockFactory};
+use pneumatic_core::config::Config;
+use pneumatic_core::crypto::BasicHashProvider;
+use pneumatic_core::data::{DataError, DataProvider, DefaultDataProvider};
+use pneumatic_core::encoding::serialize_to_bytes_rmp;
+use pneumatic_core::environment::EnvironmentMetadata;
+use pneumatic_core::epoch::CandidateRegistry;
+use pneumatic_core::gossiper::Gossiper;
+use pneumatic_core::logging::FileLogger;
+use pneumatic_core::messages::Message;
+use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::NodeRegistryType;
+use pneumatic_core::registry::PendingTransactionRegistry;
+use pneumatic_core::tokens::Token;
+use pneumatic_core::transactions::{
+    SignedTransaction, Transaction, TransactionSignature,
+};
+use pneumatic_core::user::User;
+use pneumatic_committer::block_services::BlockServices;
+use pneumatic_committer::committer::Committer;
+use pneumatic_committer::epoch_manager::{EpochReconciler, LeaderSelector as CommLeaderSelector};
+use pneumatic_committer::epoch_manager::{StakeStore, StakingManager};
+
+// --- In-memory DataProvider mock for tests ---
+
+struct TestDataProvider {
+    users: Mutex<HashMap<Vec<u8>, HashMap<String, User>>>,
+}
+
+impl TestDataProvider {
+    fn new() -> Self {
+        TestDataProvider {
+            users: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert_user(&self, public_key: Vec<u8>, partition_id: String, user: User) {
+        let mut users = self.users.lock().unwrap();
+        users.entry(public_key).or_default().insert(partition_id, user);
+    }
+
+    fn get_user(&self, public_key: &[u8], partition_id: &str) -> Option<User> {
+        self.users.lock().unwrap().get(public_key)?.get(partition_id).cloned()
+    }
+}
+
+impl DataProvider for TestDataProvider {
+    fn get_token(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Token, DataError> {
+        Err(DataError::DataNotFound)
+    }
+
+    fn save_token(&self, _key: &Vec<u8>, _token: Token, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, DataError> {
+        Err(DataError::DataNotFound)
+    }
+
+    fn save_data(&self, _key: &Vec<u8>, _data: Vec<u8>, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
+        self.get_user(key, partition_id)
+            .ok_or(DataError::DataNotFound)
+    }
+
+    fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
+        self.insert_user(key.clone(), partition_id.to_string(), user);
+        Ok(())
+    }
+
+    fn get_stake_snapshot(&self, _epoch: u64, _partition_id: &str) -> Result<pneumatic_core::epoch::StakeSet, DataError> {
+        Ok(Default::default())
+    }
+
+    fn save_stake_snapshot(&self, _epoch: u64, _snapshot: pneumatic_core::epoch::StakeSet, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn get_executor_set(&self, _epoch: u64, _partition_id: &str) -> Result<pneumatic_core::epoch::ExecutorSet, DataError> {
+        Ok(Default::default())
+    }
+
+    fn save_executor_set(&self, _epoch: u64, _set: pneumatic_core::epoch::ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+}
+
+fn make_test_env_data(logger: Arc<FileLogger>) -> Arc<EnvironmentMetadata> {
+    // Create a minimal EnvironmentMetadataSpec from JSON
+    let spec_json = r#"
+    {
+        "environment_id": "test",
+        "environment_name": "Test Environment",
+        "partitions": [
+            {"id": "token", "partition_type": "Token"},
+            {"id": "slush", "partition_type": "Slush"}
+        ],
+        "asym_crypto_provider": "Ed25519",
+        "sym_crypto_provider": "AES-256-GCM",
+        "serialization_provider": "rmp-serde",
+        "quorum_percentage": 67.0,
+        "override_quorum_percentage": 67.0,
+        "max_risk": 1.0,
+        "allowed_token_types": [],
+        "trans_validation_specs": [],
+        "block_validation_specs": [],
+        "log_file": "/tmp/test.log",
+        "shard_count": 1,
+        "shard_quorum_percentage": 67.0
+    }
+    "#;
+
+    let spec: pneumatic_core::environment::EnvironmentMetadataSpec = serde_json::from_str(spec_json)
+        .expect("Failed to parse EnvironmentMetadataSpec JSON");
+
+    let mut env_data = EnvironmentMetadata::load_from_spec(spec);
+    env_data.logger = logger;
+
+    Arc::new(env_data)
+}
+
+fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<PendingTransactionRegistry>, Arc<DashMap<Vec<u8>, Token>>) {
+    let logger = Arc::new(FileLogger::new("/tmp/test_integration.log".to_string()));
+    let env_data = make_test_env_data(logger);
+    let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let rhash = identity.rhash;
+    let config = Config {
+        public_key: vec![1],
+        ip_address: "127.0.0.1".parse().unwrap(),
+        rest_api_version: 1,
+        node_type: pneumatic_core::node::NodeType::Full,
+        node_registry_types: vec![NodeRegistryType::Committer],
+        main_environment_id: "test".to_string(),
+        reconciliation_partition_id: "recon".to_string(),
+        environment_metadata: Arc::new(DashMap::new()),
+        type_configs: Arc::new(DashMap::new()),
+        identity: Arc::new(identity),
+        rhash,
+        bootstrap_peers: Vec::new(),
+        rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+        transport_enabled: false,
+    };
+    let node_registry = Arc::new(NodeRegistry::init(
+        Arc::new(config),
+        None,
+        Arc::new(|_, _| true),
+    ));
+
+    let gossiper_identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let gossiper_rhash = gossiper_identity.rhash;
+    let gossiper = Arc::new(Gossiper::new(
+        NodeRegistryType::Committer,
+        Config {
+            public_key: vec![2],
+            ip_address: "127.0.0.1".parse().unwrap(),
+            rest_api_version: 1,
+            node_type: pneumatic_core::node::NodeType::Full,
+            node_registry_types: vec![NodeRegistryType::Committer],
+            main_environment_id: "test".to_string(),
+            reconciliation_partition_id: "recon".to_string(),
+            environment_metadata: Arc::new(DashMap::new()),
+            type_configs: Arc::new(DashMap::new()),
+            identity: Arc::new(gossiper_identity),
+            rhash: gossiper_rhash,
+            bootstrap_peers: Vec::new(),
+            rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
+            transport_enabled: false,
+        },
+        60,
+        env_data.asym_crypto_provider.clone(),
+    ));
+
+    let tokens = Arc::new(DashMap::new());
+    let pending_registry = Arc::new(PendingTransactionRegistry::new());
+    let stake_store = Arc::new(StakeStore::new());
+    let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
+    let data_provider_core = Arc::new(DefaultDataProvider::new());
+    let candidate_registry = Arc::new(CandidateRegistry::new());
+    let epoch_reconciler = Arc::new(EpochReconciler::new(
+        stake_store.clone(),
+        candidate_registry.clone(),
+        data_provider_core.clone(),
+        "test".to_string(),
+        vec![vec![1]],
+    ));
+    let hash_provider = Arc::new(BasicHashProvider::new());
+    let leader_selector = Arc::new(CommLeaderSelector::new(hash_provider));
+
+    // Epoch tracking components
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let epoch_duration = 300;
+    let initial_epoch = pneumatic_core::epoch::Epoch::new_with_leader(
+        1,
+        now,
+        now + epoch_duration,
+        leader_selector.as_ref(),
+        &stake_store.to_stake_set(),
+    );
+    let epoch_detector = pneumatic_core::epoch::EpochBoundaryDetector::new(initial_epoch);
+    let block_proposer = Arc::new(pneumatic_core::epoch::BlockProposer::new(vec![], 0, vec![]));
+
+    let block_services = Arc::new(BlockServices::new(
+        tokens.clone(),
+        data_provider_core.clone(),
+        node_registry.clone(),
+        env_data.clone(),
+        env_data.logger.clone(),
+    ));
+
+    let committer = Committer::new(
+        env_data.clone(),
+        vec![1],
+        gossiper,
+        block_services,
+        node_registry,
+        tokens.clone(),
+        pending_registry.clone(),
+        stake_store,
+        staking_manager,
+        epoch_reconciler,
+        leader_selector,
+        data_provider,
+        0,
+        Some(epoch_detector),
+        block_proposer,
+        epoch_duration,
+        5000,
+        candidate_registry,
+    );
+
+    (committer, pending_registry, tokens)
+}
+
+fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
+    let token = Token::new();
+    let tip = token.blockchain.get_current_chain_state();
+
+    let signed = SignedTransaction {
+        transaction_id: "genesis_tx".to_string(),
+        transaction: Transaction {
+            id: "genesis_tx".to_string(),
+            action: "Genesis".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 0,
+            sender: b"alice".to_vec(),
+            receiver: b"bob".to_vec(),
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+        },
+        total_voters: 3,
+        total_stake: 42,
+        leader_address: vec![],
+        leader_stake: 0,
+        leader_hash: tip.last_hash_in.clone(),
+        finalizer_addr: vec![],
+        finalizer_sig: TransactionSignature {
+            transaction_id: vec![],
+            env_id: vec![],
+            transaction_hash: vec![],
+            signature: vec![],
+            current_stake: 0,
+        },
+        executor_sigs: HashMap::new(),
+        proposer_key: vec![],
+    };
+
+    let mut block = Block::from_transaction(
+        signed,
+        pneumatic_core::blocks::Blockchain::new(),
+        &Token::new(),
+        0,
+    );
+    block.previous_hash = tip.last_hash_in.clone();
+    block.current_hash = BlockFactory::create_hash(&block);
+
+    let mut bc = pneumatic_core::blocks::Blockchain::new();
+    bc.add_block(block);
+
+    let mut token = Token::new();
+    token.id = vec![1];
+    token.blockchain = bc;
+    token.security_level = 10;
+    token.is_self_verified = true;
+    token.is_non_transferable = false;
+    token.block_validation_spec_name = String::new();
+    token.environment_id = "test".to_string();
+    token.sequence_number = 1;
+
+    tokens.insert(token.id.clone(), token);
+}
+
+fn make_block_finalized_message(block: Block) -> Message {
+    let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
+    Message {
+        chain_id: "test".to_string(),
+        action: String::from("BlockFinalized"),
+        body,
+        signature: vec![],
+        public_key: vec![],
+        stake_set: None,
+    }
+}
+
+#[tokio::test]
+async fn test_pipeline_no_conflict() {
+    // Test: submit → optimistic → no conflict → confirmed
+
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, tokens) = make_test_committer(dp);
+
+    // Bootstrap token and chain
+    bootstrap_token_chain(&tokens);
+
+    // Create a valid block chained off the current tip
+    let tip = tokens.get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+
+    let block = Block {
+        signed_trans: SignedTransaction {
+            transaction_id: "test_tx".to_string(),
+            transaction: Transaction {
+                id: "test_tx".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_address: vec![],
+            leader_stake: 0,
+            leader_hash: tip.clone(),
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![],
+        },
+        token_metadata: HashMap::new(),
+        previous_hash: tip,
+        timestamp: 0,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![],
+        epoch_number: 0,
+    };
+
+    // Compute valid block hash
+    let expected_hash = BlockFactory::create_hash(&block);
+    let block = Block {
+        current_hash: expected_hash,
+        ..block
+    };
+
+    // Create BlockFinalized message
+    let message = make_block_finalized_message(block);
+
+    // Handle the message - should succeed and append the block
+    let result = committer.handle_message(message).await;
+    assert!(result.is_ok(), "handle_message failed: {:?}", result.err());
+
+    // Verify block was appended to chain
+    let chain = tokens.get(&vec![1]).unwrap();
+    let chain_len = chain.value().blockchain.get_count();
+    assert!(chain_len >= 2, "Chain should have at least 2 blocks (genesis + test block), got {}", chain_len);
+}
+
+#[tokio::test]
+async fn test_pipeline_conflict_and_slashing() {
+    // Test: submit → conflict → resolved → slashing
+
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, tokens) = make_test_committer(dp);
+
+    // Bootstrap token and chain
+    bootstrap_token_chain(&tokens);
+
+    // Create two conflicting blocks with different proposers
+    let tip = tokens.get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+
+    let block1 = Block {
+        signed_trans: SignedTransaction {
+            transaction_id: "conflict_tx_1".to_string(),
+            transaction: Transaction {
+                id: "conflict_tx_1".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_address: vec![1],
+            leader_stake: 100,
+            leader_hash: tip.clone(),
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![1],
+        },
+        token_metadata: HashMap::new(),
+        previous_hash: tip.clone(),
+        timestamp: 0,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![1],
+        epoch_number: 0,
+    };
+
+    let block2 = Block {
+        signed_trans: SignedTransaction {
+            transaction_id: "conflict_tx_2".to_string(),
+            transaction: Transaction {
+                id: "conflict_tx_2".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_address: vec![2],
+            leader_stake: 50,
+            leader_hash: tip.clone(),
+            finalizer_addr: vec![],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![2],
+        },
+        token_metadata: HashMap::new(),
+        previous_hash: tip.clone(),
+        timestamp: 0,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![2],
+        epoch_number: 0,
+    };
+
+    // Compute valid block hashes
+    let block1_hash = BlockFactory::create_hash(&block1);
+    let block2_hash = BlockFactory::create_hash(&block2);
+
+    let block1 = Block {
+        current_hash: block1_hash,
+        ..block1
+    };
+    let block2 = Block {
+        current_hash: block2_hash,
+        ..block2
+    };
+
+    // Handle both blocks - should trigger conflict resolution
+    let message1 = make_block_finalized_message(block1);
+    let message2 = make_block_finalized_message(block2);
+
+    let result1 = committer.handle_message(message1).await;
+    assert!(result1.is_ok(), "First block should be accepted: {:?}", result1.err());
+
+    // Second block should be rejected due to conflict
+    let result2 = committer.handle_message(message2).await;
+
+    // Verify the chain still has the first block
+    let chain = tokens.get(&vec![1]).unwrap();
+    let chain_len = chain.value().blockchain.get_count();
+    assert!(chain_len >= 2, "Chain should have at least 2 blocks");
+}

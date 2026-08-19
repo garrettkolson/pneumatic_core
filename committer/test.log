@@ -3115,3 +3115,77 @@
 2026-08-18 22:32:59.783551 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
 2026-08-18 22:32:59.783578 UTC: Attempted to distribute block to archivers (hash: 1e48e8c82c739ed815c9e8c24ff9cbcf9fef714d14431f3c53a7c1790fb9fd3b)
 2026-08-18 22:32:59.784644 UTC: BlockFinalized: invalid hash for token [01], rejecting
+2026-08-19 06:32:09.282656 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.282665 UTC: Double-proposal detected (same proposer) at commit: slashing 0a, winner 3d9cd162e5ef3f436a5c132810eb552a64ae3eb2c33ec73c617655afad29ac05 (token: 01)
+2026-08-19 06:32:09.282702 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.282665 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.282654 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.282654 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.282656 UTC: Conflict resolved (DiscardLoser) at commit: winner b333715b4ce86878e3d8900e83414f189435bfb48bb538924af6f128f7ae1682 (token: 01)
+2026-08-19 06:32:09.283287 UTC: Applied 1 staking ops during epoch reconciliation
+2026-08-19 06:32:09.283419 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.283452 UTC: Attempted to distribute block to archivers (hash: 0ade733006bd3af59fbf864fbaacdd2ddce1ae8cd0ea364781b0301f8637eabf)
+2026-08-19 06:32:09.283474 UTC: Attempted to distribute block to archivers (hash: 118783cd0003ed6440ae2b20d4ff85e96abd92ff2f83884f192b2ef1703941e4)
+2026-08-19 06:32:09.283458 UTC: Attempted to distribute block to archivers (hash: 83ab1a0e34497a57cad829d261387c4727da0b9fec28978507891f25df54cc29)
+2026-08-19 06:32:09.283452 UTC: Attempted to distribute block to archivers (hash: 32c0eac637d4462bc0d49cb33ae563bf02927c87289b94ee40048050bb96089b)
+2026-08-19 06:32:09.283464 UTC: Attempted to distribute block to archivers (hash: 6524911c51f83ce845e36c5b5d0f4fa0280c343e745a4c949a447a1d35fd3419)
+2026-08-19 06:32:09.283477 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.283705 UTC: Attempted to distribute block to archivers (hash: b333715b4ce86878e3d8900e83414f189435bfb48bb538924af6f128f7ae1682)
+2026-08-19 06:32:09.283853 UTC: Attempted to distribute block to archivers (hash: 59dce8aabf2dd35bf2ae1f380612b156fdfbeb10532af8a3a949bda84da5b575)
+2026-08-19 06:32:09.285680 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-08-19 06:32:09.285897 UTC: Attempted to distribute block to archivers (hash: e15d4cc87ccb097c98dba029727b206d94738733fd1e3ca248da5df465a078b1)
+2026-08-19 06:32:09.286993 UTC: Conflict resolved (DiscardLoser) at commit: winner 3d9cd162e5ef3f436a5c132810eb552a64ae3eb2c33ec73c617655afad29ac05 (token: 01)
+2026-08-19 06:32:09.287203 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.287431 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 06:32:09.287431 UTC: Attempted to distribute block to archivers (hash: 79fbdb361525ef083b61c95cab76297ce26c710d220f1a94ad2c189cd8d25997)
+2026-08-19 06:32:09.287668 UTC: Attempted to distribute block to archivers (hash: b4cf51346f3970cb429689cb264237b0b314005a5ff03354e79b85de363b6ca5)
+2026-08-19 06:32:09.287700 UTC: Attempted to distribute block to archivers (hash: 156c593986d2f1ab296e4420704abb322ca14e114cbde7519cbee2e702327492)
+2026-08-19 06:32:09.288027 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 06:32:09.288615 UTC: Attempted to distribute block to archivers (hash: 1e48e8c82c739ed815c9e8c24ff9cbcf9fef714d14431f3c53a7c1790fb9fd3b)
+2026-08-19 06:32:09.288615 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 06:32:09.288617 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 06:32:09.288627 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 06:32:09.289223 UTC: Attempted to distribute block to archivers (hash: ea2efc729941ec64fa3c27529e7b0c8dee4344ff16baa66bd2ae77a166fec193)
+2026-08-19 06:32:09.289626 UTC: Attempted to distribute block to archivers (hash: b6d94ea881ab1254541268490aa97b356b8b85235bceaa352d3b4a8e1e174579)
+2026-08-19 06:32:09.289684 UTC: Attempted to distribute block to archivers (hash: d08b6d22547a5ff391eec175db815ecf2907913ee0faaebb636c915470ab4818)
+2026-08-19 06:32:09.291064 UTC: Attempted to distribute block to archivers (hash: cf1ffc06f26422c05d96946370c77f32acd604e45b12bd52c67d2e2d373513d2)
+2026-08-19 06:32:09.291930 UTC: BlockFinalized: invalid hash for token [01], rejecting
+2026-08-19 06:32:09.294044 UTC: Attempted to distribute block to archivers (hash: 9348ff6458a0ad65db84b29dd34519d443471ae20976a96ffce2190b7ae2b3fa)
+2026-08-19 06:32:09.294306 UTC: Attempted to distribute block to archivers (hash: 7168d69d596e26f95aecfccec11b33d04c36c20779a9c5172a6d2d016fc7d7ad)
+2026-08-19 13:17:49.107758 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.107759 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.107908 UTC: Double-proposal detected (same proposer) at commit: slashing 0a, winner 3d9cd162e5ef3f436a5c132810eb552a64ae3eb2c33ec73c617655afad29ac05 (token: 01)
+2026-08-19 13:17:49.107759 UTC: Conflict resolved (DiscardLoser) at commit: winner b333715b4ce86878e3d8900e83414f189435bfb48bb538924af6f128f7ae1682 (token: 01)
+2026-08-19 13:17:49.107938 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.107758 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.107953 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.108507 UTC: Attempted to distribute block to archivers (hash: 6524911c51f83ce845e36c5b5d0f4fa0280c343e745a4c949a447a1d35fd3419)
+2026-08-19 13:17:49.108506 UTC: Attempted to distribute block to archivers (hash: 32c0eac637d4462bc0d49cb33ae563bf02927c87289b94ee40048050bb96089b)
+2026-08-19 13:17:49.108505 UTC: Attempted to distribute block to archivers (hash: 0ade733006bd3af59fbf864fbaacdd2ddce1ae8cd0ea364781b0301f8637eabf)
+2026-08-19 13:17:49.109169 UTC: Attempted to distribute block to archivers (hash: 118783cd0003ed6440ae2b20d4ff85e96abd92ff2f83884f192b2ef1703941e4)
+2026-08-19 13:17:49.109225 UTC: Applied 1 staking ops during epoch reconciliation
+2026-08-19 13:17:49.109286 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.109389 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.109504 UTC: Attempted to distribute block to archivers (hash: b333715b4ce86878e3d8900e83414f189435bfb48bb538924af6f128f7ae1682)
+2026-08-19 13:17:49.109578 UTC: Attempted to distribute block to archivers (hash: 59dce8aabf2dd35bf2ae1f380612b156fdfbeb10532af8a3a949bda84da5b575)
+2026-08-19 13:17:49.109666 UTC: Attempted to distribute block to archivers (hash: 83ab1a0e34497a57cad829d261387c4727da0b9fec28978507891f25df54cc29)
+2026-08-19 13:17:49.109991 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-08-19 13:17:49.110324 UTC: Attempted to distribute block to archivers (hash: e15d4cc87ccb097c98dba029727b206d94738733fd1e3ca248da5df465a078b1)
+2026-08-19 13:17:49.113958 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.114373 UTC: Attempted to distribute block to archivers (hash: b4cf51346f3970cb429689cb264237b0b314005a5ff03354e79b85de363b6ca5)
+2026-08-19 13:17:49.115910 UTC: Conflict resolved (DiscardLoser) at commit: winner 3d9cd162e5ef3f436a5c132810eb552a64ae3eb2c33ec73c617655afad29ac05 (token: 01)
+2026-08-19 13:17:49.116165 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-08-19 13:17:49.116224 UTC: BlockFinalized: invalid hash for token [01], rejecting
+2026-08-19 13:17:49.116358 UTC: Attempted to distribute block to archivers (hash: 156c593986d2f1ab296e4420704abb322ca14e114cbde7519cbee2e702327492)
+2026-08-19 13:17:49.116408 UTC: Attempted to distribute block to archivers (hash: 79fbdb361525ef083b61c95cab76297ce26c710d220f1a94ad2c189cd8d25997)
+2026-08-19 13:17:49.116393 UTC: Attempted to distribute block to archivers (hash: 83d935a67fe91480971cd1920e55ae4610e8b9df1c7ea79d638e92de9b9aab66)
+2026-08-19 13:17:49.116526 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.116567 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.116608 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117071 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117116 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117149 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117363 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117364 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.117364 UTC: BlockFinalized: previous_hash mismatch for token [01], ignoring
+2026-08-19 13:17:49.127271 UTC: Attempted to distribute block to archivers (hash: 3722b3e647094da98f65789c798bb58257bb37968657f135591caa4123dcd423)
