@@ -20,7 +20,12 @@ pub struct Gossiper {
     config: Config,
     /// Connection factory for sending messages
     conn_factory: ConnFactory,
-    /// Signature-based dedup cache with configurable TTL
+    /// Content-hash dedup cache with configurable TTL. Keyed on a hash of
+    /// `(sender_key, body)` (see `handle_message` and the `dedup_key` helper),
+    /// not raw signature bytes, so an honest re-send is deduped regardless of
+    /// signature and forged content is never admitted — insertion follows
+    /// verification, so a rejected message never occupies the cache slot that a
+    /// legitimate message with the same key/body would use.
     cache: Cache<Vec<u8>, ()>,
     /// Registered handlers — invoked sequentially for each valid, non-duplicate
     /// message. Set via `initialize()` (first handler) and `add_handler()` (extra
@@ -76,8 +81,13 @@ impl Gossiper {
         self.handlers.lock().unwrap().push(Box::new(handler));
     }
 
-    /// Handle an incoming message: deserialize, check cache, validate crypto,
-    /// fan out to handlers, and call the message received handler.
+    /// Handle an incoming message: deserialize, verify the envelope signature,
+    /// dedup on a content hash, and fan out to handlers.
+    ///
+    /// Verification runs *before* the dedup cache is touched, so forged or
+    /// tampered content is rejected and never admitted to the cache. A later
+    /// legitimate message carrying the same `(sender_key, body)` is therefore
+    /// accepted instead of being silently dropped by a poisoned entry.
     pub fn handle_message(&self, raw_data: Vec<u8>) -> Result<(), DataError> {
         // Deserialize the message from MsgPack bytes
         let message: Message = match deserialize_rmp_to(&raw_data) {
@@ -85,16 +95,7 @@ impl Gossiper {
             Err(e) => return Err(DataError::DeserializationError(e)),
         };
 
-        // Check signature cache for duplicates
-        let signature_key = message.signature.clone();
-        if self.cache.get(&signature_key).is_some() {
-            return Ok(()); // Duplicate — silently skip
-        }
-
-        // Add to cache (will expire after TTL)
-        self.cache.insert(signature_key, ());
-
-        // Validate sender's cryptographic signature over the message body.
+        // Validate the envelope signature against the sender's public key.
         // RwLock poison and crypto errors are propagated as DataError instead of
         // panicking, so a malformed/tampered message cannot crash a handling thread.
         let crypto = self
@@ -108,6 +109,19 @@ impl Gossiper {
             return Err(DataError::InvalidSignature);
         }
 
+        // Dedup on a hash of (sender_key, body), not the signature bytes, so an
+        // honest re-send is collapsed regardless of signature randomness and
+        // two different senders with identical bodies are not confused with one
+        // another.
+        let dedup_key = Self::dedup_key(&message.public_key, &message.body);
+        if self.cache.get(&dedup_key).is_some() {
+            return Ok(()); // Duplicate — silently skip
+        }
+
+        // Insert into the cache only after verification succeeded (see
+        // `handle_message` docs above).
+        self.cache.insert(dedup_key, ());
+
         // Fan-out: invoke every registered handler with a copy of the raw data.
         // Each handler owns the dispatch logic (routing by action, etc.).
         let handlers = self.handlers.lock().unwrap();
@@ -116,6 +130,20 @@ impl Gossiper {
         }
 
         Ok(())
+    }
+
+    /// Build a collision-resistant dedup key from `(sender_key, body)`: the
+    /// SHA-256 of the public key concatenated with the SHA-256 of the body.
+    /// Hashing both operands independently (Merkle-style) prevents a
+    /// `public_key`/`body` pair from prefix-colliding with another — e.g. a
+    /// 1-byte-key + 3-byte-body vs. a 3-byte-key + 1-byte-body.
+    fn dedup_key(public_key: &[u8], body: &[u8]) -> Vec<u8> {
+        let pk = crate::crypto::sha256(public_key);
+        let bd = crate::crypto::sha256(body);
+        let mut key = Vec::with_capacity(pk.len() + bd.len());
+        key.extend_from_slice(&pk);
+        key.extend_from_slice(&bd);
+        key
     }
 
     /// Send a message to all nodes of a given type via the provided sender factory.
@@ -450,6 +478,153 @@ mod tests {
         assert!(expected >= 1);
         for c in &counts[1..] {
             assert_eq!(c.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    // --- Verify-then-insert / content-hash dedup tests (Phase 1.2, audit C4) ---
+
+    #[test]
+    fn gossiper_two_senders_same_body_both_pass() {
+        // Verify (a): two different senders with identical bodies must both
+        // reach the handler. Content-hash dedup keys on (sender_key, body), so
+        // the two distinct public keys yield distinct dedup keys.
+        let (gossiper, _crypto_provider) = make_gossiper_with_provider();
+
+        let sender_a = NodeIdentity::generate_in_memory();
+        let sender_b = NodeIdentity::generate_in_memory();
+        let body = vec![7, 7, 7, 7];
+
+        let msg_a =
+            Message::signed("env".into(), "Process", body.clone(), None, &sender_a).unwrap();
+        let msg_b =
+            Message::signed("env".into(), "Process", body, None, &sender_b).unwrap();
+        let raw_a = crate::encoding::serialize_to_bytes_rmp(&msg_a).unwrap();
+        let raw_b = crate::encoding::serialize_to_bytes_rmp(&msg_b).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        gossiper.initialize(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        gossiper.handle_message(raw_a).unwrap();
+        gossiper.handle_message(raw_b).unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "both senders' identical-body messages must reach the handler"
+        );
+    }
+
+    #[test]
+    fn gossiper_content_hash_dedup() {
+        // Verify (b): same identity + same body twice → the second is deduped.
+        // An honest re-send must be collapsed regardless of whether the dedup
+        // key is content-based.
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        gossiper.initialize(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let msg = make_signed_message(&sig_guard, "env", "Process", vec![9, 9]);
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+        drop(sig_guard);
+
+        gossiper.handle_message(raw.clone()).unwrap();
+        gossiper.handle_message(raw).unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "identical (key, body) must be deduped to a single handler invocation"
+        );
+    }
+
+    #[test]
+    fn gossiper_forged_signature_not_cached() {
+        // Verify (c): a forged message that claims the legit sender's public key
+        // but is signed by an attacker key is rejected with InvalidSignature and
+        // is NOT cached. A subsequent legitimate re-send from the legit key still
+        // reaches the handler (count == 1).
+        //
+        // This is the distinguishing regression test for the reorder: with
+        // insert-before-verify, the forged message would occupy the
+        // (legit_key, body) cache slot and the legit re-send would be silently
+        // dropped (count == 0).
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+
+        let legit = NodeIdentity::generate_in_memory();
+        let attacker = NodeIdentity::generate_in_memory();
+        let body = vec![3, 1, 4];
+        let legit_pub = legit.ed25519.public_key().unwrap();
+        let attacker_sig = attacker.sign_message(&body).unwrap();
+
+        // Forged: public_key = legit, signature = attacker's signature over body.
+        let forged = Message {
+            chain_id: "env".into(),
+            action: "Process".into(),
+            body: body.clone(),
+            signature: attacker_sig,
+            public_key: legit_pub,
+            stake_set: None,
+        };
+        let forged_raw = crate::encoding::serialize_to_bytes_rmp(&forged).unwrap();
+
+        // Legit re-send (built while the read guard is still held).
+        let legit_msg = make_signed_message(&sig_guard, "env", "Process", body);
+        let legit_raw = crate::encoding::serialize_to_bytes_rmp(&legit_msg).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        gossiper.initialize(move |_| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(sig_guard);
+
+        // Forged message must be rejected.
+        match gossiper.handle_message(forged_raw) {
+            Err(DataError::InvalidSignature) => {}
+            other => panic!(
+                "forged message must be rejected as InvalidSignature, got {:?}",
+                other
+            ),
+        }
+
+        // Legit re-send must reach the handler (forged was not cached).
+        gossiper.handle_message(legit_raw).unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "forged message must not poison the cache; the legit re-send must reach the handler"
+        );
+    }
+
+    #[test]
+    fn gossiper_tampered_body_rejected() {
+        // Sanity: sign a message, then mutate its body → the envelope signature
+        // no longer matches and the message is rejected as InvalidSignature.
+        // Guards that the verify path actually closes on mutation.
+        let (gossiper, crypto_provider) = make_gossiper_with_provider();
+        let sig_guard = crypto_provider.read().expect("RwLock poisoned");
+
+        let mut msg = make_signed_message(&sig_guard, "env", "Process", vec![5, 5, 5]);
+        msg.body.push(6); // mutate after signing
+        drop(sig_guard);
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        match gossiper.handle_message(raw) {
+            Err(DataError::InvalidSignature) => {}
+            other => panic!(
+                "tampered body must be rejected as InvalidSignature, got {:?}",
+                other
+            ),
         }
     }
 }

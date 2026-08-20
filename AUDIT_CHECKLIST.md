@@ -46,7 +46,7 @@ work and removes forgeable identity from the consensus path.*
   impls). 12 regression tests (RecordingConnection capture + `assert_signed_by` per send path,
   including a gossiper pass-through test), grep gate clean, workspace suite 444 green.
 
-- [ ] **1.2 Gossiper: verify-then-insert, dedup on content hash** (C4)
+- [x] **1.2 Gossiper: verify-then-insert, dedup on content hash** (C4) — *done 2026-08-20*
   File: `src/gossiper.rs`.
   Action: key the dedup cache on a hash of `(sender_key, body)`, not raw `message.signature`
   bytes; insert into the cache only **after** signature verification succeeds; verify the
@@ -54,6 +54,24 @@ work and removes forgeable identity from the consensus path.*
   Verify: new tests — (a) two different senders with identical bodies both pass; (b) same
   sender+body twice → second deduped; (c) bad signature rejected AND not cached (a re-sent
   valid message from the same sender is accepted).
+  **Done:** rewrote `Gossiper::handle_message` (src/gossiper.rs) to verify-then-insert:
+  deserialize → `check_signature(signature, public_key, body)` (reject `InvalidSignature`,
+  never poison the cache) → insert into the dedup cache → fan out. Added a `dedup_key()`
+  helper computing a Merkle-style key over `(public_key, body)` — double SHA-256 (`SHA-256(pk)`
+  `‖` `SHA-256(body)`) so a key/body pair cannot prefix-collide, e.g. a 1-byte key + 3-byte body
+  vs. a 3-byte key + 1-byte body; keyed on content not the raw signature, so an honest re-send
+  is collapsed and two senders with an identical body are not confused. Verification now runs
+  *before* the cache is touched, so a forged/tampered message is rejected and never admitted —
+  closing the poison-the-cache replay/bloom (a bad-sig entry can no longer silently drop the
+  next legit re-send). 4 regression tests: `gossiper_two_senders_same_body_both_pass` (a),
+  `gossiper_content_hash_dedup` (b), `gossiper_forged_signature_not_cached` (c), and
+  `gossiper_tampered_body_rejected`. The (c) test asserts the re-sent valid message reaches the
+  handler (`count == 1`); it was proven a true regression discriminator — it fails
+  (`count == 0`) under the old insert-before-verify ordering. Verification is self-contained
+  (checks the envelope signature against `public_key` only); per-sender registry-role
+  authentication is deferred to Phase 1.3. No wire-shape change — the `Message` struct,
+  signature encoding, and `check_signature` are untouched. `cargo check` clean; workspace suite
+  ~448 green (baseline 444 + these 4).
 
 - [ ] **1.3 Committer: authenticate the envelope** (C1)
   File: `committer/src/committer.rs:176-187`.
