@@ -26,7 +26,7 @@ full exploit scenarios and reasoning).
 *Closes: C1, C4, C7, L1. This is the highest-leverage phase — it makes the wire path actually
 work and removes forgeable identity from the consensus path.*
 
-- [ ] **1.1 Sign every outgoing message with node identity** (C1, C4)
+- [x] **1.1 Sign every outgoing message with node identity** (C1, C4) — *done 2026-08-20*
   Files: `sentinel/src/transaction_notifier.rs` (lines 35, 55, 96, 112, 128, 147, 168),
   `committer/src/block_services.rs:111,146`, and every other `Message { ... signature: vec![] }`
   construction site in production code.
@@ -34,6 +34,17 @@ work and removes forgeable identity from the consensus path.*
   *public key* in the signature field — replace with a real signature.
   Verify: `grep -rn "signature: vec!\[\]" --include=*.rs` in production code (exclude tests)
   returns nothing.
+  **Done:** all 18 production send sites (sentinel 7, executor 2, finalizer 5, committer 4)
+  build envelopes via `Message::signed` (src/messages.rs) — raw `body` bytes signed with the
+  node's Ed25519 identity key, `public_key` set to the identity pubkey, the exact payload the
+  live verifier `Gossiper::handle_message` checks (src/gossiper.rs). No wire-shape change —
+  previously empty/malformed fields are now populated. Identity (`Arc<NodeIdentity>`) injected
+  into `BlockServices`, `Committer`, `Executor`/`ExecutorHandle`, and `MessageDispatcher`
+  (the dead `finalizer_signature` placeholder field is removed) / `Finalizer` constructors —
+  intentional breaking library-API change (fail-closed). Three destination-key-in-signature-field
+  bugs fixed (sentinel `send_to_finalizer_for_preload`, both executor `send_to_finalizer`
+  impls). 12 regression tests (RecordingConnection capture + `assert_signed_by` per send path,
+  including a gossiper pass-through test), grep gate clean, workspace suite 444 green.
 
 - [ ] **1.2 Gossiper: verify-then-insert, dedup on content hash** (C4)
   File: `src/gossiper.rs`.
@@ -62,6 +73,10 @@ work and removes forgeable identity from the consensus path.*
   `TransactionSignature.signature` over the transaction with the voter's key before accepting;
   reject (not create) unknown voters in the signature registry (currently check-or-create);
   `current_stake` must come from the stake snapshot, not the message.
+  Note: with 1.1 done, envelopes now carry *real* signatures, so
+  `Finalizer::handle_preload` (finalizer/src/finalizer.rs:249) storing
+  `message.signature` as **data** in `preload_tasks` is now a live bug, not a
+  placeholder — fold into this item.
   Verify: test that a forged voter key / missing signature / non-registered voter is all
   rejected; quorum counts only verified, registered voters.
 

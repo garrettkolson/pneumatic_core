@@ -216,12 +216,14 @@ async fn main() {
         node_registry.clone(),
         env_data.clone(),
         shared_logger.clone(),
+        config.identity.clone(),
     ));
 
     // 11. Create Committer
     let committer = Arc::new(Committer::new(
         env_data.clone(),
         config.public_key.clone(),
+        config.identity.clone(),
         gossiper,
         block_services,
         node_registry,

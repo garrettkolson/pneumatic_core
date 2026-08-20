@@ -8,11 +8,12 @@ use tokio::sync::Mutex;
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
-use pneumatic_core::errors::ValidationFailureReason;
+use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::transactions::Transaction;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,8 @@ pub struct Executor {
     env_id: String,
     /// Public key of this executor node
     public_key: Vec<u8>,
+    /// Node identity — signs all outgoing execution messages
+    identity: Arc<NodeIdentity>,
     /// Shared registry of connected nodes
     node_registry: Arc<NodeRegistry>,
     /// Data provider for fetching contract/user/token data
@@ -56,6 +59,7 @@ impl Executor {
     pub fn new(
         env_id: String,
         public_key: Vec<u8>,
+        identity: Arc<NodeIdentity>,
         node_registry: Arc<NodeRegistry>,
         data_provider: Arc<dyn DataProvider>,
         pending_registry: Arc<PendingTransactionRegistry>,
@@ -65,6 +69,7 @@ impl Executor {
         Executor {
             env_id,
             public_key,
+            identity,
             node_registry,
             data_provider,
             pending_registry,
@@ -143,7 +148,6 @@ impl Executor {
         tx_id: &str,
         execution_result: Vec<u8>,
         result_hash: Vec<u8>,
-        finalizer_key: &[u8],
     ) -> Result<(), ExecutorError> {
         // Look up the finalizer nodes in the registry
         let finalizer_nodes = self
@@ -164,14 +168,15 @@ impl Executor {
             result_hash,
         }).map_err(|e| ExecutorError::Encoding(e))?;
 
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("Execute"),
-            body: msg_body,
-            signature: finalizer_key.to_vec(),
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+        // Sign with our own identity — the receiver verifies against the
+        // sender's registered key, never the destination's.
+        let message = Message::signed(
+            self.env_id.clone(),
+            "Execute",
+            msg_body,
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
 
@@ -219,6 +224,7 @@ impl Executor {
         ExecutorHandle {
             env_id: self.env_id.clone(),
             public_key: self.public_key.clone(),
+            identity: self.identity.clone(),
             node_registry: self.node_registry.clone(),
             data_provider: self.data_provider.clone(),
             pending_registry: self.pending_registry.clone(),
@@ -238,6 +244,7 @@ impl Executor {
 struct ExecutorHandle {
     env_id: String,
     public_key: Vec<u8>,
+    identity: Arc<NodeIdentity>,
     node_registry: Arc<NodeRegistry>,
     data_provider: Arc<dyn DataProvider>,
     pending_registry: Arc<PendingTransactionRegistry>,
@@ -343,7 +350,7 @@ impl ExecutorHandle {
 
         // Step 11: Send execution result to the Finalizer
         if let Err(e) = self
-            .send_to_finalizer(tx_id, final_result.result_data.clone(), final_result.result_hash.clone(), &finalizer_key)
+            .send_to_finalizer(tx_id, final_result.result_data.clone(), final_result.result_hash.clone())
             .await
         {
             // Transition to Failed state on send failure
@@ -421,7 +428,6 @@ impl ExecutorHandle {
         tx_id: &str,
         execution_result: Vec<u8>,
         result_hash: Vec<u8>,
-        finalizer_key: &[u8],
     ) -> Result<(), ExecutorError> {
         let msg_body = serialize_to_bytes_rmp(&ExecutionResult {
             transaction_id: tx_id.to_string(),
@@ -429,14 +435,15 @@ impl ExecutorHandle {
             result_hash,
         }).map_err(|e| ExecutorError::Encoding(e))?;
 
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("Execute"),
-            body: msg_body,
-            signature: finalizer_key.to_vec(),
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+        // Sign with our own identity — the receiver verifies against the
+        // sender's registered key, never the destination's.
+        let message = Message::signed(
+            self.env_id.clone(),
+            "Execute",
+            msg_body,
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
 
@@ -498,6 +505,12 @@ impl From<DataError> for ExecutorError {
 impl From<std::io::Error> for ExecutorError {
     fn from(e: std::io::Error) -> Self {
         ExecutorError::Encoding(e)
+    }
+}
+
+impl From<PneumaticError> for ExecutorError {
+    fn from(e: PneumaticError) -> Self {
+        ExecutorError::Data(DataError::CryptoError(e.to_string()))
     }
 }
 
@@ -568,7 +581,14 @@ mod tests {
             main_environment_id: "test_env".to_string(),
             reconciliation_partition_id: "reconciliation".to_string(),
             environment_metadata: make_test_env_data(),
-            type_configs: Arc::new(DashMap::new()),
+            // Capacity entries are required — without them get_max_node_number
+            // returns 0 and register_peer rejects every peer.
+            type_configs: Arc::new({
+                let tc = DashMap::new();
+                tc.insert(NodeRegistryType::Finalizer.clone(),
+                    pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+                tc
+            }),
             identity: Arc::new(identity),
             rhash,
             bootstrap_peers: Vec::new(),
@@ -619,6 +639,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -640,6 +661,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -683,6 +705,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -710,6 +733,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -736,6 +760,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry.clone(),
@@ -781,6 +806,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -811,6 +837,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -853,6 +880,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -914,6 +942,7 @@ mod tests {
         let executor = Executor::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             data_provider,
             pending_registry,
@@ -945,5 +974,102 @@ mod tests {
         let result_b = executor.preload_for_transaction("bp_tx_b").await;
         assert!(result_b.is_ok());
         assert_eq!(executor.in_flight_count().await, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.1 regression: Execute dispatch signed with node identity
+    // -----------------------------------------------------------------------
+
+    /// A Connection that records each sent payload verbatim.
+    struct RecordingConnection {
+        recorder: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for RecordingConnection {
+        async fn send(&self, data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            self.recorder.lock().unwrap().push(data.clone());
+            Ok(())
+        }
+    }
+
+    /// Assert the message envelope is signed by `identity` — the same check
+    /// the gossiper performs: signature over `body` under `public_key`.
+    fn assert_signed_by(
+        message: &pneumatic_core::messages::Message,
+        identity: &pneumatic_core::rns::identity::NodeIdentity,
+    ) {
+        let expected_pk = identity.ed25519.public_key().expect("identity pubkey");
+        assert_eq!(
+            message.public_key, expected_pk,
+            "message.public_key must be the sender's identity key"
+        );
+        let verifier = pneumatic_core::crypto::Ed25519Provider::generate();
+        let ok = verifier
+            .check_signature(&message.signature, &message.public_key, &message.body)
+            .expect("signature check should succeed");
+        assert!(ok, "message body must verify under the sender's identity key");
+    }
+
+    /// Both `send_to_finalizer` impls (Executor and ExecutorHandle — the one
+    /// spawned execution tasks use) must emit an "Execute" message signed
+    /// with the executor's identity, never the destination finalizer's key
+    /// (the pre-1.1 bug placed the destination key in the signature field).
+    #[tokio::test]
+    async fn send_to_finalizer_signed_with_executor_identity() {
+        let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
+        let node_registry = make_test_node_registry();
+        // The finalizer peer's registered key.
+        let finalizer_key = vec![0xAB; 32];
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(node_registry.register_peer(
+            finalizer_key.clone(),
+            [5u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        let executor = Executor::new(
+            "test_env".to_string(),
+            vec![1, 2, 3, 4],
+            identity.clone(),
+            node_registry,
+            make_test_data_provider(),
+            make_test_pending_registry(),
+            make_test_hash_provider(),
+            10,
+        );
+
+        // Executor::send_to_finalizer ...
+        executor
+            .send_to_finalizer("test_tx_001", vec![1, 2, 3], vec![4, 5, 6])
+            .await
+            .expect("send should succeed");
+        // ... and ExecutorHandle::send_to_finalizer (the impl used by run_execution).
+        executor
+            .clone_handle()
+            .send_to_finalizer("test_tx_001", vec![7, 8, 9], vec![10, 11, 12])
+            .await
+            .expect("send should succeed");
+
+        let captured = recorder.lock().unwrap();
+        assert_eq!(captured.len(), 2, "finalizer should receive two Execute messages");
+        for bytes in captured.iter() {
+            let message: pneumatic_core::messages::Message =
+                pneumatic_core::encoding::deserialize_rmp_to(bytes)
+                    .expect("captured payload should be a Message");
+            assert_eq!(message.action, "Execute");
+            assert_signed_by(&message, &identity);
+
+            // ...and never under the destination's key.
+            let verifier = pneumatic_core::crypto::Ed25519Provider::generate();
+            let under_destination = verifier
+                .check_signature(&message.signature, &finalizer_key, &message.body)
+                .unwrap_or(false);
+            assert!(
+                !under_destination,
+                "signature must not verify under the destination's key"
+            );
+        }
     }
 }

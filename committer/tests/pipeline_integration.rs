@@ -133,7 +133,7 @@ fn make_test_env_data(logger: Arc<FileLogger>) -> Arc<EnvironmentMetadata> {
 fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<PendingTransactionRegistry>, Arc<DashMap<Vec<u8>, Token>>) {
     let logger = Arc::new(FileLogger::new("/tmp/test_integration.log".to_string()));
     let env_data = make_test_env_data(logger);
-    let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
     let rhash = identity.rhash;
     let config = Config {
         public_key: vec![1],
@@ -145,7 +145,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<
         reconciliation_partition_id: "recon".to_string(),
         environment_metadata: Arc::new(DashMap::new()),
         type_configs: Arc::new(DashMap::new()),
-        identity: Arc::new(identity),
+        identity: identity.clone(),
         rhash,
         bootstrap_peers: Vec::new(),
         rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
@@ -219,11 +219,13 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<
         node_registry.clone(),
         env_data.clone(),
         env_data.logger.clone(),
+        identity.clone(),
     ));
 
     let committer = Committer::new(
         env_data.clone(),
         vec![1],
+        identity,
         gossiper,
         block_services,
         node_registry,

@@ -229,6 +229,27 @@ mod tests {
         assert!(gossiper.handle_message(raw).is_ok());
     }
 
+    /// Locks in the honest wire path that Phase 1.1 brings live: a message
+    /// built with `Message::signed` (the production envelope) must pass the
+    /// gossiper's signature check and reach registered handlers.
+    #[test]
+    fn node_identity_signed_message_reaches_handlers() {
+        let (gossiper, _crypto_provider) = make_gossiper_with_provider();
+        let identity = NodeIdentity::generate_in_memory();
+        let msg = Message::signed("test".to_string(), "Process", vec![1, 2, 3], None, &identity)
+            .expect("Message::signed should succeed");
+        let raw = crate::encoding::serialize_to_bytes_rmp(&msg).unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        gossiper.initialize(move |_data| {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+
+        gossiper.handle_message(raw).expect("signed message should be accepted");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn gossiper_silently_ignores_duplicate() {
         let (gossiper, crypto_provider) = make_gossiper_with_provider();

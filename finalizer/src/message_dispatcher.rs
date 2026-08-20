@@ -7,6 +7,7 @@ use pneumatic_core::epoch::StakeSet;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::transactions::TransactionCommit;
 
 // ---------------------------------------------------------------------------
@@ -25,8 +26,8 @@ pub struct MessageDispatcher {
     env_id: String,
     /// Public key of this finalizer node
     public_key: Vec<u8>,
-    /// Signature from this finalizer (for outgoing messages)
-    finalizer_signature: Vec<u8>,
+    /// Node identity — signs all outgoing dispatch messages
+    identity: Arc<NodeIdentity>,
 }
 
 impl MessageDispatcher {
@@ -35,13 +36,13 @@ impl MessageDispatcher {
         node_registry: Arc<NodeRegistry>,
         env_id: String,
         public_key: Vec<u8>,
-        finalizer_signature: Vec<u8>,
+        identity: Arc<NodeIdentity>,
     ) -> Self {
         MessageDispatcher {
             node_registry,
             env_id,
             public_key,
-            finalizer_signature,
+            identity,
         }
     }
 
@@ -54,15 +55,14 @@ impl MessageDispatcher {
         let msg_body = serialize_to_bytes_rmp(&commit)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Package as a wire message
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("Commit"),
-            body: msg_body,
-            signature: self.finalizer_signature.clone(),
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+        // Package as a wire message, signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "Commit",
+            msg_body,
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -82,15 +82,14 @@ impl MessageDispatcher {
         let msg_body = serialize_to_bytes_rmp(&tx_id)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Package as a wire message
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("Clear"),
-            body: msg_body,
-            signature: self.finalizer_signature.clone(),
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+        // Package as a wire message, signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "Clear",
+            msg_body,
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -115,15 +114,14 @@ impl MessageDispatcher {
         let msg_body = serialize_to_bytes_rmp(&block)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Package as a wire message
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("BlockFinalized"),
-            body: msg_body,
-            signature: self.finalizer_signature.clone(),
-            public_key: self.public_key.clone(),
+        // Package as a wire message, signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "BlockFinalized",
+            msg_body,
             stake_set,
-        };
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -148,15 +146,14 @@ impl MessageDispatcher {
         let body = serialize_to_bytes_rmp(&(block_hash.to_vec(), self.public_key.clone()))
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Package as a wire message
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("BlockConfirmed"),
+        // Package as a wire message, signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "BlockConfirmed",
             body,
-            signature: vec![],
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -185,14 +182,14 @@ impl MessageDispatcher {
         let body = serialize_to_bytes_rmp(&block_hash.to_vec())
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        let message = Message {
-            chain_id: self.env_id.clone(),
-            action: String::from("BlockQuorumReached"),
+        // Signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "BlockQuorumReached",
             body,
-            signature: vec![],
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -242,7 +239,21 @@ mod tests {
             main_environment_id: "test_env".to_string(),
             reconciliation_partition_id: "reconciliation".to_string(),
             environment_metadata: make_test_env_data(),
-            type_configs: Arc::new(DashMap::new()),
+            // Capacity entries are required — without them get_max_node_number
+            // returns 0 and register_peer rejects every peer.
+            type_configs: Arc::new({
+                let tc = DashMap::new();
+                for t in [
+                    NodeRegistryType::Committer,
+                    NodeRegistryType::Sentinel,
+                    NodeRegistryType::Executor,
+                    NodeRegistryType::Finalizer,
+                    NodeRegistryType::Archiver,
+                ] {
+                    tc.insert(t.clone(), pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+                }
+                tc
+            }),
             identity: Arc::new(identity),
             rhash,
             bootstrap_peers: Vec::new(),
@@ -321,7 +332,7 @@ mod tests {
             registry,
             "test_env".to_string(),
             vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
         );
 
         let commit = make_test_commit();
@@ -336,7 +347,7 @@ mod tests {
             registry,
             "test_env".to_string(),
             vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
         );
 
         let result = dispatcher.send_clear_to_sentinels("test_tx_001").await;
@@ -377,5 +388,175 @@ mod tests {
         let recovered_block: Block = deserialize_rmp_to(&recovered.body).expect("Block deserialization should succeed");
         assert_eq!(recovered_block.previous_hash, vec![1, 2, 3]);
         assert_eq!(recovered_block.current_hash, vec![4, 5, 6]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.1 regression: every dispatch method signs with node identity
+    // -----------------------------------------------------------------------
+
+    /// A Connection that records each sent payload verbatim.
+    struct RecordingConnection {
+        recorder: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for RecordingConnection {
+        async fn send(&self, data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            self.recorder.lock().unwrap().push(data.clone());
+            Ok(())
+        }
+    }
+
+    /// Assert the message envelope is signed by `identity` — the same check
+    /// the gossiper performs: signature over `body` under `public_key`.
+    fn assert_signed_by(message: &Message, identity: &pneumatic_core::rns::identity::NodeIdentity) {
+        let expected_pk = identity.ed25519.public_key().expect("identity pubkey");
+        assert_eq!(
+            message.public_key, expected_pk,
+            "message.public_key must be the sender's identity key"
+        );
+        let verifier = pneumatic_core::crypto::Ed25519Provider::generate();
+        let ok = verifier
+            .check_signature(&message.signature, &message.public_key, &message.body)
+            .expect("signature check should succeed");
+        assert!(ok, "message body must verify under the sender's identity key");
+    }
+
+    /// Pull the first captured Message with the given action out of the recorder.
+    fn captured_message(
+        recorder: &std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        action: &str,
+    ) -> Message {
+        let raw = recorder
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .find(|raw| matches!(deserialize_rmp_to::<Message>(raw), Ok(m) if m.action == action))
+            .unwrap_or_else(|| panic!("no {} message captured", action));
+        deserialize_rmp_to(&raw).expect("captured payload should be a Message")
+    }
+
+    fn make_dispatcher(
+        registry: Arc<NodeRegistry>,
+    ) -> (MessageDispatcher, Arc<pneumatic_core::rns::identity::NodeIdentity>) {
+        let identity =
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
+        (
+            MessageDispatcher::new(registry, "test_env".to_string(), vec![1, 2, 3, 4], identity.clone()),
+            identity,
+        )
+    }
+
+    #[tokio::test]
+    async fn commit_broadcast_signed_with_finalizer_identity() {
+        let registry = make_test_node_registry();
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(registry.register_peer(
+            vec![0xA1; 32],
+            [1u8; 16],
+            &NodeRegistryType::Committer,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        let (dispatcher, identity) = make_dispatcher(registry);
+        dispatcher.send_to_committers(make_test_commit()).await.expect("send should succeed");
+
+        let message = captured_message(&recorder, "Commit");
+        assert_signed_by(&message, &identity);
+    }
+
+    #[tokio::test]
+    async fn clear_broadcast_signed_with_finalizer_identity() {
+        let registry = make_test_node_registry();
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(registry.register_peer(
+            vec![0xA2; 32],
+            [2u8; 16],
+            &NodeRegistryType::Sentinel,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        let (dispatcher, identity) = make_dispatcher(registry);
+        dispatcher.send_clear_to_sentinels("tx_1.1").await.expect("send should succeed");
+
+        let message = captured_message(&recorder, "Clear");
+        assert_signed_by(&message, &identity);
+    }
+
+    #[tokio::test]
+    async fn block_finalized_broadcast_signed_with_finalizer_identity() {
+        let registry = make_test_node_registry();
+        let committer_recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let archiver_recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(registry.register_peer(
+            vec![0xA3; 32],
+            [3u8; 16],
+            &NodeRegistryType::Committer,
+            Box::new(RecordingConnection { recorder: committer_recorder.clone() }),
+        ));
+        assert!(registry.register_peer(
+            vec![0xA4; 32],
+            [4u8; 16],
+            &NodeRegistryType::Archiver,
+            Box::new(RecordingConnection { recorder: archiver_recorder.clone() }),
+        ));
+
+        let (dispatcher, identity) = make_dispatcher(registry);
+        let block = Block {
+            signed_trans: SignedTransaction::test_transaction(),
+            token_metadata: HashMap::new(),
+            previous_hash: vec![1, 2, 3],
+            current_hash: vec![4, 5, 6],
+            timestamp: chrono::Utc::now().timestamp(),
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        dispatcher
+            .send_block_finalized(block, Some(StakeSet::default()))
+            .await
+            .expect("send should succeed");
+
+        let to_committer = captured_message(&committer_recorder, "BlockFinalized");
+        assert_signed_by(&to_committer, &identity);
+        let to_archiver = captured_message(&archiver_recorder, "BlockFinalized");
+        assert_signed_by(&to_archiver, &identity);
+    }
+
+    #[tokio::test]
+    async fn block_confirmed_vote_signed_with_finalizer_identity() {
+        let registry = make_test_node_registry();
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(registry.register_peer(
+            vec![0xA5; 32],
+            [5u8; 16],
+            &NodeRegistryType::Executor,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        let (dispatcher, identity) = make_dispatcher(registry);
+        dispatcher.send_block_confirmed_vote(&[9, 9, 9]).await.expect("send should succeed");
+
+        let message = captured_message(&recorder, "BlockConfirmed");
+        assert_signed_by(&message, &identity);
+    }
+
+    #[tokio::test]
+    async fn block_quorum_reached_signed_with_finalizer_identity() {
+        let registry = make_test_node_registry();
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(registry.register_peer(
+            vec![0xA6; 32],
+            [6u8; 16],
+            &NodeRegistryType::Archiver,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        let (dispatcher, identity) = make_dispatcher(registry);
+        dispatcher.send_block_quorum_reached(&[7, 7, 7]).await.expect("send should succeed");
+
+        let message = captured_message(&recorder, "BlockQuorumReached");
+        assert_signed_by(&message, &identity);
     }
 }

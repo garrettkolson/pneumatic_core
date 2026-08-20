@@ -15,6 +15,7 @@ use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::{PendingTransactionRegistry, TransactionSignatureRegistry};
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::transactions::{
     PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature,
     TransactionState, TransactionValidationResult,
@@ -101,6 +102,7 @@ impl Finalizer {
     pub fn new(
         env_id: String,
         public_key: Vec<u8>,
+        identity: Arc<NodeIdentity>,
         node_registry: Arc<NodeRegistry>,
         pending_registry: Arc<PendingTransactionRegistry>,
         signature_registry: Arc<TransactionSignatureRegistry>,
@@ -127,7 +129,7 @@ impl Finalizer {
             node_registry.clone(),
             env_id.clone(),
             public_key.clone(),
-            vec![], // Signature set in initialize
+            identity,
         );
 
         let block_builder = BlockBuilder::new(
@@ -659,6 +661,7 @@ mod tests {
         Finalizer::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             pending_registry,
             signature_registry,
@@ -692,6 +695,7 @@ mod tests {
         Finalizer::new(
             "test_env".to_string(),
             vec![1, 2, 3, 4],
+            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
             node_registry,
             pending_registry,
             signature_registry,

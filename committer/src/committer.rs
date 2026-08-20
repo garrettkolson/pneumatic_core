@@ -17,6 +17,7 @@ use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::tokens::Token;
 use pneumatic_core::transactions::{SignedTransaction, TransactionCommit, TransactionState};
 
@@ -50,6 +51,8 @@ pub struct Committer {
     env_data: Arc<EnvironmentMetadata>,
     /// Public key of this committer node
     public_key: Vec<u8>,
+    /// Node identity — signs all outgoing broadcast messages
+    identity: Arc<NodeIdentity>,
     /// Gossiper for receiving messages
     gossiper: Arc<Gossiper>,
     /// Block services (token commit, block distribution, token distribution)
@@ -99,6 +102,7 @@ impl Committer {
     pub fn new(
         env_data: Arc<EnvironmentMetadata>,
         public_key: Vec<u8>,
+        identity: Arc<NodeIdentity>,
         gossiper: Arc<Gossiper>,
         block_services: Arc<BlockServices>,
         node_registry: Arc<NodeRegistry>,
@@ -119,6 +123,7 @@ impl Committer {
         Committer {
             env_data,
             public_key,
+            identity,
             gossiper,
             block_services,
             node_registry,
@@ -499,14 +504,13 @@ impl Committer {
         let body = serialize_to_bytes_rmp(&block_hash.to_vec())
             .map_err(|_| CommitterError::InternalSerialization)?;
 
-        let message = Message {
-            chain_id: self.env_data.environment_id.clone(),
-            action: String::from("BlockQuorumReached"),
+        let message = Message::signed(
+            self.env_data.environment_id.clone(),
+            "BlockQuorumReached",
             body,
-            signature: vec![],
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        };
+            None,
+            &self.identity,
+        )?;
 
         let payload = serialize_to_bytes_rmp(&message)
             .map_err(|_| CommitterError::InternalSerialization)?;
@@ -527,15 +531,17 @@ impl Committer {
         let body = serialize_to_bytes_rmp(&(block_hash.to_vec(), self.public_key.clone()))
             .map_err(|_| ());
 
-        let payload = serialize_to_bytes_rmp(&Message {
-            chain_id: self.env_data.environment_id.clone(),
-            action: String::from("BlockConfirmed"),
-            body: body.unwrap_or_default(),
-            signature: vec![],
-            public_key: self.public_key.clone(),
-            stake_set: None,
-        })
+        let message = Message::signed(
+            self.env_data.environment_id.clone(),
+            "BlockConfirmed",
+            body.unwrap_or_default(),
+            None,
+            &self.identity,
+        )
         .map_err(|_| ());
+
+        let payload = message
+            .and_then(|m| serialize_to_bytes_rmp(&m).map_err(|_| ()));
 
         if let Ok(p) = payload {
             let _ = self.node_registry.send_to_all(p.clone(), &NodeRegistryType::Committer).await;
@@ -911,7 +917,7 @@ mod tests {
 
     use pneumatic_core::blocks::Block;
     use pneumatic_core::config::Config;
-    use pneumatic_core::crypto::BasicHashProvider;
+    use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider};
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
@@ -1098,7 +1104,7 @@ mod tests {
         data_provider: Arc<TestDataProvider>,
     ) -> (Committer, Arc<PendingTransactionRegistry>) {
         let env_data = Arc::new(make_test_env_data());
-        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
         let rhash = identity.rhash;
         let config = Config {
             public_key: vec![1],
@@ -1109,8 +1115,19 @@ mod tests {
             main_environment_id: "test".to_string(),
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
-            type_configs: Arc::new(DashMap::new()),
-            identity: Arc::new(identity),
+            // Capacity entries are required — without them get_max_node_number
+            // returns 0 and register_peer rejects every peer.
+            type_configs: Arc::new({
+                let tc = DashMap::new();
+                tc.insert(NodeRegistryType::Committer.clone(),
+                    pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+                tc.insert(NodeRegistryType::Sentinel.clone(),
+                    pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+                tc.insert(NodeRegistryType::Archiver.clone(),
+                    pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+                tc
+            }),
+            identity: identity.clone(),
             rhash,
             bootstrap_peers: Vec::new(),
             rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
@@ -1184,11 +1201,13 @@ mod tests {
             node_registry.clone(),
             env_data.clone(),
             env_data.logger.clone(),
+            identity.clone(),
         ));
 
         let committer = Committer::new(
             env_data.clone(),
             vec![1],
+            identity,
             gossiper,
             block_services,
             node_registry,
@@ -1480,7 +1499,7 @@ mod tests {
         leader_key: Vec<u8>,
     ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<TestDataProvider>) {
         let env_data = Arc::new(make_test_env_data());
-        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
         let rhash = identity.rhash;
         let config = Config {
             public_key: committer_key.clone(),
@@ -1492,7 +1511,7 @@ mod tests {
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
             type_configs: Arc::new(DashMap::new()),
-            identity: Arc::new(identity),
+            identity: identity.clone(),
             rhash,
             bootstrap_peers: Vec::new(),
             rns_port: pneumatic_core::rns::config_builder::DEFAULT_UDP_PORT,
@@ -1564,12 +1583,14 @@ mod tests {
             node_registry.clone(),
             env_data.clone(),
             env_data.logger.clone(),
+            identity.clone(),
         ));
 
         let test_dp = Arc::new(TestDataProvider::new());
         let committer = Committer::new(
             env_data,
             committer_key,
+            identity,
             gossiper,
             block_services,
             node_registry,
@@ -2400,5 +2421,95 @@ mod tests {
         let (keys, cumulative) = votes.get(&block_hash).expect("block_hash should have votes");
         assert_eq!(keys.len(), 2);
         assert_eq!(*cumulative, 150);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1.1 regression: outbound broadcasts signed with node identity
+    // -----------------------------------------------------------------------
+
+    /// A Connection that records each sent payload verbatim.
+    struct RecordingConnection {
+        recorder: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for RecordingConnection {
+        async fn send(&self, data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            self.recorder.lock().unwrap().push(data.clone());
+            Ok(())
+        }
+    }
+
+    /// Assert the message envelope is signed by `identity` — the same check
+    /// the gossiper performs: signature over `body` under `public_key`.
+    fn assert_signed_by(message: &Message, identity: &pneumatic_core::rns::identity::NodeIdentity) {
+        let expected_pk = identity.ed25519.public_key().expect("identity pubkey");
+        assert_eq!(
+            message.public_key, expected_pk,
+            "message.public_key must be the sender's identity key"
+        );
+        let verifier = pneumatic_core::crypto::Ed25519Provider::generate();
+        let ok = verifier
+            .check_signature(&message.signature, &message.public_key, &message.body)
+            .expect("signature check should succeed");
+        assert!(ok, "message body must verify under the sender's identity key");
+    }
+
+    /// Drive the public `handle_block_finalized` path and assert every
+    /// outbound broadcast — the `BlockConfirmed` vote and the
+    /// `DistributeBlock` payload — verifies under the committer identity.
+    #[tokio::test]
+    async fn block_finalized_broadcasts_signed_with_committer_identity() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let sentinel_recorder = Arc::new(Mutex::new(Vec::new()));
+        let archiver_recorder = Arc::new(Mutex::new(Vec::new()));
+        assert!(committer.node_registry.register_peer(
+            vec![0xCC; 32],
+            [3u8; 16],
+            &NodeRegistryType::Sentinel,
+            Box::new(RecordingConnection { recorder: sentinel_recorder.clone() }),
+        ));
+        assert!(committer.node_registry.register_peer(
+            vec![0xAA; 32],
+            [4u8; 16],
+            &NodeRegistryType::Archiver,
+            Box::new(RecordingConnection { recorder: archiver_recorder.clone() }),
+        ));
+
+        let block = make_gossip_block(&committer, "signed_tx", b"alice".to_vec());
+        committer
+            .handle_block_finalized(make_block_finalized_message(block))
+            .await
+            .expect("BlockFinalized should be accepted");
+
+        // The sentinel received a BlockConfirmed vote signed by the committer.
+        let vote_raw = sentinel_recorder
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|raw| matches!(deserialize_rmp_to::<Message>(raw), Ok(m) if m.action == "BlockConfirmed"))
+            .cloned()
+            .expect("sentinel should receive a BlockConfirmed vote");
+        let vote: Message = deserialize_rmp_to(&vote_raw).expect("vote payload is a Message");
+        assert_signed_by(&vote, &committer.identity);
+
+        // The archiver received the DistributeBlock payload signed by the committer.
+        let dist_raw = archiver_recorder
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|raw| matches!(deserialize_rmp_to::<Message>(raw), Ok(m) if m.action == "DistributeBlock"))
+            .cloned()
+            .expect("archiver should receive a DistributeBlock payload");
+        let dist: Message = deserialize_rmp_to(&dist_raw).expect("dist payload is a Message");
+        assert_signed_by(&dist, &committer.identity);
     }
 }
