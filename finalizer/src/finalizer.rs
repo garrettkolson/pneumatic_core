@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use pneumatic_core::blocks::Block;
 use pneumatic_core::config::Config;
-use pneumatic_core::crypto::HashProvider;
+use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
 use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
@@ -84,6 +84,10 @@ pub struct Finalizer {
     data_provider: Arc<dyn DataProvider>,
     /// Token partition ID — DataProvider key for token lookups.
     partition_id: String,
+    /// Ed25519 identity provider, retained (cloned from the constructor arg) so the
+    /// finalizer can verify inbound envelope and per-transaction signatures against
+    /// the voter's public key. See `authenticate_signature_message`.
+    identity: Arc<NodeIdentity>,
 }
 
 impl Finalizer {
@@ -125,6 +129,10 @@ impl Finalizer {
         );
 
         let finalizer_addr = verifying_key.to_bytes().to_vec();
+        // Retain a clone of the identity for inbound signature verification
+        // (`authenticate_signature_message`); the dispatcher keeps the other half
+        // for signing outbound messages.
+        let finalizer_identity = identity.clone();
         let message_dispatcher = MessageDispatcher::new(
             node_registry.clone(),
             env_id.clone(),
@@ -158,6 +166,7 @@ impl Finalizer {
             stake_set: None,
             data_provider,
             partition_id,
+            identity: finalizer_identity,
         }
     }
 
@@ -238,6 +247,69 @@ impl Finalizer {
         let _ = _on_message_received;
     }
 
+    /// Authenticate an inbound voter (executor) message.
+    ///
+    /// Implements the finalizer side of audit finding C1: the voter's identity is
+    /// the public key *proven* by the envelope signature, never the self-declared
+    /// `message.public_key` used for routing. Returns the voter's public key on
+    /// success, or `PneumaticError` (fail closed) if the envelope signature does
+    /// not verify or the key is not registered as an `Executor`.
+    ///
+    /// This is the single chokepoint every voter signature passes through
+    /// (`handle_signature`), so the registered-`Executor` requirement here
+    /// prevents any unregistered key from ever entering the signature registry.
+    fn authenticate_signature_message(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
+        // (1) Envelope signature: the sender's Ed25519 signature over `body`,
+        //     verified against the claimed `public_key`. `check_signature` is pure
+        //     and returns `Ok(false)` (never panics) on malformed input.
+        if !self
+            .identity
+            .ed25519
+            .check_signature(&message.signature, &message.public_key, &message.body)
+            .map_err(|e| {
+                PneumaticError::CryptoError(format!(
+                    "envelope signature verification failed for {}: {e}",
+                    bytes_to_hex(&message.public_key)
+                ))
+            })?
+        {
+            return Err(PneumaticError::CryptoError(format!(
+                "envelope signature verification failed for {}",
+                bytes_to_hex(&message.public_key)
+            )));
+        }
+
+        // (2) Role gate: the verified signer must be registered as an `Executor`.
+        match self
+            .node_registry
+            .find_node_type_by_public_key(&message.public_key)
+        {
+            Some(NodeRegistryType::Executor) => Ok(message.public_key.clone()),
+            Some(other_role) => Err(PneumaticError::Registry(format!(
+                "sender {} is registered as {:?}, not an Executor",
+                bytes_to_hex(&message.public_key),
+                other_role
+            ))),
+            None => Err(PneumaticError::Registry(format!(
+                "sender {} is not registered as any node",
+                bytes_to_hex(&message.public_key)
+            ))),
+        }
+    }
+
+    /// Resolve a voter's stake from the current epoch's snapshot.
+    ///
+    /// Returns the voter's recorded stake, or `0` if the snapshot is unavailable
+    /// or the voter has no recorded stake. Used to stamp `current_stake` on an
+    /// admitted signature so stake-weighted reconciliation can never trust a
+    /// self-reported stake from the message.
+    fn current_stake_for_voter(&self, voter_pubkey: &[u8]) -> u64 {
+        match self.get_stake_set_for_epoch() {
+            Some(set) => set.stakers.get(voter_pubkey).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// Handle a Preload message from the Sentinel/Executor.
     ///
     /// Receives preloaded transaction data and stores it for later processing.
@@ -247,8 +319,16 @@ impl Finalizer {
         let tx: Transaction = deserialize_rmp_to(&message.body)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        // Store as a preload task
-        self.preload_tasks.lock().await.insert(tx.id.clone(), message.signature.clone());
+        // Store as a preload task. We persist the *serialized transaction*, not
+        // the envelope signature — after Phase 1.1 `message.signature` is a live
+        // 64-byte Ed25519 signature, and storing it here would masquerade as
+        // preload payload. The sender of preload is Sentinel/Executor and is
+        // out of scope for C1 (envelope auth is NOT added to handle_preload in
+        // this phase).
+        self.preload_tasks
+            .lock()
+            .await
+            .insert(tx.id.clone(), serialize_to_bytes_rmp(&tx)?);
 
         // Acknowledge receipt
         Ok(pneumatic_core::messages::acknowledge())
@@ -264,22 +344,57 @@ impl Finalizer {
     /// if this signature completed the optimistic path.
     pub async fn handle_signature(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
         // Deserialize the executor signature
-        let sig: TransactionSignature = deserialize_rmp_to(&message.body)
+        let mut sig: TransactionSignature = deserialize_rmp_to(&message.body)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
         // Extract transaction ID from the signature
         let tx_id = String::from_utf8_lossy(&sig.transaction_id).to_string();
 
-        // Extract executor public key
-        let executor_key = message.public_key.clone();
+        // (C1) Authenticate the voter. The key that enters the signature registry —
+        // and that the optimistic path credits — is the public key proven by the
+        // envelope signature and confirmed as a registered `Executor`. Fails
+        // closed on any anomaly.
+        let voter_pubkey = self.authenticate_signature_message(message)?;
 
-        // Add the signature to the collector
+        // (C1) Verify the inner signature actually signs this voter's claimed
+        // transaction hash with their key. Rejects any voter whose claimed
+        // signature does not verify over the claimed hash. Mirrors the envelope
+        // check above: `check_signature` returns `Ok(false)` on a mismatch, so
+        // the result must be negated (a bare `?` would only propagate a provider
+        // error and silently accept a failing verification).
+        if !self
+            .identity
+            .ed25519
+            .check_signature(&sig.signature, &voter_pubkey, &sig.transaction_hash)
+            .map_err(|e| {
+                PneumaticError::CryptoError(format!(
+                    "executor signature verification failed for {}: {e}",
+                    bytes_to_hex(&voter_pubkey)
+                ))
+            })?
+        {
+            return Err(PneumaticError::CryptoError(format!(
+                "executor signature verification failed for {}",
+                bytes_to_hex(&voter_pubkey)
+            )));
+        }
+
+        // (C1) Stamp the voter's real stake from the epoch snapshot — never the
+        // self-reported stake carried in the message.
+        sig.current_stake = self.current_stake_for_voter(&voter_pubkey);
+
+        // Add the signature to the collector. This is the only path a key enters
+        // the registry, and the key is already authenticated.
         self.signature_collector
-            .add_signature(&tx_id, executor_key.clone(), sig.clone())?;
+            .add_signature(&tx_id, voter_pubkey.clone(), sig.clone())?;
 
-        // OPTIMISTIC: First valid signature → try optimistic finalize immediately
+        // OPTIMISTIC: First valid signature → try optimistic finalize immediately.
+        // The signer is now authenticated + registered, so an attacker cannot
+        // forge a registered executor's signature to trigger an optimistic commit.
         if self.signature_collector.signature_count(&tx_id) == 1 {
-            return self.try_finalize_optimistic(&tx_id, &sig, &executor_key).await;
+            return self
+                .try_finalize_optimistic(&tx_id, &sig, &voter_pubkey)
+                .await;
         }
 
         // Subsequent signatures — just acknowledge (stake accumulates in background)
@@ -390,11 +505,14 @@ impl Finalizer {
     /// This is the fast path — no quorum waiting, no signature reconciliation.
     /// The single executor's honest signature is proof enough for optimistic commit.
     /// Subsequent signatures accumulate stake in the background.
+    ///
+    /// `voter_pubkey` is the *authenticated* voter (verified in `handle_signature`):
+    /// the envelope signature verified and the key is a registered `Executor`.
     async fn try_finalize_optimistic(
         &self,
         tx_id: &str,
         single_sig: &TransactionSignature,
-        executor_key: &[u8],
+        voter_pubkey: &[u8],
     ) -> Result<Vec<u8>, PneumaticError> {
         // Step 1: Load the transaction from pending registry
         let entry = self.pending_registry.get_transaction_mut(tx_id)?;
@@ -427,11 +545,12 @@ impl Finalizer {
             Err(_) => vec![],
         };
 
-        // Step 3: Build SignedTransaction using the single executor's signature
+        // Step 3: Build SignedTransaction using the single authenticated voter's
+        // signature.
         let mut signed_tx = self.block_builder.build_signed_transaction_optimistic(
             single_sig,
             &transaction,
-            executor_key,
+            voter_pubkey,
         );
 
         // Step 4: Sign the finalizer's portion
@@ -541,6 +660,7 @@ mod tests {
     use pneumatic_core::node::{NodeRegistryType, NodeType};
     use pneumatic_core::tokens::Token;
     use pneumatic_core::transactions::{PendingTransaction, TransactionState};
+    use pneumatic_core::rns::identity::NodeIdentity;
     use rand::RngCore;
 
     fn make_test_env_data() -> Arc<DashMap<String, EnvironmentMetadata>> {
@@ -652,30 +772,10 @@ mod tests {
     fn make_finalizer(
         pending_registry: Arc<PendingTransactionRegistry>,
     ) -> Finalizer {
-        let node_registry = make_test_node_registry();
-        let signature_registry = Arc::new(TransactionSignatureRegistry::new());
-        let hash_provider = Arc::new(BasicHashProvider::new());
-
-        let (signing_key, verifying_key) = make_test_signing_key();
-
-        Finalizer::new(
-            "test_env".to_string(),
-            vec![1, 2, 3, 4],
-            Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
-            node_registry,
+        make_finalizer_with_registry_and_data_provider(
+            make_test_node_registry(),
             pending_registry,
-            signature_registry,
-            67.0,   // quorum
-            3,      // total voters
-            signing_key,
-            verifying_key,
-            hash_provider,
-            vec![10, 20, 30], // leader address
-            100,              // leader stake
-            vec![40, 50, 60], // leader hash
-            0,                // current_epoch
             Arc::new(StubDataProvider::new()),
-            "test_env".to_string(),
         )
     }
 
@@ -686,7 +786,22 @@ mod tests {
         pending_registry: Arc<PendingTransactionRegistry>,
         data_provider: Arc<StubDataProvider>,
     ) -> Finalizer {
-        let node_registry = make_test_node_registry();
+        make_finalizer_with_registry_and_data_provider(
+            make_test_node_registry(),
+            pending_registry,
+            data_provider,
+        )
+    }
+
+    /// Build a finalizer wired to a caller-supplied `node_registry` and
+    /// `data_provider`. Used by the auth-gate regression tests, which need to
+    /// register executor voters in the registry before constructing the
+    /// finalizer.
+    fn make_finalizer_with_registry_and_data_provider(
+        node_registry: Arc<NodeRegistry>,
+        pending_registry: Arc<PendingTransactionRegistry>,
+        data_provider: Arc<StubDataProvider>,
+    ) -> Finalizer {
         let signature_registry = Arc::new(TransactionSignatureRegistry::new());
         let hash_provider = Arc::new(BasicHashProvider::new());
 
@@ -711,6 +826,65 @@ mod tests {
             data_provider,
             "test_env".to_string(),
         )
+    }
+
+    /// Register `voter` as an `Executor` in `registry` so the finalizer's auth
+    /// gate (`find_node_type_by_public_key`) recognizes it. The connection is a
+    /// no-op — the auth gate only needs the key to be present in the Executor
+    /// shard. Executor capacity must be configured; an unconfigured type has
+    /// `get_max_node_number == 0` and `register_peer` rejects every peer.
+    fn register_executor(registry: &Arc<NodeRegistry>, voter: &NodeIdentity) {
+        registry
+            .get_config()
+            .type_configs
+            .insert(
+                NodeRegistryType::Executor,
+                pneumatic_core::node::NodeTypeConfig { min: 0, max: 10, min_stake: 0 },
+            );
+        let pk = voter.ed25519.public_key().expect("voter public key");
+        assert!(
+            registry.register_peer(pk, voter.rhash, &NodeRegistryType::Executor, Box::new(NoOpConnection)),
+            "executor should register within capacity"
+        );
+    }
+
+    /// A `Connection` that discards sent data. Only needed because
+    /// `NodeRegistry::register_peer` requires a `Box<dyn Connection>`; the
+    /// finalizer's auth gate never sends over it.
+    struct NoOpConnection;
+
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for NoOpConnection {
+        async fn send(&self, _data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            Ok(())
+        }
+    }
+
+    /// Build an authenticated `Sign` message from `voter` for `tx_id` over
+    /// `transaction_hash`. Both the envelope signature and the inner
+    /// `TransactionSignature.signature` are real Ed25519 signatures under
+    /// `voter`'s key, so the finalizer's auth gate accepts the message.
+    fn build_signed_sign_message(
+        chain_id: &str,
+        tx_id: &[u8],
+        transaction_hash: Vec<u8>,
+        current_stake: u64,
+        voter: &NodeIdentity,
+    ) -> Message {
+        let inner_signature = voter
+            .ed25519
+            .sign_data(&transaction_hash)
+            .expect("voter signs transaction hash");
+        let sig = TransactionSignature {
+            transaction_id: tx_id.to_vec(),
+            env_id: chain_id.as_bytes().to_vec(),
+            transaction_hash,
+            signature: inner_signature,
+            current_stake,
+        };
+        let body = serialize_to_bytes_rmp(&sig).expect("serialize signature");
+        Message::signed(chain_id.to_string(), "Sign", body, None, voter)
+            .expect("sign envelope")
     }
 
     #[test]
@@ -756,58 +930,302 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_signature_adds_to_collector() {
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
         let pending_registry = make_test_pending_registry();
-        let finalizer = make_finalizer(pending_registry);
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
 
-        let sig = TransactionSignature {
-            transaction_id: b"test_tx_001".to_vec(),
-            env_id: b"test_env".to_vec(),
-            transaction_hash: vec![1, 2, 3],
-            signature: vec![4, 5, 6, 7],
-            current_stake: 10,
-        };
-        let body = serialize_to_bytes_rmp(&sig).unwrap();
-        let message = Message {
-            chain_id: "test_env".to_string(),
-            action: String::from("Sign"),
-            body,
-            signature: vec![],
-            public_key: b"executor_1".to_vec(),
-            stake_set: None,
-        };
+        let message =
+            build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);
 
         let result = finalizer.handle_signature(&message).await;
-        // OPTIMISTIC: First signature triggers immediate optimistic finalize,
-        // which cleans up the signature registry. Count is 0 after finalize.
+        // OPTIMISTIC: First (authenticated) signature triggers immediate
+        // optimistic finalize, which cleans up the signature registry. Count is
+        // 0 after finalize.
         assert!(result.is_ok());
         assert_eq!(finalizer.signature_count("test_tx_001"), 0);
     }
 
     #[tokio::test]
     async fn test_handle_signature_optimistic_first_sig() {
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
         let pending_registry = make_test_pending_registry();
-        let finalizer = make_finalizer(pending_registry);
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
 
+        let message =
+            build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);
+
+        let result = finalizer.handle_signature(&message).await;
+        // First authenticated signature → optimistic finalize succeeds.
+        assert!(result.is_ok());
+    }
+
+    // --- Phase 1.4 / audit finding C1 regression tests -----------------------
+    //
+    // Every test below asserts on what the *fix* restores and on what the
+    // pre-fix code (which trusted the self-declared `message.public_key`)
+    // violated. With an empty pending registry, an optimistic finalize fails
+    // before cleanup, so an admitted signature persists in the registry for
+    // inspection — and a rejected voter's signature never enters it.
+    //
+    // Each fails WITHOUT the fix: the old `handle_signature` never verified the
+    // envelope signature, never consulted the registry, never verified the inner
+    // signature, and never stamped stake from the snapshot.
+
+    #[tokio::test]
+    async fn forged_voter_key_rejected() {
+        // The body is signed by `attacker`, but the message claims a *registered*
+        // voter's public key. Without the fix, `handle_signature` trusted the
+        // claimed `public_key` and admitted the signature for that voter.
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
+        let attacker = NodeIdentity::generate_in_memory();
+        let voter_pk = voter.ed25519.public_key().expect("voter public key");
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
+
+        let inner = voter.ed25519.sign_data(&[1, 2, 3]).expect("voter signs inner");
         let sig = TransactionSignature {
-            transaction_id: b"test_tx_001".to_vec(),
+            transaction_id: b"forged_tx".to_vec(),
             env_id: b"test_env".to_vec(),
             transaction_hash: vec![1, 2, 3],
-            signature: vec![4, 5, 6, 7],
+            signature: inner,
             current_stake: 10,
         };
-        let body = serialize_to_bytes_rmp(&sig).unwrap();
+        let body = serialize_to_bytes_rmp(&sig).expect("serialize inner");
+        // Envelope signed by the attacker, claiming the voter's key.
         let message = Message {
             chain_id: "test_env".to_string(),
-            action: String::from("Sign"),
+            action: "Sign".to_string(),
             body,
-            signature: vec![],
-            public_key: b"executor_1".to_vec(),
+            signature: attacker.ed25519.sign_data(&Vec::new()).expect("attacker signs"),
+            public_key: voter_pk.clone(),
             stake_set: None,
         };
 
         let result = finalizer.handle_signature(&message).await;
-        // First signature → optimistic finalize succeeds
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), pneumatic_core::errors::PneumaticError::CryptoError(_))
+        );
+        // The forged identity must not have been admitted to the registry.
+        assert!(
+            finalizer
+                .signature_registry
+                .get_transaction_registry("forged_tx")
+                .is_none(),
+            "attacker impersonating a registered voter must not be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_envelope_signature_rejected() {
+        // A `Sign` message with an empty envelope signature. Without the fix the
+        // handler ignored the signature entirely and cached the self-declared key.
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
+
+        let mut message =
+            build_signed_sign_message("test_env", b"nosig_tx", vec![1, 2, 3], 10, &voter);
+        message.signature = Vec::new();
+
+        let result = finalizer.handle_signature(&message).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), pneumatic_core::errors::PneumaticError::CryptoError(_))
+        );
+        assert!(
+            finalizer
+                .signature_registry
+                .get_transaction_registry("nosig_tx")
+                .is_none(),
+            "a message with no verifiable signature must not be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_registered_voter_rejected() {
+        // A valid envelope, but the signer is not registered as any node — the
+        // core C1 rejection. Without the fix the self-declared key was silently
+        // admitted into the check-or-create signature registry.
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory(); // deliberately NOT registered
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
+
+        let message = build_signed_sign_message("test_env", b"noreg_tx", vec![1, 2, 3], 10, &voter);
+
+        let result = finalizer.handle_signature(&message).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), pneumatic_core::errors::PneumaticError::Registry(_))
+        );
+        assert!(
+            finalizer
+                .signature_registry
+                .get_transaction_registry("noreg_tx")
+                .is_none(),
+            "an unregistered voter must not pollute the signature registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_inner_signature_rejected() {
+        // Registered Executor and a valid envelope, but the inner
+        // `TransactionSignature.signature` does not verify over `transaction_hash`.
+        // Without the fix the inner signature was never verified at all.
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
+
+        // Inner signature verifies over [9,9,9], but claims transaction_hash = [1,2,3].
+        let inner = voter.ed25519.sign_data(&vec![9, 9, 9]).expect("inner signs wrong hash");
+        let body = serialize_to_bytes_rmp(&TransactionSignature {
+            transaction_id: b"bad_inner_tx".to_vec(),
+            env_id: b"test_env".to_vec(),
+            transaction_hash: vec![1, 2, 3],
+            signature: inner,
+            current_stake: 10,
+        })
+        .expect("serialize inner");
+        // Envelope itself is a valid signature of `body` by the registered voter.
+        let message = Message::signed(String::from("test_env"), "Sign", body, None, &voter).expect("sign envelope");
+
+        let result = finalizer.handle_signature(&message).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), pneumatic_core::errors::PneumaticError::CryptoError(_))
+        );
+        assert!(
+            finalizer
+                .signature_registry
+                .get_transaction_registry("bad_inner_tx")
+                .is_none(),
+            "a voter whose inner signature does not verify must not be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_counts_only_verified_registered_voters() {
+        // Three voters: A and B are registered Executors, C is not. A and B are
+        // admitted (and persist because the empty-pending optimistic path fails
+        // before cleanup); C is rejected at the auth gate. Without the fix all
+        // three would be admitted via the self-declared key.
+        let node_registry = make_test_node_registry();
+        let a = NodeIdentity::generate_in_memory();
+        let b = NodeIdentity::generate_in_memory();
+        let c = NodeIdentity::generate_in_memory(); // unregistered
+        register_executor(&node_registry, &a);
+        register_executor(&node_registry, &b);
+        let a_pk = a.ed25519.public_key().expect("a public key");
+        let b_pk = b.ed25519.public_key().expect("b public key");
+        let c_pk = c.ed25519.public_key().expect("c public key");
+        let pending_registry = make_test_pending_registry();
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            Arc::new(StubDataProvider::new()),
+        );
+
+        let tx = b"quorum_tx";
+        let sig_a = build_signed_sign_message("test_env", tx, vec![1, 2, 3], 10, &a);
+        let sig_b = build_signed_sign_message("test_env", tx, vec![1, 2, 3], 10, &b);
+        let sig_c = build_signed_sign_message("test_env", tx, vec![1, 2, 3], 10, &c);
+
+        // A: admitted, then optimistic fails (no pending tx) — signature persists.
+        let _ = finalizer.handle_signature(&sig_a).await;
+        // B: admitted (quorum-accumulate path, no optimistic).
+        let _ = finalizer.handle_signature(&sig_b).await;
+        // C: rejected at the auth gate — never reaches the registry.
+        assert!(finalizer.handle_signature(&sig_c).await.is_err());
+
+        let registry = finalizer
+            .signature_registry
+            .get_transaction_registry("quorum_tx")
+            .expect("transaction entry exists");
+        assert_eq!(
+            registry.len(),
+            2,
+            "only the two registered+verified voters count toward quorum"
+        );
+        assert!(registry.contains_key(&a_pk));
+        assert!(registry.contains_key(&b_pk));
+        assert!(
+            !registry.contains_key(&c_pk),
+            "an unregistered voter must not advance the count"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_stake_comes_from_snapshot_not_message() {
+        // The voter injects a bogus current_stake (u64::MAX). The fix stamps the
+        // voter's real stake from the epoch snapshot before admitting the
+        // signature; without the fix the self-reported stake would be trusted.
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
+        let voter_pk = voter.ed25519.public_key().expect("voter public key");
+        let pending_registry = make_test_pending_registry();
+        let data_provider = Arc::new(
+            StubDataProvider::new()
+                .with_stake_snapshot(0, make_stake_set(vec![(voter_pk.clone(), 100)])),
+        );
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            pending_registry,
+            data_provider,
+        );
+
+        let message = build_signed_sign_message("test_env", b"stake_tx", vec![1, 2, 3], u64::MAX, &voter);
+        let _ = finalizer.handle_signature(&message).await;
+
+        let registry = finalizer
+            .signature_registry
+            .get_transaction_registry("stake_tx")
+            .expect("transaction entry exists");
+        let stored = registry.get(&voter_pk).expect("voter signature persisted");
+        assert_eq!(
+            stored.current_stake, 100,
+            "stake must be taken from the epoch snapshot"
+        );
+        assert_ne!(
+            stored.current_stake,
+            u64::MAX,
+            "a self-reported stake from the message must never be trusted"
+        );
     }
 
     #[tokio::test]
@@ -974,29 +1392,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimistic_finalize_with_seeded_token() {
-        let pending_registry = make_test_pending_registry();
+        let node_registry = make_test_node_registry();
+        let voter = NodeIdentity::generate_in_memory();
+        register_executor(&node_registry, &voter);
         let data_provider = Arc::new(
             StubDataProvider::new()
                 .with_token(vec![0, 1, 2], "test_env".to_string(), Token::new().with_id(vec![0, 1, 2])),
         );
-        let finalizer = make_finalizer_with_data_provider(pending_registry, data_provider);
+        let finalizer = make_finalizer_with_registry_and_data_provider(
+            node_registry,
+            make_test_pending_registry(),
+            data_provider,
+        );
 
-        let sig = TransactionSignature {
-            transaction_id: b"test_tx_001".to_vec(),
-            env_id: b"test_env".to_vec(),
-            transaction_hash: vec![1, 2, 3],
-            signature: vec![4, 5, 6, 7],
-            current_stake: 10,
-        };
-        let body = serialize_to_bytes_rmp(&sig).unwrap();
-        let message = Message {
-            chain_id: "test_env".to_string(),
-            action: String::from("Sign"),
-            body,
-            signature: vec![],
-            public_key: b"executor_1".to_vec(),
-            stake_set: None,
-        };
+        // An authenticated, registered executor's honest first signature. The
+        // pre-fix code trusted a self-declared `public_key` with an empty
+        // envelope signature; Phase 1.4 requires the envelope signature to verify
+        // and the voter to be registered as an Executor. The real intent of this
+        // test — optimistic finalize with a real previous_hash lookup against a
+        // seeded token — is unchanged.
+        let message = build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);
 
         // First signature → optimistic finalize, now with a real previous_hash
         // lookup against the seeded token
