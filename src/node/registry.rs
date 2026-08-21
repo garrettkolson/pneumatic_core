@@ -36,6 +36,19 @@ pub struct NodeRegistry {
     evictor: Option<JoinHandle<()>>,
 }
 
+/// Canonical bytes for a directory response's envelope signature: the full
+/// `(entries, registry_type, responder_rhash)` tuple. Shared by `handle_request`
+/// (signer) and `handle_directory_response` (verifier) so the two cannot drift
+/// and a signature over one (type, responder) cannot be replayed under another.
+fn directory_response_signature_payload(
+    entries: &[NodeRegistryEntry],
+    registry_type: &NodeRegistryType,
+    responder_rhash: &[u8; 16],
+) -> Result<Vec<u8>, PneumaticError> {
+    serialize_to_bytes_rmp(&(entries, registry_type, responder_rhash))
+        .map_err(|e| PneumaticError::Encoding(e.to_string()))
+}
+
 impl NodeRegistry {
     pub fn init(
         config: Arc<Config>,
@@ -229,25 +242,41 @@ impl NodeRegistry {
         let requested_type = request.requested_type.clone();
         let requester_rhash = request.requester_rhash;
 
-        let entries = self
+        // Build directory entries only from nodes we vouched for at
+        // registration (a non-empty `directory_signature`). A node learned
+        // via a directory response carries no binding of its own here, so we
+        // cannot re-vouch for it.
+        let entries: Vec<NodeRegistryEntry> = self
             .get_nodes(&requested_type)
             .map(|nodes| {
                 nodes
                     .iter()
-                    .map(|e| NodeRegistryEntry {
-                        node_key: e.key().clone(),
-                        node_rhash: e.value().rhash,
+                    .filter(|e| !e.value().directory_signature.is_empty())
+                    .map(|e| {
+                        let v = e.value();
+                        NodeRegistryEntry {
+                            node_key: e.key().clone(),
+                            node_rhash: v.rhash,
+                            signature: v.directory_signature.clone(),
+                            requested_type: v.directory_requested_type.clone(),
+                            node_types: v.directory_node_types.clone(),
+                        }
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        let Ok(entries_bytes) = serialize_to_bytes_rmp(&entries) else {
-            eprintln!("[pneumatic] failed to serialize directory entries; dropping response");
+        // Sign over the full (entries, registry_type, responder_rhash) tuple so
+        // a valid signature over one (type, responder) cannot be replayed
+        // under another.
+        let Ok(payload_bytes) =
+            directory_response_signature_payload(&entries, &requested_type, &self.config.rhash)
+        else {
+            eprintln!("[pneumatic] failed to serialize directory response; dropping response");
             return;
         };
 
-        let Ok(signature) = self.config.identity.sign_message(&entries_bytes) else {
+        let Ok(signature) = self.config.identity.sign_message(&payload_bytes) else {
             eprintln!("[pneumatic] failed to sign directory response; dropping response");
             return;
         };
@@ -338,7 +367,16 @@ impl NodeRegistry {
             None => Box::new(NullConnection),
         };
 
-        let node = NodeRegistryNode::new(requester_rhash, conn);
+        // Store the node's own rhash binding so we can vouch for it in
+        // directory responses. This is the only place a node has signed its
+        // rhash, so only directly-registered nodes are eligible to be listed.
+        let node = NodeRegistryNode::with_binding(
+            requester_rhash,
+            conn,
+            request.binding_signature.clone(),
+            request.requested_type.clone(),
+            request.requester_types.clone(),
+        );
         match self.get_nodes(&node_type) {
             None => {
                 self.reply_register_ack(requester_rhash, false, node_type, "no registry for type");
@@ -470,35 +508,71 @@ impl NodeRegistry {
         }
     }
 
-    /// Apply a directory response: verify its signature, then upsert each
-    /// entry under the response's registry type (entries are hints, so we
-    /// re-check capacity and do not clobber live connections).
+    /// Apply a directory response. Verifies (fail-closed) that the responder is
+    /// a registered node and that the envelope covers this exact
+    /// `(entries, registry_type, responder_rhash)`; then that each entry is
+    /// bound by its *own* listed node; then upserts the survivors. A directory
+    /// response can never redirect an already-registered peer (see
+    /// `register_directory_peer`).
     pub fn handle_directory_response(
         &self,
         response: &NodeRegistryResponse,
     ) -> Result<(), PneumaticError> {
-        let entries_bytes = serialize_to_bytes_rmp(&response.entries)
-            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+        // The responder must be a registered node. Without this an attacker
+        // fabricates a response signed by an arbitrary key and injects
+        // arbitrary (key, rhash) mappings.
+        if self.find_node_type_by_public_key(&response.responder_key).is_none() {
+            return Err(PneumaticError::Registry(
+                "directory response from unregistered node".to_string(),
+            ));
+        }
 
-        let valid = Ed25519Provider::generate()
-            .check_signature(
-                &response.signature,
-                &response.responder_key,
-                &entries_bytes,
-            )
-            .unwrap_or(false);
-        if !valid {
+        // Envelope signature must cover the entries *under this registry type
+        // and responder rhash* (see `directory_response_signature_payload`),
+        // so a valid signature over one (type, responder) cannot be replayed
+        // under another.
+        let payload_bytes = directory_response_signature_payload(
+            &response.entries,
+            &response.registry_type,
+            &response.responder_rhash,
+        )
+        .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+        if !Ed25519Provider::generate()
+            .check_signature(&response.signature, &response.responder_key, &payload_bytes)
+            .unwrap_or(false)
+        {
             return Err(PneumaticError::Registry(
                 "directory response signature invalid".to_string(),
             ));
         }
 
+        // Verify every entry is bound by its own listed node (fail closed:
+        // reject the whole response on the first bad entry, before installing
+        // any peer). This is what stops an attacker from attributing an
+        // attacker rhash to a real key — the directory cannot forge the entry
+        // node's signature.
+        for entry in &response.entries {
+            if !NodeIdentity::verify_binding(
+                &entry.node_key,
+                &entry.node_rhash,
+                &entry.requested_type,
+                &entry.node_types,
+                &entry.signature,
+            ) {
+                return Err(PneumaticError::Registry(
+                    "directory response entry signature invalid".to_string(),
+                ));
+            }
+        }
+
+        // All entries verified: install them via the refresh-only path so a
+        // directory response can never overwrite an established rhash.
         for entry in &response.entries {
             let conn: Box<dyn Connection> = match &self.network {
                 Some(network) => Box::new(RnsConnection::new(entry.node_rhash, Arc::clone(network))),
                 None => Box::new(NullConnection),
             };
-            self.register_peer(
+            self.register_directory_peer(
                 entry.node_key.clone(),
                 entry.node_rhash,
                 &response.registry_type,
@@ -507,6 +581,37 @@ impl NodeRegistry {
         }
 
         Ok(())
+    }
+
+    /// Register or update a peer learned via a directory response. Unlike
+    /// `register_peer`, an existing key's rhash/connection is NEVER
+    /// overwritten here: a directory response can only refresh liveness, never
+    /// redirect an already-established peer to a new address (Phase 1.5, C7).
+    /// Returns `false` when the type has no registry or is at capacity (and
+    /// the entry is new).
+    pub fn register_directory_peer(
+        &self,
+        key: Vec<u8>,
+        rhash: [u8; 16],
+        node_type: &NodeRegistryType,
+        conn: Box<dyn Connection>,
+    ) -> bool {
+        let Some(nodes) = self.get_nodes(node_type) else {
+            return false;
+        };
+
+        if let Some(mut existing) = nodes.get_mut(&key) {
+            // Refresh liveness only — never touch rhash or conn.
+            existing.value_mut().last_seen = Instant::now();
+            return true;
+        }
+
+        if nodes.len() >= self.config.get_max_node_number(node_type) {
+            return false;
+        }
+
+        nodes.insert(key, NodeRegistryNode::new(rhash, conn));
+        true
     }
 
     fn handle_heartbeat(&self, request: &NodeRequest) {
@@ -654,6 +759,69 @@ mod tests {
         }
     }
 
+    /// Register `identity` with `reg` by driving the real `Register` path
+    /// (`handle_register`). The request is binding-signed over
+    /// `(identity.rhash, requested_type, types)`, so `handle_register` stores
+    /// the node via `with_binding` — the same binding a later directory
+    /// response would echo. Returns the type it was actually registered under.
+    fn register_node(
+        reg: &NodeRegistry,
+        identity: &NodeIdentity,
+        requested_type: NodeRegistryType,
+    ) -> NodeRegistryType {
+        let types = vec![requested_type.clone()];
+        let binding = identity
+            .sign_binding(&identity.rhash, &requested_type, &types)
+            .expect("sign binding");
+        let req = NodeRequest {
+            requester_key: identity.ed25519.public_key().unwrap(),
+            requester_rhash: identity.rhash,
+            request_type: NodeRequestType::Register,
+            requester_types: types,
+            requested_type,
+            binding_signature: binding,
+        };
+        reg.handle_register(req);
+        reg.find_node_type_by_public_key(&identity.ed25519.public_key().unwrap())
+            .expect("node registered")
+    }
+
+    /// A per-entry binding that a node produces for its *own* rhash: the node
+    /// key, its real transport address, and a signature verifying against
+    /// `(node_rhash, requested_type, node_types)`. This is what a directory
+    /// carries so the receiver can authenticate the (key, rhash) pair
+    /// independently of the directory.
+    fn valid_entry(
+        identity: &NodeIdentity,
+        requested_type: NodeRegistryType,
+    ) -> NodeRegistryEntry {
+        let node_types = vec![requested_type.clone()];
+        let signature = identity
+            .sign_binding(&identity.rhash, &requested_type, &node_types)
+            .unwrap();
+        NodeRegistryEntry {
+            node_key: identity.ed25519.public_key().unwrap(),
+            node_rhash: identity.rhash,
+            signature,
+            requested_type,
+            node_types,
+        }
+    }
+
+    /// The envelope signature a real responder would produce: an Ed25519 sign
+    /// over `directory_response_signature_payload(entries, registry_type,
+    /// responder_rhash)`, i.e. the exact bytes the receiver re-derives.
+    fn envelope_signature(
+        responder: &NodeIdentity,
+        entries: &[NodeRegistryEntry],
+        registry_type: &NodeRegistryType,
+        responder_rhash: [u8; 16],
+    ) -> Vec<u8> {
+        let payload =
+            directory_response_signature_payload(entries, registry_type, &responder_rhash).unwrap();
+        responder.sign_message(&payload).unwrap()
+    }
+
     #[test]
     fn select_prefers_finalizer_over_lower_types() {
         let reg = registry_with_capacity(&[
@@ -739,41 +907,248 @@ mod tests {
 
     #[test]
     fn directory_response_registers_valid_entries() {
+        // Happy path: a registered responder lists a peer whose per-entry
+        // binding verifies. The receiver installs the peer.
         let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
         let responder = NodeIdentity::generate_in_memory();
-        let responder_pub = responder.ed25519.public_key().unwrap();
-        let entries = vec![NodeRegistryEntry {
-            node_key: vec![42],
-            node_rhash: [7u8; 16],
-        }];
-        let entries_bytes = serialize_to_bytes_rmp(&entries).unwrap();
-        let signature = responder.ed25519.sign_data(&entries_bytes).unwrap();
+        register_node(&reg, &responder, NodeRegistryType::Finalizer);
+        let listed = NodeIdentity::generate_in_memory();
+        let entries = vec![valid_entry(&listed, NodeRegistryType::Finalizer)];
+        let signature = envelope_signature(
+            &responder,
+            &entries,
+            &NodeRegistryType::Finalizer,
+            responder.rhash,
+        );
         let response = NodeRegistryResponse {
-            responder_key: responder_pub,
+            responder_key: responder.ed25519.public_key().unwrap(),
             responder_rhash: responder.rhash,
             registry_type: NodeRegistryType::Finalizer,
             entries,
             signature,
         };
         reg.handle_directory_response(&response).unwrap();
-        assert!(reg.get_nodes(&NodeRegistryType::Finalizer).unwrap().contains_key(&vec![42]));
+        assert!(reg
+            .get_nodes(&NodeRegistryType::Finalizer)
+            .unwrap()
+            .contains_key(&listed.ed25519.public_key().unwrap()));
     }
 
     #[test]
     fn directory_response_rejects_invalid_signature() {
+        // Responder is registered, but the envelope signature is over a
+        // payload with a different responder rhash, so it does not cover the
+        // (entries, type, responder_rhash) the receiver derives.
         let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
-        let entries = vec![NodeRegistryEntry {
-            node_key: vec![42],
-            node_rhash: [7u8; 16],
-        }];
-        let responder = Ed25519Provider::default();
-        let entries_bytes = serialize_to_bytes_rmp(&entries).unwrap();
+        let responder = NodeIdentity::generate_in_memory();
+        register_node(&reg, &responder, NodeRegistryType::Finalizer);
+        let entries = vec![valid_entry(&responder, NodeRegistryType::Finalizer)];
+        let bad_payload = directory_response_signature_payload(
+            &entries,
+            &NodeRegistryType::Finalizer,
+            &[1u8; 16],
+        )
+        .unwrap();
+        let bad_signature = responder.sign_message(&bad_payload).unwrap();
         let response = NodeRegistryResponse {
-            responder_key: responder.public_key().unwrap(),
-            responder_rhash: [0u8; 16],
+            responder_key: responder.ed25519.public_key().unwrap(),
+            responder_rhash: responder.rhash,
             registry_type: NodeRegistryType::Finalizer,
             entries,
-            signature: vec![0u8; 64],
+            signature: bad_signature,
+        };
+        assert!(reg
+            .handle_directory_response(&response)
+            .is_err(),
+            "a signature that does not cover (entries, type, responder_rhash) must be rejected");
+    }
+
+    #[test]
+    fn directory_response_rejects_unregistered_responder() {
+        // The responder is not a registered node anywhere. Without the
+        // responder-registration gate an attacker self-signs with an arbitrary
+        // key and injects arbitrary (key, rhash) mappings.
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let attacker = NodeIdentity::generate_in_memory();
+        let listed = NodeIdentity::generate_in_memory();
+        let entries = vec![valid_entry(&listed, NodeRegistryType::Finalizer)];
+        let signature = envelope_signature(
+            &attacker,
+            &entries,
+            &NodeRegistryType::Finalizer,
+            attacker.rhash,
+        );
+        let response = NodeRegistryResponse {
+            responder_key: attacker.ed25519.public_key().unwrap(),
+            responder_rhash: attacker.rhash,
+            registry_type: NodeRegistryType::Finalizer,
+            entries,
+            signature,
+        };
+        assert!(reg
+            .handle_directory_response(&response)
+            .is_err(),
+            "a directory response from an unregistered responder must be rejected");
+    }
+
+    #[test]
+    fn directory_response_rejects_real_key_attacker_rhash() {
+        // The headline C7 attack: a malicious directory pairs a REAL node key
+        // with an ATTACKER rhash. The directory cannot forge the real node's
+        // binding, so a signature computed over the real node's own rhash does
+        // NOT verify against the attacker rhash, and the response is rejected
+        // — never install real_key -> attacker_rhash.
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let responder = NodeIdentity::generate_in_memory();
+        register_node(&reg, &responder, NodeRegistryType::Finalizer);
+        let victim = NodeIdentity::generate_in_memory();
+        let attacker_rhash = [9u8; 16];
+        // The victim's honest binding, over its OWN rhash, forged into an entry
+        // that instead claims attacker_rhash.
+        let entry = NodeRegistryEntry {
+            node_key: victim.ed25519.public_key().unwrap(),
+            node_rhash: attacker_rhash,
+            signature: victim
+                .sign_binding(
+                    &victim.rhash,
+                    &NodeRegistryType::Finalizer,
+                    &[NodeRegistryType::Finalizer],
+                )
+                .unwrap(),
+            requested_type: NodeRegistryType::Finalizer,
+            node_types: vec![NodeRegistryType::Finalizer],
+        };
+        let entries = vec![entry];
+        let signature = envelope_signature(
+            &responder,
+            &entries,
+            &NodeRegistryType::Finalizer,
+            responder.rhash,
+        );
+        let response = NodeRegistryResponse {
+            responder_key: responder.ed25519.public_key().unwrap(),
+            responder_rhash: responder.rhash,
+            registry_type: NodeRegistryType::Finalizer,
+            entries,
+            signature,
+        };
+        assert!(reg
+            .handle_directory_response(&response)
+            .is_err(),
+            "an entry claiming attacker_rhash under a real key must be rejected");
+    }
+
+    #[test]
+    fn directory_response_poisoned_cannot_change_registered_rhash() {
+        // A node is already registered under real_rhash. A poisoned directory
+        // response claiming attacker_rhash for that same key is rejected by the
+        // per-entry check, and the already-established binding is left exactly
+        // as it was — the whole response is dropped, nothing is partial.
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let responder = NodeIdentity::generate_in_memory();
+        register_node(&reg, &responder, NodeRegistryType::Finalizer);
+        let victim = NodeIdentity::generate_in_memory();
+        let real_rhash = victim.rhash;
+        register_node(&reg, &victim, NodeRegistryType::Finalizer);
+
+        let attacker_rhash = [9u8; 16];
+        let entry = NodeRegistryEntry {
+            node_key: victim.ed25519.public_key().unwrap(),
+            node_rhash: attacker_rhash,
+            signature: victim
+                .sign_binding(
+                    &victim.rhash,
+                    &NodeRegistryType::Finalizer,
+                    &[NodeRegistryType::Finalizer],
+                )
+                .unwrap(),
+            requested_type: NodeRegistryType::Finalizer,
+            node_types: vec![NodeRegistryType::Finalizer],
+        };
+        let entries = vec![entry];
+        let signature = envelope_signature(
+            &responder,
+            &entries,
+            &NodeRegistryType::Finalizer,
+            responder.rhash,
+        );
+        let response = NodeRegistryResponse {
+            responder_key: responder.ed25519.public_key().unwrap(),
+            responder_rhash: responder.rhash,
+            registry_type: NodeRegistryType::Finalizer,
+            entries,
+            signature,
+        };
+
+        assert!(reg.handle_directory_response(&response).is_err());
+        let nodes = reg.get_nodes(&NodeRegistryType::Finalizer).unwrap();
+        let stored = nodes
+            .get(&victim.ed25519.public_key().unwrap())
+            .expect("victim still registered");
+        assert_eq!(
+            stored.rhash, real_rhash,
+            "a rejected poisoned response must not alter an established rhash"
+        );
+    }
+
+    #[test]
+    fn register_directory_peer_refresh_only() {
+        // A directory response can only refresh liveness, never redirect an
+        // already-registered peer to a new address.
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let victim = NodeIdentity::generate_in_memory();
+        register_node(&reg, &victim, NodeRegistryType::Finalizer);
+        let real_rhash = victim.rhash;
+        let key = victim.ed25519.public_key().unwrap();
+        // Backdate liveness. The guard is dropped at the end of the block so it
+        // is not held across `register_directory_peer` (which re-locks the same
+        // entry).
+        {
+            let mut nodes = reg.get_nodes(&NodeRegistryType::Finalizer).unwrap();
+            let mut stored = nodes.get_mut(&key).expect("victim registered");
+            stored.value_mut().last_seen = Instant::now() - Duration::from_secs(100);
+        }
+
+        let attacker_rhash = [9u8; 16];
+        assert!(reg.register_directory_peer(
+            key.clone(),
+            attacker_rhash,
+            &NodeRegistryType::Finalizer,
+            Box::new(NullConnection),
+        ));
+        let nodes = reg.get_nodes(&NodeRegistryType::Finalizer).unwrap();
+        let stored = nodes.get(&key).expect("victim still registered");
+        assert_eq!(
+            stored.rhash, real_rhash,
+            "register_directory_peer must never overwrite rhash"
+        );
+        assert!(
+            stored.last_seen >= Instant::now() - Duration::from_secs(5),
+            "register_directory_peer should refresh liveness to ~now"
+        );
+    }
+
+    #[test]
+    fn directory_response_rejects_tampered_registry_type() {
+        // The envelope covers (entries, registry_type, responder_rhash).
+        // Declaring a different registry_type than the one signed must fail.
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let responder = NodeIdentity::generate_in_memory();
+        register_node(&reg, &responder, NodeRegistryType::Finalizer);
+        let entries = vec![valid_entry(&responder, NodeRegistryType::Finalizer)];
+        // Sign over (entries, Finalizer, responder.rhash); declare Executor.
+        let signature = envelope_signature(
+            &responder,
+            &entries,
+            &NodeRegistryType::Finalizer,
+            responder.rhash,
+        );
+        let response = NodeRegistryResponse {
+            responder_key: responder.ed25519.public_key().unwrap(),
+            responder_rhash: responder.rhash,
+            registry_type: NodeRegistryType::Executor,
+            entries,
+            signature,
         };
         assert!(reg.handle_directory_response(&response).is_err());
     }

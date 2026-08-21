@@ -95,7 +95,7 @@ work and removes forgeable identity from the consensus path.*
   `committer/tests/pipeline_integration.rs`; the 2 updated e2e pipeline tests register a
   Finalizer sender and sign the envelope.
 
-- [ ] **1.4 Finalizer: voter identity from the registry, signatures verified** (C1)
+- [x] **1.4 Finalizer: voter identity from the registry, signatures verified** (C1)
   Files: `finalizer/src/finalizer.rs:263-316`, `finalizer/src/signature_collector.rs`,
   `src/transactions.rs:240-246`.
   Action: stop using `message.public_key` as the self-declared `executor_key` — take voter
@@ -110,15 +110,40 @@ work and removes forgeable identity from the consensus path.*
   Verify: test that a forged voter key / missing signature / non-registered voter is all
   rejected; quorum counts only verified, registered voters.
 
-- [ ] **1.5 Directory responses: per-entry authenticity, no rhash overwrite** (C7)
-  File: `src/node/registry.rs:474-508` (`handle_directory_response`), `:150-154`
-  (`register_peer`).
-  Action: require each entry to carry the node's own binding signature over its rhash, verified
-  here; require `responder_key` to be a registered node; include `registry_type` and
-  `responder_rhash` in the signed payload; change `register_peer` so an existing key's rhash is
-  **never** overwritten from a directory response (refresh liveness only).
-  Verify: test that `{real_key, attacker_rhash}` entries are rejected; test that a poisoned
-  response cannot change a registered node's rhash.
+- [x] **1.5 Directory responses: per-entry authenticity, no rhash overwrite** (C7) — *done 2026-08-21*
+  File: `src/node/registry.rs` (only structural type change lives in `src/node.rs`).
+  Action: `handle_directory_response` fails closed — (1) `responder_key` must be a registered node;
+  (2) the envelope `check_signature` must verify over the *enriched* payload
+  `(entries, registry_type, responder_rhash)` (new shared free fn
+  `directory_response_signature_payload`, so a valid signature over one (type, responder) can't be
+  replayed under another); (3) each entry must carry its *own* binding signature, verified with
+  `NodeIdentity::verify_binding(node_key, node_rhash, requested_type, node_types, signature)` — a
+  directory cannot forge a peer's signature, so it can't attribute an attacker rhash to a real key.
+  On the first bad entry the whole response is rejected before any peer is installed. Entries are
+  installed via a new refresh-only `register_directory_peer` (existing key → only `last_seen`
+  refreshed, rhash/conn never touched); `register_peer`'s legitimate overwrite is preserved for the
+  RegisterAck path. The binding is captured at registration (`handle_register` stores it via
+  `NodeRegistryNode::with_binding`) and echoed in responses by `handle_request` (entries built only
+  from nodes with a non-empty stored binding — the "vouch only for nodes you directly registered"
+  property). `src/node.rs`: `NodeRegistryEntry` gains `signature`/`requested_type`/`node_types`;
+  `NodeRegistryNode` gains `directory_signature`/`directory_requested_type`/`directory_node_types`.
+  Note (**wire-compat, AUDIT ground rule 4**): this phase *changes* wire shapes — `NodeRegistryEntry`
+  gains three fields and the `NodeRegistryResponse` envelope signature now covers
+  `(entries, registry_type, responder_rhash)` instead of the old `rmp(&entries)`. It is
+  forward/backward-safe only if both ends run 1.5; directory sync between mixed-version nodes is
+  gated until both sides ship this. The control-plane struct *names* are unchanged, so no other
+  crate's wire code breaks.
+  Done: production producer + fail-closed receiver in place. 7 tests in `src/node/registry.rs`:
+  `directory_response_registers_valid_entries` (positive), and 6 new/fixed regression tests each
+  **failing without the fix** (proven by temporarily reverting `handle_directory_response` and
+  `register_directory_peer`, running the suite, then restoring the fix):
+  `directory_response_rejects_real_key_attacker_rhash` (headline C7 — `{real_key, attacker_rhash}`
+  rejected), `directory_response_rejects_unregistered_responder`,
+  `directory_response_rejects_invalid_signature`,
+  `directory_response_rejects_tampered_registry_type`,
+  `directory_response_poisoned_cannot_change_registered_rhash`,
+  `register_directory_peer_refresh_only`. Full workspace green
+  (core 314, committer 33, executor 10, finalizer 53, sentinel 42 — 0 failed).
 
 - [ ] **1.6 Heartbeats: authenticate before refreshing liveness** (L1)
   File: `src/node/registry.rs:510-514`.

@@ -87,15 +87,47 @@ pub struct NodeRegistryNode {
     pub conn: Box<dyn Connection>,
     /// Last time any inbound packet was seen from this node (heartbeat/eviction).
     pub last_seen: Instant,
+    /// Binding this node produced at registration, so we can vouch for it in
+    /// directory responses. Empty ⇒ we cannot vouch for this node (it was not
+    /// directly registered here), and it is skipped when building directory
+    /// entries. See `NodeIdentity::sign_binding`.
+    pub directory_signature: Vec<u8>,
+    /// `requested_type` from the node's own registration binding — needed to
+    /// re-verify `directory_signature` with `verify_binding` when we list it.
+    pub directory_requested_type: NodeRegistryType,
+    /// The node's role set from its registration binding.
+    pub directory_node_types: Vec<NodeRegistryType>,
 }
 
 impl NodeRegistryNode {
+    /// A plain connection with no directory binding (nodes learned via a
+    /// directory response or seeded in tests). Such a node cannot be vouched
+    /// for by us, so it is skipped when building directory entries.
     pub fn new(rhash: [u8; 16], conn: Box<dyn Connection>) -> Self {
         NodeRegistryNode {
             rhash,
             conn,
             last_seen: Instant::now(),
+            directory_signature: Vec::new(),
+            directory_requested_type: NodeRegistryType::Archiver,
+            directory_node_types: Vec::new(),
         }
+    }
+
+    /// A node that registered directly, carrying its own rhash binding so the
+    /// directory can echo it in responses and peers can verify it.
+    pub fn with_binding(
+        rhash: [u8; 16],
+        conn: Box<dyn Connection>,
+        directory_signature: Vec<u8>,
+        directory_requested_type: NodeRegistryType,
+        directory_node_types: Vec<NodeRegistryType>,
+    ) -> Self {
+        let mut node = NodeRegistryNode::new(rhash, conn);
+        node.directory_signature = directory_signature;
+        node.directory_requested_type = directory_requested_type;
+        node.directory_node_types = directory_node_types;
+        node
     }
 }
 
@@ -143,9 +175,12 @@ pub struct NodeRegistryResponse {
     pub responder_rhash: [u8; 16],
     pub registry_type: NodeRegistryType,
     pub entries: Vec<NodeRegistryEntry>,
-    /// Ed25519 signature over the rmp serialization of `entries`, made by
-    /// the responder. Directory entries are hints, not authority — the
-    /// receiver re-checks them.
+    /// Ed25519 signature over the rmp serialization of
+    /// `(entries, registry_type, responder_rhash)`, made by the responder.
+    /// The envelope proves the responder vouched for this exact set of
+    /// entries under this type and rhash; each `entry.signature` independently
+    /// proves the *listed* node bound its own rhash (Phase 1.5). Directory
+    /// entries are hints, not authority — the receiver re-checks both.
     pub signature: Vec<u8>,
 }
 
@@ -185,6 +220,16 @@ impl NodeRegistryRequest {
 pub struct NodeRegistryEntry {
     pub node_key: Vec<u8>,
     pub node_rhash: [u8; 16],
+    /// The listed node's own binding signature over its rhash, produced when
+    /// it registered. Lets the receiver authenticate `(node_key, node_rhash)`
+    /// independently of the responder — without it a directory could attribute
+    /// a fabricated rhash to a node it never saw bind it (Phase 1.5, C7).
+    /// This is the signature, and `requested_type` + `node_types` are the
+    /// remaining fields of the `(rhash, requested_type, requester_types)`
+    /// tuple that `NodeIdentity::verify_binding` re-checks.
+    pub signature: Vec<u8>,
+    pub requested_type: NodeRegistryType,
+    pub node_types: Vec<NodeRegistryType>,
 }
 
 /// Top-level wire packet from the RNS data plane: either a control-plane
@@ -280,8 +325,20 @@ mod tests {
             responder_rhash: [2u8; 16],
             registry_type: NodeRegistryType::Committer,
             entries: vec![
-                NodeRegistryEntry { node_key: vec![10], node_rhash: [11u8; 16] },
-                NodeRegistryEntry { node_key: vec![12], node_rhash: [13u8; 16] },
+                NodeRegistryEntry {
+                    node_key: vec![10],
+                    node_rhash: [11u8; 16],
+                    signature: vec![1, 1],
+                    requested_type: NodeRegistryType::Committer,
+                    node_types: vec![NodeRegistryType::Committer],
+                },
+                NodeRegistryEntry {
+                    node_key: vec![12],
+                    node_rhash: [13u8; 16],
+                    signature: vec![2, 2],
+                    requested_type: NodeRegistryType::Executor,
+                    node_types: vec![NodeRegistryType::Executor],
+                },
             ],
             signature: vec![4, 4],
         };
@@ -292,7 +349,10 @@ mod tests {
         assert_eq!(back.entries.len(), 2);
         assert_eq!(back.entries[0].node_key, vec![10]);
         assert_eq!(back.entries[0].node_rhash, [11u8; 16]);
+        assert_eq!(back.entries[0].signature, vec![1, 1]);
+        assert_eq!(back.entries[0].requested_type, NodeRegistryType::Committer);
         assert_eq!(back.entries[1].node_rhash, [13u8; 16]);
+        assert_eq!(back.entries[1].requested_type, NodeRegistryType::Executor);
         assert_eq!(back.signature, vec![4, 4]);
     }
 
