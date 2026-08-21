@@ -148,7 +148,11 @@ impl ExecutorSet {
     /// Create a deterministic shuffler for this executor set at a given epoch.
     /// The shuffle is used for per-epoch shard reassignment (rotation).
     pub fn shuffler(&self, epoch_number: u64) -> Shuffler {
-        let keys: Vec<Vec<u8>> = self.executors.keys().cloned().collect();
+        let mut keys: Vec<Vec<u8>> = self.executors.keys().cloned().collect();
+        // C6: sort before Fisher-Yates so the shuffle is independent of HashMap insertion
+        // order (matches deterministic_select at epoch.rs:236-237). Without this the
+        // shuffle's starting order — and therefore the shard partition — varies per node.
+        keys.sort();
         Shuffler::new(keys, epoch_number)
     }
 }
@@ -273,8 +277,11 @@ pub fn deterministic_select_shard(
         return None;
     }
     if shard_count == 1 {
-        // No sharding: return all executors
-        return Some(executors.executors.keys().cloned().collect());
+        // No sharding: return all executors, sorted so the set is identical regardless of the
+        // ExecutorSet's HashMap insertion order (C6).
+        let mut keys: Vec<Vec<u8>> = executors.executors.keys().cloned().collect();
+        keys.sort();
+        return Some(keys);
     }
 
     // Deterministic seed: SHA-256(epoch_number || tx_id_bytes)
@@ -1344,5 +1351,41 @@ mod tests {
         let result2 = deterministic_select_shard(&executors, 2, "same-tx", 5);
         assert!(result1.is_some() && result2.is_some());
         assert_eq!(result1.unwrap(), result2.unwrap());
+    }
+
+    // --- C6: sort before shuffling ---
+
+    #[test]
+    fn deterministic_select_shard_sorted_before_shuffle() {
+        // Same logical executor set, in different HashMap insertion orders and after a serde
+        // round-trip, must yield identical shard partitions. Without the sort both the
+        // shard_count==1 shortcut and the shuffle consumed HashMap iteration order, so two
+        // nodes with the same executor set would route the same tx to different shards.
+        fn build() -> ExecutorSet {
+            let mut e = ExecutorSet::default();
+            for i in 0..8 {
+                e.executors.insert(format!("exec{i}").into_bytes(), 100 + i);
+            }
+            e
+        }
+        let forward = build();
+        let mut reversed = build();
+        reversed.executors.clear();
+        for i in (0..8).rev() {
+            reversed.executors.insert(format!("exec{i}").into_bytes(), 100 + i);
+        }
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&forward).unwrap();
+        let roundtrip: ExecutorSet = crate::encoding::deserialize_rmp_to(&bytes).unwrap();
+
+        // shard_count==1 hits the shortcut path (full sorted set); the >1 cases hit the
+        // shuffle path. Several (shard_count, tx, epoch) tuples cover the round-robin.
+        let cases = [(1u32, "tx-a", 7), (3, "tx-a", 7), (4, "other-tx", 9), (2, "tx-a", 7)];
+        for (sc, tx, ep) in cases {
+            let a = deterministic_select_shard(&forward, sc, tx, ep).unwrap();
+            let b = deterministic_select_shard(&reversed, sc, tx, ep).unwrap();
+            let c = deterministic_select_shard(&roundtrip, sc, tx, ep).unwrap();
+            assert_eq!(a, b, "forward vs reversed differ: shard_count={} tx={} epoch={}", sc, tx, ep);
+            assert_eq!(a, c, "forward vs round-trip differ: shard_count={} tx={} epoch={}", sc, tx, ep);
+        }
     }
 }

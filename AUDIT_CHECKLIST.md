@@ -178,12 +178,24 @@ agree on anything.*
   in different insertion orders (and across a serde round-trip) and assert identical
   `current_hash`.
 
-- [ ] **2.2 Sort before shuffling** (C6)
-  Files: `src/epoch.rs:150-153` (`ExecutorSet::shuffler()`), `:277` (shard_count==1 shortcut).
+- [x] **2.2 Sort before shuffling** (C6)
+  Files: `src/epoch.rs:150-153` (`ExecutorSet::shuffler()`), `:275-277` (shard_count==1 shortcut).
   Action: `keys.sort()` before Fisher-Yates, matching `deterministic_select` at
   `src/epoch.rs:236-237`.
   Verify: `deterministic_select_shard` returns identical partitions for the same stake set built
   in different insertion orders and after a serde round-trip.
+  **Done:** *2026-08-21* — the RNG seed in `shuffler()` was already deterministic (SHA-256(epoch)),
+  but it was applied to `HashMap`'s random insertion order, so the Fisher-Yates permutation — and
+  therefore the shard partition the sentinel routes on — varied per node's build order. Sorted the
+  keys at both HashMap read-sites: `ExecutorSet::shuffler()` (`let mut keys … ; keys.sort();`) so
+  the shuffle starts from a canonical order, and the `shard_count==1` shortcut (return the sorted
+  full set). Left `Shuffler::new` a pure Fisher-Yates over the given slice; determinism is fixed
+  exactly where the randomness leaks in. **Regression** `deterministic_select_shard_sorted_before_shuffle`:
+  same `ExecutorSet` built forward, reversed, and via rmp serde round-trip → identical partitions for
+  `shard_count==1` (shortcut) and `>1` (shuffle) across 4 (shard_count, tx, epoch) tuples; proven a
+  true discriminator (it fails `forward vs reversed` with the sorts commented out). **Wire-compat:**
+  `deterministic_select_shard` still returns `Vec<Vec<u8>>` — internal ordering normalization only,
+  no wire-shape change (AUDIT ground rule 4). Core 321 (was 320, +1); full workspace 0 failed.
 
 - [ ] **2.3 One `proposer_key` semantics** (C2)
   Files: `src/blocks.rs:57` vs `committer/src/block_builder.rs:179,187`.
