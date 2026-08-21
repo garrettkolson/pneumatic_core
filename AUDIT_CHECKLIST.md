@@ -145,10 +145,25 @@ work and removes forgeable identity from the consensus path.*
   `register_directory_peer_refresh_only`. Full workspace green
   (core 314, committer 33, executor 10, finalizer 53, sentinel 42 — 0 failed).
 
-- [ ] **1.6 Heartbeats: authenticate before refreshing liveness** (L1)
-  File: `src/node/registry.rs:510-514`.
-  Action: verify the heartbeat's binding signature before `refresh_last_seen`.
-  Verify: forged heartbeat for a registered key does not refresh `last_seen`.
+- [x] **1.6 Heartbeats: authenticate before refreshing liveness** (L1) — *done 2026-08-21*
+  File: `src/node/registry.rs` (`handle_heartbeat`, `refresh_last_seen`).
+  Action: `handle_heartbeat` refreshed `last_seen` on a *self-claimed* `requester_key` with no
+  check (L1), so any sender could make any registered node appear alive — liveness
+  (`evict_expired`, 30 s cutoff) was forgeable. Added a fail-closed
+  `NodeIdentity::verify_binding` over the standard `NodeRequest` binding tuple
+  `(requester_rhash, requested_type, requester_types)` before the registered-key lookup,
+  mirroring `handle_register`. Forged / wrong-tuple / unregistered → reject early, never
+  reach `refresh_last_seen`.
+  Note: no production worker produces a `NodeRequestType::Heartbeat` (only the handler exists,
+  plus test-only constructions in `src/node.rs`), so authenticating the receiver breaks no
+  live producer. No wire-shape change — `binding_signature` was already carried, the receiver
+  now simply checks it (AUDIT ground rule 4).
+  Done: production `handle_heartbeat` now verifies the binding signature before refreshing.
+  3 tests in `src/node/registry.rs`: `forged_heartbeat_does_not_refresh_last_seen` (headline L1),
+  `heartbeat_binding_is_tuple_specific` (replay with a spoofed rhash rejected), and
+  `authenticated_heartbeat_refreshes_last_seen` (positive control); each of the two
+  discriminators was proven to fail without the fix by reverting `handle_heartbeat` and running
+  the suite. Full workspace green (0 failed).
 
 ## Phase 2 — Deterministic consensus primitives
 *Closes: C2, C6, L7. Small mechanical fixes with large impact — without these, no two nodes can
