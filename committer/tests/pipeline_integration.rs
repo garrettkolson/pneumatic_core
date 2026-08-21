@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use dashmap::DashMap;
 use pneumatic_core::blocks::{Block, BlockFactory};
 use pneumatic_core::config::Config;
-use pneumatic_core::crypto::BasicHashProvider;
+use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider};
 use pneumatic_core::data::{DataError, DataProvider, DefaultDataProvider};
 use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::environment::EnvironmentMetadata;
@@ -16,8 +16,10 @@ use pneumatic_core::epoch::CandidateRegistry;
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::FileLogger;
 use pneumatic_core::messages::Message;
-use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::registry::{NullConnection, NodeRegistry};
 use pneumatic_core::node::NodeRegistryType;
+use pneumatic_core::node::NodeTypeConfig;
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::tokens::Token;
 use pneumatic_core::transactions::{
@@ -26,6 +28,7 @@ use pneumatic_core::transactions::{
 use pneumatic_core::user::User;
 use pneumatic_committer::block_services::BlockServices;
 use pneumatic_committer::committer::Committer;
+use pneumatic_committer::committer_error::CommitterError;
 use pneumatic_committer::epoch_manager::{EpochReconciler, LeaderSelector as CommLeaderSelector};
 use pneumatic_committer::epoch_manager::{StakeStore, StakingManager};
 
@@ -130,11 +133,33 @@ fn make_test_env_data(logger: Arc<FileLogger>) -> Arc<EnvironmentMetadata> {
     Arc::new(env_data)
 }
 
-fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<PendingTransactionRegistry>, Arc<DashMap<Vec<u8>, Token>>) {
+fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
+    Committer,
+    Arc<PendingTransactionRegistry>,
+    Arc<DashMap<Vec<u8>, Token>>,
+    Arc<NodeRegistry>,
+) {
     let logger = Arc::new(FileLogger::new("/tmp/test_integration.log".to_string()));
     let env_data = make_test_env_data(logger);
     let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
     let rhash = identity.rhash;
+    // Realistic per-type node counts so `register_peer` succeeds for the node
+    // roles this test registers. The empty map the old code used was fine only
+    // because, prior to the sender-auth gate, no pipeline test registered a
+    // sender before calling `handle_message`.
+    let type_configs = {
+        let map = DashMap::new();
+        for node_type in [
+            NodeRegistryType::Committer,
+            NodeRegistryType::Sentinel,
+            NodeRegistryType::Executor,
+            NodeRegistryType::Finalizer,
+            NodeRegistryType::Archiver,
+        ] {
+            map.insert(node_type, NodeTypeConfig { min: 1, max: 1000, min_stake: 0 });
+        }
+        Arc::new(map)
+    };
     let config = Config {
         public_key: vec![1],
         ip_address: "127.0.0.1".parse().unwrap(),
@@ -144,7 +169,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<
         main_environment_id: "test".to_string(),
         reconciliation_partition_id: "recon".to_string(),
         environment_metadata: Arc::new(DashMap::new()),
-        type_configs: Arc::new(DashMap::new()),
+        type_configs,
         identity: identity.clone(),
         rhash,
         bootstrap_peers: Vec::new(),
@@ -228,7 +253,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<
         identity,
         gossiper,
         block_services,
-        node_registry,
+        node_registry.clone(),
         tokens.clone(),
         pending_registry.clone(),
         stake_store,
@@ -244,7 +269,24 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (Committer, Arc<
         candidate_registry,
     );
 
-    (committer, pending_registry, tokens)
+    (committer, pending_registry, tokens, node_registry)
+}
+
+/// Register `identity` under `role` in `registry`, as a sender whose envelope
+/// will pass the commender's fail-closed auth gate (registered node of an
+/// allowed role). Returns the identity so the caller can sign with its key.
+fn register_node(
+    registry: &NodeRegistry,
+    role: NodeRegistryType,
+) -> pneumatic_core::rns::identity::NodeIdentity {
+    let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let public_key = identity.ed25519.public_key().expect("public key");
+    assert!(
+        registry
+            .register_peer(public_key, identity.rhash, &role, Box::new(NullConnection)),
+        "register peer"
+    );
+    identity
 }
 
 fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
@@ -307,16 +349,10 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
     tokens.insert(token.id.clone(), token);
 }
 
-fn make_block_finalized_message(block: Block) -> Message {
+fn make_block_finalized_message(block: Block, finalizer: &pneumatic_core::rns::identity::NodeIdentity) -> Message {
     let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
-    Message {
-        chain_id: "test".to_string(),
-        action: String::from("BlockFinalized"),
-        body,
-        signature: vec![],
-        public_key: vec![],
-        stake_set: None,
-    }
+    Message::signed("test".to_string(), "BlockFinalized", body, None, finalizer)
+        .expect("sign BlockFinalized")
 }
 
 #[tokio::test]
@@ -324,7 +360,18 @@ async fn test_pipeline_no_conflict() {
     // Test: submit → optimistic → no conflict → confirmed
 
     let dp = Arc::new(TestDataProvider::new());
-    let (committer, _registry, tokens) = make_test_committer(dp);
+    let (committer, _registry, tokens, node_registry) = make_test_committer(dp);
+
+    // Register a Finalizer node identity so the commender's fail-closed
+    // sender-auth gate accepts the BlockFinalized message(s) this test sends.
+    let finalizer = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    node_registry
+        .register_peer(
+            finalizer.ed25519.public_key().expect("finalizer public key"),
+            finalizer.rhash,
+            &NodeRegistryType::Finalizer,
+            Box::new(NullConnection),
+        );
 
     // Bootstrap token and chain
     bootstrap_token_chain(&tokens);
@@ -384,8 +431,8 @@ async fn test_pipeline_no_conflict() {
         ..block
     };
 
-    // Create BlockFinalized message
-    let message = make_block_finalized_message(block);
+    // Create a BlockFinalized message, signed by the registered Finalizer.
+    let message = make_block_finalized_message(block, &finalizer);
 
     // Handle the message - should succeed and append the block
     let result = committer.handle_message(message).await;
@@ -402,7 +449,18 @@ async fn test_pipeline_conflict_and_slashing() {
     // Test: submit → conflict → resolved → slashing
 
     let dp = Arc::new(TestDataProvider::new());
-    let (committer, _registry, tokens) = make_test_committer(dp);
+    let (committer, _registry, tokens, node_registry) = make_test_committer(dp);
+
+    // Register a Finalizer node identity so the commender's fail-closed
+    // sender-auth gate accepts the BlockFinalized message(s) this test sends.
+    let finalizer = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    node_registry
+        .register_peer(
+            finalizer.ed25519.public_key().expect("finalizer public key"),
+            finalizer.rhash,
+            &NodeRegistryType::Finalizer,
+            Box::new(NullConnection),
+        );
 
     // Bootstrap token and chain
     bootstrap_token_chain(&tokens);
@@ -508,18 +566,109 @@ async fn test_pipeline_conflict_and_slashing() {
         ..block2
     };
 
-    // Handle both blocks - should trigger conflict resolution
-    let message1 = make_block_finalized_message(block1);
-    let message2 = make_block_finalized_message(block2);
+    // Handle both blocks - should trigger conflict resolution. Both are
+    // signed by the same registered Finalizer identity.
+    let message1 = make_block_finalized_message(block1, &finalizer);
+    let message2 = make_block_finalized_message(block2, &finalizer);
 
     let result1 = committer.handle_message(message1).await;
     assert!(result1.is_ok(), "First block should be accepted: {:?}", result1.err());
 
     // Second block should be rejected due to conflict
-    let result2 = committer.handle_message(message2).await;
+    let _result2 = committer.handle_message(message2).await;
 
     // Verify the chain still has the first block
     let chain = tokens.get(&vec![1]).unwrap();
     let chain_len = chain.value().blockchain.get_count();
     assert!(chain_len >= 2, "Chain should have at least 2 blocks");
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed sender-auth regression tests (Phase 1.3)
+//
+// These assert the commender's router rejects message envelopes that fail the
+// sender-auth gate: an unregistered public key, or a registered key whose role
+// is not allowed to send the action. Each must fail before the gate is in
+// place and pass once it is — the gate itself is the test.
+// ---------------------------------------------------------------------------
+
+/// Build an action message signed by `identity` over `body` (body content is
+/// irrelevant to the gate, which runs before any handler deserializes it).
+fn signed_message_with(identity: &NodeIdentity, action: &str, body: Vec<u8>) -> Message {
+    Message::signed("test".to_string(), action, body, None, identity).expect("sign message")
+}
+
+#[tokio::test]
+async fn unregistered_sender_commit_is_rejected() {
+    // A Commit from a key never registered as a node must be rejected as
+    // UnauthenticatedSender rather than reaching the commit handler.
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, _tokens, _node_registry) = make_test_committer(dp);
+
+    let rogue = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let message = signed_message_with(&rogue, "Commit", vec![0u8; 8]);
+
+    assert!(
+        matches!(
+            committer.handle_message(message).await,
+            Err(CommitterError::UnauthenticatedSender(_))
+        ),
+        "an unregistered sender must not feed the router a Commit"
+    );
+}
+
+#[tokio::test]
+async fn unregistered_sender_block_finalized_is_rejected() {
+    // Same rejection for a BlockFinalized from an unregistered key.
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, _tokens, _node_registry) = make_test_committer(dp);
+
+    let rogue = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let message = signed_message_with(&rogue, "BlockFinalized", vec![0u8; 8]);
+
+    assert!(
+        matches!(
+            committer.handle_message(message).await,
+            Err(CommitterError::UnauthenticatedSender(_))
+        ),
+        "an unregistered sender must not feed the router a BlockFinalized"
+    );
+}
+
+#[tokio::test]
+async fn wrong_role_sender_block_finalized_is_rejected() {
+    // A Committer that IS registered may not send BlockFinalized — only a
+    // Finalizer may. Role mismatch must surface as UnauthorizedRole.
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, _tokens, node_registry) = make_test_committer(dp);
+
+    let imposter = register_node(&node_registry, NodeRegistryType::Committer);
+    let message = signed_message_with(&imposter, "BlockFinalized", vec![0u8; 8]);
+
+    assert!(
+        matches!(
+            committer.handle_message(message).await,
+            Err(CommitterError::UnauthorizedRole(_))
+        ),
+        "a registered Committer must not be able to send BlockFinalized"
+    );
+}
+
+#[tokio::test]
+async fn foreign_sender_epoch_reconcile_is_rejected() {
+    // EpochReconcile is self-only: a foreign (unregistered) identity must be
+    // rejected from reaching the epoch-reconcile logic.
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, _tokens, _node_registry) = make_test_committer(dp);
+
+    let rogue = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    let message = signed_message_with(&rogue, "EpochReconcile", vec![0u8; 8]);
+
+    assert!(
+        matches!(
+            committer.handle_message(message).await,
+            Err(_)
+        ),
+        "a foreign sender must not reach the epoch-reconcile handler"
+    );
 }

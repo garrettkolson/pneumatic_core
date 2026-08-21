@@ -5,6 +5,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
+use pneumatic_core::crypto::AsymCryptoProvider;
 use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
@@ -28,6 +29,34 @@ use super::epoch_manager::{EpochReconciler, LeaderSelector, StakeStore, StakingM
 /// Convert a byte slice to a hex string (lowercase, no prefix).
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Which node roles are permitted to originate a message of a given action.
+/// Derived from the actual wire senders: `Commit`/`BlockFinalized` come only
+/// from Finalizers, `DistributeToken`/`DistributeBlock` only from Committers,
+/// and `BlockConfirmed`/`BlockQuorumReached` are honest broadcasts from any
+/// registered node.
+#[derive(Debug, Clone)]
+enum AllowedSenders {
+    /// Exactly one role may send the action.
+    Exact(NodeRegistryType),
+    /// Any registered node may send the action.
+    AnyRegistered,
+    /// Only this committer's own identity may send the action.
+    SelfOnly,
+}
+
+/// Map an action string to the roles permitted to send it.
+fn allowed_senders_for(action: &str) -> AllowedSenders {
+    match action {
+        "Commit" | "BlockFinalized" => AllowedSenders::Exact(NodeRegistryType::Finalizer),
+        "DistributeToken" | "DistributeBlock" => AllowedSenders::Exact(NodeRegistryType::Committer),
+        "BlockConfirmed" | "BlockQuorumReached" => AllowedSenders::AnyRegistered,
+        "EpochReconcile" => AllowedSenders::SelfOnly,
+        // Any unrecognized action falls back to Committer-only so it is still
+        // rejected at the dispatch stage as UnknownAction.
+        _ => AllowedSenders::Exact(NodeRegistryType::Committer),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +208,13 @@ impl Committer {
     /// Primary entry point — routes incoming messages by action.
     /// Called by the gossiper's message handler after deserialization.
     pub async fn handle_message(&self, message: Message) -> Result<(), CommitterError> {
+        // Fail-closed sender authentication. The gossiper already verified the
+        // envelope signature and deduplicated before forwarding here, but the
+        // router is the authoritative auth boundary and must not accept a
+        // message from an unregistered sender or a role that may not send this
+        // action.
+        self.authenticate_message(&message)?;
+
         match message.action.as_str() {
             "Commit" => self.handle_commit(message).await,
             "DistributeToken" => self.handle_token_distribution(message).await,
@@ -189,6 +225,73 @@ impl Committer {
             "BlockQuorumReached" => self.handle_block_quorum_reached(message).await,
             action => Err(CommitterError::UnknownAction(action.to_string())),
         }
+    }
+
+    /// Fail-closed sender authentication for an incoming message.
+    ///
+    /// Verifies, in order, that:
+    ///   1. the message body is signed by `message.public_key` (envelope
+    ///      integrity — defense-in-depth alongside the gossiper's upstream
+    ///      signature check);
+    ///   2. `message.public_key` identifies a registered node (unregistered
+    ///      keys cannot be authenticated); and
+    ///   3. that node's role is permitted to send `message.action`.
+    ///
+    /// Any failure is returned as an error rather than falling through to the
+    /// action handler.
+    fn authenticate_message(&self, message: &Message) -> Result<(), CommitterError> {
+        let crypto = self
+            .env_data
+            .asym_crypto_provider
+            .read()
+            .expect("crypto provider poisoned");
+
+        // (1) Envelope signature over the message body.
+        if !crypto
+            .check_signature(&message.signature, &message.public_key, &message.body)
+            .unwrap_or(false)
+        {
+            return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
+        }
+
+        // (2) Registration: is the signer a known node, and of what role?
+        let Some(role) = self
+            .node_registry
+            .find_node_type_by_public_key(&message.public_key)
+        else {
+            return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
+        };
+
+        // (3) Role gate.
+        match allowed_senders_for(&message.action) {
+            AllowedSenders::Exact(expected) if role != expected => {
+                Err(CommitterError::UnauthorizedRole(format!(
+                    "{}: action={} role={:?}",
+                    bytes_to_hex(&message.public_key),
+                    message.action,
+                    role
+                )))
+            }
+            AllowedSenders::SelfOnly => {
+                if message.public_key != self.sender_public_key() {
+                    Err(CommitterError::UnauthorizedRole(format!(
+                        "{}: action={} role={:?}",
+                        bytes_to_hex(&message.public_key),
+                        message.action,
+                        role
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            AllowedSenders::AnyRegistered | AllowedSenders::Exact(_) => Ok(()),
+        }
+    }
+
+    /// This committer's Ed25519 public key — used to gate self-only actions
+    /// (e.g. EpochReconcile) against an externally-supplied sender key.
+    fn sender_public_key(&self) -> Vec<u8> {
+        self.identity.ed25519.public_key().unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------

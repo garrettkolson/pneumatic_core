@@ -307,6 +307,14 @@ fn worker_loop(
         let Some(handler) = handler.read().unwrap().clone() else {
             continue;
         };
+        // Delivery is transport-agnostic: RNS is destination-encrypted and
+        // multi-hop, so this callback cannot recover the sender (`RawPacket`
+        // carries no sender rhash; HEADER_1 packets have none). Sender
+        // authentication is the application layer's job — the commender's
+        // router gate (Phase 1.3) verifies the self-identified
+        // `message.public_key` + `message.signature`, which RNS delivery cannot
+        // strip or forge. The "drops attribution" concern from the audit is
+        // therefore resolved without an `rns-core` change.
         handler(plaintext);
     }
 }

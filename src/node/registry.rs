@@ -114,10 +114,12 @@ impl NodeRegistry {
         }
     }
 
-    /// Find the registry type under which `key` is already registered, if
+    /// Return the registry type under which `key` is already registered, if
     /// any. A node is not necessarily under its `requested_type` — priority
-    /// selection may have placed it under a different type.
-    fn find_registered_type(&self, key: &Vec<u8>) -> Option<NodeRegistryType> {
+    /// selection may have placed it under a different type. This is the
+    /// committer's sender-authentication lookup: it maps an Ed25519 public key
+    /// to the role that node is registered under.
+    pub fn find_node_type_by_public_key(&self, key: &[u8]) -> Option<NodeRegistryType> {
         NodeRegistryType::iter().find(|t| {
             self.get_nodes(t)
                 .map(|nodes| nodes.contains_key(key))
@@ -309,7 +311,7 @@ impl NodeRegistry {
         // Idempotent re-registration: refresh liveness under the type we
         // already hold it, re-ack. Checked across all types — the node may
         // sit under a priority-selected type, not its `requested_type`.
-        if let Some(existing_type) = self.find_registered_type(&requester_key) {
+        if let Some(existing_type) = self.find_node_type_by_public_key(&requester_key) {
             self.refresh_last_seen(&requester_key, &existing_type);
             self.reply_register_ack(requester_rhash, true, existing_type, "");
             return;
@@ -508,7 +510,7 @@ impl NodeRegistry {
     }
 
     fn handle_heartbeat(&self, request: &NodeRequest) {
-        if let Some(existing_type) = self.find_registered_type(&request.requester_key) {
+        if let Some(existing_type) = self.find_node_type_by_public_key(&request.requester_key) {
             self.refresh_last_seen(&request.requester_key, &existing_type);
         }
     }

@@ -73,15 +73,27 @@ work and removes forgeable identity from the consensus path.*
   signature encoding, and `check_signature` are untouched. `cargo check` clean; workspace suite
   ~448 green (baseline 444 + these 4).
 
-- [ ] **1.3 Committer: authenticate the envelope** (C1)
-  File: `committer/src/committer.rs:176-187`.
-  Action: `handle_message` must read `message.public_key`, verify the envelope signature, and
-  confirm the sender is a registered node of a role allowed to send this action; reject
-  otherwise. Apply the same to the RNS packet bridge (`committer/src/main.rs:119-121`), which
-  currently drops attribution (`src/rns/wrapper.rs:310` discards the sender rhash — plumb it
-  through to the handler).
-  Verify: test that an unregistered/unknown sender's Commit/BlockFinalized/EpochReconcile is
-  rejected.
+- [x] **1.3 Committer: authenticate the envelope** (C1)
+  File: `committer/src/committer.rs:210`.
+  Action: `handle_message` calls `authenticate_message` first (fail-closed). It verifies the
+  envelope signature over `message.body`, requires `message.public_key` to be a registered node
+  (`NodeRegistry::find_node_type_by_public_key`), and enforces a role→action map (`Commit` /
+  `BlockFinalized` → Finalizer; `DistributeToken` / `DistributeBlock` → Committer;
+  `BlockConfirmed` / `BlockQuorumReached` → any registered role; `EpochReconcile` → self only).
+  Unknown key → `UnauthenticatedSender`; registered-but-wrong-role → `UnauthorizedRole`.
+  **RNS packet bridge — transport-agnostic (AUDIT ground rule: do not change the wire/transport
+  shape).** `src/rns/wrapper.rs:310` still drops the sender rhash, but that is safe: RNS is
+  destination-encrypted and multi-hop (`RawPacket` carries no sender; HEADER_1 packets have
+  none), so the delivery callback could not recover the originator anyway. The commender
+  authenticates on the envelope's self-identified `public_key` + `signature`, which RNS delivery
+  cannot strip or forge. The gate lives at the router, the single chokepoint the RNS-data bridge
+  (`committer/src/main.rs`) and any direct caller pass through. No `rns-core` change. Rationale
+  noted at `src/rns/wrapper.rs:310`.
+  Verify: 4 regression tests (`unregistered_sender_commit_is_rejected`,
+  `unregistered_sender_block_finalized_is_rejected`, `wrong_role_sender_block_finalized_is_rejected`,
+  `foreign_sender_epoch_reconcile_is_rejected`) assert the four rejection cases in
+  `committer/tests/pipeline_integration.rs`; the 2 updated e2e pipeline tests register a
+  Finalizer sender and sign the envelope.
 
 - [ ] **1.4 Finalizer: voter identity from the registry, signatures verified** (C1)
   Files: `finalizer/src/finalizer.rs:263-316`, `finalizer/src/signature_collector.rs`,

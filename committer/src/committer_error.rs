@@ -28,6 +28,12 @@ pub enum CommitterError {
     BlockCommit(BlockCommitError),
     /// Unknown message action
     UnknownAction(String),
+    /// Sender's Ed25519 public key (hex) is not a registered node — the
+    /// committer cannot authenticate the envelope's origin.
+    UnauthenticatedSender(String),
+    /// Sender is registered but its role is not permitted to send this
+    /// action: `<public_key hex>: action=<action> role=<role>`.
+    UnauthorizedRole(String),
     /// Underlying PneumaticError from core
     Core(pneumatic_core::errors::PneumaticError),
     /// Internal serialization failure (gossip protocol)
