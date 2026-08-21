@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
 use std::vec;
 use chrono::{Utc, prelude::*};
@@ -81,7 +81,19 @@ pub struct BlockFactory {}
 
 impl BlockFactory {
     /// Create a block hash using SHA-256 from the crypto module.
-    /// Hashes: previous_hash || timestamp || signed_transaction || token_metadata
+    ///
+    /// Hashes a *canonical* form of the block so that any two equal blocks hash identically
+    /// regardless of map insertion order or serialization state (AUDIT finding C2). Input is,
+    /// in fixed order, and is hashed as a whole:
+    ///
+    /// ```text
+    /// previous_hash ‖ timestamp ‖ canonical(signed_trans) ‖ canonical(token_metadata)
+    ///   ‖ proposer_key ‖ epoch_number
+    /// ```
+    ///
+    /// `signed_trans` and `token_metadata` are `HashMap`-backed, so they are serialized through
+    /// sorted-key (BTreeMap) forms that ignore a random-seeded iteration order; `proposer_key`
+    /// and `epoch_number` are newly bound into the input.
     pub fn create_hash(block: &Block) -> Vec<u8> {
         let mut input = block.previous_hash.clone();
 
@@ -89,16 +101,39 @@ impl BlockFactory {
             .expect("Block timestamp couldn't be serialized.");
         input.append(&mut time_bytes);
 
-        let mut trans_bytes = crate::encoding::serialize_to_bytes_rmp(&block.signed_trans)
-            .expect("Block signed transaction couldn't be serialized.");
+        let mut trans_bytes = crate::transactions::canonical_signed_trans_bytes(&block.signed_trans)
+            .expect("Block signed transaction couldn't be canonicalized.");
         input.append(&mut trans_bytes);
 
-        let mut metadata_bytes = crate::encoding::serialize_to_bytes_rmp(&block.token_metadata)
-            .expect("Block token metadata couldn't be serialized.");
+        let mut metadata_bytes = canonical_map_bytes(&block.token_metadata)
+            .expect("Block token metadata couldn't be canonicalized.");
         input.append(&mut metadata_bytes);
+
+        let mut proposer_bytes = crate::encoding::serialize_to_bytes_rmp(&block.proposer_key)
+            .expect("Block proposer_key couldn't be serialized.");
+        input.append(&mut proposer_bytes);
+
+        let mut epoch_bytes = crate::encoding::serialize_to_bytes_rmp(&block.epoch_number)
+            .expect("Block epoch_number couldn't be serialized.");
+        input.append(&mut epoch_bytes);
 
         BasicHashProvider::new().hash(&input)
     }
+}
+
+/// Serialize a `HashMap` in a canonical, sorted-key form.
+///
+/// A `std` `HashMap`'s iteration order is random-seeded, so serializing the same logical contents
+/// directly produces different bytes on different runs. Building a `BTreeMap` from it first sorts
+/// the entries by key, making the serialized form deterministic. Used by `create_hash` so a block's
+/// hash reflects its content rather than the memory layout of its maps.
+fn canonical_map_bytes<'a, K, V>(map: &'a HashMap<K, V>) -> Result<Vec<u8>, std::io::Error>
+where
+    K: 'a + Ord + Serialize,
+    V: 'a + Serialize,
+{
+    let sorted: BTreeMap<&'a K, &'a V> = map.iter().collect();
+    crate::encoding::serialize_to_bytes_rmp(&sorted)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -226,6 +261,7 @@ impl ChainState {
 pub mod tests {
     use super::*;
     use crate::blocks::Block;
+    use crate::transactions::{Transaction, TransactionSignature};
 
     // --- FinalityStatus tests ---
 
@@ -384,5 +420,135 @@ pub mod tests {
         genesis_block.current_hash = vec![1, 2, 3];
 
         assert!(!blockchain.validate_next_block(&genesis_block));
+    }
+
+    // --- Phase 2.1 (C2): canonical block hash is order-independent ---
+
+    /// A `TransactionSignature` for an executor public key.
+    fn sig_entry(key: Vec<u8>) -> TransactionSignature {
+        TransactionSignature {
+            transaction_id: vec![1],
+            env_id: vec![2],
+            transaction_hash: key.clone(),
+            signature: key,
+            current_stake: 1,
+        }
+    }
+
+    /// A populated `SignedTransaction` with a non-empty `executor_sigs` map.
+    fn signed_tx_with(executor_sigs: HashMap<Vec<u8>, TransactionSignature>) -> SignedTransaction {
+        SignedTransaction {
+            transaction_id: "block_tx".into(),
+            transaction: Transaction {
+                id: "block_tx".into(),
+                action: "Transfer".into(),
+                token_id: vec![1, 2, 3],
+                bid: None,
+                sequence_number: 7,
+                sender: vec![9, 9, 9],
+                receiver: vec![8, 8, 8],
+                amount: Some(500),
+                timestamp: 4242,
+                result_hash: vec![0xAA],
+            },
+            total_stake: 1000,
+            total_voters: 5,
+            leader_address: vec![11, 22, 33],
+            leader_stake: 500,
+            leader_hash: vec![4, 5, 6],
+            finalizer_addr: vec![7, 7, 7],
+            finalizer_sig: sig_entry(vec![7, 7, 7]),
+            executor_sigs,
+            proposer_key: vec![3, 1, 4],
+        }
+    }
+
+    /// A populated `Block` whose maps can be varied in insertion order; `current_hash` is computed.
+    fn populated_block(
+        metadata: HashMap<String, String>,
+        executor_sigs: HashMap<Vec<u8>, TransactionSignature>,
+    ) -> Block {
+        let mut block = Block {
+            signed_trans: signed_tx_with(executor_sigs),
+            token_metadata: metadata,
+            previous_hash: vec![0xDE, 0xAD],
+            timestamp: 999,
+            current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![3, 1, 4],
+            epoch_number: 17,
+        };
+        block.current_hash = BlockFactory::create_hash(&block);
+        block
+    }
+
+    /// `token_metadata` contents in one order.
+    fn metadata_forward() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("decimals".into(), "18".into());
+        m.insert("name".into(), "AcmeCoin".into());
+        m.insert("symbol".into(), "ACM".into());
+        m
+    }
+
+    /// Same `token_metadata` contents in a *different* order.
+    fn metadata_reversed() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("symbol".into(), "ACM".into());
+        m.insert("name".into(), "AcmeCoin".into());
+        m.insert("decimals".into(), "18".into());
+        m
+    }
+
+    /// `executor_sigs` contents in one order.
+    fn sigs_forward() -> HashMap<Vec<u8>, TransactionSignature> {
+        let mut m = HashMap::new();
+        m.insert(vec![10], sig_entry(vec![10]));
+        m.insert(vec![20], sig_entry(vec![20]));
+        m.insert(vec![30], sig_entry(vec![30]));
+        m
+    }
+
+    /// Same `executor_sigs` contents in a *different* order.
+    fn sigs_reversed() -> HashMap<Vec<u8>, TransactionSignature> {
+        let mut m = HashMap::new();
+        m.insert(vec![30], sig_entry(vec![30]));
+        m.insert(vec![20], sig_entry(vec![20]));
+        m.insert(vec![10], sig_entry(vec![10]));
+        m
+    }
+
+    #[test]
+    fn block_hash_is_deterministic_across_insertion_order() {
+        let a = populated_block(metadata_forward(), sigs_forward());
+        let b = populated_block(metadata_reversed(), sigs_reversed());
+        // Same logical block, both maps populated in different insertion orders → identical hash.
+        assert_eq!(a.current_hash, b.current_hash);
+    }
+
+    #[test]
+    fn block_hash_is_deterministic_across_serde_roundtrip() {
+        let a = populated_block(metadata_forward(), sigs_forward());
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&a).unwrap();
+        let mut b: Block = crate::encoding::deserialize_rmp_to(&bytes).unwrap();
+        // Recompute as the pipeline does (it sets current_hash = create_hash(block)); the
+        // deserialized block carries the same contents in a fresh, re-seeded HashMap state.
+        b.current_hash = BlockFactory::create_hash(&b);
+        assert_eq!(a.current_hash, b.current_hash);
+    }
+
+    #[test]
+    fn block_hash_binds_proposer_and_epoch() {
+        let a = populated_block(metadata_forward(), sigs_forward());
+        // Same everything, only proposer_key differs → hash must change (proposer_key is bound in).
+        let mut b = populated_block(metadata_forward(), sigs_forward());
+        b.proposer_key = vec![9, 9, 9];
+        b.current_hash = BlockFactory::create_hash(&b); // recompute after the field change
+        assert_ne!(a.current_hash, b.current_hash);
+        // Same everything, only epoch_number differs → hash must change (epoch_number is bound in).
+        let mut c = populated_block(metadata_forward(), sigs_forward());
+        c.epoch_number = 18;
+        c.current_hash = BlockFactory::create_hash(&c); // recompute after the field change
+        assert_ne!(a.current_hash, c.current_hash);
     }
 }

@@ -169,7 +169,7 @@ work and removes forgeable identity from the consensus path.*
 *Closes: C2, C6, L7. Small mechanical fixes with large impact — without these, no two nodes can
 agree on anything.*
 
-- [ ] **2.1 Canonical serialization in the block hash; hash-bind the missing fields** (C2)
+- [x] **2.1 Canonical serialization in the block hash; hash-bind the missing fields** (C2)
   Files: `src/blocks.rs:24, 85-101`, `src/transactions.rs:273`.
   Action: `BlockFactory::create_hash` must hash canonical forms — sorted-key (e.g. `BTreeMap`
   or explicit sort) serialization of `token_metadata` and `executor_sigs`; include

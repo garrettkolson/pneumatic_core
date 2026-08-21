@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use crate::blocks::Block;
 use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
@@ -309,6 +309,55 @@ impl SignedTransaction {
             proposer_key: vec![],
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical serialization for the block hash
+// ---------------------------------------------------------------------------
+
+/// Deterministic, order-independent serialization of a `SignedTransaction`, used by
+/// `BlockFactory::create_hash`.
+///
+/// `SignedTransaction`'s only non-deterministic field is `executor_sigs`, a `std` `HashMap` whose
+/// iteration order is random-seeded. This serializes a view whose `executor_sigs` is a `BTreeMap`
+/// (sorted by executor public key), so two equal `SignedTransaction`s always produce identical
+/// bytes regardless of insertion order or a serde round-trip. The real `Serialize` impl of
+/// `SignedTransaction` is left untouched — this is hashing-only, it does not change the wire form.
+#[derive(Serialize)]
+struct CanonicalSignedTransaction<'a> {
+    transaction_id: &'a str,
+    transaction: &'a Transaction,
+    total_stake: u64,
+    total_voters: u32,
+    leader_address: &'a [u8],
+    leader_stake: u64,
+    leader_hash: &'a [u8],
+    finalizer_addr: &'a [u8],
+    finalizer_sig: &'a TransactionSignature,
+    executor_sigs: BTreeMap<&'a Vec<u8>, &'a TransactionSignature>,
+    proposer_key: &'a [u8],
+}
+
+/// Serialize a `SignedTransaction` in canonical (sorted-key) form for block hashing.
+pub(crate) fn canonical_signed_trans_bytes(
+    tx: &SignedTransaction,
+) -> Result<Vec<u8>, std::io::Error> {
+    let cst = CanonicalSignedTransaction {
+        transaction_id: &tx.transaction_id,
+        transaction: &tx.transaction,
+        total_stake: tx.total_stake,
+        total_voters: tx.total_voters,
+        leader_address: &tx.leader_address,
+        leader_stake: tx.leader_stake,
+        leader_hash: &tx.leader_hash,
+        finalizer_addr: &tx.finalizer_addr,
+        finalizer_sig: &tx.finalizer_sig,
+        // BTreeMap collects the HashMap entries sorted by public key — mirroring the finalizer's
+        // own canonical signature ordering (finalizer/src/block_builder.rs:141-142).
+        executor_sigs: tx.executor_sigs.iter().collect(),
+        proposer_key: &tx.proposer_key,
+    };
+    crate::encoding::serialize_to_bytes_rmp(&cst)
 }
 
 // ---------------------------------------------------------------------------
