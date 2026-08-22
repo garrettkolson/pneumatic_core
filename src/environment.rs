@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::logging::{FileLogger, Logger};
-use crate::tokens::BlockValidator;
 use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry,
     SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec};
 
@@ -105,8 +103,6 @@ pub struct EnvironmentMetadata {
     /// Gas cost model for action pricing and protocol policy
     pub cost_model: CostModel,
     pub asym_crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
-    /// Block validators keyed by spec name (for per-token block validation).
-    pub block_validators: Arc<DashMap<String, Box<dyn BlockValidator>>>,
     /// Transaction validation specs — action-based specs registered by name.
     pub transaction_validation_specs: Arc<ValidationSpecRegistry>,
     /// Block validator specs — used by Committers and Archivers.
@@ -202,7 +198,6 @@ impl EnvironmentMetadata {
             max_risk: spec.max_risk,
             cost_model: spec.cost_model,
             asym_crypto_provider,
-            block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(specs),
             block_validator_specs: Arc::new(block_specs),
             allowed_token_types: spec.allowed_token_types,

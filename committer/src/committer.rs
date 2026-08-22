@@ -1184,7 +1184,14 @@ mod tests {
 
     fn bootstrap_token_chain(committer: &Committer) {
         // Pre-seed a genesis block so these tests exercise the
-        // non-empty-chain path
+        // non-empty-chain path. Also mark the token self-verified: with
+        // fail-closed block validation (AUDIT Phase 3.2 / C5) a process-style
+        // block committed on this chain only validates under the "SelfSigned"
+        // spec, which gates on token.is_self_verified.
+        if let Some(mut entry) = committer.tokens.get_mut(&vec![1]) {
+            entry.value_mut().is_self_verified = true;
+        }
+
         let prev_hash = vec![42u8; 32];
         let signed = SignedTransaction::test_transaction();
         let mut genesis = Block {
@@ -1911,6 +1918,10 @@ mod tests {
         // Bootstrap the token only — the chain stays empty
         let mut token = Token::new();
         token.id = vec![1];
+        // Fail-closed validation (AUDIT Phase 3.2 / C5): the genesis commit only
+        // validates under the "SelfSigned" spec when the token is flagged
+        // is_self_verified.
+        token.is_self_verified = true;
         committer.bootstrap_token(token);
 
         let tx_id = "tx_first_block";

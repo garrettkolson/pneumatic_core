@@ -234,7 +234,7 @@ agree on anything.*
   authenticated envelope sender ≠ `transaction.sender`.
   Verify: a peer cannot submit a transfer debiting an account it does not control.
 
-- [ ] **3.2 Real block validation, fail closed** (C5)
+- [x] **3.2 Real block validation, fail closed** (C5)
   Files: `src/environment.rs:205` (block validator registry created empty),
   `src/tokens.rs:864-869` (accept-all `DefaultBlockValidator`).
   Action: populate the registry in production wiring; remove the accept-all fallback — no

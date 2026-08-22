@@ -10,6 +10,7 @@ use crate::encoding::serialize_to_bytes_rmp;
 use crate::environment::{CostModel, EnvironmentMetadata};
 use crate::transactions::{SignedTransaction, TransactionCommit};
 use crate::registry::{PendingAdminCredit, PendingTransactionRegistry};
+use crate::errors::{PneumaticError, ValidationFailureReason};
 
 /// A token IS its own blockchain — independent parallel ledgers.
 #[derive(Serialize, Deserialize, Debug)]
@@ -164,9 +165,33 @@ impl Token {
             self.block_validation_spec_name.clone()
         };
 
-        match env_data.block_validators.get(&validator_name) {
-            None => DefaultBlockValidator {}.validate(block, &self),
-            Some(v) => v.validate(block, &self),
+        // Fail closed (AUDIT Phase 3.2 / C5): there is no accept-all fallback.
+        // If no validator is registered for this token's spec name, reject the
+        // block instead of silently passing. Validation now delegates to the
+        // already-populated spec registry; the concrete `block_validators` map
+        // was removed.
+        // Fail closed (AUDIT Phase 3.2 / C5): there is no accept-all fallback.
+        // If no validator is registered for this token's spec name, reject the
+        // block instead of silently passing. Validation now delegates to the
+        // already-populated spec registry; the concrete `block_validators` map
+        // was removed.
+        let spec = match env_data.block_validator_specs.get(&validator_name) {
+            Some(spec) => spec,
+            None => return BlockValidationResult::Err(BlockValidationError::NoValidatorRegistered),
+        };
+
+        // Delegate to the registered validator spec and translate its result
+        // (validation::BlockValidationResult / a PneumaticError) into the
+        // token's own BlockValidationResult.
+        match spec.validate(block, &self, env_data) {
+            Ok(crate::validation::BlockValidationResult::Valid) => BlockValidationResult::Ok,
+            Ok(crate::validation::BlockValidationResult::Invalid(reasons)) => {
+                BlockValidationResult::Err(BlockValidationError::InvalidBlock(reasons))
+            }
+            Err(PneumaticError::Validation(reasons)) => {
+                BlockValidationResult::Err(BlockValidationError::InvalidBlock(reasons))
+            }
+            Err(_) => BlockValidationResult::Err(BlockValidationError::InvalidBlock(vec![])),
         }
     }
 
@@ -809,6 +834,11 @@ mod tests {
     fn commit_block_first_block_on_empty_chain_succeeds() {
         let env = make_test_env();
         let mut token = Token::test_token();
+        // Fail-closed validation (Phase 3.2 / C5) delegates to the token's
+        // "SelfSigned" spec, which requires is_self_verified. The test token
+        // defaults that flag to false — set it so the commit is genuinely
+        // validated rather than falling through to the (removed) accept-all.
+        token.is_self_verified = true;
 
         // Fresh block via the standard constructor: empty previous_hash
         // (genesis convention) and current_hash not yet computed.
@@ -851,22 +881,27 @@ mod tests {
             BlockCommitError::BlockValidationError(BlockValidationError::ChainLinkage)
         ));
     }
-}
 
-// ---------------------------------------------------------------------------
-// BlockValidator — trait for validating blocks
-// ---------------------------------------------------------------------------
+    #[test]
+    fn commit_block_rejects_token_with_no_registered_validator() {
+        // AUDIT Phase 3.2 / C5 — fail closed: a token whose spec name has no
+        // registered validator must be rejected, never silently accepted.
+        let env = make_test_env(); // registers only "SelfSigned"/"Executed"
+        let mut token = Token::test_token();
+        token.block_validation_spec_name = String::from("NonexistentValidator");
 
-pub trait BlockValidator: Send + Sync {
-    fn validate(&self, block: &Block, token: &Token) -> BlockValidationResult;
-}
+        let block = Block::from_transaction(
+            SignedTransaction::test_transaction(),
+            token.blockchain.clone(),
+            &token,
+            0,
+        );
 
-pub struct DefaultBlockValidator {}
-
-impl BlockValidator for DefaultBlockValidator {
-    fn validate(&self, block: &Block, token: &Token) -> BlockValidationResult {
-        let _ = (block, token);
-        BlockValidationResult::Ok
+        let err = token.commit_block(block, false, &env).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockCommitError::BlockValidationError(BlockValidationError::NoValidatorRegistered)
+        ));
     }
 }
 
@@ -904,6 +939,12 @@ pub enum BlockValidationError {
     FinalizedTransactionDataWasModified,
     InvalidFinalizerSignature,
     ChainLinkage,
+    /// No block validator is registered for this token's spec name
+    /// (AUDIT Phase 3.2 / C5 — fail closed; there is no accept-all fallback).
+    NoValidatorRegistered,
+    /// A registered validator rejected the block; carries the spec's failure
+    /// reasons.
+    InvalidBlock(Vec<ValidationFailureReason>),
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -916,6 +957,10 @@ impl std::fmt::Display for BlockValidationError {
             BlockValidationError::FinalizedTransactionDataWasModified => write!(f, "FinalizedTransactionDataWasModified"),
             BlockValidationError::InvalidFinalizerSignature => write!(f, "InvalidFinalizerSignature"),
             BlockValidationError::ChainLinkage => write!(f, "ChainLinkage"),
+            BlockValidationError::NoValidatorRegistered => write!(f, "NoValidatorRegistered"),
+            BlockValidationError::InvalidBlock(reasons) => {
+                write!(f, "InvalidBlock({reasons:?})")
+            }
         }
     }
 }

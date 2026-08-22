@@ -354,7 +354,6 @@ mod tests {
             max_risk: 1.0,
             cost_model: CostModel::default(),
             asym_crypto_provider: Arc::new(RwLock::new(Ed25519Provider::generate())),
-            block_validators: Arc::new(DashMap::new()),
             transaction_validation_specs: Arc::new(ValidationSpecRegistry::new()),
             block_validator_specs: Arc::new(BlockValidatorSpecRegistry::new()),
             logger: Arc::new(FileLogger::new("test.log".to_string())),

@@ -343,7 +343,11 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
     token.security_level = 10;
     token.is_self_verified = true;
     token.is_non_transferable = false;
-    token.block_validation_spec_name = String::new();
+    // Fail-closed block validation (Phase 3.2 / C5) requires a registered
+    // validator spec; "SelfSigned" validates these genesis/process-style
+    // blocks (chain linkage + is_self_verified). The empty string here would
+    // otherwise resolve to the unregistered name "" and get rejected.
+    token.block_validation_spec_name = String::from("SelfSigned");
     token.environment_id = "test".to_string();
     token.sequence_number = 1;
 
