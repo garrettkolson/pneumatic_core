@@ -28,6 +28,13 @@ pub struct Block {
     /// Whether this block is optimistically committed or confirmed.
     pub finality_status: FinalityStatus,
     /// Public key of the proposer who created this block.
+    ///
+    /// Single semantics (AUDIT Phase 2.3, finding C2): this is the leader/proposer identity
+    /// recorded on the signed transaction, i.e. always read from
+    /// `SignedTransaction.proposer_key`. All block constructors (`from_transaction`,
+    /// `Token::create_block`, `BlockBuilder::create_block`) derive it from that field, so the
+    /// value is consistent regardless of which constructor formed the block — it feeds the block
+    /// hash, the stake lookup, and the slash-target selection in conflict resolution.
     pub proposer_key: Vec<u8>,
     /// Epoch number at which this block was proposed.
     /// Used by downstream nodes to verify deterministic routing decisions.
@@ -54,7 +61,10 @@ impl Block {
             timestamp: Utc::now().timestamp(),
             current_hash: vec![],
             finality_status: FinalityStatus::Optimistic,
-            proposer_key: signed.leader_address.clone(),
+            // Phase 2.3 (C2): derive proposer_key from the same SignedTransaction field the
+            // other block constructors use, so its value is consistent everywhere it is hashed
+            // and consulted for conflict resolution.
+            proposer_key: signed.proposer_key.clone(),
             epoch_number,
         }
     }
@@ -306,6 +316,24 @@ pub mod tests {
 
         // Genesis convention: block 1 has an empty previous_hash
         assert!(block.previous_hash.is_empty());
+    }
+
+    /// Phase 2.3 (C2): `Block::from_transaction` derives `proposer_key` from the signed
+    /// transaction's `proposer_key`, not `leader_address`. A leader/key drift must resolve to a
+    /// single, hash-bound value everywhere the block is consumed.
+    #[test]
+    fn from_transaction_uses_signed_transaction_proposer_key() {
+        let mut tx = SignedTransaction::test_transaction();
+        // leader_address and proposer_key deliberately diverge (the C2 drift scenario).
+        tx.leader_address = vec![11, 22, 33];
+        tx.proposer_key = vec![3, 1, 4];
+        let blockchain = Blockchain::new();
+        let token = Token::test_token();
+
+        let block = Block::from_transaction(tx, blockchain, &token, 7);
+
+        assert_eq!(block.proposer_key, vec![3, 1, 4]);
+        assert_eq!(block.epoch_number, 7);
     }
 
     #[test]

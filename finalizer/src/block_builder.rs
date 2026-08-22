@@ -30,7 +30,10 @@ pub struct BlockBuilder {
     verifying_key: VerifyingKey,
     /// Hash provider for computing block hashes
     hash_provider: Arc<dyn pneumatic_core::crypto::HashProvider>,
-    /// Leader address (genesis block proposer)
+    /// The current epoch's verified leader identity — the proposer recorded on the blocks this
+    /// finalizer builds. It populates `SignedTransaction.leader_address` and
+    /// `SignedTransaction.proposer_key`; both must equal the epoch-selected leader so the final
+    /// block's identity is consistent with the committer path (Phase 2.3, finding C2).
     leader_address: Vec<u8>,
     /// Leader's stake amount
     leader_stake: u64,
@@ -176,6 +179,8 @@ impl BlockBuilder {
         previous_hash: Vec<u8>,
         epoch_number: u64,
     ) -> Block {
+        // Phase 2.3 (C2): proposer_key is the block's identity in the hash + conflict resolution,
+        // so read it from the signed transaction (the same field `Block::from_transaction` uses).
         let proposer_key = signed_tx.proposer_key.clone();
         let block = Block {
             signed_trans: signed_tx,
@@ -459,5 +464,73 @@ mod tests {
         let beta_key: Vec<u8> = b"beta".to_vec();
         assert!(signed.executor_sigs.contains_key(&alpha_key));
         assert!(signed.executor_sigs.contains_key(&beta_key));
+    }
+
+    /// Phase 2.3 (C2): the three block constructors agree on `proposer_key` from a
+    /// `SignedTransaction` whose `leader_address` and `proposer_key` diverge. Without the
+    /// `Block::from_transaction` fix (which read `leader_address`), the core block would carry a
+    /// different, hash-bound proposer identity than the finalizer block.
+    #[test]
+    fn all_block_constructors_agree_on_proposer_key() {
+        let signed = SignedTransaction {
+            transaction_id: "c2_test".into(),
+            transaction: Transaction {
+                id: "c2_test".into(),
+                action: "Transfer".into(),
+                token_id: vec![1, 2, 3],
+                bid: None,
+                sequence_number: 1,
+                sender: vec![9],
+                receiver: vec![8],
+                amount: Some(500),
+                timestamp: 4242,
+                result_hash: vec![0xAA],
+            },
+            total_stake: 1000,
+            total_voters: 5,
+            leader_address: vec![11, 22, 33],
+            leader_stake: 500,
+            leader_hash: vec![4, 5, 6],
+            finalizer_addr: vec![7, 7, 7],
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![1],
+                env_id: vec![2],
+                transaction_hash: vec![3],
+                signature: vec![4],
+                current_stake: 1,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![3, 1, 4],
+        };
+
+        // Finalizer: BlockBuilder::create_block.
+        let hp = Arc::new(pneumatic_core::crypto::BasicHashProvider::new());
+        let (signing_key, verifying_key) = make_test_keypair();
+        let builder = BlockBuilder::new(
+            signing_key,
+            verifying_key,
+            hp,
+            vec![11, 22, 33], // leader_address
+            500,
+            vec![4, 5, 6],
+            vec![7, 7, 7],
+        );
+        let finalizer_block = builder.create_block(signed.clone(), vec![1, 2, 3], 17);
+        assert_eq!(finalizer_block.proposer_key, vec![3, 1, 4]);
+
+        // Core: Token::create_block.
+        let token_block = pneumatic_core::tokens::Token::new().create_block(signed.clone(), 17);
+        assert_eq!(token_block.proposer_key, vec![3, 1, 4]);
+
+        // Core: Block::from_transaction — the constructor the fix changed.
+        let token = pneumatic_core::tokens::Token::new();
+        let blockchain = pneumatic_core::blocks::Blockchain::new();
+        let core_block = pneumatic_core::blocks::Block::from_transaction(
+            signed,
+            blockchain,
+            &token,
+            17,
+        );
+        assert_eq!(core_block.proposer_key, vec![3, 1, 4]);
     }
 }

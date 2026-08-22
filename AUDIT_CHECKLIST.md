@@ -197,11 +197,28 @@ agree on anything.*
   `deterministic_select_shard` still returns `Vec<Vec<u8>>` — internal ordering normalization only,
   no wire-shape change (AUDIT ground rule 4). Core 321 (was 320, +1); full workspace 0 failed.
 
-- [ ] **2.3 One `proposer_key` semantics** (C2)
-  Files: `src/blocks.rs:57` vs `committer/src/block_builder.rs:179,187`.
-  Action: make both constructors set `proposer_key` identically (from the verified leader
-  identity).
-  Verify: both constructors produce the same `proposer_key` for the same leader.
+- [x] **2.3 One `proposer_key` semantics** (C2) — *done 2026-08-21*
+  Files: `src/blocks.rs:57`, `src/tokens.rs:180`, `finalizer/src/block_builder.rs:179,187`
+  (the checklist's `committer/src/block_builder.rs` path is stale — the file has always lived in
+  the finalizer crate; the quoted line numbers 179/187 match it exactly).
+  Action: unify the one field `Block.proposer_key` is derived from. `Token::create_block` and
+  `BlockBuilder::create_block` already read `signed_tx.proposer_key`; `Block::from_transaction`
+  read `signed.leader_address` instead — change it to `signed.proposer_key`. Add a single
+  semantics doc comment at `src/blocks.rs:30` (always the leader identity on the signed
+  transaction, fed to the hash + conflict resolution), and a doc note on the finalizer's
+  `leader_address` field (line 33) that it must equal the epoch-selected leader.
+  Verify: both/all constructors produce the same `proposer_key` for the same leader.
+  **Done:** `Block::from_transaction` now sets `proposer_key: signed.proposer_key.clone()`
+  (`src/blocks.rs:67`); `Token::create_block` and `BlockBuilder::create_block` were already
+  correct — the mismatch was latent because every producer set `SignedTransaction.leader_address`
+  and `.proposer_key` equal. One-line production change, no wire/serialized-field change
+  (AUDIT ground rule 4). Regression `from_transaction_uses_signed_transaction_proposer_key`
+  (`src/blocks.rs`, asserts a `leader_address != proposer_key` tx resolves to the tx's
+  `proposer_key`) and `all_block_constructors_agree_on_proposer_key` (finalizer, runs one
+  drifted `SignedTransaction` through all three constructors and asserts identical
+  `proposer_key`) — each proven a true discriminator by reverting the one-line fix. `cargo
+  check` clean; full workspace **473** green (baseline 471 + these 2); grep gate shows no
+  remaining `leader_address`→`proposer_key` derivation in core block construction.
 
 - [ ] **2.4 `remove_block` pops the tip** (L7)
   File: `src/blocks.rs:127-129`.
