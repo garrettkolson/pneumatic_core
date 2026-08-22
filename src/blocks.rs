@@ -153,6 +153,21 @@ pub struct Blockchain {
     pub metadata: HashMap<String, String>,
 }
 
+/// Outcome of validating and appending a block (AUDIT Phase 3.3 / C5):
+/// distinguishes the non-fatal "node is behind" case from the fatal tamper case so callers can keep
+/// the existing gossip semantics — drop a stale/sibling block (ignore) but reject an invalid hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// The block does not chain onto the current tip (it is a non-tip sibling or the receiver is
+    /// behind). The caller should ignore it, never reject.
+    LinkageMismatch,
+    /// The block's recomputed hash differs from its claimed `current_hash`, or it is internally
+    /// inconsistent. The caller must reject it (fail closed).
+    InvalidHash,
+    /// The block validated and was appended to the tip.
+    Appended,
+}
+
 impl Blockchain {
     pub fn new() -> Self {
         Blockchain {
@@ -167,6 +182,42 @@ impl Blockchain {
 
     pub fn add_block(&mut self, block: Block) {
         self.chain.push_back(block);
+    }
+
+    /// Validate `block` against this chain and append it, **under a single `&mut self` borrow**
+    /// (AUDIT Phase 3.3 / C5).
+    ///
+    /// The read of the tip (`get_current_chain_state`) and the append (`push_back`) happen inside
+    /// this one `&mut self` call — there is no window in which another writer can append a sibling
+    /// block between the linkage check and the append. This is the same atomic read-tip-then-append
+    /// shape `Token::commit_block` uses on the `Commit` path.
+    ///
+    /// Linkage (`previous_hash` == tip, or both empty for genesis) is non-fatal: a non-tip sibling
+    /// is dropped rather than rejected, preserving the existing gossip semantics. An internally
+    /// inconsistent block (recomputed hash != `current_hash`) is fatal.
+    pub fn append_validated_block(&mut self, block: &Block) -> AppendOutcome {
+        let current_state = self.get_current_chain_state();
+
+        // Linkage (non-fatal): block does not chain onto the current tip — the receiver is behind
+        // or this is a sibling block. Drop it, don't reject.
+        let linkage_ok = if current_state.last_hash_in.is_empty() {
+            block.previous_hash.is_empty()
+        } else {
+            current_state.last_hash_in == block.previous_hash
+        };
+        if !linkage_ok {
+            return AppendOutcome::LinkageMismatch;
+        }
+
+        // Hash (fatal): the block is internally inconsistent — its recomputed hash differs from its
+        // claimed `current_hash` (tampered), or its `previous_hash` does not match the recomputed
+        // tip. Reject, do not silently pass.
+        if BlockFactory::create_hash(block) != block.current_hash {
+            return AppendOutcome::InvalidHash;
+        }
+
+        self.chain.push_back(block.clone());
+        AppendOutcome::Appended
     }
 
     /// Removes and returns the TIP (most recent block, the head of the chain).

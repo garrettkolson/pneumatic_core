@@ -24,6 +24,9 @@ pub enum CommitterError {
     EnvironmentMismatch { expected: String, got: String },
     /// Proposed block has an empty hash
     InvalidBlockHash,
+    /// The block's finalizer signature is missing or does not verify against the claimed
+    /// `finalizer_addr` — fail closed (AUDIT Phase 3.3 / C5).
+    InvalidFinalizerSignature,
     /// Block validation/commit failed on the token
     BlockCommit(BlockCommitError),
     /// Unknown message action

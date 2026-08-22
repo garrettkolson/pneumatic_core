@@ -9,7 +9,7 @@ use pneumatic_core::crypto::AsymCryptoProvider;
 use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
-use pneumatic_core::blocks::{Block, BlockFactory, Blockchain, FinalityStatus};
+use pneumatic_core::blocks::{AppendOutcome, Block, BlockFactory, Blockchain, FinalityStatus};
 
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, ConflictResolution, EpochBoundaryDetector, ExecutorSet, IEpochLeaderSelector, IEpochReconciler, IBlockProposer, IStakingManager, StakeSet, resolve_block_conflict};
 use pneumatic_core::gossiper::Gossiper;
@@ -449,6 +449,30 @@ impl Committer {
     /// This is the entry point for quorum gossip — the finalizer has
     /// committed a block and is broadcasting it to all nodes.
     /// Receivers validate the block, append it, and broadcast a vote.
+    /// Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5).
+    ///
+    /// A `BlockFinalized` block carries exactly one authoritative signature — the finalizer's, in
+    /// `SignedTransaction.finalizer_sig`. Its `transaction_hash` is the hash the finalizer actually
+    /// signed, so the Ed25519 verification needs no reconstruction. Because `create_hash` binds the
+    /// whole `finalizer_sig` into the block hash (canonical serialization includes it), a swapped
+    /// signature would already fail the linkage/hash check in `append_validated_block`. Reject a
+    /// missing or unverified signature rather than silently accepting it.
+    fn verify_block_finalizer_sig(&self, block: &Block) -> Result<(), CommitterError> {
+        let finalizer_sig = &block.signed_trans.finalizer_sig;
+        if finalizer_sig.signature.is_empty() {
+            return Err(CommitterError::InvalidFinalizerSignature);
+        }
+        let valid = self.identity.ed25519.check_signature(
+            &finalizer_sig.signature,
+            &block.signed_trans.finalizer_addr,
+            &finalizer_sig.transaction_hash,
+        )?;
+        if !valid {
+            return Err(CommitterError::InvalidFinalizerSignature);
+        }
+        Ok(())
+    }
+
     async fn handle_block_finalized(&self, message: Message) -> Result<(), CommitterError> {
         let block: Block = deserialize_rmp_to(&message.body)
             .map_err(CommitterError::Deserialization)?;
@@ -462,39 +486,37 @@ impl Committer {
             cache.insert(block_hash.clone(), stake_set.clone());
         }
 
-        // Check token exists, get chain tip for validation
-        let tip = {
-            let token_entry = self.tokens.get(token_id).ok_or_else(|| {
-                CommitterError::TokenNotFound(bytes_to_hex(token_id))
-            })?;
-            token_entry.value().blockchain.get_current_chain_state()
-        };
+        // Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5): reject a block whose
+        // finalizer signature does not verify. Pure computation over the block's own fields — no
+        // lock is held here.
+        self.verify_block_finalizer_sig(&block)?;
 
-        // Validate chain linkage (non-fatal if node is behind)
-        if block.previous_hash != tip.last_hash_in {
-            self.env_data.logger.log(format!(
-                "BlockFinalized: previous_hash mismatch for token [{}], ignoring",
-                bytes_to_hex(token_id)
-            ));
-            return Ok(());
-        }
-
-        // Validate block hash (fatal if tampered)
-        let expected_hash = BlockFactory::create_hash(&block);
-        if expected_hash != block.current_hash {
-            self.env_data.logger.log(format!(
-                "BlockFinalized: invalid hash for token [{}], rejecting",
-                bytes_to_hex(token_id)
-            ));
-            return Err(CommitterError::InvalidBlockHash);
-        }
-
-        // Append block to local chain
+        // Validate linkage + hash and append under a SINGLE mutable borrow of the token (AUDIT
+        // Phase 3.3 / C5). This closes the read-then-`get_mut` gap: previously the tip was read via
+        // an immutable borrow, dropped, and only then re-looked-up mutably — so two concurrent
+        // sibling blocks could both validate and both append. `append_validated_block` reads the tip
+        // and appends inside one `&mut self`, which maps here to a single `get_mut` on the token.
         {
             let mut entry = self.tokens.get_mut(token_id).ok_or_else(|| {
                 CommitterError::TokenNotFound(bytes_to_hex(token_id))
             })?;
-            entry.value_mut().blockchain.add_block(block.clone());
+            match entry.value_mut().blockchain.append_validated_block(&block) {
+                AppendOutcome::LinkageMismatch => {
+                    self.env_data.logger.log(format!(
+                        "BlockFinalized: previous_hash mismatch for token [{}], ignoring",
+                        bytes_to_hex(token_id)
+                    ));
+                    return Ok(());
+                }
+                AppendOutcome::InvalidHash => {
+                    self.env_data.logger.log(format!(
+                        "BlockFinalized: invalid hash for token [{}], rejecting",
+                        bytes_to_hex(token_id)
+                    ));
+                    return Err(CommitterError::InvalidBlockHash);
+                }
+                AppendOutcome::Appended => {}
+            }
         }
 
         // Distribute to archivars (propagate gossip)
@@ -1020,7 +1042,7 @@ mod tests {
 
     use pneumatic_core::blocks::Block;
     use pneumatic_core::config::Config;
-    use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider};
+    use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider, Ed25519Provider};
     use pneumatic_core::data::{DataError, DataProvider, StubDataProvider};
     use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
@@ -2075,12 +2097,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build a valid block for the given transaction, chained off the current tip.
+    /// Build a gossip block that chains off the token's **live** chain tip, carrying a valid,
+    /// self-consistent finalizer signature (AUDIT Phase 3.3 / C5). `verify_block_finalizer_sig`
+    /// re-checks this signature in `handle_block_finalized`, so an empty or forged signature would
+    /// now be rejected — a pre-fix `make_gossip_block` used `signature: vec![]` and slipped through.
     fn make_gossip_block(committer: &Committer, trans_id: &str, proposer_key: Vec<u8>) -> Block {
         let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
             entry.value().blockchain.get_current_chain_state().last_hash_in
         } else {
             vec![42u8; 32]
         };
+        make_gossip_block_at_prev(trans_id, proposer_key, &prev_hash)
+    }
+
+    /// Build a gossip block with a caller-supplied `previous_hash` (so several blocks can share a
+    /// frozen parent, as in a sibling-race test) and a valid finalizer signature. Distinct
+    /// `trans_id`s yield distinct `transaction_hash`/`signature` values, hence distinct
+    /// `current_hash` — exactly what a true sibling race needs. The finalizer signs the stored
+    /// `transaction_hash` (which `create_hash` binds via `CanonicalSignedTransaction`), so the
+    /// signature and the block hash are mutually consistent.
+    fn make_gossip_block_at_prev(
+        trans_id: &str,
+        proposer_key: Vec<u8>,
+        prev_hash: &[u8],
+    ) -> Block {
+        // A throwaway test finalizer key. `finalizer_addr` is its public key; `signature` is an
+        // Ed25519 sign over the stored `transaction_hash`, which `verify_block_finalizer_sig`
+        // re-checks against `finalizer_addr`. Any fixed value works for `transaction_hash` — it
+        // only has to survive inside the canonical bytes that `create_hash` hashes.
+        let finalizer = Ed25519Provider::generate();
+        let finalizer_addr = finalizer.public_key().expect("finalizer public key");
+        let transaction_hash = format!("gossip-{trans_id}").into_bytes();
+        let signature = finalizer.sign_data(&transaction_hash).expect("finalizer signature");
 
         let signed = SignedTransaction {
             transaction_id: trans_id.to_string(),
@@ -2099,15 +2147,15 @@ mod tests {
             },
             total_voters: 3,
             total_stake: 42,
-            leader_hash: prev_hash.clone(),
+            leader_hash: prev_hash.to_vec(),
             leader_address: vec![],
             leader_stake: 0,
-            finalizer_addr: vec![],
+            finalizer_addr: finalizer_addr.clone(),
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: transaction_hash.clone(),
+                signature,
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -2117,7 +2165,7 @@ mod tests {
         let mut block = Block {
             signed_trans: signed,
             token_metadata: HashMap::new(),
-            previous_hash: prev_hash,
+            previous_hash: prev_hash.to_vec(),
             current_hash: vec![],
             timestamp: 0,
             finality_status: FinalityStatus::Optimistic,
@@ -2223,6 +2271,93 @@ mod tests {
         assert_eq!(new_chain_len, original_chain_len + 1);
     }
 
+    /// (AUDIT Phase 3.3 / C5 discriminator) N concurrent sibling blocks — same frozen parent
+    /// (`previous_hash`), distinct tx_ids ⇒ distinct `current_hash`, each carrying a valid finalizer
+    /// signature — may only append ONE. The atomic `append_validated_block` (a single `get_mut`
+    /// spanning the tip read and the push) guarantees this; without it, the read-then-`get_mut`
+    /// gap let two siblings both validate and append (a fork), growing the chain by more than one.
+    #[tokio::test]
+    async fn concurrent_sibling_blocks_exactly_one_appended() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain.
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // Capture the tip once; every sibling chains off this same parent.
+        let tip = committer.tokens.get(&vec![1]).unwrap().value().blockchain
+            .get_current_chain_state().last_hash_in;
+        let original_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(original_len, 1); // genesis only
+
+        // Build N sibling blocks up front, each with the frozen `previous_hash` and its own valid
+        // finalizer signature — distinct tx_ids make their `current_hash` distinct.
+        let n = 16;
+        let siblings: Vec<Block> = (0..n)
+            .map(|i| make_gossip_block_at_prev(&format!("sibling-{i}"), vec![i as u8], &tip))
+            .collect();
+
+        // Fan out the concurrent handlers; each runs its own runtime.
+        // A single runtime shared across all handler threads: each spawned handler drives to
+        // completion on its own OS thread, so the handlers actually race in wall-clock time — which
+        // exposes the read-then-get_mut gap (with the gap, every sibling reads the same stale tip
+        // and all of them append). A per-thread `Runtime::new()` serialized startup and hid the race.
+        let committer_arc = Arc::new(committer);
+        // Pre-create each handler's runtime up front, outside the spawn loop, so all N handlers
+        // begin their block_on in the same instant. The per-thread `Runtime::new()` inside the
+        // loop previously serialized startup and hid the race. (A shared multi_thread runtime
+        // can't be dropped off the worker threads here, so each thread keeps its own current-thread
+        // runtime and drops it on its own OS thread.)
+        let runtimes: Vec<_> = (0..n).map(|_| tokio::runtime::Runtime::new().unwrap()).collect();
+        std::thread::scope(|s| {
+            let mut handles = vec![];
+            for (block, rt) in siblings.into_iter().zip(runtimes) {
+                let committer = committer_arc.clone();
+                let message = make_block_finalized_message(block);
+                handles.push(s.spawn(move || {
+                    rt.block_on(async { committer.handle_block_finalized(message).await })
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+
+        // Exactly one of the N siblings appended; the rest were rejected with LinkageMismatch.
+        let new_len = committer_arc.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(new_len, original_len + 1);
+    }
+
+    /// (AUDIT Phase 3.3 / C5 discriminator) A block whose finalizer signature does not verify is
+    /// rejected (`Err(InvalidFinalizerSignature)`) and never appended. A pre-fix block with an
+    /// empty `finalizer_sig` would have been accepted and appended.
+    #[tokio::test]
+    async fn handle_block_finalized_rejects_bad_finalizer_sig() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain.
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // A validly-chained block (correct previous_hash, valid finalizer sig) — then forge the
+        // signature bytes so verification fails.
+        let mut block = make_gossip_block(&committer, "forged", b"mallory".to_vec());
+        let original_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        block.signed_trans.finalizer_sig.signature = vec![0xAA; 64]; // forged
+
+        let message = make_block_finalized_message(block);
+        let result = committer.handle_block_finalized(message).await;
+        assert!(matches!(result, Err(CommitterError::InvalidFinalizerSignature)));
+
+        // Rejected → nothing appended.
+        let chain_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(chain_len, original_len);
+    }
+
     #[tokio::test]
     async fn handle_block_finalized_ignores_orphan_block() {
         let dp = Arc::new(TestDataProvider::new());
@@ -2240,7 +2375,13 @@ mod tests {
             .blockchain
             .get_count();
 
-        // Build a block with wrong previous_hash (orphaned)
+        // Build a block with wrong previous_hash (orphaned). It carries a valid finalizer
+        // signature so it clears the C5 (finalizer-sig) gate in handle_block_finalized and reaches
+        // the intended LinkageMismatch path (wrong previous_hash) instead of being rejected first.
+        let orphan_finalizer = Ed25519Provider::generate();
+        let orphan_finalizer_addr = orphan_finalizer.public_key().expect("finalizer public key");
+        let orphan_tx_hash = b"orphan-transaction-hash".to_vec();
+        let orphan_sig = orphan_finalizer.sign_data(&orphan_tx_hash).expect("finalizer signature");
         let signed = SignedTransaction {
             transaction_id: "orphan".to_string(),
             transaction: Transaction {
@@ -2261,12 +2402,12 @@ mod tests {
             leader_hash: vec![42u8; 32],
             leader_address: vec![],
             leader_stake: 0,
-            finalizer_addr: vec![],
+            finalizer_addr: orphan_finalizer_addr,
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: orphan_tx_hash,
+                signature: orphan_sig,
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -2336,6 +2477,12 @@ mod tests {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
+        // A valid finalizer signature so the block clears the C5 gate and reaches the expected
+        // TokenNotFound path (this block targets a token that is not in the committer's cache).
+        let unknown_finalizer = Ed25519Provider::generate();
+        let unknown_finalizer_addr = unknown_finalizer.public_key().expect("finalizer public key");
+        let unknown_tx_hash = b"unknown-transaction-hash".to_vec();
+        let unknown_sig = unknown_finalizer.sign_data(&unknown_tx_hash).expect("finalizer signature");
         let signed = SignedTransaction {
             transaction_id: "unknown".to_string(),
             transaction: Transaction {
@@ -2356,12 +2503,12 @@ mod tests {
             leader_hash: vec![],
             leader_address: vec![],
             leader_stake: 0,
-            finalizer_addr: vec![],
+            finalizer_addr: unknown_finalizer_addr,
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: unknown_tx_hash,
+                signature: unknown_sig,
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),

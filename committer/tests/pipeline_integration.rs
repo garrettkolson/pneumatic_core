@@ -410,12 +410,16 @@ async fn test_pipeline_no_conflict() {
             leader_address: vec![],
             leader_stake: 0,
             leader_hash: tip.clone(),
-            finalizer_addr: vec![],
+            // A valid finalizer signature (AUDIT Phase 3.3 / C5) so handle_block_finalized's
+            // fail-closed verify passes: finalizer_addr is the pubkey, signature signs the stored
+            // transaction_hash, which create_hash binds into the block hash — so current_hash stays
+            // consistent. A pre-fix block used signature: vec![] and was accepted.
+            finalizer_addr: finalizer.ed25519.public_key().expect("public key"),
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: b"pipeline_no_conflict_tx_hash".to_vec(),
+                signature: finalizer.ed25519.sign_data(b"pipeline_no_conflict_tx_hash").expect("finalizer sig"),
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -500,12 +504,15 @@ async fn test_pipeline_conflict_and_slashing() {
             leader_address: vec![1],
             leader_stake: 100,
             leader_hash: tip.clone(),
-            finalizer_addr: vec![],
+            // Valid finalizer signature (AUDIT Phase 3.3 / C5): verify_block_finalizer_sig checks
+            // it in handle_block_finalized. create_hash binds the whole finalizer_sig, so
+            // current_hash (set below) stays self-consistent.
+            finalizer_addr: finalizer.ed25519.public_key().expect("public key"),
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: b"pipeline_conflict_1_tx_hash".to_vec(),
+                signature: finalizer.ed25519.sign_data(b"pipeline_conflict_1_tx_hash").expect("finalizer sig"),
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -541,12 +548,15 @@ async fn test_pipeline_conflict_and_slashing() {
             leader_address: vec![2],
             leader_stake: 50,
             leader_hash: tip.clone(),
-            finalizer_addr: vec![],
+            // Valid finalizer signature (AUDIT Phase 3.3 / C5): verify_block_finalizer_sig checks
+            // it in handle_block_finalized. create_hash binds the whole finalizer_sig, so
+            // current_hash (set below) stays self-consistent.
+            finalizer_addr: finalizer.ed25519.public_key().expect("public key"),
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: vec![],
-                signature: vec![],
+                transaction_hash: b"pipeline_conflict_2_tx_hash".to_vec(),
+                signature: finalizer.ed25519.sign_data(b"pipeline_conflict_2_tx_hash").expect("finalizer sig"),
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
