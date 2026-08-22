@@ -215,9 +215,11 @@ impl Token {
             }
         }
 
-        // If chain has reached max length, trim oldest block
+        // If chain has reached max length, trim the oldest block (not the tip): the incoming
+        // block links to the current tip, so pruning the oldest keeps the chain validly chained.
+        // `remove_block` now removes the tip (AUDIT Phase 2.4, L7) and is not used for trimming.
         if !is_archiver && self.has_reached_max_chain_length() {
-            self.blockchain.remove_block();
+            self.blockchain.remove_oldest();
         }
 
         // Add block to the chain

@@ -220,7 +220,7 @@ agree on anything.*
   check` clean; full workspace **473** green (baseline 471 + these 2); grep gate shows no
   remaining `leader_address`→`proposer_key` derivation in core block construction.
 
-- [ ] **2.4 `remove_block` pops the tip** (L7)
+- [x] **2.4 `remove_block` pops the tip** (L7)
   File: `src/blocks.rs:127-129`.
   Action: `pop_back()` (tip), not `pop_front()`; update callers/tests.
   Verify: unit test on a multi-block chain.

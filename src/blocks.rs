@@ -169,7 +169,25 @@ impl Blockchain {
         self.chain.push_back(block);
     }
 
+    /// Removes and returns the TIP (most recent block, the head of the chain).
+    ///
+    /// This is the primitive for rolling back the head of the chain — undoing the most
+    /// recently committed block for conflict resolution, orphan handling, or rejecting an
+    /// invalid tip. To prune the oldest block instead (bounded-window trimming for
+    /// non-archivers), use `remove_oldest`.
+    ///
+    /// AUDIT Phase 2.4 (finding L7): previously `pop_front()` removed the oldest block and could
+    /// never touch the tip, so the chain had no way to undo its head.
     pub fn remove_block(&mut self) -> Option<Block> {
+        self.chain.pop_back()
+    }
+
+    /// Removes and returns the OLDEST block (genesis side).
+    ///
+    /// Used to keep the chain at its bounded length for non-archivers: when the chain reaches
+    /// `security_level`, the oldest block is pruned and the newest appended. To roll back the
+    /// tip instead, use `remove_block`.
+    pub fn remove_oldest(&mut self) -> Option<Block> {
         self.chain.pop_front()
     }
 
@@ -578,5 +596,41 @@ pub mod tests {
         c.epoch_number = 18;
         c.current_hash = BlockFactory::create_hash(&c); // recompute after the field change
         assert_ne!(a.current_hash, c.current_hash);
+    }
+
+    // --- Phase 2.4 (L7): remove_block removes the tip; remove_oldest removes the oldest ---
+
+    #[test]
+    fn remove_block_removes_tip_not_oldest() {
+        let mut blockchain = Blockchain::new();
+        // Build a properly chained multi-block chain: genesis -> b1 -> b2.
+        let genesis = Block::test_block(Vec::<u8>::new());
+        blockchain.add_block(genesis.clone());
+        let b1 = Block::test_block(genesis.current_hash.clone());
+        blockchain.add_block(b1.clone());
+        let b2 = Block::test_block(b1.current_hash.clone());
+        blockchain.add_block(b2.clone());
+
+        assert_eq!(blockchain.get_count(), 3);
+        assert!(blockchain.get_current_chain_state().is_valid);
+
+        // `remove_block` must remove the TIP (b2), not the oldest (genesis).
+        let removed = blockchain.remove_block().expect("a block to remove");
+        assert_eq!(removed.current_hash, b2.current_hash);
+        assert_eq!(blockchain.get_count(), 2);
+
+        // The remaining chain (genesis -> b1) is still valid, with b1 now the tip.
+        let state = blockchain.get_current_chain_state();
+        assert!(state.is_valid);
+        assert_eq!(state.last_hash_in, b1.current_hash);
+
+        // `remove_oldest` removes the genesis (oldest) side, leaving b1 as the sole block.
+        let oldest = blockchain.remove_oldest().expect("the oldest block");
+        assert_eq!(oldest.current_hash, genesis.current_hash);
+        assert_eq!(blockchain.get_count(), 1);
+        assert_eq!(
+            blockchain.get_block_at(0).unwrap().current_hash,
+            b1.current_hash
+        );
     }
 }
