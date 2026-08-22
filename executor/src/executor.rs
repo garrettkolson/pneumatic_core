@@ -619,6 +619,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let pending = PendingTransaction::new("test_tx_001".to_string(), TransactionState::Preloaded { transaction: tx });
         let _ = registry.add_transaction("test_tx_001".to_string(), pending);
@@ -698,6 +699,7 @@ mod tests {
             amount: Some(0),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let pending = PendingTransaction::new("capacity_tx".to_string(), TransactionState::Preloaded { transaction: tx });
         let _ = pending_registry.add_transaction("capacity_tx".to_string(), pending);
@@ -780,6 +782,7 @@ mod tests {
             amount: Some(0),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let pending = PendingTransaction::new("failed_tx".to_string(), TransactionState::Failed {
             transaction: tx,
@@ -856,6 +859,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let result = ExecutionResult {
             transaction_id: "test_tx_001".to_string(),
@@ -899,6 +903,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let result = ExecutionResult {
             transaction_id: "test_tx_001".to_string(),
@@ -931,6 +936,7 @@ mod tests {
                 amount: Some(0),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             };
             let pending = PendingTransaction::new(
                 tx_id.to_string(),

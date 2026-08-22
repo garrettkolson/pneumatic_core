@@ -133,6 +133,38 @@ impl Sentinel {
         let tx: Transaction = deserialize_rmp_to(&message.body)
             .map_err(|e| SentinelError::Encoding(e))?;
 
+        // Phase 3.1 (AUDIT finding C3): fail-closed sender authentication. This runs
+        // *before* `compute_gas_used`/`validate_transaction` so a forged or unauthorized
+        // transaction is dropped the instant it arrives, without touching the pool or
+        // consuming gas. Two independent checks must both pass:
+        //
+        //   1. `tx.sender` must be non-empty.
+        //   2. `tx.sender`'s Ed25519 signature over the canonical transaction bytes
+        //      (`tx.sender_signature`) must verify — the signature proves the submitter
+        //      actually authorized *this* payload, not a swapped replacement.
+        //   3. The authenticated envelope sender (`message.public_key`, verified by the
+        //      gossiper) must equal `tx.sender` — the network submitter must be the
+        //      account being debited, so a peer can't debit an account it does not own.
+        if tx.sender.is_empty() {
+            return Err(SentinelError::UnauthenticatedSubmitter(
+                "transaction has an empty sender".to_string(),
+            ));
+        }
+        let sender_authorized = tx.verify_sender_signature().map_err(|e| {
+            // `check_signature` returns Err on malformed/corrupt bytes; fail closed.
+            SentinelError::InvalidSenderSignature(format!("sender-signature check error: {e}"))
+        })?;
+        if !sender_authorized {
+            return Err(SentinelError::InvalidSenderSignature(
+                "sender did not authorize this transaction".to_string(),
+            ));
+        }
+        if message.public_key != tx.sender {
+            return Err(SentinelError::UnauthenticatedSubmitter(
+                "authenticated envelope sender does not match transaction sender".to_string(),
+            ));
+        }
+
         // Step 1: Compute gas used for this transaction (before validation, since validation may fail and we don't track gas for failed txs)
         let gas_used = self.transaction_validator.compute_gas_used(&tx);
 
@@ -559,6 +591,13 @@ pub enum SentinelError {
     UnknownAction(String),
     /// Deterministic routing failure (no snapshot, empty stake set, etc.)
     Routing(String),
+    /// The authenticated envelope sender (`message.public_key`) does not match
+    /// `transaction.sender` — a peer tried to debit an account whose key it does
+    /// not control (AUDIT finding C3).
+    UnauthenticatedSubmitter(String),
+    /// The transaction's `sender_signature` is missing, empty, or does not verify
+    /// against `sender` over the canonical transaction bytes (AUDIT finding C3).
+    InvalidSenderSignature(String),
 }
 
 impl From<std::io::Error> for SentinelError {
@@ -601,6 +640,7 @@ mod tests {
     use dashmap::DashMap;
     use pneumatic_core::config::Config;
     use pneumatic_core::crypto::AsymCryptoProvider;
+    use pneumatic_core::rns::identity::NodeIdentity;
     use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, NodeType, NodeTypeConfig};
     use pneumatic_core::user::User;
     use pneumatic_core::conns::ConnError;
@@ -738,6 +778,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let name = sentinel.get_validation_spec_name(&tx);
         assert_eq!(name, "Executed");
@@ -757,6 +798,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let name = sentinel.get_validation_spec_name(&tx);
         assert_eq!(name, "Transfer");
@@ -801,6 +843,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             }).unwrap(),
             signature: vec![1, 2, 3],
             public_key: vec![4, 5, 6],
@@ -812,6 +855,159 @@ mod tests {
         match result {
             Err(SentinelError::Encoding(_)) => panic!("should not be Encoding error"),
             _ => {} // any other error is fine (validation, registry, etc.)
+        }
+    }
+
+    // --- Phase 3.1 (AUDIT C3): sender-authentication regression tests ---
+
+    /// Build a "Process" message whose transaction carries a valid sender signature
+    /// (signed by `sender_pk`) and whose envelope sender is `sender_pk`.
+    fn c3_process_message(sender_pk: Vec<u8>, tx: Transaction) -> Message {
+        Message {
+            chain_id: "test".into(),
+            action: "Process".into(),
+            body: serialize_to_bytes_rmp(&tx).unwrap(),
+            signature: vec![],
+            public_key: sender_pk,
+            stake_set: None,
+        }
+    }
+
+    /// Sign `tx`'s canonical bytes with `identity`, returning a C3-valid transaction.
+    fn c3_sign(tx: &mut Transaction, identity: &NodeIdentity) {
+        let canonical = tx.canonical_signature_bytes().expect("canonical transaction bytes");
+        tx.sender_signature = identity.ed25519.sign_data(&canonical).expect("sender signs");
+    }
+
+    #[test]
+    fn process_tx_with_valid_sender_signature_accepted() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        // A real sender signs the canonical transaction bytes.
+        let sender_identity = NodeIdentity::generate_in_memory();
+        let sender_pk = sender_identity.ed25519.public_key().expect("sender public key");
+
+        let mut tx = Transaction {
+            id: "c3_valid".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: sender_pk.clone(),
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        c3_sign(&mut tx, &sender_identity);
+
+        let msg = c3_process_message(sender_pk, tx);
+        // The C3 gate must pass: the result may be Ok or a downstream stub error, but
+        // never a sender-authentication rejection.
+        let result = sentinel.handle_process_request(msg);
+        assert!(
+            !matches!(
+                result,
+                Err(SentinelError::UnauthenticatedSubmitter(_))
+                    | Err(SentinelError::InvalidSenderSignature(_))
+            ),
+            "valid sender signature must pass the C3 gate, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_submitter_debit_is_rejected() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        // HEADLINE C3: a different node submits a transaction debiting account X. Even
+        // though X really signed the payload, the node submitting it is not X's node, so
+        // the binding check must reject.
+        let victim = NodeIdentity::generate_in_memory();
+        let victim_pk = victim.ed25519.public_key().expect("victim public key");
+
+        let attacker = NodeIdentity::generate_in_memory();
+        let attacker_pk = attacker.ed25519.public_key().expect("attacker public key");
+
+        let mut tx = Transaction {
+            id: "c3_unauth".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: victim_pk.clone(),
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        // The payload really was authorized by victim, so the signature check passes —
+        // only the binding check (network submitter != account) can stop this.
+        c3_sign(&mut tx, &victim);
+
+        let msg = c3_process_message(attacker_pk, tx);
+        match sentinel.handle_process_request(msg) {
+            Err(SentinelError::UnauthenticatedSubmitter(_)) => {}
+            other => panic!("expected UnauthenticatedSubmitter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_sender_signature_rejected() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        // Binding holds (envelope sender == tx.sender) but the signature is empty/forged.
+        let sender = NodeIdentity::generate_in_memory();
+        let sender_pk = sender.ed25519.public_key().expect("sender public key");
+
+        let tx = Transaction {
+            id: "c3_forged".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: sender_pk.clone(),
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![], // empty -> verify returns Ok(false)
+        };
+
+        let msg = c3_process_message(sender_pk, tx);
+        match sentinel.handle_process_request(msg) {
+            Err(SentinelError::InvalidSenderSignature(_)) => {}
+            other => panic!("expected InvalidSenderSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sender_signature_does_not_cross_accounts() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+        // A signature valid for account A must not authorize a payload claiming sender == B.
+        let a = NodeIdentity::generate_in_memory();
+        let a_pk = a.ed25519.public_key().expect("a public key");
+        let b_claim = vec![7, 7, 7, 7];
+
+        let mut tx = Transaction {
+            id: "c3_cross".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: b_claim.clone(), // claims to be B
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        // A signs the canonical bytes; the binding (envelope == "B" == tx.sender) holds,
+        // but verifying A's signature against "B" fails.
+        c3_sign(&mut tx, &a);
+
+        let msg = c3_process_message(b_claim, tx);
+        match sentinel.handle_process_request(msg) {
+            Err(SentinelError::InvalidSenderSignature(_)) => {}
+            other => panic!("A's signature cannot authorize a tx claiming sender==B, got {other:?}"),
         }
     }
 
@@ -863,6 +1059,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
 
         // Validate with SelfSigned spec directly
@@ -901,6 +1098,7 @@ mod tests {
             amount: Some(0),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let gas = validator.compute_gas_used(&tx);
         // base_cost=1, amount=0, multiplier=1.0 → 1 + 0 = 1
@@ -924,6 +1122,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let gas = validator.compute_gas_used(&tx);
         // base_cost=1, amount=100, Preload multiplier=2.0 → 1 + 200 = 201
@@ -947,6 +1146,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let gas = validator.compute_gas_used(&tx);
         // base_cost=1, amount=100, unknown multiplier=1.0 → 1 + 100 = 101
@@ -972,6 +1172,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         // Should succeed (spawns async task; no nodes registered means no sends)
         let result = notifier.send_to_executors_for_preload(&tx, &env);
@@ -995,6 +1196,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let result = notifier.send_to_finalizer_for_preload(&tx, b"finalizer_key", &env);
         assert!(result.is_ok());
@@ -1031,6 +1233,7 @@ mod tests {
                     token_id: vec![1], bid: None, sequence_number: 1,
                     sender: vec![1], receiver: vec![2], amount: Some(100),
                     timestamp: 0, result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 TransactionValidationResult::valid(
                     finalizer_key.clone(),
@@ -1175,6 +1378,7 @@ mod tests {
                     token_id: vec![], bid: None, sequence_number: 0,
                     sender: vec![], receiver: vec![], amount: None,
                     timestamp: 0, result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 vec![],
             );
@@ -1340,6 +1544,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
 
         // Pre-register the transaction (as handle_self_signed in the real flow does)
@@ -1378,6 +1583,7 @@ mod tests {
             amount: Some(50),
             timestamp: 2000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
 
         // Pre-register the transaction (as handle_process_request does)
@@ -1429,6 +1635,7 @@ mod tests {
                 amount: Some(10),
                 timestamp: 3000,
                 result_hash: vec![],
+                sender_signature: vec![],
             };
             let tx_id = tx.id.clone();
             registry.register_pending(tx_id.clone()).unwrap();

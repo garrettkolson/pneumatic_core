@@ -743,6 +743,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![1, 2, 3, 4],
+            sender_signature: vec![],
         };
         let validation = TransactionValidationResult::valid(
             vec![5, 6, 7, 8], // finalizer key
@@ -912,6 +913,7 @@ mod tests {
             amount: Some(50),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         let body = serialize_to_bytes_rmp(&tx).unwrap();
         let message = Message {

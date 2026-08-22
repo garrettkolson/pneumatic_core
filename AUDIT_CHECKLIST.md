@@ -228,7 +228,7 @@ agree on anything.*
 ## Phase 3 — Transaction & block security
 *Closes: C3, C5, H12, H15.*
 
-- [ ] **3.1 Bind the authenticated submitter to `tx.sender`** (C3)
+- [x] **3.1 Bind the authenticated submitter to `tx.sender`** (C3)
   Files: `src/transactions.rs` (add sender-signature field), sentinel validation path.
   Action: require a sender signature over the canonical transaction; verify it; reject when the
   authenticated envelope sender ≠ `transaction.sender`.

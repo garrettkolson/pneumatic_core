@@ -278,6 +278,7 @@ mod tests {
                     amount: Some(100),
                     timestamp: 0,
                     result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 total_voters: 3,
                 total_stake: 42,

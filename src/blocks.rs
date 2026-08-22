@@ -496,6 +496,7 @@ pub mod tests {
                 amount: Some(500),
                 timestamp: 4242,
                 result_hash: vec![0xAA],
+                sender_signature: vec![],
             },
             total_stake: 1000,
             total_voters: 5,

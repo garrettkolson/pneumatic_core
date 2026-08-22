@@ -424,6 +424,7 @@ mod tests {
             amount,
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         }
     }
 
@@ -591,6 +592,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
 
         // Validate with SelfSigned spec
@@ -673,6 +675,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash,
+                sender_signature: vec![],
             },
             total_stake: 42,
             total_voters: 3,
@@ -704,6 +707,7 @@ mod tests {
                     amount: None,
                     timestamp: 0,
                     result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 total_stake: 42,
                 total_voters: 3,

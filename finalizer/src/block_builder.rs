@@ -297,6 +297,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![1, 2, 3, 4],
+            sender_signature: vec![],
         }
     }
 
@@ -485,6 +486,7 @@ mod tests {
                 amount: Some(500),
                 timestamp: 4242,
                 result_hash: vec![0xAA],
+                sender_signature: vec![],
             },
             total_stake: 1000,
             total_voters: 5,

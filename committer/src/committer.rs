@@ -1149,6 +1149,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,
@@ -1349,6 +1350,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         // Transition directly via the internal map — register_pending creates Pending,
         // then we mutate to Finalizing state.
@@ -1498,6 +1500,7 @@ mod tests {
             amount: Some(100),
             timestamp: 0,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         // Transition to Validated (NOT Finalizing) — simulates leader-proposal path
         {
@@ -1752,6 +1755,7 @@ mod tests {
             amount: Some(50),
             timestamp: 5000,
             result_hash: vec![],
+            sender_signature: vec![],
         };
         registry.transition_to_validated_and_enqueue(
             &tx_id,
@@ -1827,6 +1831,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,
@@ -2079,6 +2084,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,
@@ -2237,6 +2243,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,
@@ -2331,6 +2338,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,
@@ -2411,6 +2419,7 @@ mod tests {
                 amount: Some(100),
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_voters: 3,
             total_stake: 42,

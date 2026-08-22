@@ -385,6 +385,7 @@ mod tests {
             id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
             sequence_number: nonce, sender: public_key.clone(), receiver: vec![],
             amount: Some(amount), timestamp: 0, result_hash: vec![],
+            sender_signature: vec![],
         };
         let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
         make_message_with_body("Process", public_key, body)
@@ -395,6 +396,7 @@ mod tests {
             id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
             sequence_number: 0, sender: public_key.clone(), receiver: vec![],
             amount: Some(amount), timestamp: 0, result_hash: vec![],
+            sender_signature: vec![],
         };
         let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
         make_message_with_body("Preload", public_key, body)

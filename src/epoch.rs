@@ -837,6 +837,7 @@ mod tests {
                     token_id: vec![1, 2], bid: None, sequence_number: 1,
                     sender: vec![10], receiver: vec![20], amount: Some(100),
                     timestamp: 1000, result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 TransactionValidationResult::valid(
                     vec![99],
@@ -857,6 +858,7 @@ mod tests {
                     token_id: vec![1, 2], bid: None, sequence_number: 2,
                     sender: vec![10], receiver: vec![20], amount: Some(200),
                     timestamp: 2000, result_hash: vec![],
+                    sender_signature: vec![],
                 },
                 TransactionValidationResult::valid(
                     vec![99],

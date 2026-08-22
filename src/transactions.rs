@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use crate::blocks::Block;
-use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
+use crate::crypto::{AsymCryptoProvider, Ed25519Provider};
+use crate::errors::{PneumaticError, ValidationFailureReason, TransactionRiskFactor};
 
 // ---------------------------------------------------------------------------
 // TransactionState — explicit lifecycle through the pipeline
@@ -179,6 +180,15 @@ pub struct Transaction {
     pub timestamp: i64,
     /// Hash of execution result (set by Executor)
     pub result_hash: Vec<u8>,
+    /// Sender's Ed25519 signature over the canonical transaction form — the bytes of every field
+    /// above **except this one**, in a fixed order (`CanonicalTransaction`). Verified by the sentinel
+    /// before the transaction is accepted (AUDIT finding C3 / Phase 3.1): the signature proves the
+    /// submitter controls `sender`'s key and authorized *this* payload, and the sentinel binds the
+    /// authenticated envelope sender to `sender`. `#[serde(default)]` keeps deserialization of
+    /// legacy transactions (which predate the field) valid so they fail *at verification* rather
+    /// than throwing, not a silent accept.
+    #[serde(default)]
+    pub sender_signature: Vec<u8>,
 }
 
 /// Optional bid attached to a transaction.
@@ -291,6 +301,7 @@ impl SignedTransaction {
                 amount: None,
                 timestamp: 0,
                 result_hash: vec![],
+                sender_signature: vec![],
             },
             total_stake: 42,
             total_voters: 3,
@@ -358,6 +369,64 @@ pub(crate) fn canonical_signed_trans_bytes(
         proposer_key: &tx.proposer_key,
     };
     crate::encoding::serialize_to_bytes_rmp(&cst)
+}
+
+// ---------------------------------------------------------------------------
+// Canonical serialization for the sender signature (AUDIT C3 / Phase 3.1)
+// ---------------------------------------------------------------------------
+
+/// Deterministic serialization of a `Transaction` used as the message-a-sender signs.
+///
+/// Deliberately **excludes `sender_signature`**: serializing over the bytes a signature itself
+/// covers would be self-referential. `Transaction` has no non-deterministic field (no `HashMap`),
+/// so this ordered view is already canonical — two equal transactions produce identical bytes and a
+/// serde round-trip is byte-identical.
+#[derive(Serialize)]
+struct CanonicalTransaction<'a> {
+    id: &'a str,
+    action: &'a str,
+    token_id: &'a [u8],
+    bid: Option<&'a Bid>,
+    sequence_number: usize,
+    sender: &'a [u8],
+    receiver: &'a [u8],
+    amount: Option<u64>,
+    timestamp: i64,
+    result_hash: &'a [u8],
+}
+
+impl Transaction {
+    /// The canonical byte stream a sender signs to authorize this transaction — the exact bytes the
+    /// sentinel re-serializes when verifying (`verify_sender_signature`). Deterministic; unaffected by
+    /// field insertion order or a serde round-trip.
+    pub fn canonical_signature_bytes(&self) -> Result<Vec<u8>, PneumaticError> {
+        let canon = CanonicalTransaction {
+            id: &self.id,
+            action: &self.action,
+            token_id: &self.token_id,
+            bid: self.bid.as_ref(),
+            sequence_number: self.sequence_number,
+            sender: &self.sender,
+            receiver: &self.receiver,
+            amount: self.amount,
+            timestamp: self.timestamp,
+            result_hash: &self.result_hash,
+        };
+        crate::encoding::serialize_to_bytes_rmp(&canon)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))
+    }
+
+    /// Verify `sender_signature` against `sender`: returns `true` iff `sender`'s Ed25519 key produced
+    /// a valid signature over `canonical_signature_bytes`. An empty or forged signature verifies
+    /// `false`; the check never panics on malformed input (returns `Ok(false)`), so this is safe to
+    /// call on untrusted data before rejecting.
+    pub fn verify_sender_signature(&self) -> Result<bool, PneumaticError> {
+        let canonical = self.canonical_signature_bytes()?;
+        // `Ed25519Provider::check_signature` uses only the supplied verifying key (`sender`), so a
+        // throwaway provider is fine — the same idiom as `NodeIdentity::verify_binding`.
+        Ed25519Provider::generate()
+            .check_signature(&self.sender_signature, &self.sender, &canonical)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +572,7 @@ mod tests {
             amount: Some(100),
             timestamp: 1000,
             result_hash: vec![],
+            sender_signature: vec![],
         }
     }
 
