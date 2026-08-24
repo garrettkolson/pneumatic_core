@@ -6,6 +6,7 @@ pub mod block_services;
 pub mod committer;
 pub mod committer_error;
 pub mod epoch_manager;
+pub mod orphan_buffer;
 
 pub use committer::Committer;
 

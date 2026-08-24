@@ -241,19 +241,27 @@ agree on anything.*
   validator registered = reject the block, don't silently pass.
   Verify: a `BlockFinalized` for a token with no registered validator is rejected.
 
-- [ ] **3.3 Atomic, validated tip append in `handle_block_finalized`** (C5)
+- [x] **3.3 Atomic, validated tip append in `handle_block_finalized`** (C5)
   File: `committer/src/committer.rs:344-399`.
   Action: verify hash + linkage + (Phase-1) proposer signature; perform read-tip and append
   under one lock scope (no read-guard-then-`get_mut` gap).
   Verify: concurrent sibling blocks → exactly one appended; **update the double-append test at
   `committer.rs:2041-2047`** which currently asserts the buggy behavior.
 
-- [ ] **3.4 Orphan handling for non-tip blocks** (H15)
-  File: `committer/src/committer.rs` (BlockFinalized path).
-  Action: buffer blocks whose `previous_hash` isn't the current tip (bounded, TTL'd) and
-  re-evaluate on tip advance; or explicitly reject with a re-request signal. No silent drop.
-  Verify: out-of-order delivery of N blocks → all eventually committed; partition/rejoin
-  scenario test.
+- [x] **3.4 Orphan handling for non-tip blocks** (H15)
+  Files: `committer/src/orphan_buffer.rs` (new), `committer/src/committer.rs` (BlockFinalized path).
+  Action: blocks whose `previous_hash` isn't the current tip are buffered in a bounded, per-token,
+  TTL'd [`OrphanBuffer`] (no `Block`/`Message` wire change) instead of being silently dropped; on
+  each append the Committer replays the buffer and promotes every block whose parent has just
+  landed, cascading multi-block out-of-order sequences. A globally-full buffer is rejected and
+  logged (never silently dropped).
+  Verify: out-of-order delivery of N blocks → all eventually committed. Headline regression:
+  `handle_block_finalized_buffers_orphan_and_replays_on_tip_advance` (deliver b2 first → buffered;
+  then b1 → both land, chain grows by 2; buffer empties) and
+  `handle_block_finalized_replays_orphan_cascade_in_out_of_order_delivery` (shuffled N+2,N+1,N+3
+  order → all land). Updated the old `handle_block_finalized_ignores_orphan_block` test (it encoded
+  the silent-drop bug, per ground rule 3). `OrphanBuffer` unit tests cover capacity eviction,
+  per-token cap, TTL expiry, and the `RejectedFull` path. Workspace green (0 failures).
 
 - [ ] **3.5 Commit the validated payload, not whatever arrived** (H12)
   File: `committer/src/committer.rs` (commit path), `src/transactions.rs`

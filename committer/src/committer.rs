@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -25,6 +26,7 @@ use pneumatic_core::transactions::{SignedTransaction, TransactionCommit, Transac
 use super::block_services::BlockServices;
 use super::committer_error::CommitterError;
 use super::epoch_manager::{EpochReconciler, LeaderSelector, StakeStore, StakingManager};
+use super::orphan_buffer::{BufferDecision, OrphanBuffer};
 
 /// Convert a byte slice to a hex string (lowercase, no prefix).
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -122,6 +124,10 @@ pub struct Committer {
     /// Cache of stake sets received via BlockFinalized messages, keyed by block hash.
     /// Used to look up sender stakes when processing BlockConfirmed votes.
     stake_set_cache: Mutex<HashMap<Vec<u8>, StakeSet>>,
+    /// Bounded, per-token orphan buffer for finalized blocks received out of order (AUDIT Phase
+    /// 3.4 / H15). A BlockFinalized whose block does not chain onto the current tip is buffered
+    /// here and replayed as the tip advances, so out-of-order delivery is never silently dropped.
+    orphan_blocks: Mutex<OrphanBuffer>,
 }
 
 impl Committer {
@@ -172,6 +178,7 @@ impl Committer {
             candidate_registry,
             confirmation_votes: Mutex::new(HashMap::new()),
             stake_set_cache: Mutex::new(HashMap::new()),
+            orphan_blocks: Mutex::new(OrphanBuffer::new(1024, 256, Duration::from_secs(30))),
         }
     }
 
@@ -496,16 +503,25 @@ impl Committer {
         // an immutable borrow, dropped, and only then re-looked-up mutably — so two concurrent
         // sibling blocks could both validate and both append. `append_validated_block` reads the tip
         // and appends inside one `&mut self`, which maps here to a single `get_mut` on the token.
+        // Blocks committed by this call — the original append plus any promoted from the orphan
+        // buffer. Each is distributed to archivars and voted on, exactly as in the plain path.
+        let mut committed: Vec<Block> = Vec::new();
+
+        // Validate linkage + hash and append under a SINGLE mutable borrow of the token (AUDIT
+        // Phase 3.3 / C5). This closes the read-then-`get_mut` gap: previously the tip was read via
+        // an immutable borrow, dropped, and only then re-looked-up mutably — so two concurrent
+        // sibling blocks could both validate and both append. `append_validated_block` reads the tip
+        // and appends inside one `&mut self`, which maps here to a single `get_mut` on the token.
         {
             let mut entry = self.tokens.get_mut(token_id).ok_or_else(|| {
                 CommitterError::TokenNotFound(bytes_to_hex(token_id))
             })?;
             match entry.value_mut().blockchain.append_validated_block(&block) {
                 AppendOutcome::LinkageMismatch => {
-                    self.env_data.logger.log(format!(
-                        "BlockFinalized: previous_hash mismatch for token [{}], ignoring",
-                        bytes_to_hex(token_id)
-                    ));
+                    // AUDIT Phase 3.4 / H15: the receiver is behind — this is the next block in a
+                    // sequence whose parent has not yet landed, NOT a sibling competitor. Buffer it
+                    // and replay it as the tip advances instead of silently dropping it.
+                    self.buffer_orphan(token_id.clone(), block).await;
                     return Ok(());
                 }
                 AppendOutcome::InvalidHash => {
@@ -515,17 +531,118 @@ impl Committer {
                     ));
                     return Err(CommitterError::InvalidBlockHash);
                 }
-                AppendOutcome::Appended => {}
+                AppendOutcome::Appended => {
+                    committed.push(block.clone());
+                }
             }
         }
 
-        // Distribute to archivars (propagate gossip)
-        let _ = self.block_services.distribute_to_archivers(&block).await;
+        // AUDIT Phase 3.4 / H15: the tip just advanced by `block_hash`. Replay any buffered blocks
+        // whose parent is now the tip, cascading as the promoted chain grows.
+        let promoted = self.replay_orphan_blocks(&block_hash, token_id).await;
+        committed.extend(promoted);
 
-        // Broadcast our own vote: we've received and validated this block
-        self.broadcast_vote(&block_hash).await;
+        // Propagate every block we committed this call (the original plus the promoted ones).
+        for committed_block in &committed {
+            // Distribute to archivars (propagate gossip)
+            let _ = self.block_services.distribute_to_archivers(committed_block).await;
+
+            // Broadcast our own vote: we've received and validated this block
+            self.broadcast_vote(&committed_block.current_hash).await;
+        }
 
         Ok(())
+    }
+
+    /// Buffer an out-of-order finalized block for later replay (AUDIT Phase 3.4 / H15).
+    ///
+    /// Called when a BlockFinalized's block does not chain onto the current tip. The block is held
+    /// in the orphan buffer keyed by token; whether it was buffered — or dropped because the buffer
+    /// is full — is always logged, so the drop is observable, never silent.
+    async fn buffer_orphan(&self, token_id: Vec<u8>, block: Block) {
+        let mut orphan_blocks = self.orphan_blocks.lock().await;
+        // Compute the token hex before `token_id` is moved into `insert` below.
+        let token_hex = bytes_to_hex(&token_id);
+        match orphan_blocks.insert(token_id, block) {
+            BufferDecision::Buffered => {
+                self.env_data.logger.log(format!(
+                    "BlockFinalized: buffered out-of-order block for token [{token_hex}] for replay"
+                ));
+            }
+            BufferDecision::RejectedFull => {
+                self.env_data.logger.log(format!(
+                    "BlockFinalized: orphan buffer full for token [{token_hex}], dropping out-of-order block"
+                ));
+            }
+        }
+    }
+
+    /// Promote buffered blocks whose parent hash is `tip_hash`, cascading to blocks whose parent
+    /// chains onto each promoted block (AUDIT Phase 3.4 / H15).
+    ///
+    /// A candidate is selected under the orphan lock only, then appended under a single `get_mut`
+    /// on the token (the same atomic read-tip-then-append shape as the plain path), so a promoted
+    /// append cannot race a concurrent handler and there is no nested lock. Returns the promoted
+    /// blocks in commit order.
+    async fn replay_orphan_blocks(
+        &self,
+        tip_hash: &[u8],
+        token_id: &[u8],
+    ) -> Vec<Block> {
+        let mut committed = Vec::new();
+        let mut expected_tip = tip_hash.to_vec();
+
+        loop {
+            // Select the next buffered block that chains onto `expected_tip`, removing it from the
+            // buffer so it is "in flight" even if eviction or a concurrent handler touches it next.
+            let chosen = {
+                let mut orphan_blocks = self.orphan_blocks.lock().await;
+                orphan_blocks.drop_expired(Instant::now());
+                orphan_blocks.take_matching(token_id, &expected_tip, Instant::now())
+            };
+
+            let chosen = match chosen {
+                Some(chosen) => chosen,
+                None => break,
+            };
+
+            // Append atomically. The orphan lock is released before the token lock is taken, so
+            // there is no new lock-ordering hazard.
+            let append_outcome = {
+                match self.tokens.get_mut(token_id) {
+                    Some(mut entry) => {
+                        entry.value_mut().blockchain.append_validated_block(&chosen)
+                    }
+                    None => break,
+                }
+            };
+
+            match append_outcome {
+                AppendOutcome::Appended => {
+                    committed.push(chosen.clone());
+                    // The promoted block's own hash is now the tip — keep cascading.
+                    expected_tip = chosen.current_hash.clone();
+                }
+                AppendOutcome::InvalidHash => {
+                    // A buffered block that is now internally inconsistent (tampered) — fail
+                    // closed and stop the cascade.
+                    self.env_data.logger.log(format!(
+                        "BlockFinalized: replayed block for token [{}] failed hash check, rejecting",
+                        bytes_to_hex(token_id)
+                    ));
+                    break;
+                }
+                AppendOutcome::LinkageMismatch => {
+                    // A sibling raced in and advanced the tip past `chosen`'s parent while we
+                    // were selecting. Re-queue it so a later replay can retry if the tip returns.
+                    let mut orphan_blocks = self.orphan_blocks.lock().await;
+                    orphan_blocks.requeue_back(token_id, chosen);
+                    break;
+                }
+            }
+        }
+
+        committed
     }
 
     /// Handle "BlockConfirmed" vote from peers.
@@ -2358,12 +2475,17 @@ mod tests {
         assert_eq!(chain_len, original_len);
     }
 
+    /// (AUDIT Phase 3.4 / H15 discriminator) Out-of-order delivery is buffered, not dropped, and
+    /// all blocks eventually commit. Deliver the second block (`b2`) before its parent `b1`: `b2` is
+    /// buffered (chain length unchanged), and when `b1` lands the buffer is replayed and `b2` is
+    /// promoted. Proven discriminator: restoring the old silent-drop behavior yields a chain length
+    /// of `original + 1` after `b1` (`b2` lost) — the assertion fails without the fix.
     #[tokio::test]
-    async fn handle_block_finalized_ignores_orphan_block() {
+    async fn handle_block_finalized_buffers_orphan_and_replays_on_tip_advance() {
         let dp = Arc::new(TestDataProvider::new());
         let (committer, _registry) = make_test_committer(dp);
 
-        // Bootstrap token and chain
+        // Bootstrap token and chain (genesis only).
         let mut token = Token::new();
         token.id = vec![1];
         committer.bootstrap_token(token);
@@ -2374,71 +2496,83 @@ mod tests {
             .value()
             .blockchain
             .get_count();
+        assert_eq!(original_chain_len, 1); // genesis only
 
-        // Build a block with wrong previous_hash (orphaned). It carries a valid finalizer
-        // signature so it clears the C5 (finalizer-sig) gate in handle_block_finalized and reaches
-        // the intended LinkageMismatch path (wrong previous_hash) instead of being rejected first.
-        let orphan_finalizer = Ed25519Provider::generate();
-        let orphan_finalizer_addr = orphan_finalizer.public_key().expect("finalizer public key");
-        let orphan_tx_hash = b"orphan-transaction-hash".to_vec();
-        let orphan_sig = orphan_finalizer.sign_data(&orphan_tx_hash).expect("finalizer signature");
-        let signed = SignedTransaction {
-            transaction_id: "orphan".to_string(),
-            transaction: Transaction {
-                id: "orphan".to_string(),
-                action: "Process".into(),
-                token_id: vec![1],
-                bid: None,
-                sequence_number: 1,
-                sender: b"alice".to_vec(),
-                receiver: b"bob".to_vec(),
-                amount: Some(100),
-                timestamp: 0,
-                result_hash: vec![],
-                sender_signature: vec![],
-            },
-            total_voters: 3,
-            total_stake: 42,
-            leader_hash: vec![42u8; 32],
-            leader_address: vec![],
-            leader_stake: 0,
-            finalizer_addr: orphan_finalizer_addr,
-            finalizer_sig: TransactionSignature {
-                transaction_id: vec![],
-                env_id: vec![],
-                transaction_hash: orphan_tx_hash,
-                signature: orphan_sig,
-                current_stake: 0,
-            },
-            executor_sigs: HashMap::new(),
-            proposer_key: b"orphan".to_vec(),
-        };
+        // The current tip (genesis). b1 chains off it; b2 chains off b1.
+        let tip = committer.tokens.get(&vec![1]).unwrap().value().blockchain
+            .get_current_chain_state().last_hash_in;
+        let b1 = make_gossip_block_at_prev("orphan-b1", b"proposer-1".to_vec(), &tip);
+        let b2 = make_gossip_block_at_prev("orphan-b2", b"proposer-2".to_vec(), &b1.current_hash);
 
-        let mut block = Block {
-            signed_trans: signed,
-            token_metadata: HashMap::new(),
-            previous_hash: vec![99, 99, 99], // doesn't match tip
-            current_hash: vec![],
-            timestamp: 0,
-            finality_status: FinalityStatus::Optimistic,
-            proposer_key: vec![],
-            epoch_number: 0,
-        };
-        block.current_hash = BlockFactory::create_hash(&block);
+        // Deliver b2 FIRST (its parent b1 has not landed) → buffered, not appended.
+        let result = committer.handle_block_finalized(make_block_finalized_message(b2)).await;
+        assert!(result.is_ok(), "buffering an orphan is non-fatal");
+        let len_after_b2 = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(len_after_b2, original_chain_len, "orphan b2 not appended before its parent");
+        assert_eq!(committer.orphan_blocks.lock().await.len(), 1, "b2 is buffered");
 
-        let message = make_block_finalized_message(block);
-
-        // Should return Ok (non-fatal), but block not appended
-        let result = committer.handle_block_finalized(message).await;
+        // Now deliver b1 → it appends, and the replay loop promotes b2 whose parent is now the tip.
+        let result = committer.handle_block_finalized(make_block_finalized_message(b1)).await;
         assert!(result.is_ok());
+        let len_after_b1 = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(len_after_b1, original_chain_len + 2, "b1 appends and b2 is promoted");
+        assert!(committer.orphan_blocks.lock().await.is_empty(), "b2 promoted out of the buffer");
+    }
 
-        // Chain length unchanged
-        let chain_len = committer.tokens.get(&vec![1])
+    /// (AUDIT Phase 3.4 / H15 — cascade + reorder) A chain delivered in adversarially out-of-order
+    /// order all eventually commits via cascading replay. Order `[b3, b5, b1, b4, b2]`: early
+    /// blocks are buffered; each subsequent real block triggers a cascade that promotes everything
+    /// that now chains onto the advancing tip. A non-cascading replay (promote only the one block
+    /// whose parent is the tip) would stop after `b3` — the cascade is what drives `b4`, `b5` home.
+    #[tokio::test]
+    async fn handle_block_finalized_replays_orphan_cascade_in_out_of_order_delivery() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry) = make_test_committer(dp);
+
+        // Bootstrap token and chain (genesis only).
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let original_chain_len = committer.tokens.get(&vec![1])
             .unwrap()
             .value()
             .blockchain
             .get_count();
-        assert_eq!(chain_len, original_chain_len);
+        assert_eq!(original_chain_len, 1);
+
+        // Build a 5-block chain up front, each chaining off the prior block's hash.
+        let mut tip = committer.tokens.get(&vec![1]).unwrap().value().blockchain
+            .get_current_chain_state().last_hash_in;
+        let mut chain = Vec::new();
+        for i in 0..5 {
+            let b = make_gossip_block_at_prev(&format!("cascade-{i}"), vec![i as u8], &tip);
+            tip = b.current_hash.clone();
+            chain.push(b);
+        }
+
+        // Deliver in adversarial order: the chain breaks at b1/b2, so b3 and b5 buffer first, then
+        // b4 cannot chain until its parent b3 lands, etc.
+        let order = [2usize, 4, 0, 3, 1]; // b3, b5, b1, b4, b2
+        for &i in &order {
+            let result = committer.handle_block_finalized(make_block_finalized_message(chain[i].clone())).await;
+            assert!(result.is_ok(), "block {i} delivered without error");
+        }
+
+        // All five landed: a single chain of genesis + 5.
+        let final_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+        assert_eq!(final_len, original_chain_len + 5);
+        assert!(committer.orphan_blocks.lock().await.is_empty(), "everything promoted out");
+
+        // The chain is now contiguous: each block's previous_hash matches its predecessor's hash.
+        let entry = committer.tokens.get(&vec![1]).unwrap();
+        let blocks: Vec<&Block> = entry.value().blockchain.chain.iter().collect();
+        let mut idx = 1;
+        while idx < blocks.len() {
+            assert_eq!(blocks[idx].previous_hash, blocks[idx - 1].current_hash);
+            idx += 1;
+        }
     }
 
     #[tokio::test]
