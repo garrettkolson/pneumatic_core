@@ -61,7 +61,10 @@ pub struct RnsNetwork {
     destinations: Arc<DashMap<[u8; 16], AnnouncedIdentity>>,
     stopped: Arc<AtomicBool>,
     handler: Arc<RwLock<Option<PacketHandler>>>,
-    announce_handler: Arc<RwLock<Option<Arc<dyn Fn(AnnouncedIdentity) + Send + Sync>>>>,
+    /// Announcement handler. The handler returns a `Result` so a caller (e.g. a
+    /// directory-request that failed to sign its binding) surfaces the error to
+    /// the RNS driver thread for logging instead of silently degrading.
+    announce_handler: Arc<RwLock<Option<Arc<dyn Fn(AnnouncedIdentity) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>>>>,
     announce_rx: Mutex<Option<mpsc::Receiver<AnnouncedIdentity>>>,
     announce_worker: Mutex<Option<JoinHandle<()>>>,
     workers: Vec<JoinHandle<()>>,
@@ -230,7 +233,7 @@ impl RnsNetwork {
     ///
     /// Announce callbacks run on an RNS driver thread, so this consumes a
     /// dedicated non-blocking channel and dispatches on a worker thread.
-    pub fn on_announce(&self, handler: Arc<dyn Fn(AnnouncedIdentity) + Send + Sync>) {
+    pub fn on_announce(&self, handler: Arc<dyn Fn(AnnouncedIdentity) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>) {
         *self.announce_handler.write().unwrap() = Some(handler);
         let Some(rx) = self.announce_rx.lock().unwrap().take() else {
             return;
@@ -244,7 +247,9 @@ impl RnsNetwork {
                 let Some(handler) = handler.read().unwrap().clone() else {
                     continue;
                 };
-                handler(announced);
+                if let Err(e) = handler(announced) {
+                    eprintln!("[rns] announce handler error: {}", e);
+                }
             }
         });
         *self.announce_worker.lock().unwrap() = Some(worker);

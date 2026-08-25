@@ -21,7 +21,7 @@ use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::tokens::Token;
-use pneumatic_core::transactions::{SignedTransaction, TransactionCommit, TransactionState};
+use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, TransactionCommit, TransactionState};
 
 use super::block_services::BlockServices;
 use super::committer_error::CommitterError;
@@ -321,8 +321,11 @@ impl Committer {
         // Validate the transaction message
         self.validate_transaction_message(&commit)?;
 
-        // Check and commit the transaction results
-        self.check_and_commit_transaction_results(&commit).await
+        // Check and commit the transaction results. The authenticated sender key (verified by
+        // `authenticate_message`) is threaded through as the finalizer key: it identifies the
+        // node that actually authenticated this Commit, which is more trustworthy than the
+        // `finalizer_addr` self-declared inside the wire block.
+        self.check_and_commit_transaction_results(&commit, message.public_key.clone()).await
     }
 
     /// Check and commit transaction results.
@@ -342,8 +345,30 @@ impl Committer {
     async fn check_and_commit_transaction_results(
         &self,
         commit: &TransactionCommit,
+        finalizer_key: Vec<u8>,
     ) -> Result<(), CommitterError> {
         let tx_id = String::from_utf8_lossy(&commit.trans_id).to_string();
+
+        // AUDIT Phase 4.1 / H4: sink path. In the live pipeline the pending registry is normally
+        // populated upstream (e.g. by the sentinel), so this entry usually already exists here. But
+        // a Commit may arrive with no registry entry — e.g. a self-contained Finalizer→Committer
+        // flow, or an empty registry at boot. Rather than fail closed on `TransactionNotInFinalizing`
+        // for a transaction that is otherwise authentic (envelope-verified, registered sender,
+        // valid finalizer signature on the block), materialize it here as `Finalizing` from the wire
+        // block's transaction, keyed to the authenticated finalizer. The H12 hash check below then
+        // binds this transaction to the committed payload.
+        if !self.pending_registry.contains(&tx_id) {
+            let entry = PendingTransaction::new(
+                tx_id.clone(),
+                TransactionState::Finalizing {
+                    transaction: commit.proposed_block.signed_trans.transaction.clone(),
+                    finalizer_key: finalizer_key.clone(),
+                },
+            );
+            self.pending_registry
+                .add_transaction(tx_id.clone(), entry)
+                .map_err(|_| CommitterError::TransactionNotInFinalizing(tx_id.clone()))?;
+        }
 
         // Step 1: Acquire lock on the transaction
         self.pending_registry
@@ -1151,8 +1176,24 @@ impl Committer {
 
     /// Run the epoch loop: iterate registered token IDs and propose blocks for each.
     pub async fn run_epoch_loop(&self) -> Result<(), CommitterError> {
-        for token_id in self.tokens.iter().map(|r| r.key().clone()) {
-            let _ = self.propose_blocks(&token_id, 10).await?;
+        // Collect token IDs first: `commit_block` takes a write lock on a token entry
+        // (via `self.tokens.get_mut`). Holding the `iter()` read guard across that write
+        // would deadlock the shard. Gather the keys up front so no shard lock is held
+        // while committing.
+        let token_ids: Vec<Vec<u8>> = self.tokens.iter().map(|r| r.key().clone()).collect();
+        for token_id in token_ids {
+            // AUDIT Phase 4.1 / H4: consume the leader-proposed commits instead of discarding them.
+            // Each tx was dequeued from the pool as `Validated` by `propose_blocks`, so it is already
+            // in the registry — the same commit routine as the inbound Commit path (4.1a) commits it.
+            let commits = self.propose_blocks(&token_id, 10).await?;
+            for commit in commits {
+                if let Err(e) = self
+                    .check_and_commit_transaction_results(&commit, self.sender_public_key().clone())
+                    .await
+                {
+                    self.logger().log(format!("Leader-propose commit error: {:?}", e));
+                }
+            }
         }
         Ok(())
     }
@@ -1559,7 +1600,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         if let Err(ref e) = result {
             eprintln!("Error: {:?}", e);
         }
@@ -1598,7 +1639,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"bob".to_vec(), "token").unwrap();
@@ -1634,7 +1675,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"charlie".to_vec(), "token").unwrap();
@@ -1695,7 +1736,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         // Gas was deducted
@@ -1735,7 +1776,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         let user = dp.get_user(&b"bob".to_vec(), "token").unwrap();
@@ -1926,6 +1967,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_epoch_loop_commits_leader_proposed_block() {
+        // AUDIT Phase 4.1 / H4 (4.1c): run_epoch_loop must consume propose_blocks output and
+        // commit each leader-proposed block — not discard it. A committer that is the leader and
+        // has a Validated tx in the pool must grow the chain. Pre-fix (`let _ = self.propose_blocks(...)`)
+        // discarded every proposed commit, so the chain never grew; this asserts it does.
+        let (committer, registry, _dp) = make_committer_for_leader_test(
+            b"leader".to_vec(), // committer key
+            b"leader".to_vec(), // leader key — same, so this IS the leader
+        );
+
+        // Bootstrap token + genesis chain so commit_block has a validated chain to append to.
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // Add a Validated tx to the pool — this is what propose_blocks dequeues for the leader.
+        let tx_id = "tx_epoch_commit".to_string();
+        registry.register_pending(tx_id.clone()).unwrap();
+        registry
+            .transition_to_validated_and_enqueue(
+                &tx_id,
+                Transaction {
+                    id: tx_id.clone(),
+                    action: "Process".into(),
+                    token_id: vec![1],
+                    bid: None,
+                    sequence_number: 1,
+                    sender: b"alice".to_vec(),
+                    receiver: b"bob".to_vec(),
+                    amount: Some(100),
+                    timestamp: 0,
+                    result_hash: vec![],
+                    sender_signature: vec![],
+                },
+                TransactionValidationResult {
+                    is_valid: true,
+                    risk: TransactionRiskFactor {
+                        affected_parties: 2,
+                        amount: 100,
+                        is_contract: false,
+                        is_multi_party: false,
+                    },
+                    failure_reasons: vec![],
+                    finalizer_public_key: vec![5],
+                },
+            )
+            .unwrap();
+
+        let before = committer
+            .tokens
+            .get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+
+        let result = committer.run_epoch_loop().await;
+        assert!(result.is_ok(), "run_epoch_loop failed: {:?}", result.err());
+
+        // The leader-proposed commit must have been consumed and committed — the chain grew.
+        let after = committer
+            .tokens
+            .get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_count();
+        assert!(
+            after >= before + 1,
+            "run_epoch_loop should have committed a leader block ({} -> {})",
+            before,
+            after
+        );
+    }
+
+
+    #[tokio::test]
     async fn advance_epoch_bumps_number() {
         let (committer, _registry, _dp) = make_committer_for_leader_test(
             b"leader".to_vec(),
@@ -2037,7 +2156,7 @@ mod tests {
         );
 
         // Commit — should detect conflict and resolve
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
     }
 
@@ -2070,7 +2189,7 @@ mod tests {
         };
 
         // Block 1 must commit through the standard path
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         let entry = committer.tokens.get(&vec![1]).unwrap();
@@ -2116,7 +2235,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         // CandidateRegistry should have 2 candidates at the same position
@@ -2164,7 +2283,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
     }
 
@@ -2191,7 +2310,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
 
         // First candidate should be inserted into the registry
@@ -2237,7 +2356,7 @@ mod tests {
             proposed_block: block,
         };
 
-        match committer.check_and_commit_transaction_results(&commit).await {
+        match committer.check_and_commit_transaction_results(&commit, vec![]).await {
             Err(CommitterError::TransactionPayloadMismatch(_)) => {}
             other => panic!("expected TransactionPayloadMismatch, got {other:?}"),
         }
@@ -2273,7 +2392,7 @@ mod tests {
             proposed_block: block,
         };
 
-        assert!(committer.check_and_commit_transaction_results(&commit).await.is_ok());
+        assert!(committer.check_and_commit_transaction_results(&commit, vec![]).await.is_ok());
 
         // The entry persists (pinned by the second lock); read back its Committed.block_hash.
         let entry = registry.get_transaction_mut(tx_id).unwrap();

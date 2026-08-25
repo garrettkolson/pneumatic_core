@@ -134,27 +134,31 @@ async fn main() {
 
         // 6. Discovery: when RNS announces a new peer, request its directory.
         let dir_cfg = config.clone();
-        network.on_announce(Arc::new(move |announced: AnnouncedIdentity| {
+        network.on_announce(Arc::new(move |announced: AnnouncedIdentity| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let rhash = announced.identity_hash.0;
+            // A failed binding signature must surface as an error, not silently
+            // degrade into an empty binding_signature that every peer rejects.
+            let signature = NodeIdentity::sign_binding(
+                &dir_cfg.identity,
+                &rhash,
+                &NodeRegistryType::Committer,
+                &dir_cfg.node_registry_types,
+            ).map_err(|e| format!("directory request sign_binding failed: {}", e))?;
             let payload = serialize_to_bytes_rmp(&NodeRequest {
                 requester_key: dir_cfg.public_key.clone(),
                 requester_rhash: dir_cfg.rhash,
                 request_type: NodeRequestType::Request,
                 requester_types: dir_cfg.node_registry_types.clone(),
                 requested_type: NodeRegistryType::Committer,
-                binding_signature: NodeIdentity::sign_binding(
-                    &dir_cfg.identity,
-                    &rhash,
-                    &NodeRegistryType::Committer,
-                    &dir_cfg.node_registry_types,
-                ).unwrap_or_default(),
-            }).unwrap_or_else(|e| { eprintln!("[pneumatic] directory request serialize failed: {}", e); vec![] });
+                binding_signature: signature,
+            })?;
             if payload.is_empty() {
-                return;
+                return Err("directory request serialized to an empty payload".into());
             }
-            if let Err(e) = send_net.send_to(rhash, &payload) {
-                eprintln!("[pneumatic] directory request to {:02x?} failed: {}", rhash, e);
-            }
+            send_net
+                .send_to(rhash, &payload)
+                .map_err(|e| format!("directory request to {:02x?} failed: {}", rhash, e))?;
+            Ok(())
         }));
     }
 
@@ -171,11 +175,26 @@ async fn main() {
         shared_logger.clone(),
     ));
 
-    // 7. Create EpochReconciler and LeaderSelector
+    // Load the current epoch's stake set into the StakeStore so leader selection
+    // runs against real stakes rather than an empty set. The committer persists
+    // snapshots under token_partition_id, so read from the same partition. Fail
+    // closed at boot: a committer that proposes leaders blindly is worse than one
+    // that does not start.
+    let snapshot = data_provider
+        .get_stake_snapshot(1 /* current epoch */, &env_data.token_partition_id)
+        .expect("load stake snapshot at boot");
+    for (key, stake) in snapshot.stakers {
+        stake_store.add_staker(key, stake);
+    }
+
+    // 7. Create EpochReconciler and LeaderSelector.
+    // The CandidateRegistry is shared (cloned) between the reconciler and the
+    // Committer so the reconciler's same-chain fork detection and the
+    // Committer's commit-time conflict detection observe the same candidates.
     let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         stake_store.clone(),
-        candidate_registry,
+        candidate_registry.clone(),
         data_provider.clone(),
         env_data.environment_id.clone(),
         vec![], // token IDs: populated dynamically via token distribution
@@ -205,9 +224,6 @@ async fn main() {
     );
     let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
     let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
-
-    // 10.5. Create CandidateRegistry for conflict detection
-    let candidate_registry = Arc::new(CandidateRegistry::new());
 
     // 10. Create BlockServices
     let block_services = Arc::new(BlockServices::new(

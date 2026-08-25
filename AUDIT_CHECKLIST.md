@@ -274,7 +274,7 @@ agree on anything.*
 ## Phase 4 — Production wiring: make the pipeline actually run
 *Closes: H4, H5, H7, H8, M11, M12.*
 
-- [ ] **4.1 Repair `committer/src/main.rs` wiring** (H4)
+- [x] **4.1 Repair `committer/src/main.rs` wiring** (H4)
   Files: `committer/src/main.rs:150, 168, 175, 178, 191, 210`; `committer/src/committer.rs:895`.
   Action: populate `PendingTransactionRegistry` from the live pipeline (commit currently always
   fails `TransactionNotInFinalizing`); load `StakeStore` from the data service at boot; stop

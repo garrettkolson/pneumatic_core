@@ -23,7 +23,7 @@ use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::tokens::Token;
 use pneumatic_core::transactions::{
-    SignedTransaction, Transaction, TransactionSignature,
+    SignedTransaction, Transaction, TransactionCommit, TransactionSignature,
 };
 use pneumatic_core::user::User;
 use pneumatic_committer::block_services::BlockServices;
@@ -452,6 +452,116 @@ async fn test_pipeline_no_conflict() {
     let chain = tokens.get(&vec![1]).unwrap();
     let chain_len = chain.value().blockchain.get_count();
     assert!(chain_len >= 2, "Chain should have at least 2 blocks (genesis + test block), got {}", chain_len);
+}
+
+/// AUDIT Phase 4.1 / H4 — e2e discriminator for the Commit sink path (4.1a).
+///
+/// Boots a committer whose pending registry is intentionally EMPTY (the
+/// `make_test_committer` harness constructs `PendingTransactionRegistry::new()`
+/// with no test injection — this is the main.rs-equivalent boot wiring),
+/// registers a Finalizer, and sends a properly-signed `Commit` envelope for a
+/// block whose tx is NOT already in the registry. Before the sink existed this
+/// failed with `TransactionNotInFinalizing`; the sink materializes the tx as
+/// `Finalizing` from the wire block, keyed to the authenticated finalizer
+/// (`message.public_key`), and commits it.
+#[tokio::test]
+async fn commit_from_empty_registry_materializes_and_commits() {
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, registry, tokens, node_registry) = make_test_committer(dp);
+
+    // Register a Finalizer so the "Commit" envelope passes the fail-closed auth
+    // gate — "Commit" is Finalizer-only.
+    let finalizer = register_node(&node_registry, NodeRegistryType::Finalizer);
+
+    // Bootstrap token + genesis chain.
+    bootstrap_token_chain(&tokens);
+
+    // Build a block chained off the current tip with a valid finalizer signature
+    // (mirrors test_pipeline_no_conflict, so the block validates on the "SelfSigned" spec).
+    let tip = tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    let block = Block {
+        signed_trans: SignedTransaction {
+            transaction_id: "commit_sink_tx".to_string(),
+            transaction: Transaction {
+                id: "commit_sink_tx".to_string(),
+                action: "Process".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: b"bob".to_vec(),
+                amount: Some(100),
+                timestamp: 0,
+                result_hash: vec![],
+                sender_signature: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_address: vec![],
+            leader_stake: 0,
+            leader_hash: tip.clone(),
+            finalizer_addr: finalizer.ed25519.public_key().expect("public key"),
+            finalizer_sig: TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: b"commit_sink_tx_hash".to_vec(),
+                signature: finalizer
+                    .ed25519
+                    .sign_data(b"commit_sink_tx_hash")
+                    .expect("finalizer sig"),
+                current_stake: 0,
+            },
+            executor_sigs: HashMap::new(),
+            proposer_key: vec![],
+        },
+        token_metadata: HashMap::new(),
+        previous_hash: tip,
+        timestamp: 0,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![],
+        epoch_number: 0,
+    };
+    let block = Block {
+        current_hash: BlockFactory::create_hash(&block),
+        ..block
+    };
+
+    let commit = TransactionCommit {
+        trans_id: b"commit_sink_tx".to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block,
+    };
+
+    // The pending registry must NOT already contain this tx — the sink materializes it.
+    assert!(!registry.contains("commit_sink_tx"));
+
+    // Sign a "Commit" envelope with the finalizer key (Commit is Finalizer-only).
+    let body = serialize_to_bytes_rmp(&commit).expect("serialize commit");
+    let message =
+        Message::signed("test".to_string(), "Commit", body, None, &finalizer).expect("sign commit");
+
+    let result = committer.handle_message(message).await;
+    assert!(
+        result.is_ok(),
+        "commit from empty registry failed (sink path): {:?}",
+        result.err()
+    );
+
+    // The committed block must have grown the chain (genesis + committed).
+    let chain_len = tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+    assert!(
+        chain_len >= 2,
+        "chain should have grown to at least 2 blocks (genesis + committed), got {}",
+        chain_len
+    );
 }
 
 #[tokio::test]
