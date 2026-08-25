@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use crate::blocks::Block;
-use crate::crypto::{AsymCryptoProvider, Ed25519Provider};
+use crate::crypto::{AsymCryptoProvider, BasicHashProvider, Ed25519Provider, HashProvider};
 use crate::errors::{PneumaticError, ValidationFailureReason, TransactionRiskFactor};
 
 // ---------------------------------------------------------------------------
@@ -426,6 +426,18 @@ impl Transaction {
         // throwaway provider is fine — the same idiom as `NodeIdentity::verify_binding`.
         Ed25519Provider::generate()
             .check_signature(&self.sender_signature, &self.sender, &canonical)
+    }
+
+    /// The canonical SHA-256 hash over the *entire* transaction payload. This is distinct from
+    /// `canonical_signature_bytes`, which excludes `sender_signature` so it can be signed; the hash
+    /// here covers every field (including `sender` and `result_hash`) so a swap of any field is
+    /// caught. `Transaction` has no `HashMap`, so its serde form is insertion-order independent and
+    /// round-trip stable (`CanonicalTransaction`), giving a digest that matches across the pipeline
+    /// contexts that must agree on the same transaction — e.g. the Committer comparing the validated
+    /// transaction it holds against the block it is about to append.
+    pub fn hash(&self) -> Result<Vec<u8>, PneumaticError> {
+        let bytes = crate::encoding::serialize_to_bytes_rmp(self)?;
+        Ok(BasicHashProvider::new().hash(&bytes))
     }
 }
 

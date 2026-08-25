@@ -263,7 +263,7 @@ agree on anything.*
   the silent-drop bug, per ground rule 3). `OrphanBuffer` unit tests cover capacity eviction,
   per-token cap, TTL expiry, and the `RejectedFull` path. Workspace green (0 failures).
 
-- [ ] **3.5 Commit the validated payload, not whatever arrived** (H12)
+- [x] **3.5 Commit the validated payload, not whatever arrived** (H12)
   File: `committer/src/committer.rs` (commit path), `src/transactions.rs`
   (`Committed.block_hash` currently stores a `token_id`).
   Action: before committing, match the incoming commit's transaction payload against the

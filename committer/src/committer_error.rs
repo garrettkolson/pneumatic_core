@@ -20,6 +20,10 @@ pub enum CommitterError {
     TransactionNotFound(String),
     /// Transaction is not in the expected Finalizing state
     TransactionNotInFinalizing(String),
+    /// The incoming commit's transaction payload differs from the validated/pooled transaction
+    /// (AUDIT Phase 3.5 / H12): the block on the wire embeds a transaction that is not the one the
+    /// pipeline validated, so the commit is rejected and never appended.
+    TransactionPayloadMismatch(String),
     /// Commit message env_id does not match this committer's environment
     EnvironmentMismatch { expected: String, got: String },
     /// Proposed block has an empty hash

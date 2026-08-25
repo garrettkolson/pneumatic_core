@@ -370,11 +370,20 @@ impl Committer {
             }
         };
 
+        // AUDIT Phase 3.5 / H12: commit the validated payload, not whatever arrived. The wire
+        // TransactionCommit carries its own `proposed_block`; that block is what actually gets
+        // appended to the chain, yet nothing above verifies its embedded transaction is the one we
+        // validated and pooled. Hash-compare the wire block's transaction against the validated one
+        // (a full-payload hash, so a swap of any field is caught) — fail closed on any mismatch.
+        if transaction.hash()? != commit.proposed_block.signed_trans.transaction.hash()? {
+            return Err(CommitterError::TransactionPayloadMismatch(tx_id.clone()));
+        }
+
         // Step 3: Check for conflicts and resolve before committing
         self.handle_conflict_at_commit(commit)?;
 
         // Step 4: Commit the block via BlockServices
-        let result = self.block_services.commit_block(commit)?;
+        let _ = self.block_services.commit_block(commit)?;
 
         // Step 3.5: Deduct gas from sender's fuel balance
         if let Some(gas_used) = self.pending_registry.get_gas_used(&tx_id) {
@@ -397,7 +406,10 @@ impl Committer {
         // Transition to Committed for BOTH paths — release() checks for Committed/Failed
         // to decide whether to remove the entry when lock_count reaches 0.
         if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx_id) {
-            entry.transition_to_committed(transaction, result.token_id);
+            // AUDIT Phase 3.5 / H12: `block_hash` holds the hash of the block the transaction was
+            // committed *into* — here the committed block's own hash (the finalizer already stores
+            // this). Previously `result.token_id` (a token id) was stored, a misnomer.
+            entry.transition_to_committed(transaction, commit.proposed_block.current_hash.clone());
         }
 
         // Step 5: Release the transaction lock
@@ -1173,6 +1185,7 @@ mod tests {
     use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature, TransactionState, TransactionValidationResult};
     use pneumatic_core::user::User;
 
+    use crate::committer_error::CommitterError;
     use super::*;
 
     // --- In-memory DataProvider mock for tests ---
@@ -1256,10 +1269,33 @@ mod tests {
         EnvironmentMetadata::load_from_spec(spec)
     }
 
+    /// The canonical test `Transaction` shared by every block/entry builder in this module. Built
+    /// in one place so the committed block (`make_test_block_for_token` / `make_block_with_proposer`)
+    /// and the pending registry entry (`make_finalizing_entry` / `make_validated_entry`) carry a
+    /// byte-identical payload. This is now required: the Committer rejects a commit whose block
+    /// embeds a transaction that differs from the validated one (AUDIT Phase 3.5 / H12), so a
+    /// committed block and its registry entry must hash equal.
+    fn make_test_transaction(tx_id: &str, sender: Vec<u8>) -> Transaction {
+        Transaction {
+            id: tx_id.to_string(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender,
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        }
+    }
+
     /// Create a block that chains off the token's current chain state.
     fn make_test_block_for_token(
         committer: &Committer,
         trans_id: &str,
+        sender: Vec<u8>,
     ) -> Block {
         // Get the chain's last hash (empty previous_hash at genesis)
         let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
@@ -1277,19 +1313,7 @@ mod tests {
 
         let signed = SignedTransaction {
             transaction_id: trans_id.to_string(),
-            transaction: Transaction {
-                id: trans_id.to_string(),
-                action: "Process".into(),
-                token_id: vec![1],
-                bid: None,
-                sequence_number: 1,
-                sender: b"alice".to_vec(),
-                receiver: b"bob".to_vec(),
-                amount: Some(100),
-                timestamp: 0,
-                result_hash: vec![],
-                sender_signature: vec![],
-            },
+            transaction: make_test_transaction(trans_id, sender),
             total_voters: 3,
             total_stake: 42,
             leader_hash: prev_hash.clone(),
@@ -1485,19 +1509,7 @@ mod tests {
         sender: Vec<u8>,
     ) {
         pending_registry.register_pending(tx_id.to_string()).unwrap();
-        let tx = Transaction {
-            id: tx_id.to_string(),
-            action: "Process".into(),
-            token_id: vec![1],
-            bid: None,
-            sequence_number: 1,
-            sender: sender.clone(),
-            receiver: vec![2],
-            amount: Some(100),
-            timestamp: 0,
-            result_hash: vec![],
-            sender_signature: vec![],
-        };
+        let tx = make_test_transaction(tx_id, sender.clone());
         // Transition directly via the internal map — register_pending creates Pending,
         // then we mutate to Finalizing state.
         {
@@ -1539,7 +1551,7 @@ mod tests {
         make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
         registry.record_gas_used(tx_id, 50);
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -1578,7 +1590,7 @@ mod tests {
         make_finalizing_entry(&registry, tx_id, b"bob".to_vec());
         // No record_gas_used called
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"bob".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -1614,7 +1626,7 @@ mod tests {
         make_finalizing_entry(&registry, tx_id, b"charlie".to_vec());
         registry.record_gas_used(tx_id, 200);
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"charlie".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -1635,19 +1647,7 @@ mod tests {
         sender: Vec<u8>,
     ) {
         pending_registry.register_pending(tx_id.to_string()).unwrap();
-        let tx = Transaction {
-            id: tx_id.to_string(),
-            action: "Process".into(),
-            token_id: vec![1],
-            bid: None,
-            sequence_number: 1,
-            sender: sender.clone(),
-            receiver: vec![2],
-            amount: Some(100),
-            timestamp: 0,
-            result_hash: vec![],
-            sender_signature: vec![],
-        };
+        let tx = make_test_transaction(tx_id, sender.clone());
         // Transition to Validated (NOT Finalizing) — simulates leader-proposal path
         {
             let mut entry = pending_registry.get_transaction_mut(tx_id).unwrap();
@@ -1687,7 +1687,7 @@ mod tests {
         make_validated_entry(&registry, tx_id, b"alice".to_vec());
         registry.record_gas_used(tx_id, 75);
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -1727,7 +1727,7 @@ mod tests {
         make_validated_entry(&registry, tx_id, b"bob".to_vec());
         registry.record_gas_used(tx_id, 200); // exceeds balance
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"bob".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -1964,21 +1964,13 @@ mod tests {
             Vec::<u8>::new()
         };
 
+        // The transaction sender is fixed to `alice` here (all commit-test callers register their
+        // entry as alice); the only per-call variance is the `proposer_key`, which lives outside the
+        // transaction payload. Build via the shared helper so the committed block hashes equal the
+        // registry entry (AUDIT Phase 3.5 / H12).
         let signed = SignedTransaction {
             transaction_id: trans_id.to_string(),
-            transaction: Transaction {
-                id: trans_id.to_string(),
-                action: "Process".into(),
-                token_id: vec![1],
-                bid: None,
-                sequence_number: 1,
-                sender: b"alice".to_vec(),
-                receiver: b"bob".to_vec(),
-                amount: Some(100),
-                timestamp: 0,
-                result_hash: vec![],
-                sender_signature: vec![],
-            },
+            transaction: make_test_transaction(trans_id, b"alice".to_vec()),
             total_voters: 3,
             total_stake: 42,
             leader_hash: prev_hash.clone(),
@@ -2024,7 +2016,7 @@ mod tests {
         let tx_id = "tx_no_conflict";
         make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
             token_id: vec![1],
@@ -2068,7 +2060,7 @@ mod tests {
 
         // On an empty chain the helper emits previous_hash = vec![]
         // (genesis convention)
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
         assert!(block.previous_hash.is_empty());
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
@@ -2190,7 +2182,7 @@ mod tests {
         let tx_id = "tx_first";
         make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
 
-        let block = make_test_block_for_token(&committer, tx_id);
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
         let prev_hash = block.previous_hash.clone();
         let commit = TransactionCommit {
             trans_id: tx_id.as_bytes().to_vec(),
@@ -2207,6 +2199,92 @@ mod tests {
             committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
             1,
         );
+    }
+
+    // --- Payload-match + block_hash registry (AUDIT Phase 3.5 / H12) ---
+
+    #[tokio::test]
+    async fn check_and_commit_rejects_payload_mismatch() {
+        // Headline H12 discriminator. A commit whose block embeds a transaction differing from the
+        // validated/pooled one must be rejected — without the payload-match gate the Committer would
+        // happily append whatever block arrived on the wire.
+        let dp = Arc::new(TestDataProvider::new());
+        dp.insert_user(b"alice".to_vec(), "token".to_string(), User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_payload_mismatch";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        // Build a matching block, then tamper its embedded transaction (swap receiver) so the wire
+        // payload differs from the validated entry the Committer holds.
+        let mut block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+        block.signed_trans.transaction.receiver = vec![255];
+
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        match committer.check_and_commit_transaction_results(&commit).await {
+            Err(CommitterError::TransactionPayloadMismatch(_)) => {}
+            other => panic!("expected TransactionPayloadMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_transaction_records_block_hash_not_token_id() {
+        // Misnomer discriminator (H12). Committed.block_hash must record the hash of the block the
+        // transaction was committed *into*, never the token id (which is what the pre-fix Committer
+        // stored). We pin the entry with a second lock so it survives the commit flow (which would
+        // otherwise remove it once lock_count hits 0) and inspect its persisted state.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_blockhash";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+        {
+            let mut entry = registry.get_transaction_mut(tx_id).unwrap();
+            entry.acquire().unwrap();
+        }
+
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+        let committed_hash = block.current_hash.clone();
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        assert!(committer.check_and_commit_transaction_results(&commit).await.is_ok());
+
+        // The entry persists (pinned by the second lock); read back its Committed.block_hash.
+        let entry = registry.get_transaction_mut(tx_id).unwrap();
+        match &entry.state {
+            TransactionState::Committed { transaction, block_hash } => {
+                assert_eq!(block_hash, &committed_hash);
+                assert_ne!(block_hash, &vec![1]); // not the token id
+                assert_eq!(&transaction.sender, &b"alice".to_vec());
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
