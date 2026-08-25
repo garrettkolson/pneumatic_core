@@ -1,3 +1,4 @@
+use std::env;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -76,7 +77,19 @@ async fn main() {
         };
 
     // 3. Initialize NodeRegistry with a stake gate backed by the data service.
-    let data_provider = Arc::new(DefaultDataProvider::new());
+    //    Authenticate the data channel with the shared secret from the
+    //    PNEUMATIC_DATA_SECRET env var when present; the framing + timeout
+    //    hardening applies whether or not a secret is configured.
+    let data_provider = match env::var("PNEUMATIC_DATA_SECRET") {
+        Ok(secret) => Arc::new(DefaultDataProvider::new().with_secret(secret.into_bytes())),
+        Err(_) => {
+            eprintln!(
+                "PNEUMATIC_DATA_SECRET not set: the data service channel runs with the \
+                 unauthenticated (legacy/test) framing. Set it in production."
+            );
+            Arc::new(DefaultDataProvider::new())
+        }
+    };
     let stake_check = {
         let provider = data_provider.clone();
         let cfg = config.clone();

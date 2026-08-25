@@ -292,7 +292,7 @@ agree on anything.*
   Verify: after an epoch advance, new transactions route against the new epoch's executor
   set/stake snapshot.
 
-- [ ] **4.3 Harden the data-service channel** (H7, H8, M2, M5)
+- [x] **4.3 Harden the data-service channel** (H7, H8, M2, M5)
   Files: `src/data.rs:16-17`, `src/conns/senders.rs:29-45, 60-76`, `src/conns/factories.rs:49-58`,
   `src/conns/listeners.rs:15-21`.
   Action: absolute, 0700-scoped socket path (drop the relative `"data"`); authenticate the peer
@@ -302,6 +302,28 @@ agree on anything.*
   Verify: (a) a hung/slow data service times out and degrades registration only, not the whole
   RNS worker pool; (b) a pre-created socket path fails startup cleanly (no panic, no symlink
   hijack); (c) response > 16 MB rejected.
+
+  **Done:** *2026-08-25* — data channel hardened end to end. `src/conns/uds.rs` (new): per-UID
+  runtime dir (`$XDG_RUNTIME_DIR/pneumatic`, else `<temp>/pneumatic-<uid>`, forced 0700 via
+  `PermissionsExt`) + absolute `data_socket_path`; `prepare_socket_path` rejects a pre-created
+  symlink and removes a stale socket before bind. `src/conns/senders.rs`: every
+  `UdsSender`/`TcpSender::get_response` now sets read+write timeouts (WouldBlock/TimedOut →
+  `ConnError::Timeout`), length-frames the response, and HMAC-SHA256-authenticates via a per-worker
+  shared secret — wire shape is `[4-byte BE len][auth_tag(32) || body]`, the length covering the
+  whole authed body so the 16 MB cap covers it. `src/conns/listeners.rs`: `CoreUdsListener::new` /
+  `CoreTcpListener::new` return `Result` instead of `expect()`. `src/conns/factories.rs`:
+  `ConnFactory` carries the shared secret + rw timeout; `get_listener` UDS path resolves the
+  absolute per-UID socket. `src/data.rs`: `DefaultDataProvider` holds `source` + optional secret
+  (`with_secret` / `with_timeout`); `Timeout` / `Unauthenticated` map to `DataError::Timeout` /
+  `PeerUnauthenticated`. `committer/src/main.rs` reads `PNEUMATIC_DATA_SECRET`. 11 senders tests +
+  37 conns tests green; full workspace green.
+
+  Note (**wire-compat, AUDIT ground rule 4**): this phase *changes* the data-channel framing from
+  raw `write_all` / `read_to_end` to length-prefixed `[4-byte BE len][auth_tag(32) || body]` and
+  adds shared-secret HMAC. The external data daemon must respond with framed bodies carrying a
+  valid HMAC tag computed over the payload under the shared secret, or hardened workers reject with
+  `Unauthenticated`. Forward/backward compatible only when both the daemon and the workers ship
+  4.3; a 4.2-era unframed daemon will time out against a 4.3 worker.
 
 - [ ] **4.4 Stake gates: per-type, real, off the hot path** (H7, H8)
   Files: `src/config.rs:205-219` (uniform `min_stake: 10`), `src/environment.rs`

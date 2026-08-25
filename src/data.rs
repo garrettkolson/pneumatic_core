@@ -6,8 +6,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category::Data;
-use crate::conns::{ConnTarget, LocalTarget};
+use crate::conns::{ConnError, ConnTarget, LocalTarget};
 use crate::conns::factories::{ConnFactory, IsConnFactory};
+use crate::conns::uds::data_socket_path;
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use crate::epoch::{ExecutorSet, StakeSet};
 use crate::tokens::Token;
@@ -56,23 +57,72 @@ pub trait DataProvider : Send + Sync {
 }
 
 pub struct DefaultDataProvider {
-    conn_factory: ConnFactory
+    conn_factory: ConnFactory,
+    /// The data-service endpoint this provider talks to.
+    source: ConnTarget,
+}
+
+/// Absolute default data-service endpoint: a per-UID socket path on Unix, TCP
+/// loopback otherwise. Previously used a relative, world-writable-path `"data"`
+/// which could be hijacked by a pre-created symlink at that path.
+fn default_source() -> ConnTarget {
+    let local_target = match cfg!(unix) {
+        true => {
+            let path = data_socket_path(DATA_UNIX_PATH)
+                .unwrap_or_else(|_| std::path::PathBuf::from(format!("/tmp/{}.sock", DATA_UNIX_PATH)));
+            LocalTarget::Unix(path.to_string_lossy().into_owned())
+        }
+        false => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
+    };
+
+    ConnTarget::Local(local_target)
+}
+
+/// Translate a data-channel failure into a `DataError`. A blocked read/write
+/// (hung data service) surfaces as `Timeout` rather than a generic store error,
+/// and a failed shared-secret check surfaces as `PeerUnauthenticated`.
+fn conn_error_to_data_error(err: ConnError) -> DataError {
+    match err {
+        ConnError::Timeout(msg) => DataError::Timeout(msg),
+        ConnError::Unauthenticated(msg) => DataError::PeerUnauthenticated(msg),
+        other => DataError::FromStore(other.to_string()),
+    }
 }
 
 impl DefaultDataProvider {
     pub fn new() -> Self {
         DefaultDataProvider {
-            conn_factory: ConnFactory::new()
+            conn_factory: ConnFactory::new(),
+            source: default_source(),
         }
     }
 
-    pub fn get_source() -> ConnTarget {
-        let local_target = match cfg!(unix) {
-            true => LocalTarget::Unix(DATA_UNIX_PATH.to_string()),
-            false => LocalTarget::Tcp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DATA_TCP_PORT)))
-        };
+    /// Rebuild the backing connection factory with a shared secret so every
+    /// data-channel frame is HMAC-authenticated. The timeouts / framing / cap
+    /// hardening apply regardless of whether a secret is configured.
+    pub fn with_secret(mut self, secret: Vec<u8>) -> Self {
+        self.conn_factory = ConnFactory::new().with_secret(Some(secret));
+        self
+    }
 
-        ConnTarget::Local(local_target)
+    /// Override the data-service endpoint (used by tests to point at a custom
+    /// socket / port).
+    pub fn with_source(mut self, source: ConnTarget) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Override the blocking read/write bound applied to the backing factory.
+    /// Used by tests to prove a hung data service degrades to a `Timeout`
+    /// rather than blocking forever; production callers can set their own.
+    pub fn with_timeout(mut self, rw_timeout: Duration) -> Self {
+        self.conn_factory = self.conn_factory.with_timeout(rw_timeout);
+        self
+    }
+
+    /// The data-service endpoint this provider talks to.
+    pub fn get_source(&self) -> ConnTarget {
+        self.source.clone()
     }
 
     fn serialize_request(&self, key: &Vec<u8>, op: DataOp, partition: &str)
@@ -89,12 +139,12 @@ impl DefaultDataProvider {
         where T : Serialize + for<'a> Deserialize<'a>
     {
         if let DataOp::Save(_) = op { return Err(DataError::InvalidOperation(op)) }
-        let source = Self::get_source();
+        let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
             let response = match sender.get_response(&data) {
                 Ok(data) => data,
-                Err(err) => return Err(DataError::FromStore(err.to_string()))
+                Err(err) => return Err(conn_error_to_data_error(err))
             };
 
             return match deserialize_rmp_to::<T>(&response) {
@@ -111,12 +161,12 @@ impl DefaultDataProvider {
         where T : Serialize + for<'a> Deserialize<'a>
     {
         if let DataOp::Get(_) = op { return Err(DataError::InvalidOperation(op)) }
-        let source = Self::get_source();
+        let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, op, partition)?;
             return match sender.get_response(&data) {
                 Ok(_) => Ok(()),
-                Err(err) => Err(DataError::FromStore(err.to_string()))
+                Err(err) => Err(conn_error_to_data_error(err))
             };
         }
 
@@ -124,12 +174,12 @@ impl DefaultDataProvider {
     }
 
     fn get_user(&self, key: &Vec<u8>, partition: &str) -> Result<User, DataError> {
-        let source = Self::get_source();
+        let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, DataOp::Get(GetOp::User), partition)?;
             let response = match sender.get_response(&data) {
                 Ok(data) => data,
-                Err(err) => return Err(DataError::FromStore(err.to_string()))
+                Err(err) => return Err(conn_error_to_data_error(err))
             };
 
             return match deserialize_rmp_to::<User>(&response) {
@@ -142,12 +192,12 @@ impl DefaultDataProvider {
     }
 
     fn save_user(&self, key: &Vec<u8>, user: User, partition: &str) -> Result<(), DataError> {
-        let source = Self::get_source();
+        let source = self.get_source();
         if let Ok(sender) = self.conn_factory.get_sender(source) {
             let data = self.serialize_request(key, DataOp::Save(SaveOp::User(user)), partition)?;
             return match sender.get_response(&data) {
                 Ok(_) => Ok(()),
-                Err(err) => Err(DataError::FromStore(err.to_string()))
+                Err(err) => Err(conn_error_to_data_error(err))
             };
         }
 
@@ -277,6 +327,10 @@ pub enum DataError {
     InvalidSignature,
     /// Cryptographic error encountered during message processing
     CryptoError(String),
+    /// The data service did not respond within the connection read/write bound
+    Timeout(String),
+    /// A data-channel response failed shared-secret HMAC verification
+    PeerUnauthenticated(String),
 }
 
 impl std::fmt::Display for DataError {
@@ -292,6 +346,8 @@ impl std::fmt::Display for DataError {
             DataError::InvalidOperation(op) => write!(f, "InvalidOperation({})", op),
             DataError::InvalidSignature => write!(f, "InvalidSignature"),
             DataError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
+            DataError::Timeout(msg) => write!(f, "Timeout({})", msg),
+            DataError::PeerUnauthenticated(msg) => write!(f, "PeerUnauthenticated({})", msg),
         }
     }
 }
@@ -299,6 +355,10 @@ impl std::fmt::Display for DataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+    use std::sync::mpsc;
 
     #[test]
     fn data_error_crypto_error_display() {
@@ -324,6 +384,54 @@ mod tests {
         assert_eq!(SaveOp::Token(Token::default()).to_string(), "Token");
         assert_eq!(SaveOp::Data(vec![]).to_string(), "Data");
         assert_eq!(SaveOp::User(User::default()).to_string(), "User");
+    }
+
+    // Discriminator (verify a): a data service that accepts the connection but
+    // never responds makes a blocking `get_user` return `Err(Timeout)` instead
+    // of hanging (which is what wedged the RNS worker pool pre-fix). Reverting
+    // the sender's read timeout turns this into a permanent block.
+    #[test]
+    fn get_user_returns_timeout_on_non_responding_data_service() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sock_path = temp_dir.path().join("data.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&sock_str);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+
+        // Move a clone into the server thread so `sock_str` stays usable below.
+        let server_sock = sock_str.clone();
+        let server_handle = thread::spawn(move || {
+            let listener = UnixListener::bind(&server_sock).unwrap();
+            let _ = ready_tx.send(());
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Read the framed request so the client's write completes, then
+                // hold the connection open WITHOUT responding.
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_ok() {
+                    let len = u32::from_be_bytes(header) as usize;
+                    let mut body = vec![0u8; len];
+                    let _ = stream.read_exact(&mut body);
+                }
+                std::thread::sleep(Duration::from_secs(4));
+            }
+        });
+
+        let _ = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Point the provider at the socket and bound reads at 1s.
+        let provider = DefaultDataProvider::new()
+            .with_source(ConnTarget::Local(LocalTarget::Unix(sock_str)))
+            .with_timeout(Duration::from_secs(1));
+
+        let result = provider.get_user(&vec![1u8], "default");
+        assert!(
+            matches!(result, Err(DataError::Timeout(_))),
+            "expected Timeout on a hung data service, got {:?}",
+            result
+        );
+
+        drop(server_handle);
     }
 }
 

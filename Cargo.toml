@@ -38,6 +38,11 @@ aes-gcm = "0.11.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 hkdf = "0.12"
 sha2 = "0.10"
+# Shared-secret auth over the data channel (HMAC-SHA256). hmac re-exports
+# `digest` 0.10, which sha2 already pins — so no version divergence.
+hmac = "0.12"
+# getuid() for per-UID runtime-dir resolution (src/conns/uds.rs).
+libc = "0.2"
 # Reticulum Network Stack (rns-rs). Pinned exactly: NodeConfig has ~45 fields
 # and no Default, so any version bump is an API-migration event.
 rns-net = "=0.7.0"

@@ -2,6 +2,7 @@ pub mod streams;
 pub mod factories;
 pub mod senders;
 pub mod listeners;
+pub mod uds;
 
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{Read, Write};
@@ -160,6 +161,10 @@ pub enum ConnError {
     ConnectionRejectedByRemote,
     /// Cryptographic decryption failure on a network-reachable path
     DecryptError(String),
+    /// Blocking read/write exceeded its timeout (hung peer)
+    Timeout(String),
+    /// A frame failed shared-secret HMAC verification
+    Unauthenticated(String),
 }
 
 impl Debug for ConnError {
@@ -174,6 +179,8 @@ impl Debug for ConnError {
                 f.write_str("ConnectionRejectedByRemote")
             }
             ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
+            ConnError::Timeout(msg) => f.debug_tuple("Timeout").field(msg).finish(),
+            ConnError::Unauthenticated(msg) => f.debug_tuple("Unauthenticated").field(msg).finish(),
         }
     }
 }
@@ -190,6 +197,8 @@ impl Display for ConnError {
                 f.write_str("ConnectionRejectedByRemote")
             }
             ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
+            ConnError::Timeout(msg) => write!(f, "Timeout({})", msg),
+            ConnError::Unauthenticated(msg) => write!(f, "Unauthenticated({})", msg),
         }
     }
 }
