@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use pneumatic_core::blocks::Block;
 use pneumatic_core::config::Config;
 use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::{DataError, DataProvider};
@@ -81,7 +82,7 @@ impl Sentinel {
             stake_snapshot_cache,
             executor_set_cache,
             env_data,
-            current_epoch: parking_lot::Mutex::new(0),
+            current_epoch: parking_lot::Mutex::new(1),
         }
     }
 
@@ -115,6 +116,7 @@ impl Sentinel {
             "Reject" => self.handle_rejection(message),
             "Register" => self.handle_register_request(message),
             "Clear" | "Delete" => self.handle_clear_request(message),
+            "BlockFinalized" => self.handle_block_finalized_for_epoch(message),
             action => Err(SentinelError::UnknownAction(action.to_string())),
         }
     }
@@ -250,7 +252,7 @@ impl Sentinel {
     fn send_to_executor_for_preload(&self, tx: &Transaction) -> Result<(), SentinelError> {
         if self.env_data.shard_count > 1 {
             // Shard-aware routing: only send to the selected shard's executors
-            let shard_executors = self.get_shard_executors(&tx.id, 1)?;
+            let shard_executors = self.get_shard_executors(&tx.id, *self.current_epoch.lock())?;
             self.transaction_notifier
                 .send_to_shard_executors_for_preload(tx, &shard_executors, &self.env_data)
                 .map_err(Into::into)
@@ -293,6 +295,11 @@ impl Sentinel {
     ///
     /// Call this when a new epoch is detected (e.g., from chain blocks).
     pub fn advance_epoch(&self, epoch_number: u64) {
+        // Fail-closed: never rewind the epoch. A stale or replayed block must not
+        // roll routing back to an older executor/stake snapshot.
+        if epoch_number <= *self.current_epoch.lock() {
+            return;
+        }
         *self.current_epoch.lock() = epoch_number;
         self.executor_set_cache.invalidate_all();
         self.stake_snapshot_cache.invalidate_all();
@@ -365,7 +372,7 @@ impl Sentinel {
 
         // Assign a new finalizer deterministically using the current stake snapshot.
         // Falls back to random candidate selection if the snapshot is unavailable.
-        let new_key = match self.assign_finalizer_deterministic_retry(&tx_id, 1, &rejected_key) {
+        let new_key = match self.assign_finalizer_deterministic_retry(&tx_id, *self.current_epoch.lock(), &rejected_key) {
             Ok(key) => key,
             Err(_) => {
                 // Fallback: pick the first non-rejected candidate from the node registry.
@@ -427,6 +434,36 @@ impl Sentinel {
         // Release lock — transaction remains in Finalizing for new finalizer.
         let _ = self.registry.release_transaction(&tx_id);
 
+        Ok(())
+    }
+
+    /// Advance the sentinel's epoch from a `BlockFinalized` gossip message.
+    ///
+    /// Fail-closed (AUDIT H5): only a registered finalizer may move the epoch, and
+    /// the advance is monotonic (an `advance_epoch` guard rejects stale/replayed
+    /// blocks). The `epoch_number` is bound into the block hash (Phase 2.1), so a
+    /// gossiper-authenticated `BlockFinalized` from a registered finalizer is a
+    /// trustworthy epoch signal. This is an availability signal, not a chain-append:
+    /// the sentinel does not validate linkage here.
+    fn handle_block_finalized_for_epoch(&self, message: Message) -> Result<(), SentinelError> {
+        let block: Block = deserialize_rmp_to(&message.body)
+            .map_err(|e| SentinelError::Encoding(e))?;
+
+        // Fail-closed role guard: only a registered finalizer may advance the epoch.
+        // `message.public_key` is the gossiper-authenticated sender identity.
+        let is_finalizer = self
+            .node_registry
+            .get_nodes(&NodeRegistryType::Finalizer)
+            .map(|nodes| nodes.iter().any(|n| n.key() == &message.public_key))
+            .unwrap_or(false);
+        if !is_finalizer {
+            return Err(SentinelError::Registry(format!(
+                "BlockFinalized from non-finalizer {:?}",
+                message.public_key
+            )));
+        }
+
+        self.advance_epoch(block.epoch_number);
         Ok(())
     }
 
@@ -674,7 +711,22 @@ mod tests {
             main_environment_id: "test".to_string(),
             reconciliation_partition_id: "recon".to_string(),
             environment_metadata: Arc::new(DashMap::new()),
-            type_configs: Arc::new(DashMap::new()),
+            // Node-type capacity entries are required — without them get_max_node_number
+            // returns 0 and register_peer rejects every peer. The epoch-advance tests below
+            // register a finalizer peer to satisfy the role guard.
+            type_configs: Arc::new({
+                let tc = DashMap::new();
+                for t in [
+                    NodeRegistryType::Committer,
+                    NodeRegistryType::Sentinel,
+                    NodeRegistryType::Executor,
+                    NodeRegistryType::Finalizer,
+                    NodeRegistryType::Archiver,
+                ] {
+                    tc.insert(t.clone(), pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 10 });
+                }
+                tc
+            }),
             identity: Arc::new(identity),
             rhash,
             bootstrap_peers: Vec::new(),
@@ -704,6 +756,22 @@ mod tests {
         EnvironmentMetadata::load_from_spec(spec)
     }
 
+    /// Same as `make_test_env_data` but with shard-aware routing enabled, for
+    /// tests that exercise the per-shard executor selection path.
+    fn make_test_env_data_sharded() -> EnvironmentMetadata {
+        let json = r#"{"environment_id":"test","environment_name":"test",
+            "partitions":[{"id":"token","partition_type":"Token"},
+            {"id":"slush","partition_type":"Slush"}],
+            "asym_crypto_provider":{"Ed25519":null},"sym_crypto_provider":"sym",
+            "serialization_provider":"rmp","quorum_percentage":67.0,
+            "override_quorum_percentage":0.0,"max_risk":1.0,
+            "allowed_token_types":[],"trans_validation_specs":[],
+            "block_validation_specs":[],"log_file":"test.log",
+            "shard_count":2}"#;
+        let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
+        EnvironmentMetadata::load_from_spec(spec)
+    }
+
     fn make_sentinel_fixture() -> (Sentinel, Arc<PendingTransactionRegistry>) {
         make_sentinel_fixture_with_data_provider(StubDataProvider::new())
     }
@@ -711,9 +779,17 @@ mod tests {
     fn make_sentinel_fixture_with_data_provider(
         data_provider: StubDataProvider,
     ) -> (Sentinel, Arc<PendingTransactionRegistry>) {
+        make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data())
+    }
+
+    /// Shared fixture build for a custom environment (e.g. shard-aware routing).
+    fn make_sentinel_fixture_with_env_and_data_provider(
+        data_provider: StubDataProvider,
+        env_data: EnvironmentMetadata,
+    ) -> (Sentinel, Arc<PendingTransactionRegistry>) {
         let registry = Arc::new(PendingTransactionRegistry::new());
         let node_registry = make_test_node_registry();
-        let env_data = Arc::new(make_test_env_data());
+        let env_data = Arc::new(env_data);
         let gossiper = Arc::new(Gossiper::new(
             NodeRegistryType::Sentinel,
             make_test_config(),
@@ -1732,5 +1808,344 @@ mod tests {
         sentinel.advance_epoch(2);
         assert_eq!(sentinel.stake_snapshot_cache.cached_count(), 0);
         assert_eq!(*sentinel.current_epoch.lock(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4.2 (AUDIT H5): sentinel routes on the tracked epoch, not a
+    //                    hardcoded literal `1`. Each test is a discriminator
+    //                    that fails under the literal-1 bug and passes with the
+    //                    current_epoch wiring.
+    // -----------------------------------------------------------------------
+
+    /// The core discriminator. After `advance_epoch`, both the executor-shard and
+    /// the finalizer-stake routing primitives select against the *new* epoch.
+    #[test]
+    fn advance_epoch_routes_follows_new_epoch() {
+        use pneumatic_core::epoch::{ExecutorSet, StakeSet};
+
+        // Disjoint executor sets and stake snapshots per epoch: any selection from
+        // epoch 1 is provably distinct from any selection from epoch 2.
+        let data_provider = StubDataProvider::new()
+            .with_executor_set(
+                1,
+                ExecutorSet {
+                    executors: [(vec![1], 100), (vec![2], 100)].into_iter().collect(),
+                },
+            )
+            .with_executor_set(
+                2,
+                ExecutorSet {
+                    executors: [(vec![10], 100), (vec![20], 100)].into_iter().collect(),
+                },
+            )
+            .with_stake_snapshot(
+                1,
+                StakeSet {
+                    stakers: [(vec![1], 100), (vec![2], 100), (vec![3], 100)].into_iter().collect(),
+                },
+            )
+            .with_stake_snapshot(
+                2,
+                StakeSet {
+                    stakers: [(vec![10], 100), (vec![20], 100), (vec![30], 100)].into_iter().collect(),
+                },
+            );
+        let (sentinel, _registry) =
+            make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data_sharded());
+
+        let tx_id = "tx_epoch_route".to_string();
+
+        // advance_epoch(1) is a no-op at boot (init is 1); routing stays on epoch 1.
+        sentinel.advance_epoch(1);
+        assert_eq!(*sentinel.current_epoch.lock(), 1);
+        let exec1 = sentinel
+            .get_shard_executors(&tx_id, *sentinel.current_epoch.lock())
+            .unwrap();
+        let finalizer1 = sentinel
+            .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock())
+            .unwrap();
+
+        // advance_epoch(2) moves routing to epoch 2.
+        sentinel.advance_epoch(2);
+        assert_eq!(*sentinel.current_epoch.lock(), 2);
+        let exec2 = sentinel
+            .get_shard_executors(&tx_id, *sentinel.current_epoch.lock())
+            .unwrap();
+        let finalizer2 = sentinel
+            .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock())
+            .unwrap();
+
+        // Per-epoch routing must select different targets. Under the literal-1 bug
+        // both calls would read epoch 1 → identical selections.
+        let mut e1 = exec1.clone();
+        e1.sort();
+        let mut e2 = exec2.clone();
+        e2.sort();
+        assert_ne!(e1, e2, "executor selection must change after an epoch advance");
+        assert_ne!(finalizer1, finalizer2, "finalizer selection must change after an epoch advance");
+
+        // And each pick must come from its own epoch's disjoint key set.
+        assert!(
+            [vec![1], vec![2], vec![3]].contains(&finalizer1)
+                && [vec![10], vec![20], vec![30]].contains(&finalizer2),
+            "each finalizer pick must be drawn from its own epoch's stake snapshot"
+        );
+    }
+
+    /// True call-site discriminator for the executor path:
+    /// `send_to_executor_for_preload` routes on `current_epoch`.
+    #[test]
+    fn send_to_executor_for_preload_follows_current_epoch() {
+        use pneumatic_core::epoch::ExecutorSet;
+
+        // Only epoch 1 has an executor set; epoch 2 is absent.
+        let data_provider = StubDataProvider::new().with_executor_set(
+            1,
+            ExecutorSet {
+                executors: [(vec![1], 100), (vec![2], 100)].into_iter().collect(),
+            },
+        );
+        let (sentinel, _registry) =
+            make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data_sharded());
+
+        let tx = Transaction {
+            id: "tx_preload_epoch".to_string(),
+            action: "Transfer".to_string(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: vec![1],
+            receiver: vec![2],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+
+        // advance_epoch(1) is a no-op at boot; routing stays on epoch 1 → valid set.
+        sentinel.advance_epoch(1);
+        assert!(sentinel.send_to_executor_for_preload(&tx).is_ok());
+
+        // advance_epoch(2): no executor set for epoch 2 → routing must fail closed.
+        // Under the literal-1 bug the handler would keep reading epoch 1 → still Ok.
+        sentinel.advance_epoch(2);
+        let err = sentinel.send_to_executor_for_preload(&tx).unwrap_err();
+        match err {
+            SentinelError::Routing(msg) => assert_eq!(msg, "No executor set for epoch 2"),
+            other => panic!("expected Routing error, got {:?}", other),
+        }
+    }
+
+    /// True call-site discriminator for the finalizer path:
+    /// `handle_rejection` reassigns against `current_epoch`'s stake snapshot.
+    #[test]
+    fn handle_rejection_follows_current_epoch() {
+        use pneumatic_core::epoch::StakeSet;
+
+        // Disjoint stake snapshots per epoch.
+        let data_provider = StubDataProvider::new()
+            .with_stake_snapshot(
+                1,
+                StakeSet {
+                    stakers: [(vec![1], 100), (vec![2], 100), (vec![3], 100)].into_iter().collect(),
+                },
+            )
+            .with_stake_snapshot(
+                2,
+                StakeSet {
+                    stakers: [(vec![10], 100), (vec![20], 100), (vec![30], 100)].into_iter().collect(),
+                },
+            );
+        let (sentinel, registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        // Put the transaction into Finalizing with finalizer_key = vec![1]
+        // (a member of the epoch-1 stake set) — i.e. the assigned finalizer rejects.
+        let rejected_key = vec![1];
+        make_finalizing_entry(&registry, "tx_reject_epoch", rejected_key.clone());
+
+        // Advance to epoch 2, then drive the rejection.
+        sentinel.advance_epoch(2);
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Reject".into(),
+            body: serialize_to_bytes_rmp(&"tx_reject_epoch".to_string()).unwrap(),
+            signature: vec![],
+            public_key: rejected_key.clone(),
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        assert!(sentinel.on_data_received(raw).is_ok());
+
+        // The discriminators: the reassignment must land on the epoch-2 pick, not the
+        // epoch-1 pick (which is what the literal-1 bug would produce).
+        let epoch2_pick = sentinel
+            .assign_finalizer_deterministic_retry("tx_reject_epoch", 2, &rejected_key)
+            .unwrap();
+        let epoch1_pick = sentinel
+            .assign_finalizer_deterministic_retry("tx_reject_epoch", 1, &rejected_key)
+            .unwrap();
+        assert_ne!(epoch1_pick, epoch2_pick, "the two epochs must pick different finalizers for the test to be meaningful");
+        assert!(
+            registry.is_requested_finalizer("tx_reject_epoch", &epoch2_pick),
+            "entry must be reassigned to the epoch-2 finalizer"
+        );
+        assert!(
+            !registry.is_requested_finalizer("tx_reject_epoch", &epoch1_pick),
+            "entry must NOT be reassigned to the epoch-1 finalizer"
+        );
+    }
+
+    /// Wiring discriminator: the `BlockFinalized` action now advances the epoch
+    /// (and only a registered finalizer may do so — see fail-closed test).
+    #[test]
+    fn block_finalized_advances_epoch() {
+        use pneumatic_core::blocks::Block;
+        use pneumatic_core::conns::Connection;
+
+        // Minimal no-op connection so register_peer accepts a peer.
+        struct NoOpConnection;
+        #[async_trait::async_trait]
+        impl Connection for NoOpConnection {
+            async fn send(
+                &self,
+                _data: &Vec<u8>,
+            ) -> Result<(), pneumatic_core::conns::ConnError> {
+                Ok(())
+            }
+        }
+
+        // Register a finalizer peer so the role guard recognizes the sender.
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let finalizer_key = vec![0xA3; 32];
+        assert!(sentinel.node_registry.register_peer(
+            finalizer_key.clone(),
+            [3u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(NoOpConnection),
+        ));
+
+        // Build a finalized block bound to epoch 3.
+        let block = Block {
+            signed_trans: pneumatic_core::transactions::SignedTransaction::test_transaction(),
+            token_metadata: std::collections::HashMap::new(),
+            previous_hash: vec![1, 2, 3],
+            current_hash: vec![4, 5, 6],
+            timestamp: 0,
+            finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 3,
+        };
+        let body = serialize_to_bytes_rmp(&block).unwrap();
+
+        // Message from the registered finalizer: message.public_key is the sender.
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "BlockFinalized".into(),
+            body,
+            signature: vec![],
+            public_key: finalizer_key.clone(),
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+
+        assert!(sentinel.on_data_received(raw).is_ok());
+        assert_eq!(*sentinel.current_epoch.lock(), 3);
+    }
+
+    /// Fail-closed guardrails for the epoch-advance handler: only a registered
+    /// finalizer may advance, and the advance is monotonic (never rewind).
+    #[test]
+    fn block_finalized_fail_closed() {
+        use pneumatic_core::blocks::Block;
+        use pneumatic_core::conns::Connection;
+
+        struct NoOpConnection;
+        #[async_trait::async_trait]
+        impl Connection for NoOpConnection {
+            async fn send(
+                &self,
+                _data: &Vec<u8>,
+            ) -> Result<(), pneumatic_core::conns::ConnError> {
+                Ok(())
+            }
+        }
+
+        fn make_block(epoch: u64) -> Block {
+            Block {
+                signed_trans: pneumatic_core::transactions::SignedTransaction::test_transaction(),
+                token_metadata: std::collections::HashMap::new(),
+                previous_hash: vec![],
+                current_hash: vec![],
+                timestamp: 0,
+                finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+                proposer_key: vec![],
+                epoch_number: epoch,
+            }
+        }
+
+        let (sentinel, _registry) = make_sentinel_fixture();
+        let finalizer_key = vec![0xB1; 32];
+        assert!(sentinel.node_registry.register_peer(
+            finalizer_key.clone(),
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(NoOpConnection),
+        ));
+
+        // (b) A non-finalizer sender is rejected; the epoch must not move.
+        // Under no role guard an attacker could advance the epoch to an arbitrary
+        // (stale/empty) executor set — an availability risk.
+        let attacker_body = serialize_to_bytes_rmp(&make_block(5)).unwrap();
+        let attacker_msg = Message {
+            chain_id: "test".into(),
+            action: "BlockFinalized".into(),
+            body: attacker_body,
+            signature: vec![],
+            public_key: vec![0xDE; 32], // never registered as a finalizer
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&attacker_msg).unwrap();
+        match sentinel.on_data_received(raw) {
+            Err(SentinelError::Registry(msg)) => assert!(msg.contains("non-finalizer")),
+            other => panic!("expected Registry error for non-finalizer, got {:?}", other),
+        }
+        assert_eq!(*sentinel.current_epoch.lock(), 1);
+
+        // (c) A malformed body is rejected (encoding failure).
+        let bad_body = serialize_to_bytes_rmp(&"this is not a block".to_string()).unwrap();
+        let bad_msg = Message {
+            chain_id: "test".into(),
+            action: "BlockFinalized".into(),
+            body: bad_body,
+            signature: vec![],
+            public_key: finalizer_key.clone(),
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&bad_msg).unwrap();
+        match sentinel.on_data_received(raw) {
+            Err(SentinelError::Encoding(_)) => {}
+            other => panic!("expected Encoding error for malformed body, got {:?}", other),
+        }
+        assert_eq!(*sentinel.current_epoch.lock(), 1);
+
+        // (a) A stale/replayed block (epoch <= current) must not rewind the epoch.
+        // Advance to epoch 2, then feed a block bound to epoch 1. Under no monotonic
+        // guard the epoch would roll back to 1; the guard keeps it at 2.
+        sentinel.advance_epoch(2);
+        let stale_body = serialize_to_bytes_rmp(&make_block(1)).unwrap();
+        let stale_msg = Message {
+            chain_id: "test".into(),
+            action: "BlockFinalized".into(),
+            body: stale_body,
+            signature: vec![],
+            public_key: finalizer_key.clone(),
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&stale_msg).unwrap();
+        assert!(sentinel.on_data_received(raw).is_ok(), "stale block still routes to the handler");
+        assert_eq!(
+            *sentinel.current_epoch.lock(), 2,
+            "stale block must not rewind the epoch"
+        );
     }
 }

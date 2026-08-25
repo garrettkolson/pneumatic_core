@@ -284,7 +284,7 @@ agree on anything.*
   Verify: end-to-end test that boots the real committer (no test-only registry injection) and
   commits a transaction.
 
-- [ ] **4.2 Sentinel routes on the current epoch, not literal 1** (H5)
+- [x] **4.2 Sentinel routes on the current epoch, not literal 1** (H5)
   File: `sentinel/src/sentinel.rs:221` (and every other literal-`1` routing call site;
   `current_epoch` at `:45` is write-only).
   Action: route via `current_epoch`; keep it updated from epoch-advance events with snapshot

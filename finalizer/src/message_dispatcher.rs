@@ -132,7 +132,12 @@ impl MessageDispatcher {
 
         // Broadcast to all archivars
         self.node_registry
-            .send_to_all(payload, &NodeRegistryType::Archiver).await;
+            .send_to_all(payload.clone(), &NodeRegistryType::Archiver).await;
+
+        // Broadcast to all sentinels — delivers the finalized block (and its
+        // epoch_number + stake_set) so routing nodes can advance to the new epoch.
+        self.node_registry
+            .send_to_all(payload, &NodeRegistryType::Sentinel).await;
 
         Ok(())
     }
