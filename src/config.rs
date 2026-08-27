@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::crypto::AsymCryptoProvider;
 use crate::encoding;
-use crate::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
+use crate::environment::{CostModel, EnvironmentMetadata, EnvironmentMetadataSpec};
 use crate::rns::config_builder::DEFAULT_UDP_PORT;
 use crate::rns::identity::NodeIdentity;
 use strum::IntoEnumIterator;
@@ -75,7 +75,22 @@ impl Config {
         // Populate per-type configurations (min/max connections + minimum stake).
         // These values are protocol-level defaults; real chain state and stake data
         // may refine them at runtime.
-        let type_configs = Arc::new(Self::default_type_configs());
+        //
+        // The defaults seed every type at the uniform floor; the environment
+        // spec may then override a type's minimum via `CostModel.per_type_min_stake`
+        // (Phase 4.4). Env specs without that field (the common case) apply no
+        // override and stay at the uniform default. Config-schema, not a wire change.
+        let mut type_configs = Self::default_type_configs();
+        if let Some(main_env) = environment_metadata.get(&spec.main_env_id) {
+            for node_type in NodeRegistryType::iter() {
+                if let Some(&per_type) = main_env.cost_model.per_type_min_stake.get(&node_type) {
+                    if let Some(mut tc) = type_configs.get_mut(&node_type) {
+                        tc.min_stake = per_type;
+                    }
+                }
+            }
+        }
+        let type_configs = Arc::new(type_configs);
 
         // Load (or create) the persistent identity keystore. A corrupt
         // keystore is a hard error — silently regenerating would orphan
@@ -177,6 +192,19 @@ impl Config {
         }
     }
 
+    /// The protocol-level global minimum stake for the main environment, from
+    /// `CostModel.global_min_stake`. Falls back to the cost-model default (10)
+    /// when the environment is absent from the registry (e.g. tests). This is
+    /// the second floor on top of the per-type minimum — a node must meet
+    /// *both* to register or act (see `meets_minimum_stake`, and the
+    /// `ActionRouter::check_stake` reference at `action_router.rs:180`).
+    pub fn get_global_min_stake(&self) -> u64 {
+        self.environment_metadata
+            .get(&self.main_environment_id)
+            .map(|env| env.cost_model.global_min_stake)
+            .unwrap_or_else(CostModel::default_global_min_stake)
+    }
+
     /// Return the node registry types this node participates in.
     ///
     /// Full nodes participate in all five registry types (Committer, Sentinel,
@@ -249,6 +277,21 @@ impl Config {
             transport_enabled: false,
         }
     }
+}
+
+/// Whether `stake` meets the *lower* of the two registered floors.
+///
+/// Registration and action stake gates enforce a conjunction: a key must
+/// satisfy both the protocol-level global minimum and the per-type minimum.
+/// `meets_minimum_stake` returns `true` only when `stake` is at or above both —
+/// mirroring the AND that `ActionRouter::check_stake` enforces at
+/// (`action_router.rs:186-196`) and that the `StakeIndex` registration gate
+/// (`node/stake_index.rs`) applies on the off-thread hot path. A `stake` below
+/// either floor fails. Kept as a free function so it is reachable from any
+/// module via `crate::config::meets_minimum_stake` (an inherent method on
+/// `Config` would only be reachable via `Config::meets_minimum_stake`).
+pub fn meets_minimum_stake(stake: u64, global_min: u64, type_min: u64) -> bool {
+    stake >= global_min && stake >= type_min
 }
 
 #[derive(Serialize, Deserialize)]

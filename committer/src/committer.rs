@@ -1046,6 +1046,14 @@ impl Committer {
         self.proposal_interval_ms
     }
 
+    /// Get the current epoch number. Surfaced so the off-thread registration
+    /// stake cache (`StakeIndex`) can advance its refresher to the current
+    /// epoch on epoch boundaries (AUDIT Phase 4.4) — the single source of
+    /// truth for "which epoch's stake set is live" is this counter.
+    pub fn current_epoch_number(&self) -> u64 {
+        self.current_epoch_number.load(Ordering::SeqCst)
+    }
+
     /// Get a reference to the logger.
     pub fn logger(&self) -> &Arc<dyn Logger> {
         &self.env_data.logger

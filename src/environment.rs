@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
+
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::logging::{FileLogger, Logger};
+use crate::node::NodeRegistryType;
 use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry,
     SelfSignedBlockValidatorSpec, ExecutedBlockValidatorSpec};
 
@@ -23,6 +25,15 @@ pub struct CostModel {
     /// Default multipliers: {"Process": 1.0, "Preload": 2.0, "Sign": 1.5}.
     #[serde(default = "CostModel::default_amount_multiplier")]
     pub amount_multiplier: HashMap<String, f64>,
+    /// Per-node-type minimum stake overrides for this environment. Each entry
+    /// replaces the protocol-level default (`Config::get_min_type_stake`) for
+    /// its type; an empty map (the default when the field is omitted) leaves
+    /// every type at the uniform default. This is an env-spec *config* field,
+    /// not an RNS control-plane wire message — its `#[serde(default)]` makes
+    /// env specs without it degrade to an empty map (fully backward/forward
+    /// compatible; see AUDIT Phase 4.4 wire-compat note).
+    #[serde(default)]
+    pub per_type_min_stake: HashMap<NodeRegistryType, u64>,
 }
 
 impl CostModel {
@@ -72,6 +83,15 @@ impl CostModel {
         let gas_from_amount = Self::gas_from_amount(amount, multiplier_fixed);
         self.base_cost.saturating_add(gas_from_amount)
     }
+
+    /// The protocol-level global minimum stake used when an environment has
+    /// no configured `CostModel.global_min_stake` (e.g. tests that construct
+    /// a `Config` without a populated environment registry). Must match
+    /// `CostModel::default().global_min_stake` so the fallback never widens or
+    /// tightens the floor.
+    pub fn default_global_min_stake() -> u64 {
+        10
+    }
 }
 
 impl Default for CostModel {
@@ -82,6 +102,7 @@ impl Default for CostModel {
             admin_public_key: vec![],
             admin_tax_percentage: 0.0,
             amount_multiplier: Self::default_amount_multiplier(),
+            per_type_min_stake: HashMap::new(),
         }
     }
 }

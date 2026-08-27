@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use pneumatic_core::blocks::Block;
-use pneumatic_core::config::Config;
+use pneumatic_core::config::{Config, meets_minimum_stake};
 use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
@@ -518,10 +518,17 @@ impl Sentinel {
     }
 
     /// Check if the user with the given key has sufficient stake for the requested node type.
+    ///
+    /// Enforces the same AND semantics as the off-thread registration gate
+    /// (`node/stake_index.rs`) and `ActionRouter::check_stake`: the stake must
+    /// meet *both* the protocol-level global minimum and the per-type minimum.
+    /// A stake below either floor fails closed. See AUDIT Phase 4.4 (H7/H8).
     fn check_stake_for_type(&self, key: &Vec<u8>, node_type: &NodeRegistryType) -> Result<bool, SentinelError> {
         let user = self.data_provider.get_user(key, &self.env_data.environment_id)?;
-        let min_stake = self.node_registry.get_config().get_min_type_stake(node_type);
-        Ok(user.stake >= min_stake)
+        let node_cfg = self.node_registry.get_config();
+        let global_min = node_cfg.get_global_min_stake();
+        let type_min = node_cfg.get_min_type_stake(node_type);
+        Ok(meets_minimum_stake(user.stake, global_min, type_min))
     }
 
     /// Handle a "Clear"/"Delete" request — remove a transaction from the registry.
@@ -801,6 +808,45 @@ mod tests {
             env_data,
             node_registry,
             registry.clone(),
+            gossiper,
+            Arc::new(data_provider),
+        );
+        (sentinel, registry)
+    }
+
+    /// Sentinel fixture with the Sentinel-type registration floor overridden to
+    /// `type_min` (the global floor stays at the default 10, since the test env
+    /// is empty). Decoupling the per-type floor from the global floor lets the
+    /// AND semantics of `check_stake_for_type` be exercised independently —
+    /// AUDIT Phase 4.4.
+    fn make_sentinel_fixture_sentinel_floor(
+        type_min: u64,
+        data_provider: StubDataProvider,
+    ) -> (Sentinel, Arc<NodeRegistry>) {
+        let config = make_test_config();
+        config
+            .type_configs
+            .get_mut(&NodeRegistryType::Sentinel)
+            .expect("Sentinel is a supported registry type")
+            .min_stake = type_min;
+        let config_arc = Arc::new(config.clone());
+        let registry = Arc::new(NodeRegistry::init(
+            config_arc,
+            None,
+            Arc::new(|_, _| true),
+        ));
+        let env_data = Arc::new(make_test_env_data());
+        let gossiper = Arc::new(Gossiper::new(
+            NodeRegistryType::Sentinel,
+            make_test_config(),
+            300,
+            env_data.asym_crypto_provider.clone(),
+        ));
+        let sentinel = Sentinel::new(
+            config,
+            env_data,
+            registry.clone(),
+            Arc::new(PendingTransactionRegistry::new()),
             gossiper,
             Arc::new(data_provider),
         );
@@ -1575,6 +1621,89 @@ mod tests {
             User { public_key: key.clone(), fuel_balance: 0, stake: 1, nonce: 0 },
         );
         let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        let req = NodeRegistryRequest::new(
+            key.clone(),
+            identity.rhash,
+            identity
+                .sign_binding(&identity.rhash, &NodeRegistryType::Sentinel, &[NodeRegistryType::Sentinel])
+                .unwrap(),
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Register".into(),
+            body: serialize_to_bytes_rmp(&req).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        let result = sentinel.on_data_received(raw);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SentinelError::Registry(msg) => assert!(msg.contains("Insufficient stake")),
+            _ => panic!("expected Registry error"),
+        }
+    }
+
+    /// A well-staked user (stake 1000) passes both the global floor (10) and the
+    /// Sentinel per-type floor (10) in the default fixture — registration
+    /// succeeds. Guards the happy path against the AND-semantics refactor.
+    #[test]
+    fn handle_register_request_sufficient_stake_passes() {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let key = identity.ed25519.public_key().unwrap();
+        let mut data_provider = StubDataProvider::new();
+        data_provider = data_provider.with_user(
+            key.clone(),
+            "test".to_string(),
+            User { public_key: key.clone(), fuel_balance: 1000, stake: 1000, nonce: 0 },
+        );
+        let (sentinel, _registry) = make_sentinel_fixture_with_data_provider(data_provider);
+
+        let req = NodeRegistryRequest::new(
+            key.clone(),
+            identity.rhash,
+            identity
+                .sign_binding(&identity.rhash, &NodeRegistryType::Sentinel, &[NodeRegistryType::Sentinel])
+                .unwrap(),
+            vec![NodeRegistryType::Sentinel],
+            NodeRegistryType::Sentinel,
+        );
+        let msg = Message {
+            chain_id: "test".into(),
+            action: "Register".into(),
+            body: serialize_to_bytes_rmp(&req).unwrap(),
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&msg).unwrap();
+        // Register succeeds (no "already registered" error ⇒ the node was added).
+        assert!(sentinel.on_data_received(raw.clone()).is_ok());
+        // A second register for the same type is rejected as already-registered.
+        assert!(sentinel.on_data_received(raw.clone()).is_err());
+    }
+
+    /// Discriminator for the global-floor enforcement. The Sentinel per-type floor
+    /// is lowered to 1 while the global floor stays at 10; a user with stake 5
+    /// therefore passes the per-type floor alone (5 ≥ 1) but fails the global
+    /// floor (5 < 10). The OLD `user.stake >= min_stake` logic accepts it; the NEW
+    /// `meets_minimum_stake(5, 10, 1)` AND rejects it. Asserts rejection ⇒ proves
+    /// the global floor is now enforced.
+    #[test]
+    fn handle_register_request_below_global_floor_rejected() {
+        let identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+        let key = identity.ed25519.public_key().unwrap();
+        let mut data_provider = StubDataProvider::new();
+        data_provider = data_provider.with_user(
+            key.clone(),
+            "test".to_string(),
+            User { public_key: key.clone(), fuel_balance: 1000, stake: 5, nonce: 0 },
+        );
+        let (sentinel, _registry) = make_sentinel_fixture_sentinel_floor(1, data_provider);
 
         let req = NodeRegistryRequest::new(
             key.clone(),

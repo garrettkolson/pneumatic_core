@@ -10,6 +10,7 @@ use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBounda
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
+use pneumatic_core::node::stake_index::StakeIndex;
 use pneumatic_core::node::{NetworkPacket, NodeRequest, NodeRegistryResponse, NodeRegistryType};
 use pneumatic_core::node::NodeRequestType;
 use pneumatic_core::registry::PendingTransactionRegistry;
@@ -90,16 +91,34 @@ async fn main() {
             Arc::new(DefaultDataProvider::new())
         }
     };
-    let stake_check = {
-        let provider = data_provider.clone();
-        let cfg = config.clone();
-        Arc::new(move |key: &[u8], node_type: &NodeRegistryType| {
-            provider
-                .get_user(&key.to_vec(), &cfg.main_environment_id)
-                .map(|user| user.stake >= cfg.get_min_type_stake(node_type))
-                .unwrap_or(false)
-        })
-    };
+    // 3.5. Build the registration stake gate OFF the RNS worker pool (AUDIT
+    // Phase 4.4 / H7, H8). The closure below was replaced: it previously called
+    // `data_provider.get_user`, a blocking framed TCP/UDS read, inside
+    // `NodeRegistry::handle_register` — which the 4 plain std::thread RNS workers
+    // invoke with no Tokio runtime. A hung data service could therefore hold one
+    // worker for the full read timeout, and 4 concurrent registrations would
+    // exhaust the pool and wedge the transport. StakeIndex keeps a background
+    // std::thread that periodically loads the current-epoch stake snapshot into
+    // an in-process pubkey->stake index, so the gate is a pure in-memory map
+    // lookup with zero I/O: a hung data service can never touch the worker pool.
+    // A cache miss (key absent) returns 0 stake ⇒ the gate rejects (fail
+    // closed); a refresh error leaves the stale index in place ⇒ still fail
+    // closed. `StakeCheck`'s signature is unchanged — only its backing closure
+    // moved off the hot path.
+    let stake_index = Arc::new(StakeIndex::new(
+        data_provider.clone(),
+        env_data.token_partition_id.clone(),
+        1, // committer epoch at boot; advanced by set_epoch on each epoch boundary
+        None,
+    ));
+    stake_index.start();
+    // Synchronous warm-up before the gate is wired in, so a cold cache fails
+    // registrations closed rather than open before the network starts.
+    stake_index.warm();
+    // make_check captures the config so the closure reads live floors without
+    // a data-service round-trip. Pass an Arc so the returned StakeCheck owns its
+    // config (mirrors the Arc<Config> handed to NodeRegistry::init below).
+    let stake_check = stake_index.make_check(Arc::new(config.clone()));
     let node_registry = Arc::new(NodeRegistry::init(
         Arc::new(config.clone()),
         network.clone(),
@@ -286,6 +305,12 @@ async fn main() {
 
     // 13. Start background epoch loop — polls for block proposals periodically
     let epoch_committer = committer.clone();
+    // Advance the registration stake cache to the current epoch as it is
+    // selected, so the off-thread gate consults the stake set frozen when each
+    // epoch's leader was chosen (single source of truth: the committer's
+    // current_epoch_number). The refresher's own std::thread continues polling
+    // the data service on its own cadence for the target epoch.
+    let epoch_stake_index = stake_index.clone();
     tokio::spawn(async move {
         loop {
             if let Err(e) = epoch_committer.run_epoch_loop().await {
@@ -293,6 +318,7 @@ async fn main() {
                 epoch_committer.logger()
                     .log(format!("Epoch loop error: {:?}", e));
             }
+            epoch_stake_index.set_epoch(epoch_committer.current_epoch_number());
             tokio::time::sleep(std::time::Duration::from_millis(
                 epoch_committer.proposal_interval_ms(),
             ))

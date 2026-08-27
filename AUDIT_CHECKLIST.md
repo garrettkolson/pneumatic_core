@@ -325,7 +325,7 @@ agree on anything.*
   `Unauthenticated`. Forward/backward compatible only when both the daemon and the workers ship
   4.3; a 4.2-era unframed daemon will time out against a 4.3 worker.
 
-- [ ] **4.4 Stake gates: per-type, real, off the hot path** (H7, H8)
+- [x] **4.4 Stake gates: per-type, real, off the hot path** (H7, H8)
   Files: `src/config.rs:205-219` (uniform `min_stake: 10`), `src/environment.rs`
   (`CostModel.global_min_stake` never consulted), `src/node/registry.rs:329`
   (stake gate runs on the RNS worker pool).
@@ -333,6 +333,33 @@ agree on anything.*
   blocking data-service stake check off the RNS worker pool (async/off-thread) so a slow data
   service cannot wedge the 4-thread network pool.
   Verify: four concurrent stalled stake checks leave the RNS pool responsive.
+
+  **Done:** *2026-08-27* — per-type minima are now enforced alongside the global floor and the
+  registration gate runs off the RNS worker pool. `src/config.rs`: added `meets_minimum_stake` — a
+  module-scope free function (`stake >= global_min && stake >= type_min`), reachable from any crate
+  via `crate::config::meets_minimum_stake` (kept free, not an inherent `Config` method, so both the
+  registration gate and the sentinel share one AND). `Config::get_global_min_stake` reads
+  `cost_model.global_min_stake` and falls back to the cost-model default (10) when the env is
+  absent from the registry. `committer/src/main.rs` builds an `Arc<StakeIndex>`: a background
+  `std::thread` periodically loads the current-epoch `StakeSet` into an in-process `pubkey -> stake`
+  index (`StakeIndex::start`); the gate closure (`StakeIndex::make_check`) is a pure in-memory
+  DashMap lookup with zero data-service I/O, so a hung data service can never hold one of the 4
+  plain-`std::thread` RNS workers (no Tokio runtime). The index is warmed synchronously before the
+  network starts (`StakeIndex::warm`); a cache miss returns 0 stake ⇒ the gate fails closed; a
+  refresh error leaves the stale index in place ⇒ still fails closed. The committer's epoch loop
+  advances the cache via `StakeIndex::set_epoch(current_epoch_number)` (single source of truth).
+  `src/node/stake_index.rs` (new): the `StakeIndex` type + 7 regression tests. `sentinel/src/sentinel.rs`:
+  `check_stake_for_type` now uses `meets_minimum_stake` — two new tests (a well-staked user passes;
+  a user with 5 stake passes the lowered Sentinel floor of 1 but is rejected for missing the global
+  floor of 10, proving the global floor is now enforced). Workspace suite green: 513 passing, 0
+  failures.
+
+  Note (**wire-compat, AUDIT ground rule 4**): *no wire-message-shape change.* `StakeCheck` is an
+  internal Rust type (`Arc<dyn Fn(&[u8], &NodeRegistryType) -> bool + Send + Sync>`); its signature
+  is unchanged and the RNS control path (`NodeRequest` Register → `handle_register` → `RegisterAck`)
+  is byte-for-byte identical. The per-type minima are driven by the env-spec `CostModel.per_type_min_stake`
+  (`#[serde(default)]`) — a config-schema change to the local `config` JSON, not an RNS control-plane
+  message, and fully backward/forward compatible (absent ⇒ empty map ⇒ uniform `min_stake: 10`).
 
 - [ ] **4.5 Gas accounting: right partition, no swallowed errors** (M11)
   File: `committer/src/committer.rs:265-273`.

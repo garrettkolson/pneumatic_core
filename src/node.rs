@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod stake_index;
 
 use std::sync::Arc;
 use std::time::Instant;

@@ -491,6 +491,7 @@ mod tests {
             admin_public_key: vec![1, 2, 3],
             admin_tax_percentage: 0.02, // 2%
             amount_multiplier: HashMap::new(),
+            per_type_min_stake: HashMap::new(),
         }
     }
 
