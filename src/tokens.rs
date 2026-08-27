@@ -492,6 +492,7 @@ mod tests {
             admin_tax_percentage: 0.02, // 2%
             amount_multiplier: HashMap::new(),
             per_type_min_stake: HashMap::new(),
+            slash_fraction: 1.0,
         }
     }
 

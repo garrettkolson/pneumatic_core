@@ -230,6 +230,7 @@ async fn main() {
         data_provider.clone(),
         env_data.environment_id.clone(),
         vec![], // token IDs: populated dynamically via token distribution
+        env_data.cost_model.slash_fraction,
     ));
 
     let hash_provider = Arc::new(BasicHashProvider::new());

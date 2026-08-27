@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::data::DataProvider;
-use pneumatic_core::epoch::{CandidateRegistry, Conflict, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, StakeSet, StakingOp};
+use pneumatic_core::epoch::{CandidateRegistry, Conflict, ConflictResolution, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, StakeSet, StakingOp, resolve_block_conflict};
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::logging::Logger;
 
@@ -88,26 +88,12 @@ impl StakingManager {
 
 impl IStakingManager for StakingManager {
     fn apply_ops(&self, ops: &EpochReconciliation) -> Result<(), PneumaticError> {
+        // A single pass over both lists applies each op exactly once. The
+        // previous version ran two loops that *both* handled `Slash`, so a
+        // slash landing in `reward_ops` would have deducted the stake twice.
         let op_count = ops.slashing_ops.len() + ops.reward_ops.len();
 
-        for op in &ops.slashing_ops {
-            match op {
-                StakingOp::Slash(key, amount) => {
-                    self.stake_store.slash(key, *amount);
-                }
-                StakingOp::Reward(key, amount) => {
-                    self.stake_store.reward(key, *amount);
-                }
-                StakingOp::AddStaker(key, stake) => {
-                    self.stake_store.add_staker(key.clone(), *stake);
-                }
-                StakingOp::RemoveStaker(key) => {
-                    self.stake_store.remove_staker(key);
-                }
-            }
-        }
-
-        for op in &ops.reward_ops {
+        for op in ops.slashing_ops.iter().chain(ops.reward_ops.iter()) {
             match op {
                 StakingOp::Slash(key, amount) => {
                     self.stake_store.slash(key, *amount);
@@ -145,6 +131,10 @@ pub struct EpochReconciler {
     data_provider: Arc<dyn DataProvider>,
     env_id: String,
     token_ids: Vec<Vec<u8>>,
+    /// Fraction of a slashed proposer's stake to remove on a resolved
+    /// same-proposer conflict (1.0 = full stake). Set from the committer's
+    /// `CostModel.slash_fraction` so the penalty is configurable via env spec.
+    slash_fraction: f64,
 }
 
 impl EpochReconciler {
@@ -154,6 +144,7 @@ impl EpochReconciler {
         data_provider: Arc<dyn DataProvider>,
         env_id: String,
         token_ids: Vec<Vec<u8>>,
+        slash_fraction: f64,
     ) -> Self {
         EpochReconciler {
             stake_store,
@@ -161,6 +152,7 @@ impl EpochReconciler {
             data_provider,
             env_id,
             token_ids,
+            slash_fraction,
         }
     }
 
@@ -215,6 +207,31 @@ impl EpochReconciler {
                         stake_a,
                         stake_b,
                     });
+
+                    // AUDIT Phase 5.1 / H1: resolve the conflict and actually
+                    // slash a same-proposer double-sign. `resolve_block_conflict`
+                    // only branches to `SameProposerSlash` when stakes are equal
+                    // and the proposers match, so this is exactly the
+                    // protocol-violation case. Slash the full remaining stake
+                    // (times the configured fraction); a proposer already slashed
+                    // to 0 at commit time is re-slashed to a no-op.
+                    if let Ok(ConflictResolution::SameProposerSlash(_, slashed_key)) =
+                        resolve_block_conflict(
+                            &block_a.current_hash,
+                            &block_b.current_hash,
+                            &proposer_a,
+                            &proposer_b,
+                            &stake_set,
+                        )
+                    {
+                        let amount = (self.stake_store.get_stake(&slashed_key) as f64
+                            * self.slash_fraction)
+                            .round()
+                            .min(u64::MAX as f64) as u64;
+                        if amount > 0 {
+                            reconciliation.slashing_ops.push(StakingOp::Slash(slashed_key, amount));
+                        }
+                    }
                 }
             }
         }
@@ -295,10 +312,12 @@ mod tests {
     use pneumatic_core::blocks::{Block, FinalityStatus};
     use pneumatic_core::data::{DataProvider, StubDataProvider};
     use pneumatic_core::epoch::{CandidateRegistry, IEpochReconciler};
+    use pneumatic_core::epoch::StakingOp;
     use pneumatic_core::tokens::Token;
     use pneumatic_core::transactions::SignedTransaction;
 
-    use super::{EpochReconciler, StakeStore};
+    use super::{EpochReconciler, Logger, StakingManager, StakeStore};
+    use pneumatic_core::epoch::IStakingManager;
 
     fn build_valid_block(prev_hash: Vec<u8>) -> Block {
         let signed = SignedTransaction::test_transaction();
@@ -350,6 +369,7 @@ mod tests {
         stakes: Vec<(Vec<u8>, u64)>,
         tokens: Vec<(Vec<u8>, Token)>,
         token_ids: Vec<Vec<u8>>,
+        slash_fraction: f64,
     ) -> (EpochReconciler, Arc<StakeStore>, Arc<CandidateRegistry>) {
         let stake_store = make_stake_store(stakes);
         let registry = Arc::new(CandidateRegistry::new());
@@ -364,6 +384,7 @@ mod tests {
             data_provider,
             "test".to_string(),
             token_ids,
+            slash_fraction,
         );
         (reconciler, stake_store, registry)
     }
@@ -372,7 +393,7 @@ mod tests {
 
     #[test]
     fn reconcile_empty_token_ids_returns_default() {
-        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![], 1.0);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.is_empty());
         assert!(result.finalization_conflicts.is_empty());
@@ -380,7 +401,7 @@ mod tests {
 
     #[test]
     fn reconcile_token_not_found_skipped() {
-        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![vec![1], vec![2]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![], vec![vec![1], vec![2]], 1.0);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.is_empty());
         assert!(result.finalization_conflicts.is_empty());
@@ -389,7 +410,7 @@ mod tests {
     #[test]
     fn reconcile_valid_chain_not_misshapen() {
         let token = make_valid_token(vec![1], 3);
-        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]], 1.0);
         let result = reconciler.reconcile();
         assert!(!result.misshapen_tokens.contains(&vec![1]));
         assert!(result.misshapen_tokens.is_empty());
@@ -398,7 +419,7 @@ mod tests {
     #[test]
     fn reconcile_invalid_chain_detected_as_misshapen() {
         let token = make_invalid_token(vec![1]);
-        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]]);
+        let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]], 1.0);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.contains(&vec![1]));
     }
@@ -411,6 +432,7 @@ mod tests {
             vec![(vec![1], 100)],
             vec![(vec![1], make_valid_token(vec![1], 2))],
             vec![vec![1]],
+            1.0,
         );
         // No candidates inserted → no conflicts
         let result = reconciler.reconcile();
@@ -423,6 +445,7 @@ mod tests {
             vec![(vec![1], 100)],
             vec![(vec![1], make_valid_token(vec![1], 2))],
             vec![vec![1]],
+            1.0,
         );
         let tip_hash = tip_hash_for(&reconciler);
         let block = build_valid_block(vec![1, 2, 3]);
@@ -452,6 +475,7 @@ mod tests {
             vec![(vec![1], 100)],
             vec![(vec![1], make_valid_token(vec![1], 2))],
             vec![vec![1]],
+            1.0,
         );
         let tip_hash = tip_hash_for(&reconciler);
         let block_a = build_valid_block(vec![1, 2, 3]);
@@ -469,12 +493,55 @@ mod tests {
         assert_eq!(conflict.stake_b, 200);
     }
 
+    // --- Slash emission on same-proposer double-sign (AUDIT Phase 5.1 / H1) ---
+
+    /// A no-op logger so a `StakingManager` can be constructed in tests without
+    /// touching the filesystem.
+    struct NullLogger;
+    impl Logger for NullLogger {
+        fn log(&self, _message: String) {}
+    }
+
+    #[test]
+    fn reconcile_same_proposer_conflict_slashes_proposer() {
+        // Reconciliation must emit AND apply a real slash op for a same-proposer
+        // double-sign — previously reconcile_internal emitted zero slash ops.
+        let (reconciler, store, registry) = make_reconciler(
+            vec![(vec![1], 100)],
+            vec![(vec![1], make_valid_token(vec![1], 2))],
+            vec![vec![1]],
+            1.0, // full slash
+        );
+        let tip_hash = tip_hash_for(&reconciler);
+        // Two blocks by the SAME proposer at the same tip — a double-sign.
+        let block_a = build_valid_block(vec![1, 2, 3]);
+        let block_b = build_valid_block(vec![4, 5, 6]);
+        store.add_staker(vec![1], 100);
+        registry.insert(vec![1], tip_hash.clone(), block_a, vec![1]);
+        registry.insert(vec![1], tip_hash, block_b, vec![1]);
+
+        let result = reconciler.reconcile();
+        // The conflict is recorded and a full slash op is emitted for the offender.
+        assert_eq!(result.finalization_conflicts.len(), 1);
+        let slash = result.slashing_ops.iter().find_map(|op| match op {
+            StakingOp::Slash(key, amount) => Some((key.clone(), *amount)),
+            _ => None,
+        });
+        assert_eq!(slash, Some((vec![1], 100)));
+
+        // Applying the ops must actually move the StakeStore — slashing is real.
+        let manager = StakingManager::new(store.clone(), Arc::new(NullLogger));
+        manager.apply_ops(&result).expect("apply_ops should succeed");
+        assert_eq!(store.get_stake(&vec![1]), 0);
+    }
+
     #[test]
     fn reconcile_conflict_stake_resolution_returns_real_stakes() {
         let (reconciler, store, registry) = make_reconciler(
             vec![(vec![1], 500)],
             vec![(vec![1], make_valid_token(vec![1], 2))],
             vec![vec![1]],
+            1.0,
         );
         let tip_hash = tip_hash_for(&reconciler);
         let block_a = build_valid_block(vec![10]);
@@ -501,7 +568,7 @@ mod tests {
             (vec![i], make_valid_token(vec![i], 2))
         }).collect();
         let token_ids: Vec<Vec<u8>> = (0..5).map(|i| vec![i]).collect();
-        let (reconciler, _, _) = make_reconciler(stakes, tokens, token_ids);
+        let (reconciler, _, _) = make_reconciler(stakes, tokens, token_ids, 1.0);
         let result = std::thread::scope(|s| {
             let mut handles = vec![];
             for _ in 0..10 {

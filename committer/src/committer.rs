@@ -1028,23 +1028,33 @@ impl Committer {
                 ));
             }
             ConflictResolution::SameProposerSlash(winner_hash, slashed_key) => {
-                // Same proposer double-signed — slash them
+                // Same proposer double-signed — slash them for a real amount.
+                // The slash is the configured fraction (default: full stake) of
+                // the offender's current stake, so a fully-slashed proposer is
+                // zeroed and a re-slash at the next epoch boundary is a no-op.
+                let amount = (self.stake_store.get_stake(&slashed_key) as f64
+                    * self.env_data.cost_model.slash_fraction)
+                    .round()
+                    .min(u64::MAX as f64) as u64;
+
                 let logger = &self.env_data.logger;
                 logger.log(format!(
-                    "Double-proposal detected (same proposer) at commit: slashing {}, winner {} (token: {})",
+                    "Double-proposal detected (same proposer) at commit: slashing {} (winner {})(token: {})",
                     bytes_to_hex(&slashed_key),
                     bytes_to_hex(&winner_hash),
                     bytes_to_hex(&token_id),
                 ));
-                // Apply slash via staking manager
+                // Apply the slash now and fail-closed: commit-time is the first
+                // authority to slash, so a failed slash fails the commit rather
+                // than being swallowed.
                 self.staking_manager.apply_ops(&pneumatic_core::epoch::EpochReconciliation {
                     misshapen_tokens: vec![],
                     finalization_conflicts: vec![],
                     slashing_ops: vec![pneumatic_core::epoch::StakingOp::Slash(
-                        slashed_key, 0, // full stake slash — amount TBD
+                        slashed_key, amount,
                     )],
                     reward_ops: vec![],
-                }).ok(); // Non-fatal — epoch reconciliation will apply real slashes
+                })?;
             }
             ConflictResolution::TieFlagBoth(winner_hash) => {
                 let logger = &self.env_data.logger;
@@ -1538,19 +1548,31 @@ mod tests {
         }
     }
 
+    /// Builds a Committer with the default full-stake slash fraction (1.0).
     fn make_test_committer(
         data_provider: Arc<TestDataProvider>,
+    ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
+        make_test_committer_with_slash(data_provider, 1.0)
+    }
+
+    /// Builds a Committer with an overridable `CostModel.slash_fraction`. The default
+    /// `make_test_committer` delegates here with the full-stake default (1.0).
+    fn make_test_committer_with_slash(
+        data_provider: Arc<TestDataProvider>,
+        slash_fraction: f64,
     ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
         let mut env_data = Arc::new(make_test_env_data());
         // Install an in-memory collecting logger so a test can assert a failure path emitted an
         // observable log line (the default FileLogger discards to a file). `env_data` is uniquely
         // owned right here, so `Arc::get_mut` reaches the metadata to swap the logger without
-        // changing EnvironmentMetadata's shape or the public API.
+        // changing EnvironmentMetadata's shape or the public API. The slash fraction is set here too
+        // so a test can drive a partial (vs. full) slash of a double-signed proposer's stake.
         let logger = CollectingLogger::default();
         {
             let env = Arc::get_mut(&mut env_data)
                 .expect("env_data uniquely owned at construction time");
             env.logger = Arc::new(logger.clone());
+            env.cost_model.slash_fraction = slash_fraction;
         }
         let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
         let rhash = identity.rhash;
@@ -1623,6 +1645,7 @@ mod tests {
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]], // token ID from bootstrap_token
+            env_data.cost_model.slash_fraction,
         ));
         let hash_provider = Arc::new(BasicHashProvider::new());
         let leader_selector = Arc::new(LeaderSelector::new(hash_provider));
@@ -2233,6 +2256,7 @@ mod tests {
             data_provider_core.clone(),
             "test".to_string(),
             vec![vec![1]],
+            env_data.cost_model.slash_fraction,
         ));
         let hash_provider = Arc::new(BasicHashProvider::new());
         let leader_selector = Arc::new(LeaderSelector::new(hash_provider));
@@ -2666,6 +2690,67 @@ mod tests {
 
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok());
+
+        // AUDIT Phase 5.1 / H1: the double-signed proposer's stake must actually
+        // decrease by the configured fraction (default: full stake). Slashing is
+        // a no-op without this — the offender keeps their full stake.
+        assert_eq!(
+            committer.stake_store.get_stake(&vec![10]),
+            0,
+            "full-stake slash should zero the offender's stake"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_same_proposer_partial_slash_respects_fraction() {
+        // AUDIT Phase 5.1 / H1: the slash amount is the configured fraction of
+        // the offender's stake, not a hardcoded value. With slash_fraction = 0.5
+        // a proposer staked at 100 should drop to 50, proving the amount is
+        // configured rather than always full.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry, _logger) = make_test_committer_with_slash(dp, 0.5);
+
+        // Bootstrap token and chain
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_double_sign_partial";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        // Same proposer — double-signed scenario
+        committer.stake_store.add_staker(vec![10], 100);
+
+        // Insert existing candidate with same proposer key
+        let existing_block = make_block_with_proposer(&committer, "tx_existing", vec![10]);
+        committer.candidate_registry.insert(
+            vec![1], prev_hash.clone(), existing_block, vec![10],
+        );
+
+        let block = make_block_with_proposer(&committer, tx_id, vec![10]); // SAME proposer!
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            committer.stake_store.get_stake(&vec![10]),
+            50,
+            "0.5 fraction of 100 should leave 50"
+        );
     }
 
     #[tokio::test]

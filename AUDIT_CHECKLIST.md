@@ -406,15 +406,25 @@ agree on anything.*
 ## Phase 5 — Economics & consensus enforcement
 *Closes: H1, H2, H3, H6, H9, H13, H14, H16(self-signed), M10, M13.*
 
-- [ ] **5.1 Make slashing real** (H1)
-  Files: `committer/src/committer.rs:685-686` (`StakingOp::Slash(key, 0)`),
-  `committer/src/epoch_manager.rs:40-45`, `:173-223` (`reconcile_internal` never emits slashing
-  ops).
-  Action: slash a configured real amount (default: full stake); make epoch reconciliation
-  actually apply slashing ops for resolved conflicts; remove or honor the dead
-  `finalization_conflicts` field.
+- [x] **5.1 Make slashing real** (H1) — *done 2026-08-27*
+  Files: `src/environment.rs:42-43,106,120` (new `CostModel.slash_fraction`, default full stake),
+  `src/tokens.rs:495` (test-helper literal), `committer/src/epoch_manager.rs:90-132` (`apply_ops`
+  single pass), `:136-155,204-232` (`reconcile_internal` now emits `Slash` on SameProposerSlash),
+  `committer/src/committer.rs:1030-1054` (commit-time slash amount + `?` fail-closed),
+  `:1648,2259` (`slash_fraction` threaded into `EpochReconciler`).
+  Action: slash = `current_stake × CostModel.slash_fraction` (default `1.0` = full stake). Epoch
+  reconciliation now emits a `Slash` op for each resolved SameProposer (double-sign) conflict, and
+  the commit-time path computes the real amount and propagates errors (`?`) instead of the dead
+  `Slash(key, 0)` swallowed by `.ok()`. `apply_ops` applies each op (incl. `Slash`) exactly once.
+  `finalization_conflicts` kept and honored — informational record + Phase 5.2 loser-discard
+  handoff. Natural idempotency: a full-*remaining*-stake slash makes re-slashing a zeroed proposer
+  a no-op, so commit-time and reconcile-time both re-seeing the same conflict double-slashes
+  nothing.
   Verify: double-signing test asserts the offender's stake actually decreases by the configured
-  amount.
+  amount — `commit_conflict_same_proposer_emits_slash` (offender → 0 full),
+  `commit_conflict_same_proposer_partial_slash_respects_fraction` (0.5 → 50, proves the amount is
+  configured), and a `reconcile_same_proposer_conflict_slashes_proposer` path test asserting
+  `slashing_ops` plus `apply_ops` moving the StakeStore. 535 tests passing, 0 failures.
 
 - [ ] **5.2 Discard losers on conflict; bound the registry** (H2)
   Files: `committer/src/committer.rs:613-711`, `src/epoch.rs:680`

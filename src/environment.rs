@@ -34,6 +34,13 @@ pub struct CostModel {
     /// compatible; see AUDIT Phase 4.4 wire-compat note).
     #[serde(default)]
     pub per_type_min_stake: HashMap<NodeRegistryType, u64>,
+    /// Fraction of a double-signed proposer's stake to slash on a resolved
+    /// same-proposer conflict (0.0–1.0, e.g. 1.0 = full stake). This is an
+    /// env-spec *config* field, not an RNS control-plane wire message — its
+    /// `#[serde(default)]` makes env specs without it degrade to a full-stake
+    /// slash (fully backward/forward compatible, like `per_type_min_stake`).
+    #[serde(default = "CostModel::default_slash_fraction")]
+    pub slash_fraction: f64,
 }
 
 impl CostModel {
@@ -92,6 +99,13 @@ impl CostModel {
     pub fn default_global_min_stake() -> u64 {
         10
     }
+
+    /// Default slash fraction — full stake. A double-signed proposer loses
+    /// their entire current stake unless an environment overrides
+    /// `CostModel.slash_fraction` to a smaller value.
+    pub fn default_slash_fraction() -> f64 {
+        1.0
+    }
 }
 
 impl Default for CostModel {
@@ -103,6 +117,7 @@ impl Default for CostModel {
             admin_tax_percentage: 0.0,
             amount_multiplier: Self::default_amount_multiplier(),
             per_type_min_stake: HashMap::new(),
+            slash_fraction: 1.0,
         }
     }
 }

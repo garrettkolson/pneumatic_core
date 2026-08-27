@@ -218,6 +218,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
         data_provider_core.clone(),
         "test".to_string(),
         vec![vec![1]],
+        env_data.cost_model.slash_fraction,
     ));
     let hash_provider = Arc::new(BasicHashProvider::new());
     let leader_selector = Arc::new(CommLeaderSelector::new(hash_provider));
