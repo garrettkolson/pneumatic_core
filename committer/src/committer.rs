@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use pneumatic_core::crypto::AsymCryptoProvider;
-use pneumatic_core::data::DataProvider;
+use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::blocks::{AppendOutcome, Block, BlockFactory, Blockchain, FinalityStatus};
@@ -128,6 +128,19 @@ pub struct Committer {
     /// 3.4 / H15). A BlockFinalized whose block does not chain onto the current tip is buffered
     /// here and replayed as the tip advances, so out-of-order delivery is never silently dropped.
     orphan_blocks: Mutex<OrphanBuffer>,
+    /// Per-sender guard serializing the commit-time gas read-modify-write
+    /// (`get_user` -> subtract -> `save_user`). Two commits from the same sender
+    /// (which run on separate `tokio` tasks) must not race on the shared account
+    /// balance or lose an update; different senders stay concurrent (AUDIT Phase
+    /// 4.5 / M11). A blocking `std::sync::Mutex` is fine here because the guarded
+    /// calls are already blocking data-service reads inside the async handler.
+    /// Per-sender map of guards serializing the commit-time gas read-modify-write
+    /// (`get_user` -> subtract -> `save_user`). Two commits from the same sender
+    /// (which run on separate `tokio` tasks) must not race on the shared account
+    /// balance or lose an update; different senders stay concurrent (AUDIT Phase
+    /// 4.5 / M11). Keyed by sender public key, mirroring the existing
+    /// `confirmation_votes` / `stake_set_cache` fields.
+    rmw_locks: Mutex<HashMap<Vec<u8>, Arc<std::sync::Mutex<()>>>>,
 }
 
 impl Committer {
@@ -179,6 +192,7 @@ impl Committer {
             confirmation_votes: Mutex::new(HashMap::new()),
             stake_set_cache: Mutex::new(HashMap::new()),
             orphan_blocks: Mutex::new(OrphanBuffer::new(1024, 256, Duration::from_secs(30))),
+            rmw_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -301,6 +315,47 @@ impl Committer {
         self.identity.ed25519.public_key().unwrap_or_default()
     }
 
+    /// Get-or-create the per-sender guard used to serialize the commit-time gas
+    /// read-modify-write. Returns the owned `Arc<Mutex<()>>` so the caller can hold
+    /// its lock only across the `get_user` / subtract / `save_user` sequence, keeping
+    /// distinct senders concurrent while two commits for the same sender cannot lose
+    /// an update to each other (AUDIT Phase 4.5 / M11). An owned return avoids tying
+    /// the returned lock to the brief lifetime of the map lookup.
+    async fn rmw_mutex(&self, sender: &[u8]) -> Arc<std::sync::Mutex<()>> {
+        let mut cache = self.rmw_locks.lock().await;
+        cache
+            .entry(sender.to_vec())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Build a `CommitterError::GasDeduction` for a failed `get_user`/`save_user`,
+    /// and emit a prominent, greppable failure line (sender hex, tx id, gas used,
+    /// error) so a silently-free-gas condition is observable in the committer log.
+    fn gas_deduction_err(
+        &self,
+        sender: &[u8],
+        tx_id: &str,
+        gas_used: u64,
+        cause: &DataError,
+    ) -> CommitterError {
+        self.env_data
+            .logger
+            .log(format!(
+                "GAS DEDUCTION FAILED: sender={} tx_id={} gas_used={} err={:?}",
+                bytes_to_hex(sender),
+                tx_id,
+                gas_used,
+                cause
+            ));
+        CommitterError::GasDeduction {
+            sender: bytes_to_hex(sender),
+            tx_id: tx_id.to_string(),
+            gas_used,
+            cause: format!("{cause:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Commit message handling
     // -----------------------------------------------------------------------
@@ -410,16 +465,31 @@ impl Committer {
         // Step 4: Commit the block via BlockServices
         let _ = self.block_services.commit_block(commit)?;
 
-        // Step 3.5: Deduct gas from sender's fuel balance
+        // Step 3.5: Deduct gas from sender's fuel balance.
+        //
+        // AUDIT Phase 4.5 / M11: fail-closed. Any failure to read or persist the
+        // sender's balance is surfaced (a loud log line + a returned
+        // `CommitterError::GasDeduction`) rather than silently swallowed, so gas is
+        // never given for free. The per-sender lock serializes the read-modify-write so
+        // concurrent commits for the same sender cannot lose an update. The `if let
+        // Some` guard is deliberate: a tx with no tracked gas (never routed through the
+        // cost model) is not debited and is not an error. The partition is the
+        // environment's token partition (the same one `verify_gas` debited at admission).
         if let Some(gas_used) = self.pending_registry.get_gas_used(&tx_id) {
-            if let Ok(mut user) = self.data_provider.get_user(
-                &transaction.sender, &self.env_data.token_partition_id,
-            ) {
-                user.fuel_balance = user.fuel_balance.saturating_sub(gas_used);
-                let _ = self.data_provider.save_user(
-                    &transaction.sender, user, &self.env_data.token_partition_id,
-                );
-            }
+            let mutex = self.rmw_mutex(&transaction.sender).await;
+            let _guard = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            let user = self
+                .data_provider
+                .get_user(&transaction.sender, &self.env_data.token_partition_id)
+                .map_err(|e| self.gas_deduction_err(&transaction.sender, &tx_id, gas_used, &e))?;
+            let mut user = user;
+            user.fuel_balance = user.fuel_balance.saturating_sub(gas_used);
+            self.data_provider.save_user(
+                &transaction.sender,
+                user,
+                &self.env_data.token_partition_id,
+            )
+            .map_err(|e| self.gas_deduction_err(&transaction.sender, &tx_id, gas_used, &e))?;
         }
 
         // Step 4: Update transaction state
@@ -1241,12 +1311,27 @@ mod tests {
 
     struct TestDataProvider {
         users: Mutex<HashMap<Vec<u8>, HashMap<String, User>>>,
+        /// When true, `get_user` returns an error (simulates a data-service failure).
+        fail_get: bool,
+        /// When true, `save_user` returns an error (simulates a data-service failure).
+        fail_save: bool,
     }
 
     impl TestDataProvider {
         fn new() -> Self {
             Self {
                 users: Mutex::new(HashMap::new()),
+                fail_get: false,
+                fail_save: false,
+            }
+        }
+
+        /// `new()` with both simulated data-service failures armed.
+        fn with_failures(fail_get: bool, fail_save: bool) -> Self {
+            Self {
+                users: Mutex::new(HashMap::new()),
+                fail_get,
+                fail_save,
             }
         }
         fn insert_user(&self, key: Vec<u8>, partition_id: String, user: User) {
@@ -1256,6 +1341,18 @@ mod tests {
                 .entry(key)
                 .or_default()
                 .insert(partition_id, user);
+        }
+
+        /// Read a user's stored balance directly from the backing map, bypassing the fail toggles.
+        /// Lets an assertion confirm a value survived a simulated data-service failure (when the
+        /// normal `get_user` path is deliberately returning `Err`).
+        fn raw_balance(&self, key: &[u8], partition_id: &str) -> Option<u64> {
+            self.users
+                .lock()
+                .unwrap()
+                .get(key)
+                .and_then(|partitions| partitions.get(partition_id))
+                .map(|u| u.fuel_balance)
         }
     }
 
@@ -1270,6 +1367,9 @@ mod tests {
             Ok(())
         }
         fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
+            if self.fail_get {
+                return Err(DataError::StoreNotFound);
+            }
             self.users
                 .lock()
                 .unwrap()
@@ -1279,6 +1379,9 @@ mod tests {
                 .ok_or(DataError::DataNotFound)
         }
         fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
+            if self.fail_save {
+                return Err(DataError::StoreNotFound);
+            }
             self.users
                 .lock()
                 .unwrap()
@@ -1346,8 +1449,20 @@ mod tests {
         trans_id: &str,
         sender: Vec<u8>,
     ) -> Block {
+        make_block_for_token_id(committer, trans_id, sender, &vec![1])
+    }
+
+    /// Generic variant of `make_test_block_for_token` that reads the chain state of an
+    /// arbitrary `token_id`, so tests can build a block for a second, independent token
+    /// (each chaining off its own genesis).
+    fn make_block_for_token_id(
+        committer: &Committer,
+        trans_id: &str,
+        sender: Vec<u8>,
+        token_id: &[u8],
+    ) -> Block {
         // Get the chain's last hash (empty previous_hash at genesis)
-        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+        let prev_hash = if let Some(entry) = committer.tokens.get(token_id) {
             let token = entry.value();
             let state = token.blockchain.get_current_chain_state();
             if state.last_hash_in.is_empty() {
@@ -1425,8 +1540,18 @@ mod tests {
 
     fn make_test_committer(
         data_provider: Arc<TestDataProvider>,
-    ) -> (Committer, Arc<PendingTransactionRegistry>) {
-        let env_data = Arc::new(make_test_env_data());
+    ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
+        let mut env_data = Arc::new(make_test_env_data());
+        // Install an in-memory collecting logger so a test can assert a failure path emitted an
+        // observable log line (the default FileLogger discards to a file). `env_data` is uniquely
+        // owned right here, so `Arc::get_mut` reaches the metadata to swap the logger without
+        // changing EnvironmentMetadata's shape or the public API.
+        let logger = CollectingLogger::default();
+        {
+            let env = Arc::get_mut(&mut env_data)
+                .expect("env_data uniquely owned at construction time");
+            env.logger = Arc::new(logger.clone());
+        }
         let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
         let rhash = identity.rhash;
         let config = Config {
@@ -1549,7 +1674,7 @@ mod tests {
             candidate_registry,
         );
 
-        (committer, pending_registry)
+        (committer, pending_registry, Arc::new(logger))
     }
 
     fn make_finalizing_entry(
@@ -1588,7 +1713,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         // Bootstrap token and chain BEFORE creating block
         let mut token = Token::new();
@@ -1627,7 +1752,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         // Bootstrap token and chain BEFORE creating block
         let mut token = Token::new();
@@ -1663,7 +1788,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         // Bootstrap token and chain BEFORE creating block
         let mut token = Token::new();
@@ -1688,6 +1813,254 @@ mod tests {
 
         let user = dp.get_user(&b"charlie".to_vec(), "token").unwrap();
         assert_eq!(user.fuel_balance, 0);
+    }
+
+    // --- AUDIT Phase 4.5 / M11: a failed gas deduction is surfaced and observable, and the
+    //     per-sender read-modify-write is serialized so concurrent commits cannot lose an update ---
+
+    /// In-memory Logger for tests: captures every `log` call so a test can assert that a
+    /// failure path produced an observable line (the real FileLogger discards to a file).
+    #[derive(Default, Clone)]
+    struct CollectingLogger {
+        logs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Logger for CollectingLogger {
+        fn log(&self, message: String) {
+            self.logs.lock().unwrap().push(message);
+        }
+    }
+
+    /// Assert `result` is a `GasDeduction` error carrying the expected sender / tx_id / gas.
+    fn assert_gas_deduction(
+        result: Result<(), CommitterError>,
+        sender: &[u8],
+        tx_id: &str,
+        gas_used: u64,
+    ) {
+        match result {
+            Err(CommitterError::GasDeduction {
+                sender: got_sender,
+                tx_id: got_tx_id,
+                gas_used: got_gas,
+                ..
+            }) => {
+                assert_eq!(got_sender, bytes_to_hex(sender));
+                assert_eq!(got_tx_id, tx_id);
+                assert_eq!(got_gas, gas_used);
+            }
+            other => panic!("expected CommitterError::GasDeduction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_user_failure_is_reported_not_swallowed() {
+        let dp = Arc::new(TestDataProvider::with_failures(false, true));
+        dp.insert_user(b"alice".to_vec(), "token".to_string(), User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_save_fail";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+        registry.record_gas_used(tx_id, 50);
+
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // M11: a failed `save_user` must surface as `GasDeduction` — the old `let _ =` swallowed
+        // it, letting the tx reach Committed with no debit. The committed block stands (it was
+        // validated/finalized); the failure is returned, not dropped.
+        let result = committer.check_and_commit_transaction_results(&commit, vec![3]).await;
+        assert_gas_deduction(result, b"alice", tx_id, 50);
+
+        // The sender was never debited, so the tx must stay Finalizing (observable as a failed
+        // settlement), NOT Committed.
+        let entry = registry.get_transaction_mut(tx_id).unwrap();
+        assert!(
+            matches!(entry.state, TransactionState::Finalizing { .. }),
+            "tx must stay Finalizing after a failed deduction, got {:?}",
+            entry.state
+        );
+
+        // No gas given for free — balance unchanged from the pre-commit value.
+        let user = dp.get_user(&b"alice".to_vec(), "token").unwrap();
+        assert_eq!(user.fuel_balance, 1000);
+    }
+
+    #[tokio::test]
+    async fn get_user_failure_is_reported_not_swallowed() {
+        let dp = Arc::new(TestDataProvider::with_failures(true, false));
+        dp.insert_user(b"bob".to_vec(), "token".to_string(), User {
+            public_key: b"bob".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_get_fail";
+        make_finalizing_entry(&registry, tx_id, b"bob".to_vec());
+        registry.record_gas_used(tx_id, 50);
+
+        let block = make_test_block_for_token(&committer, tx_id, b"bob".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // M11: a failed `get_user` (blocked data service) must surface too, not be silently
+        // skipped (the old `if let Ok(mut user)` skipped the whole deduction).
+        let result = committer.check_and_commit_transaction_results(&commit, vec![3]).await;
+        assert_gas_deduction(result, b"bob", tx_id, 50);
+
+        let entry = registry.get_transaction_mut(tx_id).unwrap();
+        assert!(
+            matches!(entry.state, TransactionState::Finalizing { .. }),
+            "tx must stay Finalizing after a failed deduction, got {:?}",
+            entry.state
+        );
+
+        // get_user is deliberately failing here, so read the stored value directly to confirm the
+        // balance was never touched — gas was neither deducted nor, as the fail-closed rule requires,
+        // silently freed (the tx is not Committed either).
+        assert_eq!(dp.raw_balance(&b"bob".to_vec(), "token"), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn gas_deduction_failure_logs() {
+        let dp = Arc::new(TestDataProvider::with_failures(false, true));
+        dp.insert_user(b"alice".to_vec(), "token".to_string(), User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry, collector) = make_test_committer(dp.clone());
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_log";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+        registry.record_gas_used(tx_id, 50);
+
+        let block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        let result = committer.check_and_commit_transaction_results(&commit, vec![3]).await;
+        assert!(matches!(result, Err(CommitterError::GasDeduction { .. })));
+
+        let logs = collector.logs.lock().unwrap();
+        let hit = logs
+            .iter()
+            .find(|l| l.contains("GAS DEDUCTION FAILED"))
+            .expect("expected an observable 'GAS DEDUCTION FAILED' log line");
+        // The failure line carries the sender (hex), tx id, gas used, and the error cause.
+        assert!(hit.contains(&bytes_to_hex(b"alice")), "log was: {hit}");
+        assert!(hit.contains(tx_id), "log was: {hit}");
+        assert!(hit.contains("50"), "log was: {hit}");
+        assert!(hit.contains("StoreNotFound"), "log was: {hit}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_sender_commits_both_deduct() {
+        let dp = Arc::new(TestDataProvider::new());
+        dp.insert_user(b"alice".to_vec(), "token".to_string(), User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        });
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
+
+        // Two independent tokens, each with its own genesis-seeded, self-verified chain, let both
+        // commits run concurrently without colliding on block linkage (they share only the sender).
+        // Marking self_verified is required: fail-closed block validation (AUDIT Phase 3.2 / C5)
+        // only accepts a process-style block on a chain whose token is self_verified.
+        for id in [vec![1], vec![2]] {
+            let mut token = Token::new();
+            token.id = id.clone();
+            token.is_self_verified = true;
+            committer.bootstrap_token(token);
+
+            let mut genesis = Block {
+                signed_trans: SignedTransaction::test_transaction(),
+                token_metadata: HashMap::new(),
+                previous_hash: vec![42u8; 32],
+                current_hash: vec![],
+                timestamp: 0,
+                finality_status: FinalityStatus::Optimistic,
+                proposer_key: vec![],
+                epoch_number: 0,
+            };
+            let genesis_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis);
+            if let Some(mut entry) = committer.tokens.get_mut(&id) {
+                genesis.current_hash = genesis_hash;
+                entry.value_mut().blockchain.add_block(genesis);
+            }
+        }
+
+        for tx_id in ["tx_conc_1", "tx_conc_2"] {
+            make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+            registry.record_gas_used(tx_id, 50);
+        }
+
+        let block1 = make_block_for_token_id(&committer, "tx_conc_1", b"alice".to_vec(), &vec![1]);
+        let commit1 = TransactionCommit {
+            trans_id: b"tx_conc_1".to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block1,
+        };
+        let block2 = make_block_for_token_id(&committer, "tx_conc_2", b"alice".to_vec(), &vec![2]);
+        let commit2 = TransactionCommit {
+            trans_id: b"tx_conc_2".to_vec(),
+            token_id: vec![2],
+            env_id: "test".to_string(),
+            proposed_block: block2,
+        };
+
+        // Fire both commits for the SAME sender concurrently on a two-worker runtime, so the
+        // get_user -> subtract -> save_user read-modify-write can genuinely race.
+        let f1 = committer.check_and_commit_transaction_results(&commit1, vec![3]);
+        let f2 = committer.check_and_commit_transaction_results(&commit2, vec![3]);
+        let (r1, r2) = tokio::join!(f1, f2);
+        assert!(r1.is_ok(), "commit1 failed: {r1:?}");
+        assert!(r2.is_ok(), "commit2 failed: {r2:?}");
+
+        // With the per-sender RMW lock the two 50-unit deductions serialize: 1000 -> 900.
+        // Without the lock, last-write-wins loses one deduction (balance would be 950), which
+        // is the exact lost-update M11 guards against.
+        let user = dp.get_user(&b"alice".to_vec(), "token").unwrap();
+        assert_eq!(user.fuel_balance, 900);
     }
 
     fn make_validated_entry(
@@ -1724,7 +2097,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -1765,7 +2138,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         let mut token = Token::new();
         token.id = vec![1];
@@ -2132,7 +2505,7 @@ mod tests {
     #[tokio::test]
     async fn commit_no_conflict_inserts_candidate() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp);
+        let (committer, registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2171,7 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn commit_first_block_on_fresh_token_without_bootstrap() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp);
+        let (committer, registry, _logger) = make_test_committer(dp);
 
         // Bootstrap the token only — the chain stays empty
         let mut token = Token::new();
@@ -2207,7 +2580,7 @@ mod tests {
     #[tokio::test]
     async fn commit_conflict_different_stakes_discards_loser() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp);
+        let (committer, registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2256,7 +2629,7 @@ mod tests {
     #[tokio::test]
     async fn commit_conflict_same_proposer_emits_slash() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp);
+        let (committer, registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2298,7 +2671,7 @@ mod tests {
     #[tokio::test]
     async fn commit_no_existing_candidates_inserts_first() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp);
+        let (committer, registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2342,7 +2715,7 @@ mod tests {
             stake: 0,
             nonce: 0,
         });
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         let mut token = Token::new();
         token.id = vec![1];
@@ -2377,7 +2750,7 @@ mod tests {
         // stored). We pin the entry with a second lock so it survives the commit flow (which would
         // otherwise remove it once lock_count hits 0) and inspect its persisted state.
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, registry) = make_test_committer(dp.clone());
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
 
         let mut token = Token::new();
         token.id = vec![1];
@@ -2514,7 +2887,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_block_finalized_submissions_no_panic() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2561,7 +2934,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_appends_valid_block() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and create a genesis block
         let mut token = Token::new();
@@ -2601,7 +2974,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_sibling_blocks_exactly_one_appended() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain.
         let mut token = Token::new();
@@ -2657,7 +3030,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_rejects_bad_finalizer_sig() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain.
         let mut token = Token::new();
@@ -2688,7 +3061,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_buffers_orphan_and_replays_on_tip_advance() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain (genesis only).
         let mut token = Token::new();
@@ -2732,7 +3105,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_replays_orphan_cascade_in_out_of_order_delivery() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain (genesis only).
         let mut token = Token::new();
@@ -2783,7 +3156,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_rejects_tampered_block() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -2814,7 +3187,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_finalized_unknown_token_returns_error() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // A valid finalizer signature so the block clears the C5 gate and reaches the expected
         // TokenNotFound path (this block targets a token that is not in the committer's cache).
@@ -2953,7 +3326,7 @@ mod tests {
     async fn handle_block_confirmed_vote_skips_missing_stake_set() {
         // When a vote arrives before BlockFinalized, it should be silently ignored
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // No BlockFinalized was received, so no stake set is cached
         let body = serialize_to_bytes_rmp(&(vec![1, 2, 3], vec![4, 5, 6]))
@@ -2975,7 +3348,7 @@ mod tests {
     #[tokio::test]
     async fn handle_block_confirmed_vote_accumulates_stake() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();
@@ -3070,7 +3443,7 @@ mod tests {
     #[tokio::test]
     async fn block_finalized_broadcasts_signed_with_committer_identity() {
         let dp = Arc::new(TestDataProvider::new());
-        let (committer, _registry) = make_test_committer(dp);
+        let (committer, _registry, _logger) = make_test_committer(dp);
 
         // Bootstrap token and chain
         let mut token = Token::new();

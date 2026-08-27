@@ -361,7 +361,7 @@ agree on anything.*
   (`#[serde(default)]`) — a config-schema change to the local `config` JSON, not an RNS control-plane
   message, and fully backward/forward compatible (absent ⇒ empty map ⇒ uniform `min_stake: 10`).
 
-- [ ] **4.5 Gas accounting: right partition, no swallowed errors** (M11)
+- [x] **4.5 Gas accounting: right partition, no swallowed errors** (M11)
   File: `committer/src/committer.rs:265-273`.
   Action: query `token_partition_id` (not `main_environment_id`); surface `get_user`/`save_user`
   errors (log at minimum; decide protocol semantics for deduction failure).

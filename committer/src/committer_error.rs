@@ -45,6 +45,17 @@ pub enum CommitterError {
     Core(pneumatic_core::errors::PneumaticError),
     /// Internal serialization failure (gossip protocol)
     InternalSerialization,
+    /// Gas deduction could not be completed: `get_user`/`save_user` returned a
+    /// `DataError`. The committed block stands (it was validated/finalized), but the
+    /// sender's fuel balance was not debited, so the transaction does not reach the
+    /// `Committed` state — the failure is surfaced rather than silently swallowed
+    /// (AUDIT Phase 4.5 / M11: "cannot silently free gas or overdraw").
+    GasDeduction {
+        sender: String,
+        tx_id: String,
+        gas_used: u64,
+        cause: String,
+    },
 }
 
 impl From<io::Error> for CommitterError {
