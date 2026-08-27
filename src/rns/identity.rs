@@ -8,7 +8,8 @@
 //! (`node_identity.json` by default), written with mode 0600.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rns_crypto::identity::Identity;
 use rns_crypto::OsRng;
@@ -18,6 +19,138 @@ use crate::crypto::{sha256, AsymCryptoProvider, Ed25519Provider};
 use crate::encoding::serialize_to_bytes_rmp;
 use crate::errors::PneumaticError;
 use crate::node::NodeRegistryType;
+
+/// Monotonic counter that disambiguates temp files created within one process
+/// (see `unique_temp_path`).
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Name a temp file for an atomic keystore write: `stem.<pid>.<counter>.tmp`.
+///
+/// It is placed inside the target's *own* directory so the final `rename`
+/// stays on one filesystem and is atomic; a bare relative name would resolve
+/// against the CWD and fail with `EXDEV`.
+fn unique_temp_path(parent: &Path, stem: &str) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!("{}.{}-{}.tmp", stem, std::process::id(), n))
+}
+
+/// Path of the backup a keystore write produces next to `path`
+/// (`node_identity.json` -> `node_identity.json.bak`).
+fn backup_path_for(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned())?;
+    let parent = path.parent()?;
+    Some(parent.join(format!("{}.bak", name)))
+}
+
+/// Recovery guidance appended to a corrupt-keystore error.
+///
+/// Names the `.bak` file when a backup exists and tells the operator to restore
+/// it; otherwise (first boot, or corruption with no prior backup) it instructs
+/// them to recover from a trusted source and explicitly warns *not* to
+/// regenerate, since regenerating would orphan the node's on-chain stake.
+fn keystore_recovery_hint(path: &Path) -> String {
+    match (path.file_name(), path.parent()) {
+        (Some(name), Some(parent)) => {
+            let name = name.to_string_lossy().into_owned();
+            let bak = parent.join(format!("{}.bak", name));
+            if bak.exists() {
+                format!(
+                    "A previous keystore backup may exist at {} — restore it with `cp {} {}` and restart, or re-import the keys from a trusted source.",
+                    bak.display(), bak.display(), path.display()
+                )
+            } else {
+                "No backup is available to restore. Do not regenerate on a running node — that orphans the node's on-chain stake. Recover the keys from a secure offline copy or a trusted peer, or regenerate only on a fresh/unstaked node.".to_string()
+            }
+        }
+        _ => "No backup path could be derived for this keystore. Recover the keys from a secure offline copy or a trusted peer; do not regenerate on a running node.".to_string(),
+    }
+}
+
+/// Best-effort 0600 on a path (unix only); never aborts a write if the chmod
+/// fails. Used to lock down the `.bak` file, which also holds private keys.
+#[cfg(unix)]
+fn chmod_0600_best_effort(path: &Path) {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn chmod_0600_best_effort(_path: &Path) {}
+
+/// RAII guard for the intermediate temp file of an atomic keystore write.
+///
+/// Lives in the target's directory and is mode 0600 on unix. Deleted on drop
+/// unless [`TempFile::commit`] renamed it onto the final destination, so a
+/// failed write (or a panic) leaves no stray temp file behind.
+struct TempFile {
+    path: Option<PathBuf>,
+    file: Option<fs::File>,
+}
+
+impl TempFile {
+    /// Open a fresh temp file at `path`.
+    fn from_path(path: PathBuf) -> Result<Self, PneumaticError> {
+        let file = open_temp_file(&path)?;
+        Ok(Self { path: Some(path), file: Some(file) })
+    }
+
+    /// Write the full payload to the temp file.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), PneumaticError> {
+        let file = self.file.as_mut().expect("temp file opened");
+        use std::io::Write;
+        file.write_all(bytes)
+            .map_err(|e| PneumaticError::CryptoError(format!("identity temp file: {}", e)))?;
+        Ok(())
+    }
+
+    /// Durably flush the temp file before it is renamed into place.
+    fn sync(&self) -> Result<(), PneumaticError> {
+        let file = self.file.as_ref().expect("temp file opened");
+        file.sync_all()
+            .map_err(|e| PneumaticError::CryptoError(format!("identity temp file: {}", e)))?;
+        Ok(())
+    }
+
+    /// Atomically rename the temp file onto `dest`, then drop without removing
+    /// it (the guard's path is cleared). Consumes the guard.
+    fn commit(mut self, dest: &Path) -> Result<(), PneumaticError> {
+        let tmp = self.path.take().expect("TempFile committed exactly once");
+        match fs::rename(&tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(PneumaticError::CryptoError(format!("identity file: {}", e))),
+        }
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        // On any path that did not `commit`, remove the leftover temp file.
+        if let Some(p) = self.path.take() {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// Open a fresh temp file with the platform-appropriate mode.
+fn open_temp_file(path: &Path) -> Result<fs::File, PneumaticError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| PneumaticError::CryptoError(format!("identity temp file: {}", e)))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+            .map_err(|e| PneumaticError::CryptoError(format!("identity temp file: {}", e)))
+    }
+}
 
 /// The 16-byte transport address (rhash) derived from a 64-byte RNS public
 /// key: the first 16 bytes of SHA-256. This matches rns-crypto's
@@ -128,38 +261,48 @@ impl NodeIdentity {
             ))
         })?;
 
+        // Recovery guidance for the corruption below (backup restore vs. a
+        // no-backup first boot). Computed only after a successful read: a
+        // failed read is an IO/permission error, not keystore corruption.
+        let hint = keystore_recovery_hint(path);
+
         let file: IdentityFile = serde_json::from_str(&raw).map_err(|e| {
             PneumaticError::CryptoError(format!(
-                "corrupt identity file {} ({}); refusing to regenerate",
+                "corrupt identity file {} ({}); refusing to regenerate. {}",
                 path.display(),
-                e
+                e,
+                hint
             ))
         })?;
 
         let rns_sk = hex::decode(&file.rns_private_key).map_err(|e| {
             PneumaticError::CryptoError(format!(
-                "corrupt RNS private key in {}: {}",
+                "corrupt RNS private key in {}: {}; {}",
                 path.display(),
-                e
+                e,
+                hint
             ))
         })?;
         let ed_seed = hex::decode(&file.ed25519_seed).map_err(|e| {
             PneumaticError::CryptoError(format!(
-                "corrupt Ed25519 seed in {}: {}",
+                "corrupt Ed25519 seed in {}: {}; {}",
                 path.display(),
-                e
+                e,
+                hint
             ))
         })?;
         let rns_sk: [u8; 64] = rns_sk.try_into().map_err(|_| {
             PneumaticError::CryptoError(format!(
-                "RNS private key in {} must be 64 bytes",
-                path.display()
+                "RNS private key in {} must be 64 bytes; {}",
+                path.display(),
+                hint
             ))
         })?;
         let ed_seed: [u8; 32] = ed_seed.try_into().map_err(|_| {
             PneumaticError::CryptoError(format!(
-                "Ed25519 seed in {} must be 32 bytes",
-                path.display()
+                "Ed25519 seed in {} must be 32 bytes; {}",
+                path.display(),
+                hint
             ))
         })?;
 
@@ -168,8 +311,9 @@ impl NodeIdentity {
             .get_public_key()
             .ok_or_else(|| {
                 PneumaticError::CryptoError(format!(
-                    "identity file {} is internally inconsistent: no public key derived",
-                    path.display()
+                    "identity file {} is internally inconsistent: no public key derived; {}",
+                    path.display(),
+                    hint
                 ))
             })?;
         let ed25519 = Ed25519Provider::from_seed(ed_seed);
@@ -222,33 +366,43 @@ impl NodeIdentity {
         let raw =
             serde_json::to_string_pretty(&file).map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| PneumaticError::CryptoError(format!("identity dir: {}", e)))?;
-            }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| PneumaticError::CryptoError(format!("identity dir: {}", e)))?;
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut out = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| PneumaticError::CryptoError(format!("identity file: {}", e)))?;
-            use std::io::Write;
-            out.write_all(raw.as_bytes())
-                .map_err(|e| PneumaticError::CryptoError(format!("identity file: {}", e)))?;
-            Ok(())
+        // Back up the current good keystore before replacing it, so an
+        // interrupted or corrupted future write can be restored. A copy
+        // failure is a hard error — fail closed rather than overwrite with no
+        // recovery. Skipped on first boot, when there is no prior file.
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "node_identity".to_string());
+        if path.exists() {
+            let bak = backup_path_for(path)
+                .ok_or_else(|| {
+                    PneumaticError::CryptoError(format!(
+                        "identity file {} has no recognizable name; cannot back up",
+                        path.display()
+                    ))
+                })?;
+            fs::copy(path, &bak)
+                .map_err(|e| PneumaticError::CryptoError(format!("identity backup: {}", e)))?;
+            chmod_0600_best_effort(&bak);
         }
-        #[cfg(not(unix))]
-        {
-            fs::write(path, raw)
-                .map_err(|e| PneumaticError::CryptoError(format!("identity file: {}", e)))
-        }
+
+        // Write to a temp file, fsync it, then atomically `rename` into place.
+        // A reader therefore never observes a torn file, and a process killed
+        // mid-write leaves the existing keystore intact. Any error after the
+        // temp is created removes it via the guard.
+        let tmp_path = unique_temp_path(parent, &stem);
+        let mut tmp = TempFile::from_path(tmp_path)?;
+        tmp.write(raw.as_bytes())?;
+        tmp.sync()?;
+        tmp.commit(path)?;
+        Ok(())
     }
 }
 
@@ -421,5 +575,171 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // --- Phase 4.6: atomic keystore write -----------------------------------
+    //
+    // `load_or_create` only calls `write_file` when the target is absent, so it
+    // never exercises the overwrite / atomic / backup paths. These tests call
+    // `NodeIdentity::write_file` *directly*, otherwise they would silently pass
+    // against a build where overwrite was never implemented.
+
+    /// A fresh, valid 64-byte RNS private key.
+    fn fresh_rns_sk() -> [u8; 64] {
+        NodeIdentity::generate_in_memory()
+            .rns
+            .get_private_key()
+            .expect("rns private key")
+    }
+
+    /// A random 32-byte Ed25519 seed.
+    fn fresh_ed_seed() -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed).expect("ed25519 seed");
+        seed
+    }
+
+    #[test]
+    fn test_write_file_writes_backup_on_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+        let bak = dir.path().join("node_identity.json.bak");
+
+        let seed1 = fresh_ed_seed();
+        let k1 = Ed25519Provider::from_seed(seed1).public_key().unwrap();
+        let sk1 = fresh_rns_sk();
+        let sk2 = fresh_rns_sk();
+        let seed2 = fresh_ed_seed();
+
+        // First write: no prior file, so no backup yet.
+        NodeIdentity::write_file(&path, &sk1, &seed1).expect("create v1");
+        assert!(!bak.exists(), "no backup on first write");
+
+        // Overwrite: the prior good keystore is backed up before replacement.
+        NodeIdentity::write_file(&path, &sk2, &seed2).expect("overwrite v2");
+        assert!(bak.exists(), "backup created on overwrite");
+        assert!(path.exists(), "primary present after overwrite");
+
+        // Backup holds v1, primary holds v2.
+        let backup_loaded = NodeIdentity::load(&bak).expect("load backup");
+        assert_eq!(
+            k1,
+            backup_loaded.ed25519.public_key().unwrap(),
+            "backup holds the prior good keystore"
+        );
+        let primary_loaded = NodeIdentity::load(&path).expect("load primary");
+        assert_ne!(
+            k1,
+            primary_loaded.ed25519.public_key().unwrap(),
+            "primary holds the new keystore"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_keystore_error_names_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+        let bak = dir.path().join("node_identity.json.bak");
+
+        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("v1");
+        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("v2 -> .bak");
+        assert!(bak.exists());
+
+        // Clobber the primary; boot must fail closed and name the backup.
+        fs::write(&path, b"this is not json at all").expect("clobber");
+        let err = match NodeIdentity::load_or_create(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt keystore must be an error, not a regeneration"),
+        };
+        let msg = format!("{:?}", err);
+        assert!(msg.contains(".bak"), "error must name the backup: {}", msg);
+        assert!(msg.contains("restore"), "error must instruct restore: {}", msg);
+        assert!(msg.contains("refusing to regenerate"), "error must refuse regen: {}", msg);
+
+        // Restore from the backup, then boot succeeds and yields the old rhash.
+        fs::copy(&bak, &path).expect("restore");
+        let v1 = NodeIdentity::load(&bak).expect("v1 identity");
+        let restored = NodeIdentity::load_or_create(&path).expect("boot after restore");
+        assert_eq!(restored.rhash, v1.rhash);
+    }
+
+    #[test]
+    fn test_corrupt_keystore_without_backup_refuses_regenerate() {
+        // First-boot corrupt file: no `.bak`, so the guidance takes the
+        // "no backup" branch and still refuses to regenerate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+        fs::write(&path, b"not json").expect("clobber");
+        let err = match NodeIdentity::load_or_create(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt keystore must be an error"),
+        };
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("refusing to regenerate"), "{}", msg);
+        assert!(
+            !msg.contains("cp "),
+            "no restore command when no backup exists: {}",
+            msg
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_file_forces_0600_on_existing_file() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+
+        // Pre-create the keystore with looser perms.
+        fs::write(&path, b"{}").expect("precreate");
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("set 0644");
+
+        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("overwrite");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwrite must force 0600 on a pre-existing file");
+    }
+
+    #[test]
+    fn test_atomic_write_roundtrips_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+
+        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("write");
+        NodeIdentity::load_or_create(&path).expect("load");
+
+        // A successful atomic write leaves exactly one identity file and no
+        // stray temp files in the directory.
+        let tmp_count = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_count, 0, "no leftover temp files after atomic write");
+        assert_eq!(NodeIdentity::load_or_create(&path).expect("reload").rhash.len(), 16);
+    }
+
+    #[test]
+    fn test_partial_intermediate_preserves_primary() {
+        // Documents crash-safety (not a discriminator: the old in-place write
+        // also ignores a stray temp). A process killed mid-write leaves a
+        // partial temp that is never renamed onto the target; the primary
+        // keystore, written atomically on its own write, is observed intact by
+        // the next boot.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+
+        let id1 = NodeIdentity::generate_in_memory();
+        NodeIdentity::write_file(&path, &id1.rns.get_private_key().unwrap(), &fresh_ed_seed())
+            .expect("v1");
+
+        // Simulate an abandoned, partially written temp from a crashed write.
+        let tmp = dir.path().join(format!("node_identity.{}-1.tmp", std::process::id()));
+        fs::write(&tmp, b"partial").expect("seed temp");
+
+        let loaded = NodeIdentity::load_or_create(&path).expect("load after crash");
+        assert_eq!(loaded.rhash, id1.rhash, "primary intact after a mid-write crash");
     }
 }

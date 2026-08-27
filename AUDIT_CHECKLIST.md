@@ -367,11 +367,41 @@ agree on anything.*
   errors (log at minimum; decide protocol semantics for deduction failure).
   Verify: failed deduction is observable and cannot silently free gas or overdraw.
 
-- [ ] **4.6 Atomic keystore write** (M12)
+- [x] **4.6 Atomic keystore write** (M12) — *done 2026-08-27*
   File: `src/rns/identity.rs:217-252`.
   Action: write temp file + `rename()`; on boot, a corrupt keystore is a clear error with
   recovery guidance (backup restore), never a silent regenerate.
   Verify: kill the process mid-write → boot reports the corruption cleanly.
+
+  **Done:** the keystore (`node_identity.json`) is now written via temp-file + atomic `rename`,
+  with a backup + conditional recovery hint on corrupt content (identity.rs only — no runtime
+  dependency, no wire change, no new error variant, no contract change to `config.rs:98-106`).
+  `write_file` now (1) serializes once, (2) backs the existing keystore up to `node_identity.json.bak`
+  *before* the first overwrite (a copy failure is a hard `CryptoError`, fail-closed — first boot
+  skips it, so `.bak` is currently defensive), (3) writes a `0600` temp file (via `OpenOptionsExt`
+  on unix, `File::create` on non-unix — Windows has no portable chmod, documented), `sync_all()`s
+  it, then `rename`s it into place, (4) and cleans any leftover temp up through an RAII `TempFile`
+  guard that deletes on drop unless `.commit()` is called. Atomicity means a reader never sees a
+  torn file and a killed process leaves the existing keystore intact. `load` now carries the
+  recovery guidance: after a successful `fs::read`, the parse/hex/length/"no public key" branches
+  append a conditional hint — a `.bak` exists ⇒ "restore with `cp {path}.bak {path}` and restart, or
+  re-import from a trusted source"; no `.bak` ⇒ "do not regenerate on a running node — that
+  orphans the on-chain stake; recover from a secure offline copy or regenerate only on a fresh/unstaked
+  node". The raw `fs::read` failure (permissions/IO) is left untouched (not corruption). Forced
+  `0600` now applies to an **existing** file too: a `0644` keystore overwritten via the atomic rename
+  lands as `0600` (old code reopened `O_TRUNC` and kept the loose bits). Six new tests in `mod tests`
+  (`identity.rs`), all invoking `write_file` directly since `load_or_create` never overwrites:
+  `test_write_file_writes_backup_on_overwrite` (strict discriminator — `.bak` exists and reloads to
+  the prior key; fails without backup creation), `test_corrupt_keystore_error_names_backup` (strict
+  discriminator — corrupt file whose message contains `.bak`/"restore"/"refusing to regenerate"),
+  `test_corrupt_keystore_without_backup_refuses_regenerate` (first-boot branch text),
+  `test_write_file_forces_0600_on_existing_file` (strict discriminator — pre-create 0644 → 0600),
+  plus `test_atomic_write_roundtrips_and_leaves_no_tmp` and `test_partial_intermediate_preserves_primary`
+  (documented non-discriminators). Atomicity is structural (rename), so a real SIGKILL is driven
+  deterministically by corrupting the primary and asserting the recovery-guidance `load` path.
+  Ground-rule check: no production path silently regenerates a keystore, no new `.expect()`/`unwrap()`
+  on keystore I/O. `cargo check` clean; full workspace suite **533** green (Phase 4.5 baseline 527
+  + these 6), 0 failures.
 
 ## Phase 5 — Economics & consensus enforcement
 *Closes: H1, H2, H3, H6, H9, H13, H14, H16(self-signed), M10, M13.*
