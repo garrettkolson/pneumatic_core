@@ -235,6 +235,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
         now + epoch_duration,
         leader_selector.as_ref(),
         &stake_store.to_stake_set(),
+        &[], // genesis: no prior block → empty prev_block_hash
     );
     let epoch_detector = pneumatic_core::epoch::EpochBoundaryDetector::new(initial_epoch);
     let block_proposer = Arc::new(pneumatic_core::epoch::BlockProposer::new(vec![], 0, vec![]));

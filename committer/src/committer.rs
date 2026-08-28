@@ -946,7 +946,18 @@ impl Committer {
         // Select new leader for the epoch and persist stake snapshot
         let stake_set = self.stake_store.to_stake_set();
         let new_epoch_number = self.current_epoch_number.load(Ordering::SeqCst) + 1;
-        let leader_key = self.leader_selector.select(&stake_set, new_epoch_number);
+        // Phase 5.3 / H3: bind the leader seed to the mined chain tip so the next
+        // epoch's leader is only knowable once this tip is produced. Read the
+        // current tip from the local token cache — the committer holds its chain
+        // state there and does not persist it to the data service, so a persisted
+        // tip would lag the mined one (and would silently leave the seed empty).
+        let prev_block_hash = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().blockchain.get_current_chain_state().last_hash_in)
+            .next()
+            .unwrap_or_default();
+        let leader_key = self.leader_selector.select(&stake_set, new_epoch_number, &prev_block_hash);
         self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
 
         // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
@@ -1193,10 +1204,21 @@ impl Committer {
         let mut detector = self.epoch_detector.try_lock().ok()?;
         let detector = detector.as_mut()?;
         let stake_set = self.stake_store.to_stake_set();
+        // Phase 5.3 / H3: bind the new leader seed to the mined chain tip so the
+        // epoch's leader is only knowable once this tip is produced. Read the
+        // current tip from the local token cache — the committer holds its chain
+        // state there and does not persist it to the data service.
+        let prev_block_hash = self
+            .tokens
+            .iter()
+            .map(|entry| entry.value().blockchain.get_current_chain_state().last_hash_in)
+            .next()
+            .unwrap_or_default();
         detector.advance_to_new_epoch(
             self.leader_selector.as_ref(),
             &stake_set,
             self.epoch_duration,
+            &prev_block_hash,
         );
         let new_epoch_number = detector.current_epoch.epoch_number;
         self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
@@ -1706,6 +1728,7 @@ mod tests {
             now + epoch_duration,
             leader_selector.as_ref(),
             &stake_store.to_stake_set(),
+            &[], // genesis: no prior block → empty prev_block_hash
         );
         let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
         let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
@@ -2509,6 +2532,67 @@ mod tests {
         let after = committer.current_epoch_number.load(Ordering::SeqCst);
         assert_eq!(after, before + 1);
         assert!(!new_leader.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn advance_epoch_leader_changes_with_mined_tip() {
+        // AUDIT Phase 5.3 / H3 discriminator: the leader a committer selects when
+        // advancing to a new epoch must depend on the mined chain tip it holds
+        // locally in its token cache, so the next epoch's leader is only
+        // knowable once this tip is produced. This committer holds TWO real
+        // mined tips (two internally-consistent blocks with different contents)
+        // and selects a different leader for each; the bug (leader seed bound to
+        // the empty/stale persisted tip instead of the mined one) ignores the
+        // local tip, so both would select the same leader and this test fails.
+        //
+        // A many-staker spread is used so the two distinct mined tips — which are
+        // fixed hashes we cannot control — land on different stakers deterministically
+        // rather than by luck of a 50/50 draw.
+        fn committer_with_blocks(n_blocks: u64) -> Committer {
+            let (committer, _registry, _dp) = make_committer_for_leader_test(
+                b"leader".to_vec(),
+                b"leader".to_vec(),
+            );
+            // 256 spread stakers (unique keys, 1 stake each) — the tip's derived
+            // target is uniform over a large space, so two distinct tips almost
+            // certainly select different leaders.
+            for i in 0..256 {
+                committer.stake_store.add_staker(vec![i as u8], 1);
+            }
+            let mut token = Token::new();
+            token.id = vec![1];
+            token.is_self_verified = true;
+            token.environment_id = "test".to_string();
+            let mut previous_hash: Vec<u8> = vec![];
+            for _ in 0..n_blocks {
+                let mut block = Block {
+                    signed_trans: SignedTransaction::test_transaction(),
+                    token_metadata: HashMap::new(),
+                    previous_hash,
+                    timestamp: 0,
+                    current_hash: vec![],
+                    finality_status: FinalityStatus::Optimistic,
+                    proposer_key: vec![],
+                    epoch_number: 0,
+                };
+                block.current_hash = BlockFactory::create_hash(&block);
+                previous_hash = block.current_hash.clone();
+                token.blockchain.add_block(block);
+            }
+            committer.bootstrap_token(token);
+            committer
+        }
+
+        // Same epoch (both advance 1 -> 2), same stake, same starting leader, but
+        // different mined tips: one chain holds no block, one holds two blocks.
+        let leader_empty = committer_with_blocks(0).advance_epoch().unwrap();
+        let leader_two_blocks = committer_with_blocks(2).advance_epoch().unwrap();
+
+        assert_ne!(
+            leader_empty,
+            leader_two_blocks,
+            "leader must depend on the mined chain tip"
+        );
     }
 
     // --- Conflict resolution at commit time ---

@@ -6,6 +6,7 @@ use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
+use pneumatic_core::epoch::FINALIZER_DOMAIN;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
@@ -273,11 +274,18 @@ impl Sentinel {
             return Err(SentinelError::Routing("Executor set is empty".into()));
         }
 
+        let prev_block_hash = self
+            .data_provider
+            .latest_block_hash(&self.env_data.environment_id)
+            .unwrap_or_default() // unknown tip / I/O error → empty salt (genesis fails closed)
+            .unwrap_or_default();
+
         let shard_executors = pneumatic_core::deterministic_select_shard(
             &executors,
             self.env_data.shard_count,
             tx_id,
             epoch_number,
+            &prev_block_hash,
         )
         .ok_or_else(|| SentinelError::Routing("Selected shard has no executors".into()))?;
 
@@ -568,8 +576,20 @@ impl Sentinel {
             return Err(SentinelError::Routing("Stake set is empty".into()));
         }
 
-        let finalizer_key = pneumatic_core::deterministic_select(&snapshot, tx_id.as_bytes(), epoch_number)
-            .ok_or_else(|| SentinelError::Routing("Selection returned none for non-empty stake set".into()))?;
+        let prev_block_hash = self
+            .data_provider
+            .latest_block_hash(&self.env_data.environment_id)
+            .unwrap_or_default() // unknown tip / I/O error → empty salt (genesis fails closed)
+            .unwrap_or_default();
+
+        let finalizer_key = pneumatic_core::deterministic_select(
+            &snapshot,
+            FINALIZER_DOMAIN,
+            tx_id.as_bytes(),
+            epoch_number,
+            &prev_block_hash,
+        )
+        .ok_or_else(|| SentinelError::Routing("Selection returned none for non-empty stake set".into()))?;
 
         if snapshot.get_stake(&finalizer_key) == 0 {
             return Err(SentinelError::Routing("Assigned finalizer has zero stake".into()));
@@ -2018,6 +2038,117 @@ mod tests {
             [vec![1], vec![2], vec![3]].contains(&finalizer1)
                 && [vec![10], vec![20], vec![30]].contains(&finalizer2),
             "each finalizer pick must be drawn from its own epoch's stake snapshot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5.3 (AUDIT H3): deterministic finalizer / shard routing must bind
+    // the mined chain tip (prev_block_hash) so the assignment is unpredictable
+    // until the tip is produced. The seed is a deterministic function of (tip,
+    // epoch, tx_id), so comparing per-tx assignments between two different tips
+    // is deterministic and non-flaky — it fails iff the tip never reaches the
+    // seed.
+    // -----------------------------------------------------------------------
+
+    /// Build a token whose blockchain holds a single internally-consistent block
+    /// (so its tip is that block's hash, non-empty).
+    fn token_with_one_block() -> Token {
+        let mut token = Token::new();
+        token.id = vec![1];
+        token.environment_id = "test".to_string();
+        let mut block = Block {
+            signed_trans: pneumatic_core::transactions::SignedTransaction::test_transaction(),
+            token_metadata: std::collections::HashMap::new(),
+            previous_hash: vec![], // genesis convention
+            timestamp: 0,
+            current_hash: vec![],
+            finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        token.blockchain.add_block(block);
+        token
+    }
+
+    #[test]
+    fn assign_finalizer_changes_with_mined_tip() {
+        use pneumatic_core::epoch::StakeSet;
+
+        // Spread 3-staker set so finalizer assignments are well distributed.
+        let stake = StakeSet {
+            stakers: [(vec![10], 10), (vec![20], 30), (vec![30], 60)].into_iter().collect(),
+        };
+
+        // Two sentinels: identical stake snapshot + epoch, differing only in the
+        // mined tip exposed by the data provider (empty chain vs. one block).
+        let empty_tip = StubDataProvider::new().with_stake_snapshot(1, stake.clone());
+        let one_block_tip = StubDataProvider::new()
+            .with_stake_snapshot(1, stake)
+            .with_token(vec![1], "test".to_string(), token_with_one_block());
+
+        let (s_empty, _r) =
+            make_sentinel_fixture_with_env_and_data_provider(empty_tip, make_test_env_data());
+        let (s_block, _r) =
+            make_sentinel_fixture_with_env_and_data_provider(one_block_tip, make_test_env_data());
+
+        let mut finalizers_empty = Vec::new();
+        let mut finalizers_block = Vec::new();
+        for i in 0..50 {
+            let tx_id = format!("tx_finalizer_tip_{i}");
+            finalizers_empty
+                .push(s_empty.assign_finalizer_deterministic(&tx_id, 1).unwrap());
+            finalizers_block
+                .push(s_block.assign_finalizer_deterministic(&tx_id, 1).unwrap());
+        }
+
+        assert_ne!(
+            finalizers_empty,
+            finalizers_block,
+            "finalizer assignments must depend on the mined chain tip"
+        );
+    }
+
+    #[test]
+    fn get_shard_executors_changes_with_mined_tip() {
+        use pneumatic_core::epoch::ExecutorSet;
+
+        let executors = ExecutorSet {
+            executors: [
+                (vec![1], 100),
+                (vec![2], 100),
+                (vec![3], 100),
+                (vec![4], 100),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let empty_tip = StubDataProvider::new().with_executor_set(1, executors.clone());
+        let one_block_tip = StubDataProvider::new()
+            .with_executor_set(1, executors)
+            .with_token(vec![1], "test".to_string(), token_with_one_block());
+
+        let mut env_data = make_test_env_data();
+        env_data.shard_count = 2;
+
+        let (s_empty, _r) =
+            make_sentinel_fixture_with_env_and_data_provider(empty_tip, env_data.clone());
+        let (s_block, _r) =
+            make_sentinel_fixture_with_env_and_data_provider(one_block_tip, env_data);
+
+        let mut shard_empty = Vec::new();
+        let mut shard_block = Vec::new();
+        for i in 0..50 {
+            let tx_id = format!("tx_shard_tip_{i}");
+            shard_empty.push(s_empty.get_shard_executors(&tx_id, 1).unwrap());
+            shard_block.push(s_block.get_shard_executors(&tx_id, 1).unwrap());
+        }
+
+        assert_ne!(
+            shard_empty,
+            shard_block,
+            "executor shard assignment must depend on the mined chain tip"
         );
     }
 

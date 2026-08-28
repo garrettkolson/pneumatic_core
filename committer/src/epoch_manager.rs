@@ -5,7 +5,7 @@ use rand::{Rng, SeedableRng};
 
 use pneumatic_core::crypto::HashProvider;
 use pneumatic_core::data::DataProvider;
-use pneumatic_core::epoch::{CandidateRegistry, Conflict, ConflictResolution, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, StakeSet, StakingOp, resolve_block_conflict};
+use pneumatic_core::epoch::{CandidateRegistry, Conflict, ConflictResolution, EpochReconciliation, IEpochLeaderSelector, IEpochReconciler, IStakingManager, LEADER_DOMAIN, StakeSet, StakingOp, resolve_block_conflict};
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::logging::Logger;
 
@@ -281,15 +281,21 @@ impl LeaderSelector {
     }
 
     /// Select leader(s) from the current stake set using
-    /// stake-weighted deterministic selection.
-    fn select_internal(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
+    /// stake-weighted deterministic selection, bound to the mined chain tip
+    /// (Phase 5.3 / AUDIT H3).
+    fn select_internal(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8> {
         let total = stakers.total_stake();
         if total == 0 {
             return vec![];
         }
 
-        // Deterministic seed: hash(epoch_number) using the provided hash provider
-        let seed = self.hash_provider.hash(&epoch_number.to_be_bytes());
+        // Domain-separated seed bound to the mined tip:
+        // SHA-256(LEADER_DOMAIN ‖ epoch_number ‖ prev_block_hash ‖ [])
+        let mut input = Vec::with_capacity(1 + 8 + prev_block_hash.len());
+        input.push(LEADER_DOMAIN);
+        input.extend_from_slice(&epoch_number.to_be_bytes());
+        input.extend_from_slice(prev_block_hash);
+        let seed = self.hash_provider.hash(&input);
         let mut rng = rand::rngs::StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
             // SHA-256 produces 32 bytes, exactly fits [u8; 32]
             unreachable!("hash provider always produces 32 bytes")
@@ -315,8 +321,8 @@ impl LeaderSelector {
 }
 
 impl IEpochLeaderSelector for LeaderSelector {
-    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
-        self.select_internal(stakers, epoch_number)
+    fn select(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8> {
+        self.select_internal(stakers, epoch_number, prev_block_hash)
     }
 }
 

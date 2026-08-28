@@ -54,6 +54,17 @@ pub trait DataProvider : Send + Sync {
 
     /// Persist an executor set for a given epoch and partition.
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError>;
+
+    /// Current chain-tip hash (previous block hash) for a token partition, or
+    /// `None` if unknown. Used as the `prev_block_hash` input to deterministic
+    /// selection seeds (Phase 5.3 / AUDIT H3): when a provider cannot resolve a
+    /// tip, the seed simply falls back to an empty `prev_block_hash`.
+    ///
+    /// Returns `Ok(None)` by default so providers that never track the tip need
+    /// no change; providers that can resolve a tip override this.
+    fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
+        Ok(None)
+    }
 }
 
 pub struct DefaultDataProvider {
@@ -237,6 +248,14 @@ impl DataProvider for DefaultDataProvider {
 
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError> {
         self.save_data_internal::<ExecutorSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::ExecutorSet(set)), partition_id)
+    }
+
+    fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
+        // The chain tip lives in the persisted token's blockchain; reuse the
+        // existing token lookup so no new data-service action is required.
+        let token_id = partition_id.as_bytes().to_vec();
+        let token = self.get_token(&token_id, partition_id)?;
+        Ok(Some(token.blockchain.get_current_chain_state().last_hash_in))
     }
 }
 
@@ -509,6 +528,19 @@ impl DataProvider for StubDataProvider {
 
     fn save_token(&self, _key: &Vec<u8>, _token: Token, _partition_id: &str) -> Result<(), DataError> {
         Ok(())
+    }
+
+    // Phase 5.3 / H3: expose the stored token's chain tip so the sentinel's
+    // deterministic finalizer/shard routing reflects a real mined tip in tests.
+    // Mirrors DefaultDataProvider::latest_block_hash (which reads the persisted
+    // token). No existing test stores a token, so those (empty tip) are unaffected.
+    fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
+        for partitions in self.tokens.values() {
+            if let Some(token) = partitions.get(partition_id) {
+                return Ok(Some(token.blockchain.get_current_chain_state().last_hash_in));
+            }
+        }
+        Ok(None)
     }
 
     fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, DataError> {

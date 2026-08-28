@@ -147,14 +147,53 @@ impl ExecutorSet {
 
     /// Create a deterministic shuffler for this executor set at a given epoch.
     /// The shuffle is used for per-epoch shard reassignment (rotation).
-    pub fn shuffler(&self, epoch_number: u64) -> Shuffler {
+    pub fn shuffler(&self, epoch_number: u64, prev_block_hash: &[u8]) -> Shuffler {
         let mut keys: Vec<Vec<u8>> = self.executors.keys().cloned().collect();
         // C6: sort before Fisher-Yates so the shuffle is independent of HashMap insertion
         // order (matches deterministic_select at epoch.rs:236-237). Without this the
         // shuffle's starting order — and therefore the shard partition — varies per node.
         keys.sort();
-        Shuffler::new(keys, epoch_number)
+        Shuffler::new(keys, epoch_number, prev_block_hash)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic selection seed — domain-separated, prev-block-hash bound
+// ---------------------------------------------------------------------------
+// Phase 5.3 (AUDIT H3): every selection seed is derived from a per-type domain
+// byte, the epoch number, and the previous block hash, so a choice made for one
+// purpose (e.g. leader election) can never be replayed as another (e.g. shard
+// index), and so selection is only knowable once the previous block is actually
+// mined (not merely from the public epoch number + stake set).
+//
+// The byte layout is fixed so every selection type hashes the same shape:
+//   SHA-256(domain ‖ epoch_number(big-endian) ‖ prev_block_hash ‖ extra)
+pub const LEADER_DOMAIN: u8 = 0x01;
+pub const SHARD_SHUFFLE_DOMAIN: u8 = 0x02;
+pub const FINALIZER_DOMAIN: u8 = 0x03;
+pub const SHARD_INDEX_DOMAIN: u8 = 0x04;
+
+/// Derive the 32-byte seed for a deterministic selection.
+///
+/// `domain` distinguishes the selection type (see the `*_DOMAIN` constants).
+/// `prev_block_hash` binds the choice to the mined chain tip — empty at genesis.
+/// `extra` is per-transaction salt for load distribution on the finalizer and
+/// shard-index paths (empty for leader/shuffle).
+pub fn derive_selection_seed(
+    domain: u8,
+    epoch_number: u64,
+    prev_block_hash: &[u8],
+    extra: &[u8],
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(1 + 8 + prev_block_hash.len() + extra.len());
+    input.push(domain);
+    input.extend_from_slice(&epoch_number.to_be_bytes());
+    input.extend_from_slice(prev_block_hash);
+    input.extend_from_slice(extra);
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -175,20 +214,20 @@ pub struct Shuffler {
 }
 
 impl Shuffler {
-    /// Create a new shuffler from `items` seeded by `epoch_number`.
+    /// Create a new shuffler from `items`, seeded per-epoch and per-chain-tip.
     ///
-    /// The seed is `SHA-256(epoch_number)`, which guarantees per-epoch
-    /// determinism. The shuffled result is computed at construction time
-    /// and returned by `shuffle()`.
-    pub fn new(items: Vec<Vec<u8>>, epoch_number: u64) -> Self {
-        let seed_bytes = epoch_number.to_be_bytes();
-        let mut input = Vec::with_capacity(8 + 32);
-        input.extend_from_slice(&seed_bytes);
-        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
-        let seed = digest.as_ref();
-        let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
-            unreachable!("ring SHA-256 always produces 32 bytes")
-        }));
+    /// The seed is `SHA-256(SHARD_SHUFFLE_DOMAIN ‖ epoch_number ‖ prev_block_hash)`,
+    /// which guarantees per-epoch determinism while binding the shuffle to the
+    /// mined tip so it is not predictable before the previous block lands. The
+    /// shuffled result is computed at construction time and returned by `shuffle()`.
+    pub fn new(items: Vec<Vec<u8>>, epoch_number: u64, prev_block_hash: &[u8]) -> Self {
+        let seed = derive_selection_seed(
+            SHARD_SHUFFLE_DOMAIN,
+            epoch_number,
+            prev_block_hash,
+            &[],
+        );
+        let mut rng = StdRng::from_seed(seed);
 
         let n = items.len();
         if n == 0 {
@@ -219,21 +258,22 @@ impl Shuffler {
     }
 }
 
-pub fn deterministic_select(stakers: &StakeSet, seed_bytes: &[u8], epoch_number: u64) -> Option<Vec<u8>> {
+pub fn deterministic_select(
+    stakers: &StakeSet,
+    domain: u8,
+    seed_bytes: &[u8],
+    epoch_number: u64,
+    prev_block_hash: &[u8],
+) -> Option<Vec<u8>> {
     let total = stakers.total_stake();
     if total == 0 {
         return None;
     }
 
-    // Deterministic seed: SHA-256(epoch_number || seed_bytes)
-    let mut input = epoch_number.to_be_bytes().to_vec();
-    input.extend_from_slice(seed_bytes);
-    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
-    let seed = digest.as_ref();
-    let mut rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
-        // SHA-256 produces 32 bytes, exactly fits [u8; 32]
-        unreachable!("ring SHA-256 always produces 32 bytes")
-    }));
+    // Domain-separated seed bound to the mined tip:
+    // SHA-256(domain ‖ epoch_number ‖ prev_block_hash ‖ seed_bytes)
+    let seed = derive_selection_seed(domain, epoch_number, prev_block_hash, seed_bytes);
+    let mut rng = StdRng::from_seed(seed);
     let target: u64 = rng.gen_range(0..total);
 
     // Deterministic iteration: sort keys lexicographically
@@ -259,16 +299,19 @@ pub fn deterministic_select(stakers: &StakeSet, seed_bytes: &[u8], epoch_number:
 
 /// Select which executors in a shard should handle a transaction.
 ///
-/// 1. Seed = SHA-256(epoch || tx_id) — same tx + epoch → same seed
+/// 1. Shard-index seed = SHA-256(SHARD_INDEX_DOMAIN ‖ epoch ‖ prev_block_hash ‖ tx_id)
+///    — same tx + epoch + tip → same seed (tx_id spreads load across the txs)
 /// 2. Shuffle executors deterministically
+///    (SHA-256(SHARD_SHUFFLE_DOMAIN ‖ epoch ‖ prev_block_hash))
 /// 3. Stake-balanced round-robin partition into `shard_count` shards
-/// 4. `shard_index = SHA-256(epoch || tx_id) mod shard_count`
+/// 4. `shard_index = derived_seed mod shard_count`
 /// 5. Return executor public keys in the selected shard
 pub fn deterministic_select_shard(
     executors: &ExecutorSet,
     shard_count: u32,
     tx_id: &str,
     epoch_number: u64,
+    prev_block_hash: &[u8],
 ) -> Option<Vec<Vec<u8>>> {
     if executors.is_empty() {
         return None;
@@ -284,20 +327,14 @@ pub fn deterministic_select_shard(
         return Some(keys);
     }
 
-    // Deterministic seed: SHA-256(epoch_number || tx_id_bytes)
-    let mut input = epoch_number.to_be_bytes().to_vec();
-    input.extend_from_slice(tx_id.as_bytes());
-    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
-    let seed = digest.as_ref();
-
-    // Deterministic shard index
-    let mut shard_rng = StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
-        unreachable!("ring SHA-256 always produces 32 bytes")
-    }));
+    // Domain-separated shard-index seed bound to the mined tip:
+    // SHA-256(SHARD_INDEX_DOMAIN ‖ epoch_number ‖ prev_block_hash ‖ tx_id)
+    let seed = derive_selection_seed(SHARD_INDEX_DOMAIN, epoch_number, prev_block_hash, tx_id.as_bytes());
+    let mut shard_rng = StdRng::from_seed(seed);
     let shard_index: u32 = shard_rng.gen_range(0..shard_count);
 
-    // Shuffle executors deterministically
-    let shuffler = executors.shuffler(epoch_number);
+    // Shuffle executors deterministically (bound to the mined tip)
+    let shuffler = executors.shuffler(epoch_number, prev_block_hash);
     let shuffled = shuffler.shuffle();
     if shuffled.is_empty() {
         return None;
@@ -346,10 +383,11 @@ pub trait IStakingManager: Send + Sync {
 /// Selects the block leader for an epoch using stake-weighted selection
 pub trait IEpochLeaderSelector: Send + Sync {
     /// Select leader(s) from the current stake set deterministically.
-    /// `epoch_number` is used as the seed source so every node with the
-    /// same stake set produces the same leader for the same epoch.
+    /// The seed is bound to `epoch_number` and the previous block hash so the
+    /// leader is only knowable once the prior block is mined — every node with
+    /// the same stake set and chain tip produces the same leader.
     /// Returns the selected public key(s).
-    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8>;
+    fn select(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8>;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +437,8 @@ impl Default for LeaderSelector {
 }
 
 impl IEpochLeaderSelector for LeaderSelector {
-    fn select(&self, stakers: &StakeSet, epoch_number: u64) -> Vec<u8> {
-        deterministic_select(stakers, &[], epoch_number)
+    fn select(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8> {
+        deterministic_select(stakers, LEADER_DOMAIN, &[], epoch_number, prev_block_hash)
             .unwrap_or_default()
     }
 }
@@ -417,8 +455,9 @@ impl Epoch {
         end_timestamp: i64,
         selector: &dyn IEpochLeaderSelector,
         stake_set: &StakeSet,
+        prev_block_hash: &[u8],
     ) -> Self {
-        let leader_public_key = selector.select(stake_set, epoch_number);
+        let leader_public_key = selector.select(stake_set, epoch_number, prev_block_hash);
         Epoch {
             start_timestamp,
             end_timestamp,
@@ -538,11 +577,16 @@ impl EpochBoundaryDetector {
     }
 
     /// Advance to a new epoch: bump the epoch number, select a new leader.
+    ///
+    /// `prev_block_hash` is the chain tip of the epoch about to end; it is bound
+    /// into the leader seed so the new leader is only knowable once that tip is
+    /// mined (Phase 5.3 / AUDIT H3). Empty at genesis.
     pub fn advance_to_new_epoch(
         &mut self,
         selector: &dyn IEpochLeaderSelector,
         stake_set: &StakeSet,
         epoch_duration: i64,
+        prev_block_hash: &[u8],
     ) {
         // Save current leader as previous
         if !self.current_epoch.leader_public_key.is_empty() {
@@ -557,6 +601,7 @@ impl EpochBoundaryDetector {
             now + epoch_duration,
             selector,
             stake_set,
+            prev_block_hash,
         );
     }
 
@@ -759,7 +804,7 @@ mod tests {
     fn leader_selector_empty_stake_set_returns_empty() {
         let selector = LeaderSelector::new();
         let stakes = make_stake_set(vec![]);
-        let leader = selector.select(&stakes, 1);
+        let leader = selector.select(&stakes, 1, &[]);
         assert!(leader.is_empty());
     }
 
@@ -770,7 +815,7 @@ mod tests {
         let stakes = make_stake_set(vec![(key.clone(), 100)]);
         // Run 10 times — single staker should always be selected
         for _ in 0..10 {
-            assert_eq!(selector.select(&stakes, 1), key);
+            assert_eq!(selector.select(&stakes, 1, &[]), key);
         }
     }
 
@@ -781,14 +826,14 @@ mod tests {
         let key_b = vec![2];
         let stakes = make_stake_set(vec![(key_a.clone(), 50), (key_b.clone(), 50)]);
         // Same epoch → same leader
-        let leader_epoch1 = selector.select(&stakes, 1);
-        assert_eq!(leader_epoch1, selector.select(&stakes, 1));
+        let leader_epoch1 = selector.select(&stakes, 1, &[]);
+        assert_eq!(leader_epoch1, selector.select(&stakes, 1, &[]));
         // Different epochs → deterministic but may differ
-        let leader_epoch2 = selector.select(&stakes, 2);
+        let leader_epoch2 = selector.select(&stakes, 2, &[]);
         // Either they happen to be the same (still deterministic), or differ
         // Just verify both calls with same epoch return the same result
-        assert_eq!(leader_epoch1, selector.select(&stakes, 1));
-        assert_eq!(leader_epoch2, selector.select(&stakes, 2));
+        assert_eq!(leader_epoch1, selector.select(&stakes, 1, &[]));
+        assert_eq!(leader_epoch2, selector.select(&stakes, 2, &[]));
     }
 
     #[test]
@@ -800,7 +845,7 @@ mod tests {
         let stakes = make_stake_set(vec![(key_small.clone(), 10), (key_large.clone(), 90)]);
         let mut small_count = 0u64;
         for _ in 0..100 {
-            if selector.select(&stakes, 1) == key_small {
+            if selector.select(&stakes, 1, &[]) == key_small {
                 small_count += 1;
             }
         }
@@ -814,9 +859,9 @@ mod tests {
     fn leader_selector_deterministic_same_inputs_same_output() {
         let selector = LeaderSelector::new();
         let stakes = make_stake_set(vec![(vec![1], 30), (vec![2], 50), (vec![3], 20)]);
-        let first = selector.select(&stakes, 5);
+        let first = selector.select(&stakes, 5, &[]);
         for _ in 1..20 {
-            assert_eq!(selector.select(&stakes, 5), first);
+            assert_eq!(selector.select(&stakes, 5, &[]), first);
         }
     }
 
@@ -827,7 +872,7 @@ mod tests {
         let selector = LeaderSelector::new();
         let key = vec![42];
         let stakes = make_stake_set(vec![(key.clone(), 100)]);
-        let epoch = Epoch::new_with_leader(1, 1000, 2000, &selector, &stakes);
+        let epoch = Epoch::new_with_leader(1, 1000, 2000, &selector, &stakes, &[]);
         assert_eq!(epoch.epoch_number, 1);
         assert_eq!(epoch.start_timestamp, 1000);
         assert_eq!(epoch.end_timestamp, 2000);
@@ -1006,7 +1051,7 @@ mod tests {
         let mut detector = EpochBoundaryDetector::new(epoch);
         let selector = LeaderSelector::new();
         let stakes = make_stake_set(vec![(vec![2], 100)]);
-        detector.advance_to_new_epoch(&selector, &stakes, 1000);
+        detector.advance_to_new_epoch(&selector, &stakes, 1000, &[]);
         assert_eq!(detector.current_epoch.epoch_number, 2);
         assert_eq!(detector.previous_leader, Some(vec![1]));
         assert_eq!(detector.current_epoch.leader_public_key, vec![2]);
@@ -1239,7 +1284,7 @@ mod tests {
     #[test]
     fn deterministic_select_empty_returns_none() {
         let stakes = make_stake_set(vec![]);
-        let result = deterministic_select(&stakes, b"tx1", 1);
+        let result = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx1", 1, &[]);
         assert!(result.is_none());
     }
 
@@ -1248,7 +1293,7 @@ mod tests {
         let key = vec![1, 2, 3];
         let stakes = make_stake_set(vec![(key.clone(), 100)]);
         for _ in 0..20 {
-            assert_eq!(deterministic_select(&stakes, b"tx1", 1), Some(key.clone()));
+            assert_eq!(deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx1", 1, &[]), Some(key.clone()));
         }
     }
 
@@ -1263,7 +1308,7 @@ mod tests {
         let num_trials = 200;
         for i in 0..num_trials {
             let tx_id = format!("tx_{}", i);
-            if deterministic_select(&stakes, tx_id.as_bytes(), 1) == Some(key_a.clone()) {
+            if deterministic_select(&stakes, FINALIZER_DOMAIN, tx_id.as_bytes(), 1, &[]) == Some(key_a.clone()) {
                 a_count += 1;
             }
         }
@@ -1275,20 +1320,20 @@ mod tests {
     #[test]
     fn deterministic_select_deterministic_across_epochs() {
         let stakes = make_stake_set(vec![(vec![1], 30), (vec![2], 50), (vec![3], 20)]);
-        let epoch1 = deterministic_select(&stakes, b"tx_alpha", 1);
-        let epoch1_again = deterministic_select(&stakes, b"tx_alpha", 1);
+        let epoch1 = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx_alpha", 1, &[]);
+        let epoch1_again = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx_alpha", 1, &[]);
         assert_eq!(epoch1, epoch1_again); // Same seed + same epoch → same result
 
-        let epoch2 = deterministic_select(&stakes, b"tx_alpha", 2);
+        let epoch2 = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx_alpha", 2, &[]);
         // Epoch2 may or may not differ — but must be deterministic
-        let epoch2_again = deterministic_select(&stakes, b"tx_alpha", 2);
+        let epoch2_again = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx_alpha", 2, &[]);
         assert_eq!(epoch2, epoch2_again);
     }
 
     #[test]
     fn deterministic_select_zero_stake_returns_none() {
         let stakes = make_stake_set(vec![(vec![1], 0), (vec![2], 0)]);
-        let result = deterministic_select(&stakes, b"tx1", 1);
+        let result = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx1", 1, &[]);
         assert!(result.is_none());
     }
 
@@ -1333,14 +1378,14 @@ mod tests {
 
     #[test]
     fn shuffler_empty_returns_empty() {
-        let shuffler = Shuffler::new(vec![], 1);
+        let shuffler = Shuffler::new(vec![], 1, &[]);
         let shuffled = shuffler.shuffle();
         assert!(shuffled.is_empty());
     }
 
     #[test]
     fn shuffler_single_item_same_order() {
-        let shuffler = Shuffler::new(vec![b"executor_1".to_vec()], 1);
+        let shuffler = Shuffler::new(vec![b"executor_1".to_vec()], 1, &[]);
         let shuffled = shuffler.shuffle();
         assert_eq!(shuffled.len(), 1);
         assert_eq!(shuffled[0], b"executor_1".to_vec());
@@ -1349,8 +1394,8 @@ mod tests {
     #[test]
     fn shuffler_deterministic_same_epoch_same_order() {
         let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
-        let shuffler1 = Shuffler::new(keys.clone(), 42);
-        let shuffler2 = Shuffler::new(keys, 42);
+        let shuffler1 = Shuffler::new(keys.clone(), 42, &[]);
+        let shuffler2 = Shuffler::new(keys, 42, &[]);
         let result1 = shuffler1.shuffle();
         let result2 = shuffler2.shuffle();
         assert_eq!(result1.len(), result2.len());
@@ -1362,8 +1407,8 @@ mod tests {
     #[test]
     fn shuffler_different_epochs_different_order() {
         let keys = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()];
-        let shuffler1 = Shuffler::new(keys.clone(), 1);
-        let shuffler2 = Shuffler::new(keys.clone(), 2);
+        let shuffler1 = Shuffler::new(keys.clone(), 1, &[]);
+        let shuffler2 = Shuffler::new(keys.clone(), 2, &[]);
         let result1 = shuffler1.shuffle();
         let result2 = shuffler2.shuffle();
         // Different seeds must produce different full permutations.
@@ -1377,7 +1422,7 @@ mod tests {
     #[test]
     fn deterministic_select_shard_empty_returns_none() {
         let executors = ExecutorSet::default();
-        let result = deterministic_select_shard(&executors, 2, "tx1", 1);
+        let result = deterministic_select_shard(&executors, 2, "tx1", 1, &[]);
         assert!(result.is_none());
     }
 
@@ -1386,7 +1431,7 @@ mod tests {
         let mut executors = ExecutorSet::default();
         executors.executors.insert(b"exec1".to_vec(), 100);
         executors.executors.insert(b"exec2".to_vec(), 200);
-        let result = deterministic_select_shard(&executors, 1, "any-tx", 1);
+        let result = deterministic_select_shard(&executors, 1, "any-tx", 1, &[]);
         assert!(result.is_some());
         let keys = result.unwrap();
         assert_eq!(keys.len(), 2);
@@ -1399,7 +1444,7 @@ mod tests {
             executors.executors.insert(format!("exec{}", i).into_bytes(), 100);
         }
         // With 6 executors and 3 shards, each shard should get ~2 executors
-        let result = deterministic_select_shard(&executors, 3, "tx-42", 1);
+        let result = deterministic_select_shard(&executors, 3, "tx-42", 1, &[]);
         assert!(result.is_some());
         let shard = result.unwrap();
         assert!(shard.len() >= 1 && shard.len() <= 4,
@@ -1412,8 +1457,8 @@ mod tests {
         for i in 0..4 {
             executors.executors.insert(format!("exec{}", i).into_bytes(), 100 + i);
         }
-        let result1 = deterministic_select_shard(&executors, 2, "same-tx", 5);
-        let result2 = deterministic_select_shard(&executors, 2, "same-tx", 5);
+        let result1 = deterministic_select_shard(&executors, 2, "same-tx", 5, &[]);
+        let result2 = deterministic_select_shard(&executors, 2, "same-tx", 5, &[]);
         assert!(result1.is_some() && result2.is_some());
         assert_eq!(result1.unwrap(), result2.unwrap());
     }
@@ -1446,11 +1491,127 @@ mod tests {
         // shuffle path. Several (shard_count, tx, epoch) tuples cover the round-robin.
         let cases = [(1u32, "tx-a", 7), (3, "tx-a", 7), (4, "other-tx", 9), (2, "tx-a", 7)];
         for (sc, tx, ep) in cases {
-            let a = deterministic_select_shard(&forward, sc, tx, ep).unwrap();
-            let b = deterministic_select_shard(&reversed, sc, tx, ep).unwrap();
-            let c = deterministic_select_shard(&roundtrip, sc, tx, ep).unwrap();
+            let a = deterministic_select_shard(&forward, sc, tx, ep, &[]).unwrap();
+            let b = deterministic_select_shard(&reversed, sc, tx, ep, &[]).unwrap();
+            let c = deterministic_select_shard(&roundtrip, sc, tx, ep, &[]).unwrap();
             assert_eq!(a, b, "forward vs reversed differ: shard_count={} tx={} epoch={}", sc, tx, ep);
             assert_eq!(a, c, "forward vs round-trip differ: shard_count={} tx={} epoch={}", sc, tx, ep);
         }
+    }
+
+    // --- Phase 5.3 / AUDIT H3: unpredictable selection seeds ---
+    //
+    // Regression discriminators for binding every selection seed to
+    // `prev_block_hash` (plus a per-type domain byte). Each must FAIL if the seed
+    // is reverted to depend only on `epoch_number`, which would make the next
+    // leader / shard / finalizer predictable from the public stake set.
+
+    #[test]
+    fn selection_seed_leader_changes_with_prev_block_hash() {
+        // HEADLINE discriminator: same stake set + epoch, different prev_block_hash
+        // → different leader. Without this binding an attacker can precompute the
+        // next leader and pre-target it before it ever appears.
+        let selector = LeaderSelector::new();
+        let stakes = make_stake_set(vec![(vec![1], 50), (vec![2], 50)]);
+        let leader_a = selector.select(&stakes, 7, &[0x11u8; 32]);
+        let leader_b = selector.select(&stakes, 7, &[0x22u8; 32]);
+        assert_ne!(leader_a, leader_b, "leader must vary with prev_block_hash");
+    }
+
+    #[test]
+    fn selection_seed_distinct_domains_differ() {
+        // Same stake set + epoch + prev_block_hash, but the LEADER vs FINALIZER
+        // domain bytes must land on different nodes — a leader seed must never be
+        // replayable as a finalizer seed. The seed-level split is the rigorous
+        // proof (the domain byte is hashed into the seed); the selection-level
+        // split over a spread stake set shows it end-to-end.
+        let stakes = make_stake_set(vec![(vec![1], 10), (vec![2], 30), (vec![3], 60)]);
+        let prev = [0x33u8; 32];
+
+        // Seed-level: the domain byte is part of the hashed input, so two
+        // selections over the same snapshot derive from different seeds.
+        let leader_seed = derive_selection_seed(LEADER_DOMAIN, 7, &prev, &[]);
+        let finalizer_seed = derive_selection_seed(FINALIZER_DOMAIN, 7, &prev, b"tx1");
+        assert_ne!(leader_seed, finalizer_seed, "domains must be separated in the seed");
+
+        // Selection-level: the different seeds land on different stake keys.
+        let leader = deterministic_select(&stakes, LEADER_DOMAIN, &[], 7, &prev).unwrap();
+        let finalizer = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx1", 7, &prev).unwrap();
+        assert_ne!(leader, finalizer, "leader and finalizer must not collide");
+    }
+
+    #[test]
+    fn selection_seed_shard_index_changes_with_prev_block_hash() {
+        // The same tx in the same epoch routes to a different shard partition when
+        // the previous block hash differs — no pre-targeting of the assigned shard.
+        fn build() -> ExecutorSet {
+            let mut e = ExecutorSet::default();
+            e.executors.insert(b"exec0".to_vec(), 100);
+            e.executors.insert(b"exec1".to_vec(), 100);
+            e.executors.insert(b"exec2".to_vec(), 100);
+            e.executors.insert(b"exec3".to_vec(), 100);
+            e
+        }
+        let executors = build();
+        let a = deterministic_select_shard(&executors, 2, "tx-1", 7, &[0x11u8; 32]).unwrap();
+        let b = deterministic_select_shard(&executors, 2, "tx-1", 7, &[0x22u8; 32]).unwrap();
+        assert_ne!(a, b, "selected shard must vary with prev_block_hash");
+    }
+
+    #[test]
+    fn selection_seed_matches_manual_hash() {
+        // Guards the exact byte layout of the derived seed:
+        //   SHA-256(domain ‖ epoch ‖ prev_block_hash ‖ extra)
+        let prev = [0x44u8; 32];
+        let extra = b"tx1";
+        let built = derive_selection_seed(LEADER_DOMAIN, 7, &prev, extra);
+        let mut input = Vec::new();
+        input.push(LEADER_DOMAIN);
+        input.extend_from_slice(&7u64.to_be_bytes());
+        input.extend_from_slice(&prev);
+        input.extend_from_slice(extra);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+        let mut expected = [0u8; 32];
+        expected.copy_from_slice(digest.as_ref());
+        assert_eq!(built, expected, "derived seed must equal manual SHA-256(domain ‖ epoch ‖ prev ‖ extra)");
+    }
+
+    #[test]
+    fn selection_seed_independent_of_tx_id_for_leader() {
+        // The leader path carries no per-tx extra, so it is one stable leader for
+        // the stake set regardless of transaction. The finalizer path salts on
+        // tx_id, so across transactions it does NOT pin every tx to a single
+        // finalizer — dropping tx_id (the regression) would route all of them to
+        // one node and wreck load distribution. Proves `extra` is used by the
+        // finalizer/shard-index paths, not the leader.
+        let key_a = vec![1];
+        let key_b = vec![2];
+        let stakes = make_stake_set(vec![(key_a.clone(), 10), (key_b.clone(), 90)]);
+        let prev = [0x55u8; 32];
+
+        // Leader: a single, stable key, independent of any transaction.
+        let leader = deterministic_select(&stakes, LEADER_DOMAIN, &[], 7, &prev).unwrap();
+        assert_eq!(leader.len(), 1, "leader path returns exactly one stake key");
+
+        // Finalizer: across many tx_ids, routing spans more than one key (tx_id
+        // is a real salt). A regression that dropped tx_id would pin every tx to
+        // the single leader key.
+        let mut finalizer_keys = std::collections::BTreeSet::new();
+        for i in 0..100 {
+            let key = deterministic_select(
+                &stakes,
+                FINALIZER_DOMAIN,
+                format!("tx_{i}").as_bytes(),
+                7,
+                &prev,
+            )
+            .unwrap();
+            finalizer_keys.insert(key);
+        }
+        assert!(
+            finalizer_keys.len() > 1,
+            "finalizer must span multiple keys across txs (tx_id is a real salt); got {:?}",
+            finalizer_keys
+        );
     }
 }

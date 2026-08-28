@@ -254,6 +254,7 @@ async fn main() {
         now + epoch_duration,
         leader_selector.as_ref(),
         &stake_store.to_stake_set(),
+        &[], // genesis: no prior block → empty prev_block_hash
     );
     let epoch_detector = EpochBoundaryDetector::new(initial_epoch);
     let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));

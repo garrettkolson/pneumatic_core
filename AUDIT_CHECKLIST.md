@@ -473,11 +473,52 @@ agree on anything.*
   `commit_conflict_same_proposer_emits_slash` + `…partial_slash_respects_fraction` (is_ok → is_err),
   and the double-append test (reconcile with discard-loser). `cargo check` clean.
 
-- [ ] **5.3 Unpredictable selection seeds** (H3)
+- [x] **5.3 Unpredictable selection seeds** (H3) — *done 2026-08-28*
   Files: `src/epoch.rs:180-183, 225-227, 395-398`.
   Action: seed = `SHA-256(domain ‖ epoch_number ‖ prev_block_hash)` with a distinct domain byte
   per selection type (leader / shard shuffle / finalizer / shard index), per ADR-003.
   Verify: same (epoch, stake set) with different prev_block_hash → different leader/shards.
+
+  **Done:** every deterministic selection seed is now bound to the mined `prev_block_hash`, so a
+  future leader / executor shard / finalizer is only knowable once the *previous* block is actually
+  mined (before it was predictively derivable from the public `epoch_number` + stake set). One
+  shared `derive_selection_seed` helper in `src/epoch.rs` computes
+  `seed = SHA-256(domain ‖ epoch_number ‖ prev_block_hash ‖ extra)` with a **distinct domain byte
+  per selection type** (`LEADER_DOMAIN=0x01`, `SHARD_SHUFFLE_DOMAIN=0x02`, `FINALIZER_DOMAIN=0x03`,
+  `SHARD_INDEX_DOMAIN=0x04`) — so a leader seed can never be replayed as a shard-index seed, per the
+  ADR requirement `src/epoch.rs:180-183, 225-227, 395-398`. The four seed sites: `Shuffler::new`
+  (shuffle), `deterministic_select` (serves both leader `LEADER_DOMAIN`+empty-extra and finalizer
+  `FINALIZER_DOMAIN`+tx_id-extra), and `deterministic_select_shard` (finalizer + shard-index).
+  `tx_id` is **kept** as `extra` for the finalizer/shard-index paths — dropping it would route every
+  tx to the same finalizer/shard and regress load distribution. Leader selection now threads
+  `prev_block_hash`: `IEpochLeaderSelector::select` gains a `prev_block_hash` arg (breaking —
+  consistent with the intentional breaking-API changes of earlier phases), both impls updated (core
+  `LeaderSelector::select`, committer `LeaderSelector::select_internal`), and `Epoch::new_with_leader`
+  forwards it. `prev_block_hash` is sourced from the two production producers. The **committer**
+  reads the tip **locally** from its token cache (`self.tokens`, where it holds chain state and never
+  persists it to the data service) — wired into `handle_epoch_reconcile` (`committer.rs:960`) and
+  `advance_epoch` (`committer.rs:1211`); the genesis/boot path passes `vec![]`. The **sentinel** reads
+  it via the new default trait method `DataProvider::latest_block_hash` (`src/data.rs:20`; returns
+  `Ok(None)` → empty salt by default, so no existing test provider needs a change).
+  **Wire-compat:** none — `latest_block_hash` is a new default trait method (no impl change for the
+  ~6 test providers), no wire `DataOp`/`GetOp` entry, and `deterministic_select`/`Shuffler` are
+  internal helpers. Only Rust signatures change.
+  **Production-data-flow gap (recorded, not fixed):** the sentinel path does not bind the mined tip
+  in production — the chain tip is never persisted to the data service (only the committer holds it
+  locally), so `default` `latest_block_hash` returns `Ok(None)` → the sentinel's finalizer/shard
+  routing varies only by `domain ‖ epoch ‖ tx_id`, not by mined tip. The core derivation is still
+  correct and regression-tested, and the committer leader path is always tip-bound; closing the gap
+  needs a worker to persist the mined tip.
+  **Tests:** full workspace **green, 0 failures** (548 passing: core 359, committer lib 57, pipeline
+  integration 7, finalizer 54, sentinel 55, executor 10, transport 6). New discriminators — each
+  proven to fail when its fix is reverted: `committer::tests::advance_epoch_leader_changes_with_mined_tip`
+  (committer leader binds the local mined tip),
+  `sentinel::tests::assign_finalizer_changes_with_mined_tip` and
+  `sentinel::tests::get_shard_executors_changes_with_mined_tip` (finalizer + shard routing bind the
+  mined tip). Plus core `src/epoch.rs::tests`: `selection_seed_leader_changes_with_prev_block_hash`,
+  `selection_seed_distinct_domains_differ`, `selection_seed_shard_index_changes_with_prev_block_hash`,
+  `selection_seed_matches_manual_hash` (exact byte layout), and
+  `selection_seed_independent_of_tx_id_for_leader`. `cargo check` clean.
 
 - [ ] **5.4 One epoch writer; authenticated epoch advance** (H9, M8)
   Files: `committer/src/committer.rs:558-600` (`handle_epoch_reconcile`), `:775-795`
