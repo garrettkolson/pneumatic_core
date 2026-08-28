@@ -636,27 +636,57 @@ pub fn resolve_block_conflict(
 /// Registry of competing block candidates keyed by (token_id, previous_hash).
 /// Used for conflict detection — when two or more valid blocks reference the
 /// same previous_hash for the same token, they represent a fork.
-#[derive(Debug, Default)]
+///
+/// Each (token_id, previous_hash) group is bounded to at most
+/// [`CandidateRegistry::DEFAULT_MAX_CANDIDATES`] candidates: when an insert
+/// would exceed that cap the oldest candidate is evicted (LRU), so repeated
+/// conflicting proposals at one position cannot inflate the registry without
+/// bound (AUDIT Phase 5.2 / H2).
+#[derive(Debug)]
 pub struct CandidateRegistry {
     /// (token_id, previous_hash) → list of candidate (block, proposer_key) pairs
     candidates: DashMap<(Vec<u8>, Vec<u8>), Vec<(crate::blocks::Block, Vec<u8>)>>,
+    /// Max number of candidates held at a single (token_id, previous_hash)
+    /// position before the oldest is evicted.
+    max_candidates: usize,
 }
 
 impl CandidateRegistry {
+    /// Upper bound on the number of competing candidates kept at any one
+    /// (token_id, previous_hash) position. Older candidates are evicted (LRU)
+    /// once this many are present (AUDIT Phase 5.2 / H2).
+    pub const DEFAULT_MAX_CANDIDATES: usize = 1024;
+
     pub fn new() -> Self {
         CandidateRegistry {
             candidates: DashMap::new(),
+            max_candidates: CandidateRegistry::DEFAULT_MAX_CANDIDATES,
+        }
+    }
+
+    /// Build a registry with an explicit per-position cap.
+    pub fn with_max_candidates(max_candidates: usize) -> Self {
+        CandidateRegistry {
+            candidates: DashMap::new(),
+            max_candidates: max_candidates.max(1),
         }
     }
 
     /// Insert a candidate block. If another candidate already exists at this
     /// (token_id, previous_hash), the new candidate is appended — a conflict
     /// is detected when the vec has length >= 2.
+    ///
+    /// On overflow the oldest candidate is evicted so the per-position vec stays
+    /// bounded (AUDIT Phase 5.2 / H2 / LRU eviction).
     pub fn insert(&self, token_id: Vec<u8>, previous_hash: Vec<u8>,
                   block: crate::blocks::Block, proposer_key: Vec<u8>) {
         let key = (token_id, previous_hash);
         let mut entry = self.candidates.entry(key).or_insert_with(Vec::new);
         entry.push((block, proposer_key));
+        // LRU eviction: keep at most `max_candidates` candidates per position.
+        while entry.len() > self.max_candidates {
+            entry.remove(0);
+        }
     }
 
     /// Get all candidates for a given (token_id, previous_hash).
@@ -697,6 +727,13 @@ impl CandidateRegistry {
     /// Returns true if there are no candidate groups.
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
+    }
+}
+
+impl Default for CandidateRegistry {
+    /// An empty registry sized to [`CandidateRegistry::DEFAULT_MAX_CANDIDATES`].
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1046,6 +1083,32 @@ mod tests {
         let registry = CandidateRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
+    }
+
+    // --- CandidateRegistry LRU bound (AUDIT Phase 5.2 / H2) ---
+
+    #[test]
+    fn registry_lru_evicts_oldest_when_over_cap() {
+        // A per-position candidate vec is capped at `max_candidates`; the oldest
+        // candidate is evicted once the cap is exceeded, so repeated conflicting
+        // proposals cannot inflate the registry.
+        let registry = CandidateRegistry::with_max_candidates(3);
+        let token_id = vec![7];
+        let prev_hash = vec![8];
+
+        // Insert 5 candidates (cap is 3); each carries a distinguishable
+        // proposer key so we can confirm the oldest is dropped.
+        let first = vec![1];
+        for proposer in [first, vec![2], vec![3], vec![4], vec![5]] {
+            let block = Block::test_block(proposer.clone());
+            registry.insert(token_id.clone(), prev_hash.clone(), block, proposer);
+        }
+
+        let candidates = registry.get_candidates(&token_id, &prev_hash);
+        assert_eq!(candidates.len(), 3, "per-position count stays capped at max");
+        // Oldest (proposer [1]) evicted; the three most recent remain, in order.
+        let proposers: Vec<Vec<u8>> = candidates.iter().map(|(_, pk)| pk.clone()).collect();
+        assert_eq!(proposers, vec![vec![3], vec![4], vec![5]]);
     }
 
     #[test]

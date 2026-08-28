@@ -182,7 +182,26 @@ impl EpochReconciler {
             // Check chain validity
             let chain_state = token.blockchain.get_current_chain_state();
             if !chain_state.is_valid {
+                // AUDIT Phase 5.2 / H2: give `misshapen_tokens` a real economic side
+                // effect instead of being a dead accumulator. An invalid chain means its
+                // tip proposer built something the network rejects, so slash the tip
+                // proposer's stake (the same amount formula used for same-proposer
+                // double-signs, Phase 5.1). The token id is still recorded in
+                // `misshapen_tokens` as an informational record; the slash is the
+                // remediation.
                 reconciliation.misshapen_tokens.push(token_id.clone());
+                if let Some(tip_block) = token.blockchain.last_block() {
+                    let amount = (self.stake_store.get_stake(&tip_block.proposer_key) as f64
+                        * self.slash_fraction)
+                        .round()
+                        .min(u64::MAX as f64) as u64;
+                    if amount > 0 {
+                        reconciliation.slashing_ops.push(StakingOp::Slash(
+                            tip_block.proposer_key.clone(),
+                            amount,
+                        ));
+                    }
+                }
                 continue;
             }
 
@@ -357,6 +376,20 @@ mod tests {
         token
     }
 
+    /// An invalid chain whose tip block carries a specific `proposer_key`, so the
+    /// test can assert exactly who `reconcile_internal` slashes.
+    fn make_invalid_token_with_proposer(id: Vec<u8>, tip_proposer: Vec<u8>) -> Token {
+        let mut token = make_valid_token(id, 2);
+        if let Some(block) = token.blockchain.chain.back_mut() {
+            block.proposer_key = tip_proposer.clone();
+        }
+        if let Some(block) = token.blockchain.chain.back_mut() {
+            block.current_hash = vec![99u8; 32];
+        }
+        assert!(!token.blockchain.get_current_chain_state().is_valid);
+        token
+    }
+
     fn make_stake_store(stakes: Vec<(Vec<u8>, u64)>) -> Arc<StakeStore> {
         let store = Arc::new(StakeStore::new());
         for (key, stake) in stakes {
@@ -422,6 +455,39 @@ mod tests {
         let (reconciler, _, _) = make_reconciler(vec![], vec![(vec![1], token)], vec![vec![1]], 1.0);
         let result = reconciler.reconcile();
         assert!(result.misshapen_tokens.contains(&vec![1]));
+    }
+
+    #[test]
+    fn reconcile_misshapen_chain_slashes_tip_proposer() {
+        // AUDIT Phase 5.2 / H2: `misshapen_tokens` is no longer a dead accumulator —
+        // reconciling a token with an invalid chain must emit a real slash op against
+        // the tip proposer AND still record the token in `misshapen_tokens`. This is
+        // the discriminator: before the fix the branch only pushed the id and never
+        // touched `slashing_ops`, so `slash` is `None`.
+        let token = make_invalid_token_with_proposer(vec![1], vec![1]);
+        let (reconciler, store, _) = make_reconciler(
+            vec![(vec![1], 100)],
+            vec![(vec![1], token)],
+            vec![vec![1]],
+            1.0, // full slash
+        );
+        let result = reconciler.reconcile();
+
+        // The token is still recorded as misshapen (informational record preserved).
+        assert!(result.misshapen_tokens.contains(&vec![1]));
+
+        // A real slash op is emitted against the tip proposer — the tip's proposer
+        // (vec![1]) has 100 stake, slash_fraction is 1.0 → full 100.
+        let slash = result.slashing_ops.iter().find_map(|op| match op {
+            StakingOp::Slash(key, amount) => Some((key.clone(), *amount)),
+            _ => None,
+        });
+        assert_eq!(slash, Some((vec![1], 100)));
+
+        // Applying the ops actually moves the StakeStore — slashing is real.
+        let manager = StakingManager::new(store.clone(), Arc::new(NullLogger));
+        manager.apply_ops(&result).expect("apply_ops should succeed");
+        assert_eq!(store.get_stake(&vec![1]), 0);
     }
 
     // --- Same-chain conflict detection via CandidateRegistry ---

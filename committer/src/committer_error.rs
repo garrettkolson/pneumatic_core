@@ -56,6 +56,10 @@ pub enum CommitterError {
         gas_used: u64,
         cause: String,
     },
+    /// A committed block lost its conflict resolution and was discarded on the commit
+    /// path (AUDIT Phase 5.2 / H2): the incoming block did not win its conflict at the
+    /// tip, so it is rejected and the existing chain state is preserved.
+    LoserDiscarded,
 }
 
 impl From<io::Error> for CommitterError {

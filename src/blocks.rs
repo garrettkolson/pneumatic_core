@@ -242,6 +242,15 @@ impl Blockchain {
         self.chain.pop_front()
     }
 
+    /// Returns a reference to the most recently appended block (the current
+    /// tip), or `None` if the chain is empty.
+    ///
+    /// Used to derive the tip's proposer (AUDIT Phase 5.2 / H2) without cloning
+    /// the whole block.
+    pub fn last_block(&self) -> Option<&Block> {
+        self.chain.back()
+    }
+
     pub fn get_current_chain_state(&self) -> ChainState {
         if self.chain.is_empty() {
             return ChainState::empty();

@@ -426,14 +426,52 @@ agree on anything.*
   configured), and a `reconcile_same_proposer_conflict_slashes_proposer` path test asserting
   `slashing_ops` plus `apply_ops` moving the StakeStore. 535 tests passing, 0 failures.
 
-- [ ] **5.2 Discard losers on conflict; bound the registry** (H2)
-  Files: `committer/src/committer.rs:613-711`, `src/epoch.rs:680`
-  (`remove_conflicted` has zero production callers).
-  Action: on `DiscardLoser`, reject/undo the losing block's append; call `remove_conflicted`
-  after resolution; enforce a max size on `CandidateRegistry`; give `misshapen_tokens` a real
-  remediation path or delete it.
+- [x] **5.2 Discard losers on conflict; bound the registry** (H2) — *done 2026-08-27*
+  Files: `src/epoch.rs` (`CandidateRegistry`), `src/blocks.rs:250` (new `Blockchain::last_block`),
+  `src/tokens.rs:222` (`Token::commit_block`), `committer/src/block_services.rs:67`
+  (`commit_block`), `committer/src/committer.rs:999-1121` (`handle_conflict_at_commit`),
+  `:482-490` (caller `check_and_commit_transaction_results`),
+  `committer/src/committer_error.rs` (new `LoserDiscarded`),
+  `committer/src/epoch_manager.rs:182-207` (`reconcile_internal`).
+  Action: on `DiscardLoser`, undo the losing block's append and commit the winner; call
+  `remove_conflicted` after **every** resolution (`DiscardLoser`/`SameProposerSlash`/`TieFlagBoth`
+  each clear the resolved group so no branch leaves the loser standing); enforce a per-position
+  max on `CandidateRegistry`; give `misshapen_tokens` a real side effect instead of being a
+  write-once record.
   Verify: contested (token_id, previous_hash) → exactly one block remains in the chain;
   registry size stays bounded under repeated conflicts.
+
+  **Done:** honored the three locked design choices — (1) roll back the losing tip + commit the
+  winner atomically, (2) remediate `misshapen_tokens` by slashing the chain tip's proposer,
+  (3) LRU eviction (evict oldest per-position candidate). `CandidateRegistry` gains a `max_candidates`
+  field (`DEFAULT_MAX_CANDIDATES = 1024`, a `with_max_candidates` ctor, and a manual `Default` impl
+  so `new()`'s signature is unchanged across all ~14 call sites); `insert` evicts the oldest via
+  `while entry.len() > self.max_candidates { entry.remove(0) }` (Vec front = oldest = true LRU).
+  The commit path's conflict winner links to the tip's *parent*, so `Token::commit_block` now
+  **rolls the loser tip back before validating** (a `rollback_tip_hash: Option<&[u8]>` param) with
+  **restore-on-failure** so a rejected winner never truncates the chain — the ordering matters
+  because `validate_next_block` requires `previous_hash == tip`. `commit_block` threads the param
+  through, atomic under the single `get_mut` lock. `handle_conflict_at_commit` now returns
+  `Result<CommitConflictOutcome, CommitterError>` (new private `CommitConflictOutcome { Commit,
+  CommitWinnerAfterRollback(Vec<u8>) }`) and calls `remove_conflicted` on every non-empty arm; the
+  caller commits with `None` or `Some(loser_hash)` per outcome. `reconcile_internal` (via the new
+  `Blockchain::last_block`) derives the tip proposer on an invalid chain and emits a real
+  `Slash(tip_proposer, stake·slash_fraction)` op; `misshapen_tokens` is kept as an informational
+  record. New `CommitterError::LoserDiscarded` variant (no fields).
+  **Wire-compat:** none — all new parameters are internal (commit path + spec fields). Ground-rule
+  check: fail-closed (a losing re-proposal is rejected, not appended); the commit path's `add_block`
+  stays linkage-free *by design* (H2 addresses the conflict fork, not general unlinked appends).
+  **Tests:** full workspace **green, 0 failures** (core 354, committer lib 56 + main 7, finalizer 54,
+  sentinel 53, executor 10). New discriminators — each proven to fail when its fix is reverted:
+  `commit_conflict_rolls_back_loser_tip_and_commits_winner` (rollback-before-validate ordering),
+  `commit_conflict_rejects_losing_commit` (loser rejected, tip preserved),
+  `candidate_registry_bounded_under_repeated_conflicts` (LRU cap via direct raw-insert of N > cap
+  candidates and asserts the oldest evicted), `reconcile_misshapen_chain_slashes_tip_proposer`
+  (invalid chain → slash of the tip proposer, stake → 0), and core
+  `registry_lru_evicts_oldest_when_over_cap`. Updated tests encoding the old buggy behavior:
+  `commit_conflict_different_stakes_discards_loser` (candidate count 2 → 0),
+  `commit_conflict_same_proposer_emits_slash` + `…partial_slash_respects_fraction` (is_ok → is_err),
+  and the double-append test (reconcile with discard-loser). `cargo check` clean.
 
 - [ ] **5.3 Unpredictable selection seeds** (H3)
   Files: `src/epoch.rs:180-183, 225-227, 395-398`.

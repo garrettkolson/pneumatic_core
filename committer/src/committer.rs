@@ -33,6 +33,22 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Outcome of conflict resolution on the commit path. Returned by
+/// [`Committer::handle_conflict_at_commit`] so the caller knows whether to append
+/// the incoming block directly, to append it after rolling back the losing tip,
+/// or to reject it outright (a rejection is surfaced to the caller as an
+/// `Err(CommitterError::LoserDiscarded)`, not this enum). (AUDIT Phase 5.2 / H2)
+#[derive(Debug, Clone)]
+enum CommitConflictOutcome {
+    /// No competing proposal has committed a block for this position — the incoming
+    /// block is safe to append as-is.
+    Commit,
+    /// The incoming block won its conflict, but the losing proposal is the current
+    /// chain tip. Roll back `loser_hash` (only if it matches the tip) before appending
+    /// the winner, so exactly one block ends up at that position.
+    CommitWinnerAfterRollback(Vec<u8>),
+}
+
 /// Which node roles are permitted to originate a message of a given action.
 /// Derived from the actual wire senders: `Commit`/`BlockFinalized` come only
 /// from Finalizers, `DistributeToken`/`DistributeBlock` only from Committers,
@@ -459,11 +475,19 @@ impl Committer {
             return Err(CommitterError::TransactionPayloadMismatch(tx_id.clone()));
         }
 
-        // Step 3: Check for conflicts and resolve before committing
-        self.handle_conflict_at_commit(commit)?;
-
-        // Step 4: Commit the block via BlockServices
-        let _ = self.block_services.commit_block(commit)?;
+        // Step 3: Check for conflicts and resolve before committing. The resolved
+        // conflict tells us whether the incoming block wins outright (`Commit`) or
+        // wins only after the losing tip is rolled back (`CommitWinnerAfterRollback`)
+        // — or was rejected (`LoserDiscarded`, surfaced below).
+        match self.handle_conflict_at_commit(commit) {
+            Ok(CommitConflictOutcome::Commit) => {
+                self.block_services.commit_block(commit, None)?;
+            }
+            Ok(CommitConflictOutcome::CommitWinnerAfterRollback(loser_hash)) => {
+                self.block_services.commit_block(commit, Some(loser_hash))?;
+            }
+            Err(e) => return Err(e),
+        }
 
         // Step 3.5: Deduct gas from sender's fuel balance.
         //
@@ -966,12 +990,16 @@ impl Committer {
     /// - Same proposer → SameProposerSlash (double-signed)
     /// - Equal stakes + hash tie → TieFlagBoth
     ///
-    /// The winning block is inserted into the CandidateRegistry; the loser
-    /// remains for epoch reconciliation cleanup.
+    /// Every resolved group is then cleared from the registry via
+    /// `remove_conflicted`, and the loser is never left standing (AUDIT Phase
+    /// 5.2 / H2): the incoming block commits only if it wins — appended as-is
+    /// (outcome `Commit`) or, if the loser happens to be the current tip, after
+    /// that tip is rolled back (outcome `CommitWinnerAfterRollback`). Any other
+    /// resolution rejects the incoming block with `Err(CommitterError::LoserDiscarded)`.
     fn handle_conflict_at_commit(
         &self,
         commit: &TransactionCommit,
-    ) -> Result<(), CommitterError> {
+    ) -> Result<CommitConflictOutcome, CommitterError> {
         let token_id = commit.token_id.clone();
         let previous_hash = commit.proposed_block.previous_hash.clone();
 
@@ -981,13 +1009,14 @@ impl Committer {
 
         if candidates.is_empty() {
             // No conflict — this is the first candidate for this position.
-            // Insert it into the registry for future conflict detection.
+            // Insert it into the registry for future conflict detection. The
+            // incoming block is the winner by default (no rollback needed).
             self.candidate_registry.insert(
                 token_id, previous_hash,
                 commit.proposed_block.clone(),
                 commit.proposed_block.proposer_key.clone(),
             );
-            return Ok(());
+            return Ok(CommitConflictOutcome::Commit);
         }
 
         // Conflict detected — resolve with real stakes from StakeStore
@@ -1015,20 +1044,40 @@ impl Committer {
             &stake_set,
         ).map_err(|e| CommitterError::Core(e))?;
 
-        // Handle the resolution outcome
+        // Resolve the conflict and clear the entire candidate group. No branch
+        // leaves the loser standing: the winner either commits (possibly after a
+        // tip rollback) or the incoming block is rejected. (AUDIT Phase 5.2 / H2)
         match resolution {
             ConflictResolution::DiscardLoser(winner_hash) => {
-                // Network race — discard the loser, keep the winner.
-                // Both blocks stay in the registry for epoch reconciliation cleanup.
-                let logger = &self.env_data.logger;
-                logger.log(format!(
-                    "Conflict resolved (DiscardLoser) at commit: winner {} (token: {})",
-                    bytes_to_hex(&winner_hash),
-                    bytes_to_hex(&token_id),
-                ));
+                if winner_hash == block_b_hash {
+                    // Incoming block wins. Clear the loser group and commit the
+                    // winner, passing block_a's hash as the rollback target —
+                    // commit_block only rolls back if that hash is the current tip
+                    // (otherwise it appends to the real tip, so this is a no-op).
+                    self.env_data.logger.log(format!(
+                        "Conflict resolved (DiscardLoser) at commit: incoming {} wins, rollback target {} (token: {})",
+                        bytes_to_hex(&block_b_hash),
+                        bytes_to_hex(&block_a_hash),
+                        bytes_to_hex(&token_id),
+                    ));
+                    self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                    Ok(CommitConflictOutcome::CommitWinnerAfterRollback(block_a_hash))
+                } else {
+                    // Existing block_a wins — the incoming block is the loser.
+                    self.env_data.logger.log(format!(
+                        "Conflict resolved (DiscardLoser) at commit: existing {} wins, incoming {} discarded (token: {})",
+                        bytes_to_hex(&block_a_hash),
+                        bytes_to_hex(&block_b_hash),
+                        bytes_to_hex(&token_id),
+                    ));
+                    self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                    Err(CommitterError::LoserDiscarded)
+                }
             }
             ConflictResolution::SameProposerSlash(winner_hash, slashed_key) => {
-                // Same proposer double-signed — slash them for a real amount.
+                // Same proposer double-signed — slash them for a real amount, then
+                // reject the incoming re-proposal. The existing block_a remains the
+                // winner at this position.
                 // The slash is the configured fraction (default: full stake) of
                 // the offender's current stake, so a fully-slashed proposer is
                 // zeroed and a re-slash at the next epoch boundary is a no-op.
@@ -1037,8 +1086,7 @@ impl Committer {
                     .round()
                     .min(u64::MAX as f64) as u64;
 
-                let logger = &self.env_data.logger;
-                logger.log(format!(
+                self.env_data.logger.log(format!(
                     "Double-proposal detected (same proposer) at commit: slashing {} (winner {})(token: {})",
                     bytes_to_hex(&slashed_key),
                     bytes_to_hex(&winner_hash),
@@ -1055,25 +1103,21 @@ impl Committer {
                     )],
                     reward_ops: vec![],
                 })?;
+
+                self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                Err(CommitterError::LoserDiscarded)
             }
-            ConflictResolution::TieFlagBoth(winner_hash) => {
-                let logger = &self.env_data.logger;
-                logger.log(format!(
-                    "Tie conflict at commit — flagging both proposers for review, winner {} (token: {})",
-                    bytes_to_hex(&winner_hash),
+            ConflictResolution::TieFlagBoth(_winner_hash) => {
+                // Equal stakes + hash tie — flag both proposers for review and
+                // reject the incoming block to avoid a duplicate append.
+                self.env_data.logger.log(format!(
+                    "Tie conflict at commit — flagging both proposers for review (token: {})",
                     bytes_to_hex(&token_id),
                 ));
+                self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                Err(CommitterError::LoserDiscarded)
             }
         }
-
-        // Always insert the new candidate for tracking
-        self.candidate_registry.insert(
-            token_id, previous_hash,
-            commit.proposed_block.clone(),
-            commit.proposed_block.proposer_key.clone(),
-        );
-
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2555,14 +2599,30 @@ mod tests {
         } else {
             vec![42u8; 32]
         };
+        // Distinct stakes make the outcome deterministic: the incoming block
+        // (proposer vec![]) wins over the existing candidate (proposer vec![10]).
+        committer.stake_store.add_staker(vec![10], 100);
+        committer.stake_store.add_staker(vec![], 500);
+
         let existing_block = make_block_with_proposer(&committer, "tx_existing", vec![10]);
         committer.candidate_registry.insert(
             vec![1], prev_hash.clone(), existing_block, vec![10],
         );
 
-        // Commit — should detect conflict and resolve
+        // Commit — the conflict is detected and resolved. The winner commits and the
+        // loser group is cleared (AUDIT Phase 5.2 / H2).
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "higher-stake incoming block wins the conflict");
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
+            0,
+            "the resolved loser candidate group must be cleared"
+        );
+        assert_eq!(
+            committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count(),
+            2,
+            "only the winning block commits; the loser is never appended"
+        );
     }
 
     #[tokio::test]
@@ -2641,12 +2701,20 @@ mod tests {
         };
 
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "higher-stake incoming block wins the conflict");
 
-        // CandidateRegistry should have 2 candidates at the same position
+        // AUDIT Phase 5.2 / H2: the loser is discarded — only the winning block commits
+        // (chain grew by exactly one) and the resolved candidate group is cleared, so
+        // exactly one block remains at this position (no fork survives).
+        assert_eq!(
+            committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count(),
+            2,
+            "only the winning block commits; the losing proposal is never appended"
+        );
         assert_eq!(
             committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
-            2,
+            0,
+            "the resolved loser candidate group must be cleared"
         );
     }
 
@@ -2689,15 +2757,25 @@ mod tests {
         };
 
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
-        assert!(result.is_ok());
+        // AUDIT Phase 5.2 / H2: a same-proposer double-signed re-proposal is rejected
+        // on the commit path (the winner stays as the tip, the loser is discarded).
+        assert!(
+            matches!(result, Err(CommitterError::LoserDiscarded)),
+            "a double-signed re-proposal must be discarded on the commit path"
+        );
 
-        // AUDIT Phase 5.1 / H1: the double-signed proposer's stake must actually
-        // decrease by the configured fraction (default: full stake). Slashing is
-        // a no-op without this — the offender keeps their full stake.
+        // AUDIT Phase 5.1 / H1: the slash is still applied even though the block is
+        // rejected — the double-signed proposer's stake must actually drop to zero.
         assert_eq!(
             committer.stake_store.get_stake(&vec![10]),
             0,
             "full-stake slash should zero the offender's stake"
+        );
+        // And the resolved candidate group is cleared.
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
+            0,
+            "the double-signed candidate group must be cleared"
         );
     }
 
@@ -2744,12 +2822,22 @@ mod tests {
         };
 
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
-        assert!(result.is_ok());
+        // AUDIT Phase 5.2 / H2: the double-signed re-proposal is rejected on the commit path.
+        assert!(
+            matches!(result, Err(CommitterError::LoserDiscarded)),
+            "a double-signed re-proposal must be discarded on the commit path"
+        );
 
+        // The partial slash (0.5) is still applied even though the block is rejected.
         assert_eq!(
             committer.stake_store.get_stake(&vec![10]),
             50,
             "0.5 fraction of 100 should leave 50"
+        );
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
+            0,
+            "the double-signed candidate group must be cleared"
         );
     }
 
@@ -2784,6 +2872,189 @@ mod tests {
             committer.candidate_registry.candidate_count(&vec![1], &prev_hash),
             1,
         );
+    }
+
+    // --- Conflict resolution: discard losers + bound the registry (AUDIT Phase 5.2 / H2) ---
+
+    #[tokio::test]
+    async fn commit_conflict_rolls_back_loser_tip_and_commits_winner() {
+        // AUDIT Phase 5.2 / H2, design decision #1: when the losing proposal is the
+        // current chain tip, committing the winner rolls that tip back (guarded on a hash
+        // match) and appends the winner, so exactly one block remains at the position and
+        // the tip advances to the winner's hash — the loser is never left appended.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry, _logger) = make_test_committer(dp);
+
+        // Bootstrap token + genesis chain.
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // The genesis tip is the (token_id, previous_hash) position both proposals fight over.
+        let prev_tip = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+
+        // Two competing proposals at the same position (genesis tip), distinct proposers.
+        // Build both BEFORE committing so each chains off the genesis tip (they are siblings).
+        let tx_a = "tx_roll_a";
+        let block_a = make_block_with_proposer(&committer, tx_a, b"alpha".to_vec());
+        let tx_b = "tx_roll_b";
+        let block_b = make_block_with_proposer(&committer, tx_b, b"beta".to_vec());
+        assert_eq!(block_a.previous_hash, prev_tip, "block_a is a sibling of block_b");
+        assert_eq!(block_b.previous_hash, prev_tip, "block_b is a sibling of block_a");
+
+        // Give block_a the finalizing entry and commit it: it becomes the chain tip AND is
+        // recorded as the first candidate at prev_tip.
+        make_finalizing_entry(&registry, tx_a, b"alice".to_vec());
+        committer.stake_store.add_staker(b"alpha".to_vec(), 100);
+        let commit_a = TransactionCommit {
+            trans_id: tx_a.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block_a,
+        };
+        assert!(committer.check_and_commit_transaction_results(&commit_a, vec![]).await.is_ok());
+        let tip_after_a = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+        assert_eq!(tip_after_a, commit_a.proposed_block.current_hash, "block_a is now the tip");
+
+        // Now block_b (higher stake) is proposed at the same position.
+        make_finalizing_entry(&registry, tx_b, b"alice".to_vec());
+        committer.stake_store.add_staker(b"beta".to_vec(), 500);
+        let commit_b = TransactionCommit {
+            trans_id: tx_b.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block_b,
+        };
+        let result = committer.check_and_commit_transaction_results(&commit_b, vec![]).await;
+        assert!(result.is_ok(), "higher-stake block_b wins the conflict and commits");
+
+        // The loser (block_a) that was the tip is rolled back; block_b is the sole block at
+        // the position; the candidate group is cleared.
+        let tip = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+        assert_eq!(tip, commit_b.proposed_block.current_hash,
+            "the winner's hash is the new tip (the rolled-back loser is gone)");
+        assert_eq!(
+            committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count(),
+            2,
+            "genesis + winner: the rolled-back loser leaves exactly one appended block"
+        );
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_tip),
+            0,
+            "the resolved candidate group must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_rejects_losing_commit() {
+        // AUDIT Phase 5.2 / H2: when the incoming block LOSES its conflict it is rejected
+        // with `LoserDiscarded`, the existing (winning) block stays as the tip, and the
+        // resolved candidate group is cleared — the losing commit never reaches the chain.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry, _logger) = make_test_committer(dp);
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // genesis tip is the contested position.
+        let prev_tip = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+
+        let tx_a = "tx_rej_a";
+        let tx_b = "tx_rej_b";
+        let block_a = make_block_with_proposer(&committer, tx_a, b"alpha".to_vec());
+        let block_b = make_block_with_proposer(&committer, tx_b, b"beta".to_vec());
+        assert_eq!(block_a.previous_hash, prev_tip);
+        assert_eq!(block_b.previous_hash, prev_tip);
+
+        // block_a: HIGH stake (it will win); block_b: LOW stake (it will lose).
+        make_finalizing_entry(&registry, tx_a, b"alice".to_vec());
+        committer.stake_store.add_staker(b"alpha".to_vec(), 500);
+        let commit_a = TransactionCommit {
+            trans_id: tx_a.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block_a,
+        };
+        assert!(committer.check_and_commit_transaction_results(&commit_a, vec![]).await.is_ok());
+        let tip_after_a = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+        assert_eq!(tip_after_a, commit_a.proposed_block.current_hash);
+
+        // block_b (lower stake) is the loser — it must be rejected, not appended.
+        make_finalizing_entry(&registry, tx_b, b"alice".to_vec());
+        committer.stake_store.add_staker(b"beta".to_vec(), 100);
+        let commit_b = TransactionCommit {
+            trans_id: tx_b.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block_b,
+        };
+        let result = committer.check_and_commit_transaction_results(&commit_b, vec![]).await;
+        assert!(
+            matches!(result, Err(CommitterError::LoserDiscarded)),
+            "a lower-stake losing commit must be discarded on the commit path"
+        );
+
+        // The tip is unchanged (block_a stays); the loser was never appended; the group cleared.
+        let tip = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+        assert_eq!(tip, commit_a.proposed_block.current_hash, "block_a remains the tip");
+        assert_eq!(
+            committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count(),
+            2,
+            "only block_a is appended; the losing commit never reaches the chain"
+        );
+        assert_eq!(
+            committer.candidate_registry.candidate_count(&vec![1], &prev_tip),
+            0,
+            "the resolved candidate group must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_registry_bounded_under_repeated_conflicts() {
+        // AUDIT Phase 5.2 / H2: repeatedly populating one (token_id, previous_hash) position
+        // with competing proposals (the shape a sustained conflict/storm produces) must not let
+        // the candidate group grow without bound. The CandidateRegistry caps each position at
+        // DEFAULT_MAX_CANDIDATES via LRU eviction (oldest evicted). The commit path inserts
+        // (no-conflict branch) and reads (conflict branch) through this same primitive, so a
+        // bounded registry bounds the conflict surface at commit time. This drives `insert`
+        // directly to exercise the cap; see `commit_conflict_rolls_back_loser_tip_and_commits_winner`
+        // and `commit_conflict_rejects_losing_commit` for the resolved-group-cleared behavior on
+        // the actual commit path.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _, _) = make_test_committer(dp);
+
+        // Bootstrap a token so the position is realistic.
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+        let prev_hash = committer.tokens.get(&vec![1]).unwrap().value()
+            .blockchain.get_current_chain_state().last_hash_in;
+
+        // Insert far more competing proposals at this one position than the cap allows.
+        const N: usize = CandidateRegistry::DEFAULT_MAX_CANDIDATES + 16;
+        for i in 0..N {
+            let block = make_block_with_proposer(&committer, &format!("tx_bnd_{i}"), vec![i as u8]);
+            committer.candidate_registry.insert(vec![1], prev_hash.clone(), block, vec![i as u8]);
+        }
+
+        // The position is capped at DEFAULT_MAX_CANDIDATES, and the oldest 16 were evicted (LRU):
+        // each of tx_bnd_0..tx_bnd_15 is absent from the survivors, while the newest ones remain.
+        for i in 0..16 {
+            let present = committer.candidate_registry.get_candidates(&vec![1], &prev_hash)
+                .iter()
+                .any(|(block, _)| block.signed_trans.transaction_id == format!("tx_bnd_{i}"));
+            assert!(!present, "oldest proposal tx_bnd_{i} must be evicted under LRU eviction");
+        }
     }
 
     // --- Payload-match + block_hash registry (AUDIT Phase 3.5 / H12) ---

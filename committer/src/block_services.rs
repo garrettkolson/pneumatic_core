@@ -67,6 +67,9 @@ impl BlockServices {
     pub fn commit_block(
         &self,
         commit: &TransactionCommit,
+        // AUDIT Phase 5.2 / H2: when set and matching the current tip, roll the
+        // conflicting tip back before appending the winner of a resolved conflict.
+        rollback_tip_hash: Option<Vec<u8>>,
     ) -> Result<TokenCommitResult, CommitterError> {
         // Verify environment ID match
         if commit.env_id != self.env_data.environment_id {
@@ -89,6 +92,7 @@ impl BlockServices {
             commit.proposed_block.clone(),
             false, // not an archiver
             &self.env_data,
+            rollback_tip_hash.as_deref(),
         )?;
 
         self.logger.log(format!(

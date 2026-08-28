@@ -224,6 +224,10 @@ impl Token {
         mut block: Block,
         is_archiver: bool,
         env_data: &EnvironmentMetadata,
+        // AUDIT Phase 5.2 / H2: when set, the current tip is rolled back before the
+        // block is appended if its hash matches — so the winner of a resolved block
+        // conflict is the only block remaining at that position.
+        rollback_tip_hash: Option<&[u8]>,
     ) -> Result<TokenCommitResult, BlockCommitError> {
         // Compute the block's hash before validation: validate_next_block
         // checks the self-hash, and fresh blocks arrive with
@@ -231,11 +235,29 @@ impl Token {
         // in its input, so this is a no-op for already-hashed blocks.)
         block.current_hash = crate::blocks::BlockFactory::create_hash(&block);
 
-        // Validate the block before committing
+        // AUDIT Phase 5.2 / H2: roll back a conflicting tip BEFORE validating. The winner of a
+        // resolved conflict is a *sibling* of the loser — its `previous_hash` links to the parent
+        // of the current tip, not the tip itself, so `validate_block` (which requires
+        // `previous_hash == tip`) cannot pass while the loser still sits on the chain. Roll the
+        // loser back now (only when it is the current tip; a non-matching target means the tip
+        // already advanced past the loser, so there is nothing to undo and the block appends to
+        // the real tip). The removed block is remembered so a rejected winner can restore the
+        // chain — a conflict winner that ultimately fails validation must never truncate the tip.
+        let removed_for_restore: Option<Block> = match rollback_tip_hash {
+            Some(loser_hash) if self.blockchain.get_current_chain_state().last_hash_in == loser_hash => {
+                self.blockchain.remove_block()
+            }
+            _ => None,
+        };
+
+        // Validate the block against the post-rollback tip.
         let validation_result = self.validate_block(&block, env_data);
         match validation_result {
             BlockValidationResult::Ok => {}
             BlockValidationResult::Err(e) => {
+                if let Some(loser) = removed_for_restore {
+                    self.blockchain.add_block(loser);
+                }
                 return Err(BlockCommitError::BlockValidationError(e));
             }
         }
@@ -853,7 +875,7 @@ mod tests {
         assert!(block.previous_hash.is_empty());
         assert!(block.current_hash.is_empty());
 
-        let result = token.commit_block(block, false, &env).unwrap();
+        let result = token.commit_block(block, false, &env, None).unwrap();
 
         assert_eq!(result.new_chain_length, 1);
         assert_eq!(result.sequence_number, 1);
@@ -877,7 +899,7 @@ mod tests {
         // previous_hash.
         block.previous_hash = vec![1, 2, 3];
 
-        let err = token.commit_block(block, false, &env).unwrap_err();
+        let err = token.commit_block(block, false, &env, None).unwrap_err();
         assert!(matches!(
             err,
             BlockCommitError::BlockValidationError(BlockValidationError::ChainLinkage)
@@ -899,7 +921,7 @@ mod tests {
             0,
         );
 
-        let err = token.commit_block(block, false, &env).unwrap_err();
+        let err = token.commit_block(block, false, &env, None).unwrap_err();
         assert!(matches!(
             err,
             BlockCommitError::BlockValidationError(BlockValidationError::NoValidatorRegistered)
