@@ -520,16 +520,54 @@ agree on anything.*
   `selection_seed_matches_manual_hash` (exact byte layout), and
   `selection_seed_independent_of_tx_id_for_leader`. `cargo check` clean.
 
-- [ ] **5.4 One epoch writer; authenticated epoch advance** (H9, M8)
-  Files: `committer/src/committer.rs:558-600` (`handle_epoch_reconcile`), `:775-795`
-  (`advance_epoch`), `src/environment.rs` (spec-attested snapshots).
-  Action: authenticate `EpochReconcile` (Phase-1 envelope auth closes the unauthenticated
-  advance); single source of truth for the epoch number — reject/queue a second advance for the
-  same epoch, never rewind; persist a hash/attestation with each saved stake snapshot and
-  verify on load; surface `save_stake_snapshot`/`save_executor_set` errors (currently
-  `let _ =`).
+- [x] **5.4 One epoch writer; authenticated epoch advance** (H9, M8) — *done 2026-08-28*
+  Files: `src/epoch.rs` (`StakeSet`/`ExecutorSet` `canonical_bytes` + `fingerprint`), `src/data.rs`
+  (`DataError::SnapshotCorrupt`, `StakeSnapshotEnvelope`/`ExecutorSetEnvelope`, Default + Stub provider
+  verify-on-load), `committer/src/committer.rs` (`advance_epoch_to`, `snapshot_save_err`,
+  `TestDataProvider::with_snapshot_save_failure`), `committer/src/committer_error.rs`
+  (`SnapshotPersist`), `committer/tests/` (`advance_epoch_to_never_rewinds_or_reuses`,
+  `advance_epoch_to_surfaces_snapshot_save_error`).
+  Action: authenticate `EpochReconcile` (Phase-1 envelope auth closes the unauthenticated advance);
+  single source of truth for the epoch number — reject/queue a second advance for the same epoch,
+  never rewind; persist a hash/attestation with each saved stake snapshot and verify on load; surface
+  `save_stake_snapshot`/`save_executor_set` errors (currently `let _ =`).
   Verify: reconcile-then-advance does not reuse an epoch number; a corrupted snapshot file is
   detected at load, not trusted.
+
+  **Done:** the two divergent epoch-advance mechanisms now funnel through one guarded writer,
+  `advance_epoch_to` (`committer.rs:1233`), whose `EpochBoundaryDetector` epoch is the authoritative
+  source — both the internal `advance_epoch` wrapper and the wire `handle_epoch_reconcile` call it
+  (`committer.rs:1212`, `committer.rs:961`), so they can never disagree on or rewind the number, and
+  the counter can never lag the detector. Inside it: reads the stake set and the mined `prev_block_hash`
+  (local token cache, same Phase-5.3 source), locks the detector via `try_lock` (fails closed to
+  `Ok(None)` if already held, serializing the two writers), and rejects any advance whose target does
+  not strictly exceed `current_epoch_number` — a reused or rewinding number is refused, never applied
+  (`committer.rs:1263`). On success the detector advances, the counter mirrors it, and **both**
+  snapshots are persisted with `.map_err` surfacing persistence failures as `SnapshotPersist { epoch,
+  kind, cause }` (committer_error.rs) via the `snapshot_save_err` helper (`committer.rs:381`)
+  instead of the old `let _ =`. Snapshots now carry a SHA-256 attestation: `StakeSet`/`ExecutorSet`
+  gain `canonical_bytes()` (sorted `BTreeMap` → MsgPack, so the digest is stable across save/load
+  regardless of `HashMap` order) and `fingerprint()` (= `sha256(canonical_bytes)`); the
+  `StakeSnapshotEnvelope { payload, hash, epoch }` / `ExecutorSetEnvelope` (`src/data.rs`) verify
+  `hash == payload.fingerprint()` on load, else `DataError::SnapshotCorrupt` — the storage key
+  (`epoch.to_be_bytes()`) and every `GetOp` variant are unchanged. Item #1 (auth) was already closed by
+  the Phase-1 `authenticate_message` gate (`"EpochReconcile"` → `AllowedSenders::SelfOnly`) and its
+  regression test `foreign_sender_epoch_reconcile_is_rejected`, so it needs no change.
+  **Discriminators, each proven to fail without its fix by temporary revert (ground rule 2):**
+  `snapshot_envelope_detects_corruption` (revert the on-load `verify()` → corrupted snapshot
+  round-trips as `Ok`); `advance_epoch_to_never_rewinds_or_reuses` (revert the stored>=new guard → the
+  seeded-ahead counter gets overwritten instead of refused); `advance_epoch_to_surfaces_snapshot_save_error`
+  (revert the `.map_err(...)?` on the saves → the advance returns `Ok(None)` instead of the error).
+  Workspace: 553 passing (548 + 5).
+  **Wire-compat (AUDIT ground rule 4):** the `SaveOp::StakeSnapshot` / `SaveOp::ExecutorSet` variants
+  now carry a `{ payload, hash, epoch }` envelope instead of a bare `StakeSet`/`ExecutorSet` (a shape
+  change to the serialized `DataRequest`). The storage key (`epoch.to_be_bytes()`) and every `GetOp`
+  variant are **unchanged**, and the data service is a generic key→value store keyed by epoch bytes
+  that stores the serialized `DataRequest` opaquely — so the envelope round-trips through any existing
+  data service with no change. **Caveat:** if a real data service ever *deserializes* `SaveOp`
+  contents rather than storing them opaquely, it must accept the new envelope shape; a service that
+  parsed the previous bare-stake-payload shape will choke on the `hash`/`epoch` fields. No `Message`,
+  `DataOp`, or `GetOp` shape changes.
 
 - [ ] **5.5 Protect token replacement** (H13)
   File: `committer/src/committer.rs:307-314`.

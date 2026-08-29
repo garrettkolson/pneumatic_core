@@ -235,19 +235,47 @@ impl DataProvider for DefaultDataProvider {
     }
 
     fn get_stake_snapshot(&self, epoch: u64, partition_id: &str) -> Result<StakeSet, DataError> {
-        self.get_data_internal::<StakeSet>(&epoch.to_be_bytes().to_vec(), DataOp::Get(GetOp::StakeSnapshot(epoch)), partition_id)
+        // Phase 5.4 / H9/M8: read the SHA-256 envelope, verify the fingerprint,
+        // then return the plain stake set. A mismatch (corruption / a value that
+        // differs from what was persisted) surfaces as `SnapshotCorrupt` rather
+        // than silently trusting deserialized bytes.
+        let env: StakeSnapshotEnvelope = self
+            .get_data_internal::<StakeSnapshotEnvelope>(
+                &epoch.to_be_bytes().to_vec(),
+                DataOp::Get(GetOp::StakeSnapshot(epoch)),
+                partition_id,
+            )?;
+        env.verify()?;
+        Ok(env.payload)
     }
 
     fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, partition_id: &str) -> Result<(), DataError> {
-        self.save_data_internal::<StakeSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::StakeSnapshot(snapshot)), partition_id)
+        let env = StakeSnapshotEnvelope::new(snapshot, epoch);
+        self.save_data_internal::<StakeSnapshotEnvelope>(
+            &epoch.to_be_bytes().to_vec(),
+            DataOp::Save(SaveOp::StakeSnapshot(env)),
+            partition_id,
+        )
     }
 
     fn get_executor_set(&self, epoch: u64, partition_id: &str) -> Result<ExecutorSet, DataError> {
-        self.get_data_internal::<ExecutorSet>(&epoch.to_be_bytes().to_vec(), DataOp::Get(GetOp::ExecutorSet(epoch)), partition_id)
+        let env: ExecutorSetEnvelope = self
+            .get_data_internal::<ExecutorSetEnvelope>(
+                &epoch.to_be_bytes().to_vec(),
+                DataOp::Get(GetOp::ExecutorSet(epoch)),
+                partition_id,
+            )?;
+        env.verify()?;
+        Ok(env.payload)
     }
 
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError> {
-        self.save_data_internal::<ExecutorSet>(&epoch.to_be_bytes().to_vec(), DataOp::Save(SaveOp::ExecutorSet(set)), partition_id)
+        let env = ExecutorSetEnvelope::new(set, epoch);
+        self.save_data_internal::<ExecutorSetEnvelope>(
+            &epoch.to_be_bytes().to_vec(),
+            DataOp::Save(SaveOp::ExecutorSet(env)),
+            partition_id,
+        )
     }
 
     fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
@@ -300,8 +328,80 @@ pub enum SaveOp {
     Token(Token),
     Data(Vec<u8>),
     User(User),
-    StakeSnapshot(StakeSet),
-    ExecutorSet(ExecutorSet),
+    // Phase 5.4 / H9/M8: the payload travels inside a SHA-256 envelope so the
+    // store round-trips an integrity-attested value. On load, the provider
+    // recomputes `payload.fingerprint()` and rejects a mismatch as corruption
+    // instead of trusting arbitrary deserialized bytes.
+    StakeSnapshot(StakeSnapshotEnvelope),
+    ExecutorSet(ExecutorSetEnvelope),
+}
+
+/// SHA-256 envelope around a persisted stake snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StakeSnapshotEnvelope {
+    /// The frozen stake set for the epoch (sentinel deterministic routing).
+    pub payload: StakeSet,
+    /// `payload.fingerprint()` — the SHA-256 of `payload.canonical_bytes()`.
+    pub hash: [u8; 32],
+    /// Epoch the snapshot was persisted for (mirrors the storage key).
+    pub epoch: u64,
+}
+
+/// SHA-256 envelope around a persisted executor set. See `StakeSnapshotEnvelope`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExecutorSetEnvelope {
+    /// The executor pool for the epoch (sentinel shard assignment).
+    pub payload: ExecutorSet,
+    /// `payload.fingerprint()` — the SHA-256 of `payload.canonical_bytes()`.
+    pub hash: [u8; 32],
+    /// Epoch the set was persisted for (mirrors the storage key).
+    pub epoch: u64,
+}
+
+impl StakeSnapshotEnvelope {
+    /// Wrap a stake set, computing its SHA-256 fingerprint.
+    pub fn new(payload: StakeSet, epoch: u64) -> Self {
+        StakeSnapshotEnvelope {
+            hash: payload.fingerprint(),
+            payload,
+            epoch,
+        }
+    }
+
+    /// Verify the stored fingerprint matches the payload; `SnapshotCorrupt`
+    /// otherwise (AUDIT Phase 5.4 / H9/M8).
+    pub fn verify(&self) -> Result<(), DataError> {
+        if self.hash != self.payload.fingerprint() {
+            return Err(DataError::SnapshotCorrupt(format!(
+                "epoch={}: stored hash != payload.fingerprint()",
+                self.epoch
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl ExecutorSetEnvelope {
+    /// Wrap an executor set, computing its SHA-256 fingerprint.
+    pub fn new(payload: ExecutorSet, epoch: u64) -> Self {
+        ExecutorSetEnvelope {
+            hash: payload.fingerprint(),
+            payload,
+            epoch,
+        }
+    }
+
+    /// Verify the stored fingerprint matches the payload; `SnapshotCorrupt`
+    /// otherwise (AUDIT Phase 5.4 / H9/M8).
+    pub fn verify(&self) -> Result<(), DataError> {
+        if self.hash != self.payload.fingerprint() {
+            return Err(DataError::SnapshotCorrupt(format!(
+                "epoch={}: stored hash != payload.fingerprint()",
+                self.epoch
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for SaveOp {
@@ -350,6 +450,11 @@ pub enum DataError {
     Timeout(String),
     /// A data-channel response failed shared-secret HMAC verification
     PeerUnauthenticated(String),
+    /// A persisted stake/executor snapshot failed its integrity check: the
+    /// SHA-256 envelope stored alongside it does not match the re-computed
+    /// digest of the payload on load, so the bytes are treated as corrupted
+    /// and rejected rather than trusted (AUDIT Phase 5.4 / H9/M8).
+    SnapshotCorrupt(String),
 }
 
 impl std::fmt::Display for DataError {
@@ -367,6 +472,7 @@ impl std::fmt::Display for DataError {
             DataError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
             DataError::Timeout(msg) => write!(f, "Timeout({})", msg),
             DataError::PeerUnauthenticated(msg) => write!(f, "PeerUnauthenticated({})", msg),
+        DataError::SnapshotCorrupt(msg) => write!(f, "SnapshotCorrupt({})", msg),
         }
     }
 }
@@ -463,8 +569,8 @@ mod tests {
 pub struct StubDataProvider {
     tokens: std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, Token>>,
     users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
-    stake_snapshots: std::sync::Mutex<std::collections::HashMap<u64, StakeSet>>,
-    executor_sets: std::sync::Mutex<std::collections::HashMap<u64, ExecutorSet>>,
+    stake_snapshots: std::sync::Mutex<std::collections::HashMap<u64, StakeSnapshotEnvelope>>,
+    executor_sets: std::sync::Mutex<std::collections::HashMap<u64, ExecutorSetEnvelope>>,
 }
 
 impl StubDataProvider {
@@ -492,21 +598,28 @@ impl StubDataProvider {
         self
     }
 
-    /// Add a stake snapshot for a given epoch.
+    /// Add a stake snapshot for a given epoch. Wraps the payload in its SHA-256
+    /// envelope, so a subsequent `get_stake_snapshot` verifies integrity — matching
+    /// DefaultDataProvider.
     pub fn with_stake_snapshot(mut self, epoch: u64, snapshot: StakeSet) -> Self {
-        self.stake_snapshots
-            .lock()
-            .unwrap()
-            .insert(epoch, snapshot);
+        let env = StakeSnapshotEnvelope::new(snapshot, epoch);
+        self.stake_snapshots.lock().unwrap().insert(epoch, env);
         self
     }
 
-    /// Add an executor set for a given epoch.
+    /// Add a stake snapshot with a deliberately wrong fingerprint, to prove that a
+    /// corrupted/attested snapshot is detected on load (AUDIT Phase 5.4 / H9/M8).
+    pub fn with_corrupted_stake_snapshot(mut self, epoch: u64, snapshot: StakeSet) -> Self {
+        let mut env = StakeSnapshotEnvelope::new(snapshot, epoch);
+        env.hash = [0u8; 32]; // never matches payload.fingerprint()
+        self.stake_snapshots.lock().unwrap().insert(epoch, env);
+        self
+    }
+
+    /// Add an executor set for a given epoch (wrapped in its SHA-256 envelope).
     pub fn with_executor_set(mut self, epoch: u64, set: ExecutorSet) -> Self {
-        self.executor_sets
-            .lock()
-            .unwrap()
-            .insert(epoch, set);
+        let env = ExecutorSetEnvelope::new(set, epoch);
+        self.executor_sets.lock().unwrap().insert(epoch, env);
         self
     }
 }
@@ -572,36 +685,83 @@ impl DataProvider for StubDataProvider {
     }
 
     fn get_stake_snapshot(&self, epoch: u64, _partition_id: &str) -> Result<StakeSet, DataError> {
-        self.stake_snapshots
+        let env = self
+            .stake_snapshots
             .lock()
             .unwrap()
             .get(&epoch)
             .cloned()
-            .ok_or(DataError::DataNotFound)
+            .ok_or(DataError::DataNotFound)?;
+        env.verify()?;
+        Ok(env.payload)
     }
 
     fn save_stake_snapshot(&self, epoch: u64, snapshot: StakeSet, _partition_id: &str) -> Result<(), DataError> {
-        self.stake_snapshots
-            .lock()
-            .unwrap()
-            .insert(epoch, snapshot);
+        let env = StakeSnapshotEnvelope::new(snapshot, epoch);
+        self.stake_snapshots.lock().unwrap().insert(epoch, env);
         Ok(())
     }
 
     fn get_executor_set(&self, epoch: u64, _partition_id: &str) -> Result<ExecutorSet, DataError> {
-        self.executor_sets
+        let env = self
+            .executor_sets
             .lock()
             .unwrap()
             .get(&epoch)
             .cloned()
-            .ok_or(DataError::DataNotFound)
+            .ok_or(DataError::DataNotFound)?;
+        env.verify()?;
+        Ok(env.payload)
     }
 
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
-        self.executor_sets
-            .lock()
-            .unwrap()
-            .insert(epoch, set);
+        let env = ExecutorSetEnvelope::new(set, epoch);
+        self.executor_sets.lock().unwrap().insert(epoch, env);
         Ok(())
+    }
+}
+
+// Phase 5.4 / H9+M8: a snapshot whose digest does not match its payload is rejected on load,
+// never trusted. StubDataProvider exposes a valid round-trip and a deliberately corrupted one.
+#[cfg(test)]
+mod snapshot_envelope_tests {
+    use super::*;
+    use std::collections::HashMap as StdHashMap;
+
+    fn one_staker() -> StakeSet {
+        StakeSet {
+            stakers: [(b"alice".to_vec(), 100)].into_iter().collect(),
+        }
+    }
+
+    // Regression: a stored snapshot whose SHA-256 digest does not match the payload's
+    // fingerprint is detected as `SnapshotCorrupt` on load (AUDIT Phase 5.4 / H9+M8).
+    // Reverting the envelope `verify()` (or the StubDataProvider/DefaultDataProvider load path
+    // that calls it) makes this corrupted snapshot round-trip back as `Ok`, trusting untended
+    // bytes — the test would pass on the buggy code and fail on the fix.
+    #[test]
+    fn snapshot_envelope_detects_corruption() {
+        let dp = StubDataProvider::new()
+            .with_stake_snapshot(1, one_staker())
+            .with_corrupted_stake_snapshot(2, one_staker());
+
+        // Valid round-trip: fingerprint matches, payload returned byte-identical on load.
+        let loaded = dp.get_stake_snapshot(1, "token").unwrap();
+        assert_eq!(loaded.canonical_bytes().unwrap(), one_staker().canonical_bytes().unwrap());
+
+        // Corrupted fingerprint: detected, not trusted.
+        assert!(
+            matches!(dp.get_stake_snapshot(2, "token"), Err(DataError::SnapshotCorrupt(_))),
+            "corrupted snapshot must surface as SnapshotCorrupt, got {:?}",
+            dp.get_stake_snapshot(2, "token")
+        );
+
+        // Same discipline for the executor set (valid round-trips; corrupted is rejected).
+        let mut exec = StdHashMap::new();
+        exec.insert(b"ex1".to_vec(), 50);
+        let dp2 = StubDataProvider::new().with_executor_set(1, ExecutorSet { executors: exec.clone() })
+            .with_corrupted_stake_snapshot(2, one_staker());
+        assert!(dp2.get_executor_set(1, "token").is_ok());
+        assert!(matches!(dp2.get_stake_snapshot(2, "token"), Err(DataError::SnapshotCorrupt(_))));
     }
 }

@@ -372,6 +372,30 @@ impl Committer {
         }
     }
 
+    /// Build a `CommitterError::SnapshotPersist` for a failed
+    /// `save_stake_snapshot`/`save_executor_set`, and emit a prominent,
+    /// greppable failure line (epoch, kind, error) so a swallowed snapshot
+    /// persistence is observable in the committer log. Surfaces the error
+    /// rather than silently advancing with a snapshot that may be missing or
+    /// stale (AUDIT Phase 5.4 / H9/M8).
+    fn snapshot_save_err(
+        &self,
+        epoch: u64,
+        kind: &'static str,
+        cause: &DataError,
+    ) -> CommitterError {
+        self.env_data
+            .logger
+            .log(format!(
+                "SNAPSHOT PERSIST FAILED: epoch={epoch} kind={kind} err={cause:?}"
+            ));
+        CommitterError::SnapshotPersist {
+            epoch,
+            kind,
+            cause: format!("{cause:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Commit message handling
     // -----------------------------------------------------------------------
@@ -943,45 +967,23 @@ impl Committer {
             self.staking_manager.apply_ops(&reconciliation)?;
         }
 
-        // Select new leader for the epoch and persist stake snapshot
-        let stake_set = self.stake_store.to_stake_set();
-        let new_epoch_number = self.current_epoch_number.load(Ordering::SeqCst) + 1;
-        // Phase 5.3 / H3: bind the leader seed to the mined chain tip so the next
-        // epoch's leader is only knowable once this tip is produced. Read the
-        // current tip from the local token cache — the committer holds its chain
-        // state there and does not persist it to the data service, so a persisted
-        // tip would lag the mined one (and would silently leave the seed empty).
-        let prev_block_hash = self
-            .tokens
-            .iter()
-            .map(|entry| entry.value().blockchain.get_current_chain_state().last_hash_in)
-            .next()
-            .unwrap_or_default();
-        let leader_key = self.leader_selector.select(&stake_set, new_epoch_number, &prev_block_hash);
-        self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
+        // Advance to the next epoch via the single guarded writer (AUDIT Phase 5.4
+        // / H9/M8). `advance_epoch_to` binds the leader seed to the mined tip,
+        // advances the detector (the authoritative epoch source), mirrors the new
+        // number into the atomic counter, and persists the stake + executor
+        // snapshots — so the wire path can never diverge from or rewind the
+        // counter, and a snapshot persistence failure aborts the advance.
+        let advanced = self.advance_epoch_to()?;
 
-        // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
-        let _ = self.data_provider.save_stake_snapshot(
-            new_epoch_number,
-            stake_set.clone(),
-            &self.env_data.token_partition_id,
-        );
-
-        // Persist the executor set for this epoch (shard assignment).
-        // Active stakers become the executor pool, shuffled per-epoch for rotation.
-        let executor_set = stake_set.to_executor_set();
-        let _ = self.data_provider.save_executor_set(
-            new_epoch_number,
-            executor_set,
-            &self.env_data.token_partition_id,
-        );
-
-        let logger = &self.env_data.logger;
-        if !leader_key.is_empty() {
-            logger.log(format!(
-                "Epoch leader selected: {}",
-                bytes_to_hex(&leader_key)
-            ));
+        // Log the newly selected leader if the advance produced one.
+        if let Some(leader_key) = advanced {
+            let logger = &self.env_data.logger;
+            if !leader_key.is_empty() {
+                logger.log(format!(
+                    "Epoch leader selected: {}",
+                    bytes_to_hex(&leader_key)
+                ));
+            }
         }
 
         Ok(())
@@ -1200,9 +1202,35 @@ impl Committer {
 
     /// Advance to a new epoch: bump the epoch number, select a new leader,
     /// and save the previous leader for stale block detection.
-    fn advance_epoch(&self) -> Option<Vec<u8>> {
-        let mut detector = self.epoch_detector.try_lock().ok()?;
-        let detector = detector.as_mut()?;
+    ///
+    /// Thin wrapper over `advance_epoch_to`, the single guarded epoch advance
+    /// shared by this internal path and the wire `EpochReconcile` path (AUDIT
+    /// Phase 5.4 / H9/M8). Returns the new leader on a real advance, `None` when
+    /// the advance was rejected (same/older epoch number, or the detector lock was
+    /// already held), and `Err(CommitterError::SnapshotPersist)` if a snapshot
+    /// fails to persist.
+    fn advance_epoch(&self) -> Result<Option<Vec<u8>>, CommitterError> {
+        self.advance_epoch_to()
+    }
+
+    /// The one writer for the epoch number (AUDIT Phase 5.4 / H9/M8).
+    ///
+    /// The `EpochBoundaryDetector`'s epoch is the authoritative source of truth.
+    /// Both the internal production path (`advance_epoch`) and the wire
+    /// `EpochReconcile` path (`handle_epoch_reconcile`) funnel here, so they can
+    /// never disagree on or rewind the epoch number, and the counter can never
+    /// fall behind the detector.
+    ///
+    /// Returns:
+    ///  - `Ok(Some(new_leader))` on a real advance (detector advanced, number
+    ///    mirrored, snapshots persisted);
+    ///  - `Ok(None)` when the advance is rejected — the target epoch is not
+    ///    strictly greater than the authoritative value (a reused/rewinding
+    ///    number), or the detector lock is already held by another writer;
+    ///  - `Err(CommitterError::SnapshotPersist{...})` if a snapshot fails to
+    ///    persist, so the advance aborts rather than proceeding on a possibly
+    ///    stale snapshot.
+    fn advance_epoch_to(&self) -> Result<Option<Vec<u8>>, CommitterError> {
         let stake_set = self.stake_store.to_stake_set();
         // Phase 5.3 / H3: bind the new leader seed to the mined chain tip so the
         // epoch's leader is only knowable once this tip is produced. Read the
@@ -1214,25 +1242,66 @@ impl Committer {
             .map(|entry| entry.value().blockchain.get_current_chain_state().last_hash_in)
             .next()
             .unwrap_or_default();
+
+        // The detector lock serializes the two writers: the internal path and the
+        // wire path cannot both be mid-advance, and it is released before
+        // propose_blocks re-locks it for is_epoch_expired. try_lock fails closed —
+        // if it is already held, treat the advance as a no-op rather than block.
+        let mut detector = self
+            .epoch_detector
+            .try_lock()
+            .map_err(|_| CommitterError::InternalSerialization)?;
+        let detector = detector
+            .as_mut()
+            .ok_or(CommitterError::InternalSerialization)?;
+
+        // The detector's epoch is authoritative; the mirrored counter must track
+        // it. Reject an advance whose target does not strictly exceed both.
+        let current_epoch_number = detector.current_epoch.epoch_number;
+        let new_epoch_number = current_epoch_number + 1;
+        let stored = self.current_epoch_number.load(Ordering::SeqCst);
+        if stored >= new_epoch_number {
+            // Either the counter has already advanced past this target (a reused
+            // number) or it is ahead of the detector (the divergence this funnel
+            // removes) — neither is a valid advance, so rewind is refused.
+            self.env_data
+                .logger
+                .log(format!(
+                    "REJECT EPOCH ADVANCE: epoch {} would not exceed stored {} (detector epoch {})",
+                    new_epoch_number, stored, current_epoch_number
+                ));
+            return Ok(None);
+        }
+
         detector.advance_to_new_epoch(
             self.leader_selector.as_ref(),
             &stake_set,
             self.epoch_duration,
             &prev_block_hash,
         );
-        let new_epoch_number = detector.current_epoch.epoch_number;
-        self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
         let new_leader = detector.current_epoch.leader_public_key.clone();
+        // Mirror the authoritative epoch into the atomic counter — the two now
+        // move together, so the counter can never lag the detector again.
+        self.current_epoch_number.store(new_epoch_number, Ordering::SeqCst);
 
-        // Persist the frozen stake snapshot for this epoch (for sentinel deterministic routing)
-        let _ = self.data_provider.save_stake_snapshot(
-            new_epoch_number,
-            stake_set,
-            &self.env_data.token_partition_id,
-        );
+        // Persist both snapshots, surfacing (not swallowing) any persistence
+        // failure so a stale or missing snapshot never silently enters the pipeline.
+        self.data_provider
+            .save_stake_snapshot(
+                new_epoch_number,
+                stake_set.clone(),
+                &self.env_data.token_partition_id,
+            )
+            .map_err(|e| self.snapshot_save_err(new_epoch_number, "stake", &e))?;
+        self.data_provider
+            .save_executor_set(
+                new_epoch_number,
+                stake_set.to_executor_set(),
+                &self.env_data.token_partition_id,
+            )
+            .map_err(|e| self.snapshot_save_err(new_epoch_number, "executor", &e))?;
 
-        // Advance may have set previous_leader — that's fine, it stays in the detector.
-        Some(new_leader)
+        Ok(Some(new_leader))
     }
 
     /// Propose a batch of transactions for a given token.
@@ -1261,14 +1330,21 @@ impl Committer {
             };
 
             if should_advance {
-                if let Some(new_leader) = self.advance_epoch() {
-                    let epoch_num = self.current_epoch_number.load(Ordering::SeqCst);
-                    let logger = &self.env_data.logger;
-                    logger.log(format!(
-                        "Epoch advanced to {} (new leader: {})",
-                        epoch_num,
-                        bytes_to_hex(&new_leader),
-                    ));
+                match self.advance_epoch() {
+                    Ok(Some(new_leader)) => {
+                        let epoch_num = self.current_epoch_number.load(Ordering::SeqCst);
+                        let logger = &self.env_data.logger;
+                        logger.log(format!(
+                            "Epoch advanced to {} (new leader: {}",
+                            epoch_num,
+                            bytes_to_hex(&new_leader)
+                        ));
+                    }
+                    // Rejected (same/older epoch, or detector lock already held) or
+                    // an aborting persistence error — propagate it so propose_blocks
+                    // surfaces rather than silently re-runs a stale epoch.
+                    Ok(None) => {}
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -1391,6 +1467,9 @@ mod tests {
         fail_get: bool,
         /// When true, `save_user` returns an error (simulates a data-service failure).
         fail_save: bool,
+        /// When true, `save_stake_snapshot`/`save_executor_set` return an error
+        /// (simulates a snapshot-persistence failure).
+        fail_snapshot_save: bool,
     }
 
     impl TestDataProvider {
@@ -1399,6 +1478,7 @@ mod tests {
                 users: Mutex::new(HashMap::new()),
                 fail_get: false,
                 fail_save: false,
+                fail_snapshot_save: false,
             }
         }
 
@@ -1408,7 +1488,16 @@ mod tests {
                 users: Mutex::new(HashMap::new()),
                 fail_get,
                 fail_save,
+                fail_snapshot_save: false,
             }
+        }
+
+        /// Arm the stake/executor snapshot-persistence failure, so `save_stake_snapshot`
+        /// and `save_executor_set` return `Err`. Used to prove `advance_epoch_to` surfaces a
+        /// persistence error rather than swallowing it (AUDIT Phase 5.4 / M8).
+        fn with_snapshot_save_failure(mut self, fail: bool) -> Self {
+            self.fail_snapshot_save = fail;
+            self
         }
         fn insert_user(&self, key: Vec<u8>, partition_id: String, user: User) {
             self.users
@@ -1472,6 +1561,9 @@ mod tests {
         }
 
         fn save_stake_snapshot(&self, _epoch: u64, _snapshot: StakeSet, _partition_id: &str) -> Result<(), DataError> {
+            if self.fail_snapshot_save {
+                return Err(DataError::StoreNotFound);
+            }
             Ok(())
         }
 
@@ -1480,6 +1572,9 @@ mod tests {
         }
 
         fn save_executor_set(&self, _epoch: u64, _set: ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
+            if self.fail_snapshot_save {
+                return Err(DataError::StoreNotFound);
+            }
             Ok(())
         }
     }
@@ -2262,6 +2357,18 @@ mod tests {
         committer_key: Vec<u8>,
         leader_key: Vec<u8>,
     ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<TestDataProvider>) {
+        build_committer_for_leader_test(committer_key, leader_key, Arc::new(TestDataProvider::new()))
+    }
+
+    /// The full committer construction for leader/epoch tests, parameterized on the injected
+    /// data provider. The public `make_committer_for_leader_test` wraps this with a default
+    /// provider so existing call sites are unaffected; tests that need a failing provider
+    /// (e.g. snapshot-persistence failures, AUDIT Phase 5.4 / M8) call this directly.
+    fn build_committer_for_leader_test(
+        committer_key: Vec<u8>,
+        leader_key: Vec<u8>,
+        dp: Arc<TestDataProvider>,
+    ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<TestDataProvider>) {
         let env_data = Arc::new(make_test_env_data());
         let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
         let rhash = identity.rhash;
@@ -2351,7 +2458,7 @@ mod tests {
             identity.clone(),
         ));
 
-        let test_dp = Arc::new(TestDataProvider::new());
+        let test_dp = dp;
         let committer = Committer::new(
             env_data,
             committer_key,
@@ -2527,7 +2634,7 @@ mod tests {
         committer.stake_store.add_staker(b"leader".to_vec(), 100);
 
         let before = committer.current_epoch_number.load(Ordering::SeqCst);
-        let new_leader = committer.advance_epoch();
+        let new_leader = committer.advance_epoch().unwrap();
 
         let after = committer.current_epoch_number.load(Ordering::SeqCst);
         assert_eq!(after, before + 1);
@@ -2592,6 +2699,81 @@ mod tests {
             leader_empty,
             leader_two_blocks,
             "leader must depend on the mined chain tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_epoch_to_never_rewinds_or_reuses() {
+        // AUDIT Phase 5.4 / H9 discriminator: `advance_epoch_to` is the single writer of the
+        // epoch number. Two consecutive advances are strictly increasing (never reuse a number)
+        // and the mirrored counter tracks the authoritative detector; and a target that does not
+        // strictly exceed the current value is refused — a replayed/rewinding advance is a no-op,
+        // never a rewind. Reverting the guard (`if stored >= new { return Ok(None) }`) lets a
+        // seeded-ahead counter get overwritten, so this test fails on the buggy code.
+        let (committer, _registry, _dp) =
+            make_committer_for_leader_test(b"leader".to_vec(), b"leader".to_vec());
+        // Spread stakers so each epoch's derived seed lands on a distinct leader.
+        for i in 0..256 {
+            committer.stake_store.add_staker(vec![i as u8], 1);
+        }
+
+        // Two sequential advances: 1 -> 2 -> 3, strictly increasing, both non-empty leaders.
+        let leader_1 = committer.advance_epoch().unwrap().expect("advanced to 2");
+        let epoch_1 = committer.current_epoch_number.load(Ordering::SeqCst);
+        let leader_2 = committer.advance_epoch().unwrap().expect("advanced to 3");
+        let epoch_2 = committer.current_epoch_number.load(Ordering::SeqCst);
+        assert!(!leader_1.is_empty());
+        assert!(!leader_2.is_empty());
+        assert_eq!(epoch_1, 2);
+        assert_eq!(epoch_2, 3);
+        assert_ne!(epoch_1, epoch_2, "advances must never reuse an epoch number");
+
+        // The detector is authoritative: the mirrored counter matches its epoch. Scoped in a
+        // block so the guard is dropped before the next advance acquires the detector lock.
+        {
+            let guard = committer.epoch_detector.lock().await;
+            assert_eq!(
+                guard.as_ref().unwrap().current_epoch.epoch_number,
+                epoch_2,
+                "detector epoch must track the mirrored counter"
+            );
+        }
+
+        // Seed the counter ahead of the detector — exactly the divergence the single writer
+        // removes. A replayed advance to a stale target (epoch 4) must be refused, never
+        // overwrite the counter back down to 4.
+        committer.current_epoch_number.store(1000, Ordering::SeqCst);
+        assert!(
+            committer.advance_epoch().unwrap().is_none(),
+            "advance to epoch 4 must be refused when the stored counter (1000) is ahead"
+        );
+        let guard = committer.epoch_detector.lock().await;
+        assert_eq!(
+            guard.as_ref().unwrap().current_epoch.epoch_number, 3,
+            "a refused advance must not advance the detector"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_epoch_to_surfaces_snapshot_save_error() {
+        // AUDIT Phase 5.4 / M8 discriminator: a stake/executor snapshot-persistence failure must
+        // surface as `SnapshotPersist`, not be swallowed into `Ok(None)`. This provider fails
+        // `save_stake_snapshot`/`save_executor_set`; advancing to a new epoch must return that
+        // error. Reverting the `.map_err(...)` on the saves (the old `let _ =`) makes the advance
+        // return Ok(None), so the test fails on the buggy code.
+        let dp = Arc::new(TestDataProvider::new().with_snapshot_save_failure(true));
+        let (committer, _registry, _dp) =
+            build_committer_for_leader_test(b"leader".to_vec(), b"leader".to_vec(), dp);
+        committer.stake_store.add_staker(b"leader".to_vec(), 100);
+
+        let result = committer.advance_epoch();
+        assert!(
+            matches!(
+                result,
+                Err(CommitterError::SnapshotPersist { kind: "stake", .. })
+            ),
+            "advance_epoch must surface the snapshot-persistence failure, got {:?}",
+            result
         );
     }
 

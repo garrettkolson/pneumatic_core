@@ -60,6 +60,17 @@ pub enum CommitterError {
     /// path (AUDIT Phase 5.2 / H2): the incoming block did not win its conflict at the
     /// tip, so it is rejected and the existing chain state is preserved.
     LoserDiscarded,
+    /// The snapshot for an epoch could not be persisted (or was rejected on a
+    /// prior load) — `save_stake_snapshot`/`save_executor_set` returned a
+    /// `DataError`, or the SHA-256 envelope failed its integrity check. The epoch
+    /// advance is aborted rather than silently proceeding with a snapshot that
+    /// may be stale or missing (AUDIT Phase 5.4 / H9/M8). `kind` is `"stake"` or
+    /// `"executor"`.
+    SnapshotPersist {
+        epoch: u64,
+        kind: &'static str,
+        cause: String,
+    },
 }
 
 impl From<io::Error> for CommitterError {

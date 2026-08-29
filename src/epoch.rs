@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
+use crate::crypto::sha256;
+use crate::encoding::serialize_to_bytes_rmp;
 use crate::errors::PneumaticError;
 use dashmap::DashMap;
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::io::Error;
 
 // ---------------------------------------------------------------------------
 // Epoch — represents a single epoch in the blockchain
@@ -106,6 +110,31 @@ impl StakeSet {
             executors: self.stakers.clone(),
         }
     }
+
+    /// Canonical (deterministic) byte encoding for integrity binding.
+    ///
+    /// A `HashMap` has no stable iteration order, so an otherwise-identical
+    /// `StakeSet` would produce a different MsgPack digest on different nodes —
+    /// defeating the corruption check. We route the data through a `BTreeMap`
+    /// (sorted keys) before serializing, so `canonical_bytes` is stable across
+    /// save and load (same ordering discipline as `ExecutorSet::shuffler`).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
+        let sorted: BTreeMap<Vec<u8>, u64> = self
+            .stakers
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        serialize_to_bytes_rmp(&sorted)
+    }
+
+    /// SHA-256 fingerprint of `canonical_bytes()` — the value stored alongside a
+    /// persisted snapshot and re-verified on load (AUDIT Phase 5.4 / H9/M8).
+    /// Empty-stake sets still yield a well-defined 32-byte digest.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        sha256(&self.canonical_bytes().unwrap_or_default())
+            .try_into()
+            .unwrap_or([0u8; 32])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +183,26 @@ impl ExecutorSet {
         // shuffle's starting order — and therefore the shard partition — varies per node.
         keys.sort();
         Shuffler::new(keys, epoch_number, prev_block_hash)
+    }
+
+    /// Canonical (deterministic) byte encoding for integrity binding.
+    /// See `StakeSet::canonical_bytes` — routes through a `BTreeMap` so the
+    /// digest is stable across save and load.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, Error> {
+        let sorted: BTreeMap<Vec<u8>, u64> = self
+            .executors
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        serialize_to_bytes_rmp(&sorted)
+    }
+
+    /// SHA-256 fingerprint of `canonical_bytes()` — stored alongside a persisted
+    /// executor set and re-verified on load (AUDIT Phase 5.4 / H9/M8).
+    pub fn fingerprint(&self) -> [u8; 32] {
+        sha256(&self.canonical_bytes().unwrap_or_default())
+            .try_into()
+            .unwrap_or([0u8; 32])
     }
 }
 
@@ -798,6 +847,51 @@ mod tests {
         StakeSet {
             stakers: stakes.into_iter().collect(),
         }
+    }
+
+    // --- Phase 5.4 / H9+M8: snapshot integrity envelope ---
+
+    // A `StakeSet`'s canonical bytes are sorted (deterministic) so its SHA-256 digest is stable
+    // across save/load regardless of `HashMap` iteration order. `fingerprint()` is exactly
+    // SHA-256(canonical_bytes); two distinct payloads yield distinct fingerprints.
+    #[test]
+    fn stake_set_canonical_bytes_is_order_independent_and_fingerprint_matches_digest() {
+        // Identical staker pairs inserted in DIFFERENT order -> byte-identical canonical bytes.
+        let mut a = HashMap::new();
+        a.insert(vec![1, 2, 3], 100);
+        a.insert(vec![7], 200);
+        let mut b = HashMap::new();
+        b.insert(vec![7], 200);
+        b.insert(vec![1, 2, 3], 100);
+        let set_a = StakeSet { stakers: a };
+        let set_b = StakeSet { stakers: b };
+        assert_eq!(
+            set_a.canonical_bytes().unwrap(),
+            set_b.canonical_bytes().unwrap(),
+            "canonical bytes must be independent of HashMap insertion order"
+        );
+
+        // fingerprint == sha256(canonical_bytes), and a changed payload changes the digest.
+        let set = make_stake_set(vec![(vec![9], 55), (vec![8], 11)]);
+        let digest = sha256(&set.canonical_bytes().unwrap());
+        let fp: [u8; 32] = digest.as_slice().try_into().unwrap();
+        assert_eq!(set.fingerprint(), fp, "fingerprint must equal SHA-256(canonical_bytes)");
+        let set2 = make_stake_set(vec![(vec![9], 56), (vec![8], 11)]);
+        assert_ne!(set.fingerprint(), set2.fingerprint(), "distinct payloads -> distinct fingerprints");
+    }
+
+    // `ExecutorSet` mirrors `StakeSet`: same helpers, same determinism.
+    #[test]
+    fn executor_set_canonical_bytes_is_order_independent() {
+        let mut a = HashMap::new();
+        a.insert(vec![1], 100);
+        a.insert(vec![2], 200);
+        let mut b = HashMap::new();
+        b.insert(vec![2], 200);
+        b.insert(vec![1], 100);
+        let set_a = ExecutorSet { executors: a };
+        let set_b = ExecutorSet { executors: b };
+        assert_eq!(set_a.canonical_bytes().unwrap(), set_b.canonical_bytes().unwrap());
     }
 
     #[test]
