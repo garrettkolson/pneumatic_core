@@ -597,12 +597,20 @@ agree on anything.*
   Workspace: 555 passing (553 + 2), 0 failures (committer 61, core 362, finalizer 54, sentinel 55,
   executor 10, integration 7). See [[phase-5-4-epoch-writer-snapshots]].
 
-- [ ] **5.6 Enforce nonces; `amount: None` must not pass** (H14, M12 from blocks/tx audit)
+- [x] **5.6 Enforce nonces; `amount: None` must not pass** (H14, M12 from blocks/tx audit) — *done 2026-08-29*
   Files: `src/registry.rs` (pool accepts duplicate `(sender, seq)` — only `seq == 0` is
   checked), `src/validation.rs:180`, `src/action_router.rs:215,229`.
   Action: reject duplicate `(sender, seq)`; require `amount` (or define explicit
   zero-amount/no-transfer semantics) instead of `Option` flowing through every gate.
   Verify: replayed nonce is rejected; `amount: None` is rejected at admission.
+  **Done (2026-08-29):** `(token_id, sender, seq)` dedup added to
+  `PendingTransactionRegistry` (`used_nonces` DashMap, append-only, checked first in
+  `enqueue_to_pool`, which now returns `Result`); `sentinel.rs` propagates the duplicate as
+  `SentinelError::Registry`. `ExecutedBlockValidatorSpec::validate` rejects `amount: None`
+  **and** `Some(0)` (`InvalidAmount`); `action_router` "Process"/"Preload" reject `None`
+  before `verify_gas`. `SelfSigned` gate left untouched (executed path only). `amount` stays
+  `Option<u64>` (wire untouched). 4 discriminators, each proven to fail on temporary revert.
+  Workspace: 559 passing, 0 failures. See [[phase-5-6-nonce-and-null-amount]].
 
 - [ ] **5.7 Validate quorum/risk/economic config at spec load; wire the real risk gate** (H6)
   Files: `src/environment.rs:100-104` (percentages copied verbatim),

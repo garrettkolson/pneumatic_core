@@ -177,7 +177,10 @@ impl TransactionValidationSpec for ExecutedBlockValidatorSpec {
             failures.push(ValidationFailureReason::SenderMissing);
         }
 
-        if tx.amount.map(|a| a == 0).unwrap_or(false) {
+        // Phase 5.6 / M12: amount must be present and nonzero. An `Option<u64>`
+        // `None` is rejected at admission (wire-compat: keep it serialized as Option);
+        // a zero amount is rejected as before.
+        if tx.amount.is_none() || tx.amount == Some(0) {
             failures.push(ValidationFailureReason::InvalidAmount);
         }
 
@@ -514,6 +517,22 @@ mod tests {
         let env = make_env_with_defaults();
         let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn executed_rejects_null_amount() {
+        // Phase 5.6 / M12: `amount: None` must fail the executed-admission gate.
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let token = make_token_with_owner(&[1, 2, 3]);
+        let tx = make_tx(&[9, 9, 9], &[], None, 1);
+        let env = make_env_with_defaults();
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
+        assert!(result.is_err());
+        if let Err(PneumaticError::Validation(failures)) = result {
+            assert!(failures
+                .iter()
+                .any(|f| matches!(f, ValidationFailureReason::InvalidAmount)));
+        }
     }
 
     #[test]

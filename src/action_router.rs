@@ -212,7 +212,11 @@ impl IActionRouter for ActionRouter {
                 let tx: Transaction = deserialize_rmp_to(&message.body)
                     .map_err(PneumaticError::from)?;
                 let nonce_result = self.check_nonce(&sender, tx.sequence_number).await?;
-                let gas_result = self.verify_gas(&sender, "Process", tx.amount.unwrap_or(0)).await?;
+                // Phase 5.6 / M12: reject `amount: None` before consuming gas.
+                let Some(amount) = tx.amount else {
+                    return Err(PneumaticError::Validation(vec![ValidationFailureReason::InvalidAmount]));
+                };
+                let gas_result = self.verify_gas(&sender, "Process", amount).await?;
                 let _ = gas_result; // GasVerified result available to caller
                 match nonce_result {
                     ActionRouterResult::NonceUpdated { sender, new_nonce } => {
@@ -226,7 +230,11 @@ impl IActionRouter for ActionRouter {
                 let sender = message.public_key.clone();
                 let tx: Transaction = deserialize_rmp_to(&message.body)
                     .map_err(PneumaticError::from)?;
-                self.verify_gas(&sender, "Preload", tx.amount.unwrap_or(0)).await?;
+                // Phase 5.6 / M12: reject `amount: None` before checking stake.
+                let Some(amount) = tx.amount else {
+                    return Err(PneumaticError::Validation(vec![ValidationFailureReason::InvalidAmount]));
+                };
+                self.verify_gas(&sender, "Preload", amount).await?;
                 let stake = self.check_stake(&sender, NodeRegistryType::Executor).await?;
                 Ok(stake)
             }
@@ -415,6 +423,26 @@ mod tests {
                 assert_eq!(new_nonce, 1);
             }
             other => panic!("expected NonceUpdated, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_process_null_amount_rejected() {
+        // Phase 5.6 / M12: a "Process" message carrying `amount: None` is rejected.
+        let router = make_router();
+        let tx = Transaction {
+            id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
+            sequence_number: 0, sender: vec![1, 2, 3], receiver: vec![],
+            amount: None, timestamp: 0, result_hash: vec![],
+            sender_signature: vec![],
+        };
+        let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
+        let msg = make_message_with_body("Process", vec![1, 2, 3], body);
+        let result = router.route(msg).await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(matches!(e, PneumaticError::Validation(ref reasons)
+                if reasons.iter().any(|r| matches!(r, ValidationFailureReason::InvalidAmount))));
         }
     }
 

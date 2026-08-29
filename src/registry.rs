@@ -35,6 +35,11 @@ pub struct PendingTransactionRegistry {
     admin_credits: DashMap<String, PendingAdminCredit>,
     /// Gas used per transaction, tracked during validation and deducted on commit.
     gas_tracker: Mutex<HashMap<String, u64>>,
+    /// Durable record of every admitted `(token_id, sender, sequence_number)`, used to reject
+    /// replayed nonces (Phase 5.6 / H14). Append-only and never evicted: a nonce stays consumed
+    /// for its sender even after the tx is dequeued or committed, so a replay can never be
+    /// re-admitted once accepted. Keyed by all three because each token has its own account.
+    used_nonces: DashMap<(Vec<u8>, Vec<u8>, usize), ()>,
 }
 
 impl PendingTransactionRegistry {
@@ -44,6 +49,7 @@ impl PendingTransactionRegistry {
             pool: Mutex::new(TransactionPool::new()),
             admin_credits: DashMap::new(),
             gas_tracker: Mutex::new(HashMap::new()),
+            used_nonces: DashMap::new(),
         }
     }
 
@@ -178,10 +184,25 @@ impl PendingTransactionRegistry {
 
     /// Enqueue a transaction into the pool. Called when a transaction
     /// enters the Validated state.
+    ///
+    /// Rejects a replayed nonce (Phase 5.6 / H14): the same
+    /// `(token_id, sender, sequence_number)` may never be admitted twice. The
+    /// insertion point, so this also keeps the pool itself free of duplicate
+    /// `(sender, seq)` entries.
     pub fn enqueue_to_pool(&self, tx_id: &str, token_id: Vec<u8>,
-                           sequence_number: usize, timestamp: i64, sender: Vec<u8>) {
+                           sequence_number: usize, timestamp: i64, sender: Vec<u8>)
+                           -> Result<(), PneumaticError> {
+        // Guard the nonce before touching the pool so a duplicate is rejected at admission.
+        let key = (token_id.clone(), sender.clone(), sequence_number);
+        if self.used_nonces.insert(key, ()).is_some() {
+            return Err(PneumaticError::Registry(format!(
+                "duplicate nonce: (token_id={:?}, sender={:?}, sequence_number={}) already admitted",
+                token_id, sender, sequence_number
+            )));
+        }
         let mut pool = self.pool.lock().unwrap();
         pool.enqueue(tx_id.to_string(), token_id, sequence_number, timestamp, sender);
+        Ok(())
     }
 
     /// Dequeue the top n transaction IDs for a token. Returns IDs in
@@ -269,14 +290,14 @@ impl PendingTransactionRegistry {
                 )))?;
             entry.transition_to_validated(transaction.clone(), validation);
         }
-        // Enqueue into the pool
+        // Enqueue into the pool (rejects a replayed nonce — Phase 5.6 / H14)
         self.enqueue_to_pool(
             tx_id,
             transaction.token_id.clone(),
             transaction.sequence_number,
             transaction.timestamp,
             transaction.sender.clone(),
-        );
+        )?;
         Ok(())
     }
 }
@@ -402,6 +423,29 @@ mod tests {
         let registry = PendingTransactionRegistry::new();
         registry.register_pending("tx1".into()).unwrap();
         assert!(registry.register_pending("tx1".into()).is_err());
+    }
+
+    #[test]
+    fn enqueue_to_pool_rejects_duplicate_nonce() {
+        // Phase 5.6 / H14: a reused (token_id, sender, sequence_number) is a replay.
+        let registry = PendingTransactionRegistry::new();
+        let token_id = vec![1, 2, 3];
+        let sender = vec![9, 9, 9];
+
+        // First admission of (token_id, sender, seq=5) succeeds.
+        assert!(registry
+            .enqueue_to_pool("tx1", token_id.clone(), 5, 100, sender.clone())
+            .is_ok());
+
+        // A different tx_id carrying the SAME (token_id, sender, seq=5) is a replayed nonce.
+        assert!(registry
+            .enqueue_to_pool("tx2", token_id.clone(), 5, 101, sender.clone())
+            .is_err());
+
+        // A distinct sequence number for the same sender is not a replay.
+        assert!(registry
+            .enqueue_to_pool("tx3", token_id.clone(), 6, 102, sender.clone())
+            .is_ok());
     }
 
     #[test]

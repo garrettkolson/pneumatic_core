@@ -202,8 +202,9 @@ impl Sentinel {
         }
 
         // Step 6: Transition to Validated and enqueue into the pool for leader ordering.
+        // Reject a replayed nonce (Phase 5.6 / H14) instead of silently admitting it.
         let risk = self.transaction_validator.calculate_risk(&tx);
-        let _ = self.registry.transition_to_validated_and_enqueue(
+        self.registry.transition_to_validated_and_enqueue(
             &tx_id,
             tx.clone(),
             pneumatic_core::transactions::TransactionValidationResult {
@@ -212,7 +213,8 @@ impl Sentinel {
                 failure_reasons: vec![],
                 finalizer_public_key: vec![],
             },
-        );
+        )
+        .map_err(|e| SentinelError::Registry(e.to_string()))?;
 
         // Step 7: Standard pipeline — send to Executor for preloading
         self.send_to_executor_for_preload(&tx)
@@ -224,8 +226,9 @@ impl Sentinel {
         let tx_id = tx.id.clone();
 
         // Transition to Validated state and enqueue into the pool in one atomic operation.
+        // Reject a replayed nonce (Phase 5.6 / H14) instead of silently admitting it.
         let risk = self.transaction_validator.calculate_risk(&tx);
-        let _ = self.registry.transition_to_validated_and_enqueue(
+        self.registry.transition_to_validated_and_enqueue(
             &tx_id,
             tx.clone(),
             pneumatic_core::transactions::TransactionValidationResult {
@@ -234,7 +237,8 @@ impl Sentinel {
                 failure_reasons: vec![],
                 finalizer_public_key: vec![], // Empty — self-signed, no finalizer
             },
-        );
+        )
+        .map_err(|e| SentinelError::Registry(e.to_string()))?;
 
         // Record gas used for this self-signed transaction
         self.registry.record_gas_used(&tx_id, gas_used);
@@ -1839,6 +1843,74 @@ mod tests {
         let pool_txs = registry.get_ordered_transactions(&[2], 10).unwrap();
         assert!(!pool_txs.is_empty());
         assert_eq!(pool_txs[0].id, tx_id);
+    }
+
+    #[test]
+    fn handle_process_request_rejects_duplicate_nonce() {
+        // Phase 5.6 / H14: a replayed (token, sender, sequence_number) is rejected via
+        // SentinelError::Registry — even when a *different* transaction id carries it.
+        //
+        // The default test env fails every non-zero-risk transaction at the gas/risk gate
+        // (override_quorum_percentage == 0.0, but any 2-party transfer scores > 0), and the
+        // plain fixture registers no token. To let `validate_transaction` succeed and reach
+        // the pool enqueue (Step 6), we raise the risk gate and register token [1].
+        let mut env_data = make_test_env_data();
+        env_data.override_quorum_percentage = 100.0;
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), "bob".to_string());
+        let data_provider =
+            StubDataProvider::new().with_token(vec![1], "token".to_string(), token);
+        let (sentinel, registry) =
+            make_sentinel_fixture_with_env_and_data_provider(data_provider, env_data);
+
+        // A valid sender signs the canonical transaction bytes (C3 gate passes).
+        let sender_identity = NodeIdentity::generate_in_memory();
+        let sender_pk = sender_identity.ed25519.public_key().expect("sender public key");
+
+        // First tx: (token [1], sender, seq=5). Valid signature + envelope binding.
+        let mut tx1 = Transaction {
+            id: "tx_nonce_1".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 5,
+            sender: sender_pk.clone(),
+            receiver: b"carol".to_vec(),
+            amount: Some(50),
+            timestamp: 1,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        c3_sign(&mut tx1, &sender_identity);
+        let msg1 = c3_process_message(sender_pk.clone(), tx1);
+        // First tx must reach the pool enqueue (Step 6), so the nonce is now consumed.
+        let _ = sentinel.handle_process_request(msg1);
+        assert!(registry
+            .get_ordered_transactions(&[1], 10)
+            .unwrap()
+            .iter()
+            .any(|t| t.id == "tx_nonce_1"));
+
+        // Second tx: a DIFFERENT id carrying the SAME (token [1], sender, seq=5) — a replay.
+        let mut tx2 = Transaction {
+            id: "tx_nonce_2".into(),
+            action: "Process".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 5,
+            sender: sender_pk.clone(),
+            receiver: b"carol".to_vec(),
+            amount: Some(50),
+            timestamp: 2,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        c3_sign(&mut tx2, &sender_identity);
+        let msg2 = c3_process_message(sender_pk.clone(), tx2);
+        match sentinel.handle_process_request(msg2) {
+            Err(SentinelError::Registry(_)) => {}
+            other => panic!("replayed nonce must be rejected via Registry, got {other:?}"),
+        }
     }
 
     #[test]
