@@ -71,6 +71,11 @@ pub enum CommitterError {
         kind: &'static str,
         cause: String,
     },
+    /// A token distribution carried an id already present in the local token cache
+    /// (AUDIT Phase 5.5 / H13): a peer may not replace or swap in the chain or
+    /// metadata of a token that already exists. The rejected distribution is
+    /// discarded and the cached token is left intact. `token_id` is the hex id.
+    TokenConflict(String),
 }
 
 impl From<io::Error> for CommitterError {

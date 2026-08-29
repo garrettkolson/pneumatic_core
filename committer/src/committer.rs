@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, Entry};
 use tokio::sync::Mutex;
 
 use pneumatic_core::crypto::AsymCryptoProvider;
@@ -396,6 +396,18 @@ impl Committer {
         }
     }
 
+    /// Build a `CommitterError::TokenConflict` for a token distribution that carries an id already
+    /// present in the local token cache (AUDIT Phase 5.5 / H13), and emit a prominent, greppable
+    /// rejection line so a token-swap attempt is observable in the committer log rather than silent.
+    fn token_distribution_conflict_err(&self, token_id: &[u8]) -> CommitterError {
+        let token_id_hex = bytes_to_hex(token_id);
+        self.env_data.logger.log(format!(
+            "TOKEN REPLACEMENT REJECTED: token_id={} already present — refusing token swap (AUDIT Phase 5.5 / H13)",
+            token_id_hex
+        ));
+        CommitterError::TokenConflict(token_id_hex)
+    }
+
     // -----------------------------------------------------------------------
     // Commit message handling
     // -----------------------------------------------------------------------
@@ -573,14 +585,27 @@ impl Committer {
     // -----------------------------------------------------------------------
 
     /// Handle token distribution from other committers.
-    /// Inserts the token into the local cache for future commits.
+    ///
+    /// Inserts a freshly-distributed token into the local cache for future commits. A token IS its
+    /// own blockchain — its chain and metadata are authoritative, so a peer may not swap in an
+    /// alternative under an id that already exists (AUDIT Phase 5.5 / H13). A distribution carrying
+    /// a new id is accepted (this is how a node joining the network seeds a token it lacks); a
+    /// distribution whose id is already cached is refused and the cached token is left intact.
     async fn handle_token_distribution(&self, message: Message) -> Result<(), CommitterError> {
         let token: Token = deserialize_rmp_to(&message.body).map_err(CommitterError::Deserialization)?;
 
-        let token_key = token.id.clone();
-        self.tokens.insert(token_key, token);
-
-        Ok(())
+        // Reject-on-conflict: `entry()` atomically checks-and-inserts under a single shard write
+        // guard, the same single-operation shape as `handle_block_finalized`'s `get_mut`
+        // (AUDIT Phase 3.3 / C5). A `contains_key`-then-`insert` would leave a read-then-write gap
+        // where two concurrent distributions for a not-yet-existing id could both pass the check and
+        // one would silently overwrite the other — the same swap vector we are closing here.
+        match self.tokens.entry(token.id.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(token);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(self.token_distribution_conflict_err(&token.id)),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3673,6 +3698,112 @@ mod tests {
         // Rejected → nothing appended.
         let chain_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
         assert_eq!(chain_len, original_len);
+    }
+
+    /// (AUDIT Phase 5.5 / H13 discriminator) A `DistributeToken` carrying an id already present in
+    /// the local cache is refused and leaves the cached token — chain and metadata — untouched. The
+    /// old `self.tokens.insert` blindly overwrote the existing token, so any peer could swap in an
+    /// arbitrary chain/metadata under a settled id. Proven discriminator: restoring the blind insert
+    /// makes the handler return `Ok(())` and overwrites `name`/`asset_hash` (all value assertions
+    /// fail without the fix).
+    #[tokio::test]
+    async fn handle_token_distribution_rejects_conflicting_token_id() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry, collector) = make_test_committer(dp);
+
+        // Bootstrap the authoritative token: id vec![1], distinct metadata + asset_hash, and a seeded
+        // genesis chain. Pin the tip and length so we can prove the cached chain survives.
+        let mut original = Token::new();
+        original.id = vec![1];
+        original.set_metadata("name".to_string(), "original".to_string());
+        original.asset_hash = vec![0x01u8; 32];
+        committer.bootstrap_token(original);
+        bootstrap_token_chain(&committer);
+        let before_tip = committer
+            .tokens
+            .get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_current_chain_state()
+            .last_hash_in;
+        let before_len = committer.tokens.get(&vec![1]).unwrap().value().blockchain.get_count();
+
+        // A malicious token carries the SAME id but different metadata and asset_hash — a peer trying
+        // to swap in an alternative token under the settled id.
+        let mut malicious = Token::new();
+        malicious.id = vec![1];
+        malicious.set_metadata("name".to_string(), "swapped".to_string());
+        malicious.asset_hash = vec![0xFFu8; 32];
+
+        let body = serialize_to_bytes_rmp(&malicious).expect("Token serialization");
+        let message = Message {
+            chain_id: "test".to_string(),
+            action: String::from("DistributeToken"),
+            body,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let result = committer.handle_token_distribution(message).await;
+
+        // The conflicting distribution is refused, and every part of the cached token is preserved.
+        assert!(matches!(result, Err(CommitterError::TokenConflict(_))));
+        let cached_ref = committer.tokens.get(&vec![1]).unwrap();
+        let cached = cached_ref.value();
+        assert_eq!(cached.metadata.get("name").map(String::as_str), Some("original"));
+        assert_eq!(cached.asset_hash, vec![0x01u8; 32]);
+        assert_eq!(
+            cached.blockchain.get_current_chain_state().last_hash_in,
+            before_tip
+        );
+        assert_eq!(cached.blockchain.get_count(), before_len);
+        // The rejection is logged, not silent.
+        assert!(collector
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("TOKEN REPLACEMENT REJECTED")));
+    }
+
+    /// (AUDIT Phase 5.5 / H13 positive guard) A `DistributeToken` whose id is not already cached is
+    /// accepted — this is how a node joining the network seeds a token it lacks. Guards against the
+    /// fix over-rejecting the legitimate seeding path.
+    #[tokio::test]
+    async fn handle_token_distribution_accepts_new_token_id() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry, _logger) = make_test_committer(dp);
+
+        // A pre-existing token under id vec![1].
+        let mut existing = Token::new();
+        existing.id = vec![1];
+        existing.set_metadata("name".to_string(), "existing".to_string());
+        committer.bootstrap_token(existing);
+
+        // A distribution carrying a brand-new id vec![9].
+        let mut newcomer = Token::new();
+        newcomer.id = vec![9];
+        newcomer.set_metadata("name".to_string(), "newcomer".to_string());
+
+        let body = serialize_to_bytes_rmp(&newcomer).expect("Token serialization");
+        let message = Message {
+            chain_id: "test".to_string(),
+            action: String::from("DistributeToken"),
+            body,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let result = committer.handle_token_distribution(message).await;
+
+        assert!(result.is_ok());
+        let cached_ref = committer
+            .tokens
+            .get(&vec![9])
+            .expect("newcomer token should be cached");
+        let cached = cached_ref.value();
+        assert_eq!(cached.metadata.get("name").map(String::as_str), Some("newcomer"));
     }
 
     /// (AUDIT Phase 3.4 / H15 discriminator) Out-of-order delivery is buffered, not dropped, and

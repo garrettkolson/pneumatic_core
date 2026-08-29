@@ -569,12 +569,33 @@ agree on anything.*
   parsed the previous bare-stake-payload shape will choke on the `hash`/`epoch` fields. No `Message`,
   `DataOp`, or `GetOp` shape changes.
 
-- [ ] **5.5 Protect token replacement** (H13)
-  File: `committer/src/committer.rs:307-314`.
+- [x] **5.5 Protect token replacement** (H13) — *done 2026-08-29*
+  File: `committer/src/committer.rs` (`handle_token_distribution`, `token_distribution_conflict_err`,
+  `Entry` import); `committer/src/committer_error.rs` (`TokenConflict` variant).
   Action: `TokenDistribution` may not replace an existing token id from an arbitrary peer —
   require the appropriate authenticated role and reject conflicts (or define an explicit,
   authorized overwrite flow).
   Verify: a peer cannot swap in a token (chain/metadata) for an id that already exists.
+
+  **Done:** `handle_token_distribution` now rejects-on-conflict via a single atomic
+  `self.tokens.entry(id)` check-and-insert (`Vacant` → insert `Ok(())`; `Occupied` →
+  `Err(TokenConflict)`), replacing the blind `self.tokens.insert(id, token)` overwrite. `entry()`
+  holds one shard write guard, closing the read-then-write gap a `contains_key`+`insert` leaves
+  (same single-op shape as `handle_block_finalized`'s `get_mut`, Phase 3.3 / C5). The role gate is
+  already correct (`allowed_senders_for("DistributeToken")` = `Exact(Committer)` via
+  `authenticate_message`), and the vuln is role-agnostic, so no auth change. Reject-on-conflict
+  blocks nothing legitimate: the token cache starts empty and a node only receives ids it lacks;
+  chain advancement happens on the `BlockFinalized` path, never via re-distribution, and
+  `bootstrap_token` (trusted internal, tests only) stays a plain insert. Logs a greppable
+  `TOKEN REPLACEMENT REJECTED: token_id=<hex> already present — refusing token swap` line via the
+  new `token_distribution_conflict_err` helper, following the `snapshot_save_err`/`gas_deduction_err`
+  observability pattern. No wire change.
+  **Discriminators, each proven to fail without its fix by temporary revert (ground rule 2):**
+  `handle_token_distribution_rejects_conflicting_token_id` (revert the handler to the blind insert →
+  it returns `Ok(())` and overwrites `name`/`asset_hash` → every value assertion fails);
+  `handle_token_distribution_accepts_new_token_id` (positive guard — a not-yet-owned id still seeds).
+  Workspace: 555 passing (553 + 2), 0 failures (committer 61, core 362, finalizer 54, sentinel 55,
+  executor 10, integration 7). See [[phase-5-4-epoch-writer-snapshots]].
 
 - [ ] **5.6 Enforce nonces; `amount: None` must not pass** (H14, M12 from blocks/tx audit)
   Files: `src/registry.rs` (pool accepts duplicate `(sender, seq)` — only `seq == 0` is
