@@ -674,7 +674,8 @@ pub enum ConflictResolution {
     DiscardLoser(Vec<u8>),
     /// Same proposer signed both blocks — double-signed. Commit the winner, slash the proposer.
     SameProposerSlash(Vec<u8>, Vec<u8>), // (winner_hash, proposer_key_to_slash)
-    /// Equal stakes and identical hashes (theoretical) — commit winner, flag both for review.
+    /// Equal stakes and different proposers — neither verified proposer can be trusted to have
+    /// won the fork, so flag both for review and commit neither (fail-closed, AUDIT Phase 5.8 / M10).
     TieFlagBoth(Vec<u8>),
 }
 
@@ -682,10 +683,12 @@ pub enum ConflictResolution {
 /// Returns a `ConflictResolution` that determines the system response:
 /// - **DiscardLoser**: different proposers, network race. Commit winner, discard loser.
 /// - **SameProposerSlash**: same proposer double-signed. Commit winner, slash proposer.
-/// - **TieFlagBoth**: equal stakes + equal hashes (theoretical). Flag both for review.
+/// - **TieFlagBoth**: equal stakes + different proposers. Neither verified proposer can be
+///   trusted to have won the fork, so flag both for review and commit neither (fail-closed).
 ///
-/// Tie-break for equal stakes and different proposers: lexicographic comparison of
-/// block hashes (smaller wins).
+/// Equal stakes with different proposers is resolved as `TieFlagBoth` — a deliberately
+/// fail-closed outcome. The equal-stake + hash-order tie-break is intentionally absent: block
+/// hashes are attacker-searchable, so a hash-order tie-break would be grindable.
 pub fn resolve_block_conflict(
     block_a_hash: &[u8],
     block_b_hash: &[u8],
@@ -715,12 +718,11 @@ pub fn resolve_block_conflict(
         ));
     }
 
-    // Equal stakes, different proposers — hash tie-break
-    if block_a_hash <= block_b_hash {
-        Ok(ConflictResolution::DiscardLoser(block_a_hash.to_vec()))
-    } else {
-        Ok(ConflictResolution::DiscardLoser(block_b_hash.to_vec()))
-    }
+    // Equal stakes, different proposers — neither verified proposer can be trusted to have
+    // won the fork (equal stake means neither is out-staked). Fail closed: flag both for
+    // review and commit neither. (The previous lexicographic hash tie-break was
+    // attacker-grindable — block hashes are searchable — so it is removed; AUDIT Phase 5.8.)
+    Ok(ConflictResolution::TieFlagBoth(block_a_hash.to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,16 +1187,19 @@ mod tests {
     }
 
     #[test]
-    fn conflict_resolution_tie_break_by_hash_returns_discard_loser() {
+    fn conflict_resolution_equal_stake_different_proposers_returns_flag_both() {
         let stakes = make_stake_set(vec![(vec![1], 100), (vec![2], 100)]);
+        // Equal stakes, different verified proposers: neither is out-staked, so resolve to
+        // TieFlagBoth (fail-closed). This supersedes the old hash tie-break, which was
+        // attacker-grindable.
         let result = resolve_block_conflict(
             b"aa", b"bb",
             &vec![1], &vec![2],
             &stakes,
         ).unwrap();
         match result {
-            ConflictResolution::DiscardLoser(winner) => assert_eq!(winner, b"aa"),
-            _ => panic!("Expected DiscardLoser"),
+            ConflictResolution::TieFlagBoth(_) => {}
+            _ => panic!("Expected TieFlagBoth"),
         }
     }
 

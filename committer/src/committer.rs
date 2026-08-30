@@ -515,7 +515,7 @@ impl Committer {
         // conflict tells us whether the incoming block wins outright (`Commit`) or
         // wins only after the losing tip is rolled back (`CommitWinnerAfterRollback`)
         // — or was rejected (`LoserDiscarded`, surfaced below).
-        match self.handle_conflict_at_commit(commit) {
+        match self.handle_conflict_at_commit(commit, &finalizer_key) {
             Ok(CommitConflictOutcome::Commit) => {
                 self.block_services.commit_block(commit, None)?;
             }
@@ -1026,7 +1026,8 @@ impl Committer {
     /// identity branching:
     /// - Different proposers → DiscardLoser (network race)
     /// - Same proposer → SameProposerSlash (double-signed)
-    /// - Equal stakes + hash tie → TieFlagBoth
+    /// - Equal stakes + different proposers → TieFlagBoth (fail-closed; the old
+    ///   equal-stake hash tie-break was removed as attacker-grindable — Phase 5.8)
     ///
     /// Every resolved group is then cleared from the registry via
     /// `remove_conflicted`, and the loser is never left standing (AUDIT Phase
@@ -1037,9 +1038,11 @@ impl Committer {
     fn handle_conflict_at_commit(
         &self,
         commit: &TransactionCommit,
+        verified_proposer: &[u8],
     ) -> Result<CommitConflictOutcome, CommitterError> {
         let token_id = commit.token_id.clone();
         let previous_hash = commit.proposed_block.previous_hash.clone();
+        let incoming_hash = commit.proposed_block.current_hash.clone();
 
         // Check for existing candidates at this position
         let candidates = self.candidate_registry
@@ -1049,113 +1052,95 @@ impl Committer {
             // No conflict — this is the first candidate for this position.
             // Insert it into the registry for future conflict detection. The
             // incoming block is the winner by default (no rollback needed).
+            //
+            // Record the *verified* proposer (the authenticated envelope sender,
+            // `message.public_key`) — never the self-declared `proposer_key`, which
+            // is unsigned and could be forged to inflate stake or mis-trigger a
+            // slash in a later conflict resolution. (AUDIT Phase 5.8 / M10)
             self.candidate_registry.insert(
                 token_id, previous_hash,
                 commit.proposed_block.clone(),
-                commit.proposed_block.proposer_key.clone(),
+                verified_proposer.to_vec(),
             );
             return Ok(CommitConflictOutcome::Commit);
         }
 
-        // Conflict detected — resolve with real stakes from StakeStore
-        // Use the first existing candidate as block_a, the new block as block_b
-        let existing = &candidates[0];
-        let (block_a_hash, proposer_a) = (
-            existing.0.current_hash.clone(),
-            existing.1.clone(),
-        );
-        let (block_b_hash, proposer_b) = (
-            commit.proposed_block.current_hash.clone(),
-            commit.proposed_block.proposer_key.clone(),
-        );
-
-        // Build a StakeSet from the StakeStore for resolution
+        // Conflict detected — fold the incoming block over ALL candidates (AUDIT
+        // Phase 5.8 / M10): the incoming wins only if it beats every candidate, and
+        // losing to any one rejects it. Build the StakeSet once for resolution.
         let stake_set = StakeSet {
             stakers: self.stake_store.iter()
                 .map(|(k, s)| (k.clone(), s))
                 .collect(),
         };
 
-        let resolution = resolve_block_conflict(
-            &block_a_hash, &block_b_hash,
-            &proposer_a, &proposer_b,
-            &stake_set,
-        ).map_err(|e| CommitterError::Core(e))?;
+        // Reject the incoming block if it loses to ANY candidate, or if any pair is a
+        // SameProposerSlash or TieFlagBoth (fail-closed). Resolution uses the verified
+        // proposer, never the self-declared field.
+        let mut rollback_target = incoming_hash.clone();
+        for (candidate, candidate_proposer) in &candidates {
+            let candidate_hash = candidate.current_hash.clone();
 
-        // Resolve the conflict and clear the entire candidate group. No branch
-        // leaves the loser standing: the winner either commits (possibly after a
-        // tip rollback) or the incoming block is rejected. (AUDIT Phase 5.2 / H2)
-        match resolution {
-            ConflictResolution::DiscardLoser(winner_hash) => {
-                if winner_hash == block_b_hash {
-                    // Incoming block wins. Clear the loser group and commit the
-                    // winner, passing block_a's hash as the rollback target —
-                    // commit_block only rolls back if that hash is the current tip
-                    // (otherwise it appends to the real tip, so this is a no-op).
+            match resolve_block_conflict(
+                &incoming_hash, &candidate_hash,
+                verified_proposer, candidate_proposer,
+                &stake_set,
+            ).map_err(|e| CommitterError::Core(e))? {
+                // Incoming loses to this candidate (winner is the candidate) — reject it.
+                ConflictResolution::DiscardLoser(winner_hash) if winner_hash != incoming_hash => {
                     self.env_data.logger.log(format!(
-                        "Conflict resolved (DiscardLoser) at commit: incoming {} wins, rollback target {} (token: {})",
-                        bytes_to_hex(&block_b_hash),
-                        bytes_to_hex(&block_a_hash),
+                        "Conflict resolved (DiscardLoser) at commit: candidate {} beats incoming {} (token: {})",
+                        bytes_to_hex(&candidate_hash), bytes_to_hex(&incoming_hash), bytes_to_hex(&token_id),
+                    ));
+                    self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                    return Err(CommitterError::LoserDiscarded);
+                }
+                // Incoming wins vs this candidate — record the buffered loser as the rollback
+                // target and continue folding over the rest.
+                ConflictResolution::DiscardLoser(_) => rollback_target = candidate_hash,
+                // Same verified proposer double-signed — slash and reject incoming.
+                ConflictResolution::SameProposerSlash(_, slashed_key) => {
+                    let amount = (self.stake_store.get_stake(&slashed_key) as f64
+                        * self.env_data.cost_model.slash_fraction)
+                        .round()
+                        .min(u64::MAX as f64) as u64;
+
+                    self.env_data.logger.log(format!(
+                        "Double-proposal detected (same proposer) at commit: slashing {} (candidate {} vs incoming {})(token: {})",
+                        bytes_to_hex(&slashed_key), bytes_to_hex(&candidate_hash), bytes_to_hex(&incoming_hash), bytes_to_hex(&token_id),
+                    ));
+                    self.staking_manager.apply_ops(&pneumatic_core::epoch::EpochReconciliation {
+                        misshapen_tokens: vec![],
+                        finalization_conflicts: vec![],
+                        slashing_ops: vec![pneumatic_core::epoch::StakingOp::Slash(
+                            slashed_key, amount,
+                        )],
+                        reward_ops: vec![],
+                    })?;
+
+                    self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+                    return Err(CommitterError::LoserDiscarded);
+                }
+                // Equal stakes + different verified proposers — fail closed: flag both
+                // for review and reject the incoming block.
+                ConflictResolution::TieFlagBoth(_) => {
+                    self.env_data.logger.log(format!(
+                        "Tie conflict at commit — equal stakes + different verified proposers, flagging both for review and rejecting incoming (token: {})",
                         bytes_to_hex(&token_id),
                     ));
                     self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
-                    Ok(CommitConflictOutcome::CommitWinnerAfterRollback(block_a_hash))
-                } else {
-                    // Existing block_a wins — the incoming block is the loser.
-                    self.env_data.logger.log(format!(
-                        "Conflict resolved (DiscardLoser) at commit: existing {} wins, incoming {} discarded (token: {})",
-                        bytes_to_hex(&block_a_hash),
-                        bytes_to_hex(&block_b_hash),
-                        bytes_to_hex(&token_id),
-                    ));
-                    self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
-                    Err(CommitterError::LoserDiscarded)
+                    return Err(CommitterError::LoserDiscarded);
                 }
             }
-            ConflictResolution::SameProposerSlash(winner_hash, slashed_key) => {
-                // Same proposer double-signed — slash them for a real amount, then
-                // reject the incoming re-proposal. The existing block_a remains the
-                // winner at this position.
-                // The slash is the configured fraction (default: full stake) of
-                // the offender's current stake, so a fully-slashed proposer is
-                // zeroed and a re-slash at the next epoch boundary is a no-op.
-                let amount = (self.stake_store.get_stake(&slashed_key) as f64
-                    * self.env_data.cost_model.slash_fraction)
-                    .round()
-                    .min(u64::MAX as f64) as u64;
-
-                self.env_data.logger.log(format!(
-                    "Double-proposal detected (same proposer) at commit: slashing {} (winner {})(token: {})",
-                    bytes_to_hex(&slashed_key),
-                    bytes_to_hex(&winner_hash),
-                    bytes_to_hex(&token_id),
-                ));
-                // Apply the slash now and fail-closed: commit-time is the first
-                // authority to slash, so a failed slash fails the commit rather
-                // than being swallowed.
-                self.staking_manager.apply_ops(&pneumatic_core::epoch::EpochReconciliation {
-                    misshapen_tokens: vec![],
-                    finalization_conflicts: vec![],
-                    slashing_ops: vec![pneumatic_core::epoch::StakingOp::Slash(
-                        slashed_key, amount,
-                    )],
-                    reward_ops: vec![],
-                })?;
-
-                self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
-                Err(CommitterError::LoserDiscarded)
-            }
-            ConflictResolution::TieFlagBoth(_winner_hash) => {
-                // Equal stakes + hash tie — flag both proposers for review and
-                // reject the incoming block to avoid a duplicate append.
-                self.env_data.logger.log(format!(
-                    "Tie conflict at commit — flagging both proposers for review (token: {})",
-                    bytes_to_hex(&token_id),
-                ));
-                self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
-                Err(CommitterError::LoserDiscarded)
-            }
         }
+
+        // Incoming beats every candidate — commit it. rollback_target is the buffered loser's
+        // hash (the tip that the incoming displaces). commit_block rolls back only when that
+        // target matches the current tip — a buffered candidate that is not on the chain leaves
+        // the tip untouched, so the incoming appends to the real tip. (AUDIT Phase 5.2 / H2,
+        // 5.8 / M10: the rollback target is the loser, never the winner's own hash.)
+        self.candidate_registry.remove_conflicted(&token_id, &previous_hash);
+        Ok(CommitConflictOutcome::CommitWinnerAfterRollback(rollback_target))
     }
 
     // -----------------------------------------------------------------------
@@ -2891,7 +2876,7 @@ mod tests {
             vec![42u8; 32]
         };
         // Distinct stakes make the outcome deterministic: the incoming block
-        // (proposer vec![]) wins over the existing candidate (proposer vec![10]).
+        // (proposer vec![], stake 500) wins over the existing candidate (proposer vec![10], stake 100).
         committer.stake_store.add_staker(vec![10], 100);
         committer.stake_store.add_staker(vec![], 500);
 
@@ -2901,7 +2886,8 @@ mod tests {
         );
 
         // Commit — the conflict is detected and resolved. The winner commits and the
-        // loser group is cleared (AUDIT Phase 5.2 / H2).
+        // loser group is cleared (AUDIT Phase 5.2 / H2). The verified proposer (finalizer_key)
+        // is the incoming block's self-declared proposer, vec![], matching its 500-stake identity.
         let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
         assert!(result.is_ok(), "higher-stake incoming block wins the conflict");
         assert_eq!(
@@ -2991,7 +2977,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
+        let result = committer.check_and_commit_transaction_results(&commit, b"alice".to_vec()).await;
         assert!(result.is_ok(), "higher-stake incoming block wins the conflict");
 
         // AUDIT Phase 5.2 / H2: the loser is discarded — only the winning block commits
@@ -3047,7 +3033,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![10]).await;
         // AUDIT Phase 5.2 / H2: a same-proposer double-signed re-proposal is rejected
         // on the commit path (the winner stays as the tip, the loser is discarded).
         assert!(
@@ -3112,7 +3098,7 @@ mod tests {
             proposed_block: block,
         };
 
-        let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
+        let result = committer.check_and_commit_transaction_results(&commit, vec![10]).await;
         // AUDIT Phase 5.2 / H2: the double-signed re-proposal is rejected on the commit path.
         assert!(
             matches!(result, Err(CommitterError::LoserDiscarded)),
@@ -3205,7 +3191,7 @@ mod tests {
             env_id: "test".to_string(),
             proposed_block: block_a,
         };
-        assert!(committer.check_and_commit_transaction_results(&commit_a, vec![]).await.is_ok());
+        assert!(committer.check_and_commit_transaction_results(&commit_a, b"alpha".to_vec()).await.is_ok());
         let tip_after_a = committer.tokens.get(&vec![1]).unwrap().value()
             .blockchain.get_current_chain_state().last_hash_in;
         assert_eq!(tip_after_a, commit_a.proposed_block.current_hash, "block_a is now the tip");
@@ -3219,7 +3205,7 @@ mod tests {
             env_id: "test".to_string(),
             proposed_block: block_b,
         };
-        let result = committer.check_and_commit_transaction_results(&commit_b, vec![]).await;
+        let result = committer.check_and_commit_transaction_results(&commit_b, b"beta".to_vec()).await;
         assert!(result.is_ok(), "higher-stake block_b wins the conflict and commits");
 
         // The loser (block_a) that was the tip is rolled back; block_b is the sole block at
@@ -3273,7 +3259,7 @@ mod tests {
             env_id: "test".to_string(),
             proposed_block: block_a,
         };
-        assert!(committer.check_and_commit_transaction_results(&commit_a, vec![]).await.is_ok());
+        assert!(committer.check_and_commit_transaction_results(&commit_a, b"alpha".to_vec()).await.is_ok());
         let tip_after_a = committer.tokens.get(&vec![1]).unwrap().value()
             .blockchain.get_current_chain_state().last_hash_in;
         assert_eq!(tip_after_a, commit_a.proposed_block.current_hash);
@@ -3287,7 +3273,7 @@ mod tests {
             env_id: "test".to_string(),
             proposed_block: block_b,
         };
-        let result = committer.check_and_commit_transaction_results(&commit_b, vec![]).await;
+        let result = committer.check_and_commit_transaction_results(&commit_b, b"beta".to_vec()).await;
         assert!(
             matches!(result, Err(CommitterError::LoserDiscarded)),
             "a lower-stake losing commit must be discarded on the commit path"
@@ -3306,6 +3292,118 @@ mod tests {
             committer.candidate_registry.candidate_count(&vec![1], &prev_tip),
             0,
             "the resolved candidate group must be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_uses_verified_proposer_not_forged_key() {
+        // AUDIT Phase 5.8 / M10 discriminator: the incoming block's self-declared
+        // `proposer_key` claims a high-stake identity (beta, 500) that the signed envelope
+        // does NOT actually hold — the authenticated sender is delta (unregistered, stake 0).
+        // Resolution must key off the *verified* sender (delta), never the unsigned self-
+        // declared key, so a forged high-stake proposer_key can no longer steer the branch.
+        //
+        // On code that trusts self-declared proposer_key: beta (500) beats alpha (100) → the
+        // forged block commits (is_ok): the attacker steers the branch. On fixed code: the
+        // verified sender delta (0) loses to alpha (100) → the forged block is rejected.
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry, _logger) = make_test_committer(dp);
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_forged_key";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        // alpha: the real, winning candidate (stake 100). beta: a forged self-declared
+        // identity the incoming claims (stake 500) that no verified sender holds.
+        committer.stake_store.add_staker(b"alpha".to_vec(), 100);
+        committer.stake_store.add_staker(b"beta".to_vec(), 500);
+
+        let existing_block = make_block_with_proposer(&committer, "tx_existing", b"alpha".to_vec());
+        committer.candidate_registry.insert(
+            vec![1], prev_hash.clone(), existing_block, b"alpha".to_vec(),
+        );
+
+        // Incoming self-declared proposer = beta (forged, 500); verified sender (finalizer_key)
+        // = delta — not registered, so stake 0.
+        let block = make_block_with_proposer(&committer, tx_id, b"beta".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // Verified proposer (delta, 0) loses to alpha (100) → incoming rejected.
+        let result = committer.check_and_commit_transaction_results(&commit, b"delta".to_vec()).await;
+        assert!(
+            matches!(result, Err(CommitterError::LoserDiscarded)),
+            "a forged high-stake proposer_key (beta) must not steer resolution; the incoming (verified delta) is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_folds_over_all_candidates() {
+        // AUDIT Phase 5.8 / M10 discriminator: two competing candidates sit at one position.
+        // candidates[0] = alpha (stake 100), candidates[1] = beta (stake 500); the incoming
+        // (verified delta) has stake 300 — it beats alpha but loses to beta.
+        //
+        // On code that compares only candidates[0]: delta (300) beats alpha (100) → commits.
+        // On fixed code (fold over ALL candidates): delta loses to beta (500) → rejected.
+        // Order is deterministic here because the CandidateRegistry stores candidates in
+        // insertion order (push), so alpha is candidates[0] and beta is candidates[1].
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, registry, _logger) = make_test_committer(dp);
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let tx_id = "tx_fold";
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+        let prev_hash = if let Some(entry) = committer.tokens.get(&vec![1]) {
+            let token = entry.value();
+            token.blockchain.get_current_chain_state().last_hash_in
+        } else {
+            vec![42u8; 32]
+        };
+
+        committer.stake_store.add_staker(b"alpha".to_vec(), 100);
+        committer.stake_store.add_staker(b"beta".to_vec(), 500);
+        committer.stake_store.add_staker(b"delta".to_vec(), 300);
+
+        // Insert alpha (weak) first, then beta (strong): candidates[0]=alpha, candidates[1]=beta.
+        let c0 = make_block_with_proposer(&committer, "tx_c0", b"alpha".to_vec());
+        let c1 = make_block_with_proposer(&committer, "tx_c1", b"beta".to_vec());
+        committer.candidate_registry.insert(vec![1], prev_hash.clone(), c0, b"alpha".to_vec());
+        committer.candidate_registry.insert(vec![1], prev_hash.clone(), c1, b"beta".to_vec());
+
+        // Incoming verified sender = delta (300).
+        let block = make_block_with_proposer(&committer, tx_id, b"delta".to_vec());
+        let commit = TransactionCommit {
+            trans_id: tx_id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test".to_string(),
+            proposed_block: block,
+        };
+
+        // Fold: delta beats alpha but loses to beta → rejected (LoserDiscarded).
+        let result = committer.check_and_commit_transaction_results(&commit, b"delta".to_vec()).await;
+        assert!(
+            matches!(result, Err(CommitterError::LoserDiscarded)),
+            "incoming must be rejected: it loses to candidates[1] (beta) even though it beats candidates[0] (alpha)"
         );
     }
 
