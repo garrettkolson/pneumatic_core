@@ -194,16 +194,19 @@ impl TransactionValidationSpec for ExecutedBlockValidatorSpec {
 
         let risk = self.calculate_risk(tx);
 
-        // Check risk against environment threshold
-        // (placeholder: use quorum_percentage as a rough proxy)
-        if risk.score() > env_data.override_quorum_percentage {
+        // Phase 5.7 / H6: real risk gate — reject the transaction when its
+        // composite risk score exceeds the environment's configured max_risk
+        // (0.0-1.0). The placeholder that compared risk against
+        // override_quorum_percentage (a ~67 quorum value a 0.0-1.0 score can
+        // never exceed) is removed.
+        if risk.score() > env_data.max_risk {
             return Err(PneumaticError::Validation(vec![
                 ValidationFailureReason::RiskExceedsThreshold
             ]));
         }
 
-        // Return a placeholder finalizer key — in practice this is assigned
-        // by the Sentinel after checking stake thresholds
+        // Return the finalizer key — in practice this is assigned by the
+        // Sentinel after checking stake thresholds
         Ok(TransactionValidationResult::valid(vec![], risk))
     }
 
@@ -980,5 +983,48 @@ mod tests {
     fn block_validator_registry_get_nonexistent_returns_none() {
         let registry = BlockValidatorSpecRegistry::new();
         assert!(registry.get("Unknown").is_none());
+    }
+
+    // --- Phase 5.7 / H6: the risk gate enforces max_risk ---
+
+    #[test]
+    fn executed_block_validator_rejects_tx_over_max_risk() {
+        // A contract tx with a large amount scores 0.85 (amount_risk 1.0 +
+        // party_risk 0.5 + complexity 1.0, weighted). With max_risk = 0.5 it
+        // must be rejected at the risk gate. The old placeholder compared risk
+        // against override_quorum_percentage (= 1.0 here); 0.85 > 1.0 is false,
+        // so that gate would have accepted this tx — proving the gate now truly
+        // enforces max_risk.
+        let mut env = make_env_with_defaults();
+        env.max_risk = 0.5;
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let mut tx = make_tx(b"sender", b"receiver", Some(2_000_000_000), 7);
+        tx.action = "ContractProcess".into();
+        let token = Token::new();
+        // Disambiguate the two `validate` impls by calling the transaction
+        // spec trait explicitly.
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
+        assert!(matches!(
+            result,
+            Err(PneumaticError::Validation(reasons))
+                if reasons.iter().any(|reason| {
+                    matches!(reason, ValidationFailureReason::RiskExceedsThreshold)
+                })
+        ));
+    }
+
+    #[test]
+    fn executed_block_validator_allows_tx_under_max_risk() {
+        // A small 2-party transfer scores 0.30 (amount 0.0 + party 0.5 +
+        // complexity 0.5). With max_risk = 0.9 it must pass.
+        let mut env = make_env_with_defaults();
+        env.max_risk = 0.9;
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let tx = make_tx(b"sender", b"receiver", Some(100), 7);
+        let token = Token::new();
+        assert!(matches!(
+            TransactionValidationSpec::validate(&spec, &tx, &token, &env),
+            Ok(_)
+        ));
     }
 }

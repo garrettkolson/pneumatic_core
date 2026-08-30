@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
+use crate::errors::PneumaticError;
 use crate::logging::{FileLogger, Logger};
 use crate::node::NodeRegistryType;
 use crate::validation::{BlockValidatorSpecRegistry, ValidationSpecRegistry,
@@ -274,6 +275,93 @@ pub struct EnvironmentMetadataSpec {
 fn default_shard_count() -> u32 { 1 }
 fn default_shard_quorum_percentage() -> f32 { 67.0 }
 
+impl EnvironmentMetadataSpec {
+    /// Validate the protocol-relevant numeric fields of an environment spec
+    /// *before* it is loaded, so a spec that would neuter the protocol is
+    /// rejected at boot rather than silently accepted.
+    ///
+    /// Ranges enforced (this is the fail-closed config gate for audit Phase
+    /// 5.7 / H6):
+    /// - `quorum_percentage`, `shard_quorum_percentage` ∈ (0, 100]: a 0%
+    ///   finalizer quorum would be satisfied by zero signatures; anything
+    ///   above 100% is unsatisfiable and deadlocks finalization.
+    /// - `override_quorum_percentage` ∈ [0, 100]: 0 is the documented
+    ///   "disabled" sentinel; above 100% is unsatisfiable.
+    /// - `max_risk`, `cost_model.admin_tax_percentage` ∈ [0, 1].
+    /// - every `cost_model.amount_multiplier` value is finite and ≥ 0: a
+    ///   negative/non-finite multiplier would be cast to a bogus `u64` and
+    ///   make that action effectively free.
+    /// - `shard_count` ≥ 1.
+    ///
+    /// All violations are collected into a single error so a bad spec reports
+    /// every problem at once.
+    pub fn validate(&self) -> Result<(), PneumaticError> {
+        let mut violations: Vec<String> = Vec::new();
+
+        let ok_quorum = |v: f32| v.is_finite() && v > 0.0 && v <= 100.0;
+        let ok_percent = |v: f32| v.is_finite() && v >= 0.0 && v <= 100.0;
+        // `max_risk` is compared against the 0.0-1.0 risk score, so it is a
+        // ratio, not a percentage.
+        let ok_ratio = |v: f32| v.is_finite() && v >= 0.0 && v <= 1.0;
+
+        if !ok_quorum(self.quorum_percentage) {
+            violations.push(format!(
+                "quorum_percentage {} is outside (0, 100]",
+                self.quorum_percentage
+            ));
+        }
+        if !ok_quorum(self.shard_quorum_percentage) {
+            violations.push(format!(
+                "shard_quorum_percentage {} is outside (0, 100]",
+                self.shard_quorum_percentage
+            ));
+        }
+        if !ok_percent(self.override_quorum_percentage) {
+            violations.push(format!(
+                "override_quorum_percentage {} is outside [0, 100]",
+                self.override_quorum_percentage
+            ));
+        }
+        if !ok_ratio(self.max_risk) {
+            violations.push(format!(
+                "max_risk {} is outside [0, 1]",
+                self.max_risk
+            ));
+        }
+        if self.shard_count < 1 {
+            violations.push(format!("shard_count {} must be >= 1", self.shard_count));
+        }
+
+        // Economic policy lives on the cost model.
+        if !self.cost_model.admin_tax_percentage.is_finite()
+            || self.cost_model.admin_tax_percentage < 0.0
+            || self.cost_model.admin_tax_percentage > 1.0
+        {
+            violations.push(format!(
+                "admin_tax_percentage {} is outside [0, 1]",
+                self.cost_model.admin_tax_percentage
+            ));
+        }
+        for (action, mult) in &self.cost_model.amount_multiplier {
+            if !mult.is_finite() || *mult < 0.0 {
+                violations.push(format!(
+                    "amount_multiplier[{action}] {} must be finite and >= 0",
+                    *mult
+                ));
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(PneumaticError::Encoding(format!(
+                "invalid environment spec: {}",
+                violations.join("; ")
+            )))
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, PartialEq, Clone)]
 pub enum EnvironmentPartitionType {
     Token,
@@ -287,4 +375,115 @@ pub enum EnvironmentPartitionType {
 pub struct EnvironmentPartition {
     pub id: String,
     pub partition_type: EnvironmentPartitionType,
+}
+
+// ---------------------------------------------------------------------------
+// Tests — EnvironmentMetadataSpec::validate
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // A spec that satisfies every range check.
+    const VALID_BASE: &str = r#"{
+        "environment_id":"test",
+        "environment_name":"test",
+        "partitions":[
+            {"id":"token-part","partition_type":"Token"},
+            {"id":"slush-part","partition_type":"Slush"}
+        ],
+        "asym_crypto_provider":{"Ed25519":null},
+        "sym_crypto_provider":"sym",
+        "serialization_provider":"rmp",
+        "quorum_percentage":67.0,
+        "override_quorum_percentage":1.0,
+        "max_risk":1.0,
+        "cost_model":{
+            "base_cost":1,
+            "global_min_stake":10,
+            "admin_public_key":[],
+            "admin_tax_percentage":0.0,
+            "amount_multiplier":{"Process":1.0,"Preload":2.0,"Sign":1.5},
+            "per_type_min_stake":{},
+            "slash_fraction":1.0
+        },
+        "allowed_token_types":[],
+        "trans_validation_specs":[],
+        "block_validation_specs":[],
+        "log_file":"test.log",
+        "shard_count":1,
+        "shard_quorum_percentage":67.0
+    }"#;
+
+    fn parse(value: serde_json::Value) -> EnvironmentMetadataSpec {
+        serde_json::from_value(value).expect("spec JSON must be valid")
+    }
+
+    #[test]
+    fn spec_validate_accepts_valid_defaults() {
+        let value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        assert!(parse(value).validate().is_ok());
+    }
+
+    #[test]
+    fn spec_validate_rejects_quorum_percentage_zero() {
+        // quorum_percentage = 0 makes finalizer quorum always satisfied — the
+        // boot-failure case (0 signatures counts as quorum).
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["quorum_percentage"] = json!(0.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_quorum_percentage_over_100() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["quorum_percentage"] = json!(120.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_shard_quorum_percentage_zero() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["shard_quorum_percentage"] = json!(0.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_override_quorum_over_100() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["override_quorum_percentage"] = json!(150.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_max_risk_over_one() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["max_risk"] = json!(1.5);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_admin_tax_over_one() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["cost_model"]["admin_tax_percentage"] = json!(2.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_negative_amount_multiplier() {
+        // A negative multiplier is cast to a bogus u64 in
+        // CostModel::multiplier_to_fixed, making that action effectively free.
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["cost_model"]["amount_multiplier"]["Process"] = json!(-1.0);
+        assert!(parse(value).validate().is_err());
+    }
+
+    #[test]
+    fn spec_validate_rejects_shard_count_zero() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["shard_count"] = json!(0);
+        assert!(parse(value).validate().is_err());
+    }
 }

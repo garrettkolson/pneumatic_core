@@ -612,7 +612,7 @@ agree on anything.*
   `Option<u64>` (wire untouched). 4 discriminators, each proven to fail on temporary revert.
   Workspace: 559 passing, 0 failures. See [[phase-5-6-nonce-and-null-amount]].
 
-- [ ] **5.7 Validate quorum/risk/economic config at spec load; wire the real risk gate** (H6)
+- [x] **5.7 Validate quorum/risk/economic config at spec load; wire the real risk gate** (H6) — *done 2026-08-29*
   Files: `src/environment.rs:100-104` (percentages copied verbatim),
   `finalizer/src/signature_collector.rs:89` (quorum 0.0 ⇒ one signature suffices),
   `src/validation.rs:196` (risk score compared against `override_quorum_percentage`),
@@ -624,6 +624,19 @@ agree on anything.*
   `shard_count >= 1`.
   Verify: a spec with `quorum_percentage: 0` fails boot; the risk gate actually uses
   `max_risk`.
+  **Done (2026-08-29):** `EnvironmentMetadataSpec::validate()` (environment.rs) →
+  `PneumaticError::Encoding`, collects all violations. Ranges: `quorum_percentage` and
+  `shard_quorum_percentage` ∈ (0,100] (kills the quorum-0.0 vuln), `override_quorum_percentage`
+  ∈ [0,100], `max_risk` ∈ [0,1] (dedicated `ok_ratio` closure, not the [0,100] percentage check),
+  `admin_tax_percentage` ∈ [0,1], each `amount_multiplier` finite & ≥ 0, `shard_count` ≥ 1.
+  `load_from_spec` stays infallible — validation lives at the spec-load boundary:
+  `config.rs` `get_environment_metadata` calls `validate()` before `load_from_spec` and returns
+  `io::Error::InvalidData` on a bad spec, so `Config::build()` fails boot. Real gate in
+  `validation.rs` `ExecutedBlockValidatorSpec::validate` now does
+  `if risk.score() > env_data.max_risk → Validation([RiskExceedsThreshold])` (placeholder over
+  `override_quorum_percentage` removed); `SelfSignedBlockValidatorSpec` left untouched. 15
+  discriminators (9 spec validators + 2 risk-gate), each proven to fail on temporary revert.
+  Workspace: 570 passing, 0 failures. See [[phase-5-7-risk-gate]].
 
 - [ ] **5.8 Conflict resolution: verified proposer, all candidates** (M10)
   Files: `src/epoch.rs:588-622`, `committer/src/committer.rs:633-661`.

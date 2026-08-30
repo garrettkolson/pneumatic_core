@@ -171,6 +171,18 @@ impl Config {
         }
         let mut environment_metadata = DashMap::new();
         for env_spec in env_specs {
+            // Phase 5.7 / H6: reject specs whose security-relevant config is
+            // outside the valid range (quorum percentages, max_risk, admin tax,
+            // gas multipliers, shard count). A bad spec fails the node here —
+            // surfaced as an io error so Config::build() fails boot — instead of
+            // silently neutering finalization quorum or the risk gate.
+            if let Err(validation_error) = env_spec.validate() {
+                eprintln!("Could not load environment spec as valid: {validation_error}");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    validation_error.to_string(),
+                ));
+            }
             let env_metadata = EnvironmentMetadata::load_from_spec(env_spec);
             environment_metadata.insert(env_metadata.environment_id.clone(), env_metadata);
         }
