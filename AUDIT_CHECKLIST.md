@@ -695,9 +695,21 @@ agree on anything.*
   by 6 new tests (direct/blocking-failure recorded, blocking direct actually sends, timeout recorded
   on both async+blocking paths, positive control, helper keyed by rhash+type) — each proven to fail
   on temporary revert; full workspace green (585 passing, 0 failures).
-- [ ] **6.3 Atomic registration admission** — capacity check + insert under one lock (close the
+- [x] **6.3 Atomic registration admission** — capacity check + insert under one lock (close the
   check-then-insert TOCTOU with a blocking stake gap in the middle)
   (`src/node/registry.rs:157-161, 318-348`).
+  Action: added `admission_lock: Arc<std::sync::Mutex<()>>` to `NodeRegistry` (constructed in
+  `init`). `handle_register`'s admission tail now re-checks capacity and inserts under that one
+  lock, while the blocking stake gate and connection setup run OUTSIDE it, so the critical
+  section only covers a map `len()` + `insert()` (never a blocking call on the plain-std RNS
+  worker pool). `max_node_number` is now a hard invariant under concurrency — two registrations
+  for different keys can no longer both pass the optimistic capacity check and over-admit a type.
+  No selection or stake semantics changed; `register_peer`/`register_directory_peer` keep the same
+  `len()`-then-`insert` shape but are single-threaded in tests (same-pattern hardening is a
+  follow-up). Verify: `registry::tests::concurrent_admission_never_exceeds_capacity` races 200
+  registrations against Sentinel cap 20 with a 5 ms stake gate and asserts `len() <= 20`; proven
+  to fail on a temporary revert of the fix (over-admitted to 25); full workspace green (586
+  passing, 0 failures).
 - [ ] **6.4 `TcpConnection` EOF is terminal** — `ReadError => continue` busy-spins at 100 % CPU
   after peer disconnect; `break` on EOF (`src/conns.rs:89-97`).
 - [ ] **6.5 Environment spec loading: no panics, no fail-open** — missing Token/Slush partition
@@ -734,7 +746,8 @@ repo.*
 - [ ] **7.2 Cross-process determinism fixture** — same stake set in different key orders /
   serializations → identical leader, shards, and finalizer selection; same logical block →
   identical hash (guards 2.1/2.2 permanently).
-- [ ] **7.3 Concurrency tests** — `BlockFinalized` append race; registration capacity TOCTOU;
+- [ ] **7.3 Concurrency tests** — `BlockFinalized` append race; registration capacity TOCTOU
+  (admission closed by 6.3);
   reconcile-then-advance epoch interaction; ThreadPool job-panic → worker death → Drop.
 - [ ] **7.4 Boundary & adversarial tests** — quorum 0.0/100.0; duplicate nonce; mixed
   zero-stake selection sets; EOF/busy-spin on `TcpConnection`; hung data service; directory

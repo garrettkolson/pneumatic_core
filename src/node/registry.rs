@@ -42,6 +42,12 @@ pub struct NodeRegistry {
     /// `with_send_timeout` overrides it in tests so timeout-elapsed discriminators
     /// run at ~50 ms instead of the 5 s production bound.
     send_timeout: Duration,
+    /// Serializes the capacity-check + insert critical section of registration
+    /// admission so two concurrent registrations cannot both observe free
+    /// capacity and over-admit a type past `max_node_number` (Phase 6.3). Only
+    /// the non-blocking map `len()` + `insert()` hold this; the blocking stake
+    /// gate and connection setup in `handle_register` run outside it.
+    admission_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Canonical bytes for a directory response's envelope signature: the full
@@ -147,6 +153,7 @@ impl NodeRegistry {
             evictor: None,
             delivery_failures: Arc::new(DashMap::new()),
             send_timeout: SEND_TIMEOUT,
+            admission_lock: Arc::new(std::sync::Mutex::new(())),
         };
         let mut registry = registry;
         if network.is_some() {
@@ -459,12 +466,36 @@ impl NodeRegistry {
             request.requested_type.clone(),
             request.requester_types.clone(),
         );
+        // Atomic admission (Phase 6.3): the capacity check and the insert run
+        // under one lock, so two concurrent registrations can no longer both
+        // observe free capacity and over-admit this type past its limit. The
+        // blocking stake gate and connection setup above ran OUTSIDE this lock,
+        // so the critical section covers only the map len-check + insert.
+        let lock = Arc::clone(&self.admission_lock);
+        let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
         match self.get_nodes(&node_type) {
             None => {
+                drop(guard);
                 self.reply_register_ack(requester_rhash, false, node_type, "no registry for type");
             }
             Some(nodes) => {
+                if nodes.len() >= self.config.get_max_node_number(&node_type) {
+                    drop(guard);
+                    self.reply_register_ack(
+                        requester_rhash,
+                        false,
+                        node_type,
+                        "no registry type available",
+                    );
+                    return;
+                }
+                debug_assert!(
+                    !nodes.contains_key(&requester_key),
+                    "key was absent at the existing-key check and must still be absent under the lock"
+                );
                 nodes.insert(requester_key, node);
+                drop(guard);
                 self.reply_register_ack(requester_rhash, true, node_type, "");
             }
         }
@@ -908,6 +939,12 @@ impl NodeRegistry {
     pub fn with_send_timeout(&mut self, timeout: Duration) {
         self.send_timeout = timeout;
     }
+
+    /// Replace the injected stake gate (always-`true` in `registry_with_capacity`)
+    /// so a discriminator can widen the check-then-insert window with a slow gate.
+    pub fn with_stake_check(&mut self, stake: StakeCheck) {
+        self.stake_check = stake;
+    }
 }
 
 /// Connection for directory entries with no live transport (test mode, or
@@ -1111,6 +1148,63 @@ mod tests {
         assert!(!reg.register_peer(vec![3], [3u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
         // ...but an existing peer can still refresh its entry.
         assert!(reg.register_peer(vec![1], [1u8; 16], &NodeRegistryType::Sentinel, Box::new(NullConnection)));
+    }
+
+    #[test]
+    fn concurrent_admission_never_exceeds_capacity() {
+        // Phase 6.3 discriminator: with many registrations racing on a small
+        // capacity, the pre-fix check-then-insert TOCTOU lets every caller that
+        // read `len() < cap` through the optimistic check and then insert, so
+        // the type over-admits. The admission lock serializes the len-check +
+        // insert so `len` can never exceed the cap.
+        let cap = 20usize;
+        let n = 200usize;
+        let mut reg = registry_with_capacity(&[(NodeRegistryType::Sentinel, cap)]);
+        // Slow the stake gate to widen the pre-fix check-then-insert window. On
+        // the fixed code the gate runs OUTSIDE the admission lock, so this only
+        // affects throughput, never the invariant.
+        reg.with_stake_check(Arc::new(|_, _| {
+            std::thread::sleep(Duration::from_millis(5));
+            true
+        }));
+        let reg = Arc::new(reg);
+
+        let handles = (0..n)
+            .map(|_| NodeIdentity::generate_in_memory())
+            .into_iter()
+            .map(|id| {
+                let reg = Arc::clone(&reg);
+                std::thread::spawn(move || {
+                    // Drive the real Register path directly (silently: a
+                    // legitimate rejection under the cap must not panic a thread
+                    // the way the convenience `register_node` helper does).
+                    let types = vec![NodeRegistryType::Sentinel];
+                    let binding = id
+                        .sign_binding(&id.rhash, &NodeRegistryType::Sentinel, &types)
+                        .expect("sign binding");
+                    let req = NodeRequest {
+                        requester_key: id.ed25519.public_key().unwrap(),
+                        requester_rhash: id.rhash,
+                        request_type: NodeRequestType::Register,
+                        requester_types: types,
+                        requested_type: NodeRegistryType::Sentinel,
+                        binding_signature: binding,
+                    };
+                    reg.handle_register(req);
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.join().expect("registration thread panicked");
+        }
+
+        let sentinels = reg.get_nodes(&NodeRegistryType::Sentinel).expect("sentinel registry");
+        assert!(
+            sentinels.len() <= cap,
+            "capacity exceeded under concurrency: {} > {}",
+            sentinels.len(),
+            cap
+        );
     }
 
     #[test]
