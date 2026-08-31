@@ -638,7 +638,7 @@ agree on anything.*
   discriminators (9 spec validators + 2 risk-gate), each proven to fail on temporary revert.
   Workspace: 570 passing, 0 failures. See [[phase-5-7-risk-gate]].
 
-- [ ] **5.8 Conflict resolution: verified proposer, all candidates** (M10)
+- [x] **5.8 Conflict resolution: verified proposer, all candidates** (M10)
   Files: `src/epoch.rs:588-622`, `committer/src/committer.rs:633-661`.
   Action: take proposer identity from the verified leader signature, not the block's
   self-declared `proposer_key`; resolve against **all** candidates (fold), not only
