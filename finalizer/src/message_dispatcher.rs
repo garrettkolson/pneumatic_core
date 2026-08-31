@@ -297,7 +297,7 @@ mod tests {
             "logger": "FileLogger"
         }"#;
         if let Ok(spec) = serde_json::from_str::<EnvironmentMetadataSpec>(spec_json) {
-            let env = EnvironmentMetadata::load_from_spec(spec);
+            let env = EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec");
             env_map.insert(env.environment_id.clone(), env);
         }
         Arc::new(env_map)

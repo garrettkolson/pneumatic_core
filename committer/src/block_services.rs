@@ -226,7 +226,7 @@ mod tests {
             "allowed_token_types":[],"trans_validation_specs":[],
             "block_validation_specs":[],"log_file":"test.log"}"#;
         let spec: EnvironmentMetadataSpec = serde_json::from_str(json).expect("spec JSON");
-        Arc::new(EnvironmentMetadata::load_from_spec(spec))
+        Arc::new(EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec"))
     }
 
     fn make_registry() -> (Arc<NodeRegistry>, Arc<NodeIdentity>) {

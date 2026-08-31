@@ -419,7 +419,7 @@ mod tests {
             "allowed_token_types":[],"trans_validation_specs":[],
             "block_validation_specs":[],"log_file":"test.log"}"#;
         let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
-        EnvironmentMetadata::load_from_spec(spec)
+        EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec")
     }
 
     fn make_tx(sender: &[u8], receiver: &[u8], amount: Option<u64>, seq: usize) -> Transaction {

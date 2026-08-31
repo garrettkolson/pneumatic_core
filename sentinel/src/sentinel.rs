@@ -785,7 +785,7 @@ mod tests {
             "allowed_token_types":[],"trans_validation_specs":[],
             "block_validation_specs":[],"log_file":"test.log"}"#;
         let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
-        EnvironmentMetadata::load_from_spec(spec)
+        EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec")
     }
 
     /// Same as `make_test_env_data` but with shard-aware routing enabled, for
@@ -801,7 +801,7 @@ mod tests {
             "block_validation_specs":[],"log_file":"test.log",
             "shard_count":2}"#;
         let spec = serde_json::from_str::<EnvironmentMetadataSpec>(json).unwrap();
-        EnvironmentMetadata::load_from_spec(spec)
+        EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec")
     }
 
     fn make_sentinel_fixture() -> (Sentinel, Arc<PendingTransactionRegistry>) {

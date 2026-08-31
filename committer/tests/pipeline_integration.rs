@@ -127,7 +127,7 @@ fn make_test_env_data(logger: Arc<FileLogger>) -> Arc<EnvironmentMetadata> {
     let spec: pneumatic_core::environment::EnvironmentMetadataSpec = serde_json::from_str(spec_json)
         .expect("Failed to parse EnvironmentMetadataSpec JSON");
 
-    let mut env_data = EnvironmentMetadata::load_from_spec(spec);
+    let mut env_data = EnvironmentMetadata::load_from_spec(spec).expect("valid test environment spec");
     env_data.logger = logger;
 
     Arc::new(env_data)

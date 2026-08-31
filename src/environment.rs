@@ -161,7 +161,15 @@ pub struct EnvironmentMetadata {
 }
 
 impl EnvironmentMetadata {
-    pub fn load_from_spec(spec: EnvironmentMetadataSpec) -> EnvironmentMetadata {
+    /// Load a fully-resolved `EnvironmentMetadata` from a parsed spec.
+    ///
+    /// Returns `Err` (instead of panicking) on a spec that would otherwise
+    /// neuter the protocol silently at boot — audit Phase 6.5 / fail-closed:
+    /// - a missing required `Token` or `Slush` partition, and
+    /// - any validator spec name that isn't a recognised `SelfSigned` /
+    ///   `Executed` registration. A bad spec fails boot cleanly rather than
+    ///   aborting the process or silently neutering validation.
+    pub fn load_from_spec(spec: EnvironmentMetadataSpec) -> Result<EnvironmentMetadata, PneumaticError> {
         let mut token_option = None;
         let mut contract_partition = None;
         let mut proxy_partition = None;
@@ -176,17 +184,25 @@ impl EnvironmentMetadata {
             }
         }
 
-        let token_partition_id = token_option
-            .expect(&format!(
-                "Environment with name \"{0}\" should have a token partition",
-                spec.environment_name
-            ));
+        // Collect every missing required partition into one error so a bad
+        // spec reports all its problems at once (mirrors `validate()`).
+        let mut missing_partitions: Vec<String> = Vec::new();
+        if token_option.is_none() {
+            missing_partitions.push("Token".to_string());
+        }
+        if slush_partition.is_none() {
+            missing_partitions.push("Slush".to_string());
+        }
+        if !missing_partitions.is_empty() {
+            return Err(PneumaticError::Encoding(format!(
+                "invalid environment spec: environment \"{}\" is missing required partition(s): {}",
+                spec.environment_name,
+                missing_partitions.join(", ")
+            )));
+        }
 
-        let slush_partition_id = slush_partition
-            .expect(&format!(
-                "Environment with name \"{0}\" should have a slush partition",
-                spec.environment_name
-            ));
+        let token_partition_id = token_option.unwrap();
+        let slush_partition_id = slush_partition.unwrap();
 
         let asym_crypto_provider = crypto::get_asym_provider(&spec.asym_crypto_provider);
         let logger: Arc<dyn Logger> = Arc::new(FileLogger::new(spec.log_file.clone()));
@@ -201,12 +217,16 @@ impl EnvironmentMetadata {
         specs.register_defaults();
 
         // Wire trans_validation_specs from JSON into the transaction validation registry.
-        // Names not found in defaults are silently skipped (graceful degradation).
+        // Unknown spec names fail boot — never silently skipped — so an operator
+        // typo or unsupported spec name is loud rather than neutering validation.
         for name in &spec.trans_validation_specs {
             match name.as_str() {
                 "SelfSigned" => specs.register(Box::new(SelfSignedBlockValidatorSpec::new())),
                 "Executed" => specs.register(Box::new(ExecutedBlockValidatorSpec::new(0))),
-                _ => {} // silently skip unknown spec names
+                _ => return Err(PneumaticError::Encoding(format!(
+                    "invalid environment spec: unknown trans_validation spec \"{}\" for environment \"{}\"",
+                    name, spec.environment_name
+                ))),
             }
         }
 
@@ -218,11 +238,14 @@ impl EnvironmentMetadata {
             match name.as_str() {
                 "SelfSigned" => block_specs.register("SelfSigned", Box::new(SelfSignedBlockValidatorSpec::new())),
                 "Executed" => block_specs.register("Executed", Box::new(ExecutedBlockValidatorSpec::new(0))),
-                _ => {} // silently skip unknown spec names
+                _ => return Err(PneumaticError::Encoding(format!(
+                    "invalid environment spec: unknown block_validation spec \"{}\" for environment \"{}\"",
+                    name, spec.environment_name
+                ))),
             }
         }
 
-        EnvironmentMetadata {
+        Ok(EnvironmentMetadata {
             environment_id: spec.environment_id,
             environment_name: spec.environment_name,
             token_partition_id,
@@ -243,7 +266,7 @@ impl EnvironmentMetadata {
             logger,
             shard_count: spec.shard_count,
             shard_quorum_percentage: spec.shard_quorum_percentage,
-        }
+        })
     }
 }
 
@@ -485,5 +508,98 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
         value["shard_count"] = json!(0);
         assert!(parse(value).validate().is_err());
+    }
+
+    // --- Phase 6.5: fail-closed env spec loading (no panics, no fail-open) ---
+
+    #[test]
+    fn spec_load_rejects_missing_token_partition() {
+        // A spec with no Token partition must fail boot cleanly instead of
+        // panicking (the pre-fix behaviour). `match`ed on the Result directly
+        // (rather than `.unwrap_err()`) since `EnvironmentMetadata` isn't `Debug`.
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["partitions"] = json!([{ "id": "slush-part", "partition_type": "Slush" }]);
+        match EnvironmentMetadata::load_from_spec(parse(value)) {
+            Ok(_) => panic!("expected Err for missing token partition"),
+            Err(PneumaticError::Encoding(msg)) => assert!(msg.contains("Token")),
+            Err(other) => panic!("expected Encoding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_load_rejects_missing_slush_partition() {
+        // A spec with no Slush partition must fail boot cleanly instead of
+        // panicking (the pre-fix behaviour).
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["partitions"] = json!([{ "id": "token-part", "partition_type": "Token" }]);
+        match EnvironmentMetadata::load_from_spec(parse(value)) {
+            Ok(_) => panic!("expected Err for missing slush partition"),
+            Err(PneumaticError::Encoding(msg)) => assert!(msg.contains("Slush")),
+            Err(other) => panic!("expected Encoding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_load_reports_missing_partitions_together() {
+        // A spec missing *both* required partitions reports both at once.
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["partitions"] = json!([{ "id": "contract-part", "partition_type": "Contract" }]);
+        match EnvironmentMetadata::load_from_spec(parse(value)) {
+            Ok(_) => panic!("expected Err missing both partitions"),
+            Err(PneumaticError::Encoding(msg)) => {
+                assert!(msg.contains("Token"));
+                assert!(msg.contains("Slush"));
+            }
+            Err(other) => panic!("expected Encoding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_load_rejects_unknown_trans_validation_spec() {
+        // An unknown transaction-validation spec name must fail boot, never be
+        // silently skipped (the pre-fix behaviour).
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["trans_validation_specs"] = json!(["Bogus"]);
+        match EnvironmentMetadata::load_from_spec(parse(value)) {
+            Ok(_) => panic!("expected Err for unknown trans_validation spec"),
+            Err(PneumaticError::Encoding(msg)) => assert!(msg.contains("Bogus")),
+            Err(other) => panic!("expected Encoding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_load_rejects_unknown_block_validation_spec() {
+        // An unknown block-validation spec name must fail boot, never be
+        // silently skipped (the pre-fix behaviour).
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["block_validation_specs"] = json!(["Bogus"]);
+        match EnvironmentMetadata::load_from_spec(parse(value)) {
+            Ok(_) => panic!("expected Err for unknown block_validation spec"),
+            Err(PneumaticError::Encoding(msg)) => assert!(msg.contains("Bogus")),
+            Err(other) => panic!("expected Encoding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_load_accepts_and_registers_known_specs() {
+        // Positive control: a valid spec that names both known specs loads Ok
+        // and actually registers them, so the registration loops cannot
+        // regress to silent no-ops.
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["trans_validation_specs"] = json!(["SelfSigned", "Executed"]);
+        value["block_validation_specs"] = json!(["SelfSigned", "Executed"]);
+        let env =
+            EnvironmentMetadata::load_from_spec(parse(value)).expect("valid spec must load");
+
+        for name in ["SelfSigned", "Executed"] {
+            assert!(
+                env.transaction_validation_specs.get(name).is_some(),
+                "transaction validation spec {name} should be registered"
+            );
+            assert!(
+                env.block_validator_specs.get(name).is_some(),
+                "block validation spec {name} should be registered"
+            );
+        }
     }
 }

@@ -733,9 +733,28 @@ agree on anything.*
   would starve that task and deadlock the test), so it uses `tokio::sync::mpsc::unbounded_channel` with
   `rx.recv().await`. Full workspace green: **589** tests, 0 failures (Phase 6.3 baseline 586 + these 3);
   `cargo check` clean.
-- [ ] **6.5 Environment spec loading: no panics, no fail-open** — missing Token/Slush partition
-  is a boot `Result`, not `.expect()`; unknown validator spec names are logged (or rejected),
-  never silently skipped (`src/environment.rs:146-156, 176, 188`).
+- [x] **6.5 Environment spec loading: no panics, no fail-open** — *done 2026-08-31*
+  Files: `src/environment.rs` (`EnvironmentMetadata::load_from_spec`), `src/config.rs`
+  (`get_environment_metadata` boot path), plus the 11 test-only callers of `load_from_spec`.
+  Action: `load_from_spec` now returns `Result<EnvironmentMetadata, PneumaticError>` and fails closed
+  on both old failure modes — (1) a missing required `token` or `slush` partition id returns
+  `Err(Encoding("... missing required partition(s): ..."))` (reporting both if both absent), replacing
+  the two `.expect(...)` that aborted the whole process at startup; (2) any unknown `trans_validation`
+  or `block_validation` spec name returns `Err(Encoding("... unknown ... validation spec \"...\""))`
+  instead of the silent `_ => {}` skip, so a typo'd/undeclared spec name no longer leaves the token
+  unvalidated (which, per Phase 3.2, would have `Token::validate_block` fail closed at runtime
+  anyway — but now it fails at boot with a clear message). The boot path in `config.rs` mirrors the
+  adjacent `validate()` handling: on the new `Err` it `eprintln`s and returns `io::Error(InvalidData, ...)`
+  so the node fails to start rather than booting with a silently neutered spec. No wire-shape,
+  serialization, or registry-API change — the only behavioral change is at env-spec load time.
+  Verify: 6 regression tests in `environment::tests`, each a proven discriminator (each fails on a
+  temporary revert of the fix — verified manually — and the positive control passes):
+  `spec_load_rejects_missing_token_partition`, `spec_load_rejects_missing_slush_partition`,
+  `spec_load_reports_missing_partitions_together`, `spec_load_rejects_unknown_trans_validation_spec`,
+  `spec_load_rejects_unknown_block_validation_spec`, and `spec_load_accepts_and_registers_known_specs`
+  (positive control: a valid spec loads `Ok` **and** asserts each trans/block spec registered
+  `Some`, so the registration loops can't regress to silent no-ops). Full workspace green: **595**
+  tests, 0 failures (Phase 6.4 baseline 589 + these 6); `cargo check` clean.
 - [ ] **6.6 Zero-stake stakers excluded from selection** — skip zeros in the stake walk (or
   delete keys that reach 0 in `StakeStore::slash`); filter in `to_stake_set()`
   (`src/epoch.rs:233-246`, `committer/src/epoch_manager.rs:40-45, 65-69`).

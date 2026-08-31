@@ -183,7 +183,20 @@ impl Config {
                     validation_error.to_string(),
                 ));
             }
-            let env_metadata = EnvironmentMetadata::load_from_spec(env_spec);
+            // Phase 6.5: a spec missing a required Token/Slush partition, or
+            // listing an unknown validator spec name, now fails load here
+            // instead of panicking — surfaced as an io error so Config::build()
+            // fails boot cleanly — rather than aborting the process.
+            let env_metadata = match EnvironmentMetadata::load_from_spec(env_spec) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Could not load environment spec as valid: {e}");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ));
+                }
+            };
             environment_metadata.insert(env_metadata.environment_id.clone(), env_metadata);
         }
 
