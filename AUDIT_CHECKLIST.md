@@ -671,13 +671,21 @@ agree on anything.*
 ## Phase 6 — Infrastructure & reliability hardening
 *Closes: remaining Medium/Low items.*
 
-- [ ] **6.1 Timeouts on all blocking I/O** (M from infra audit) — see 4.3 for the data
-  channel; also bound per-send time in `src/node/registry.rs:525-595` (`send_to_all` issues
-  sequential blocking `get_response` calls inside an `async fn`).
+- [x] **6.1 Timeouts on all blocking I/O** (M from infra audit) — see 4.3 for the data
+  channel; also bound per-send time in `src/node/registry.rs:701-787`.
+  Files: `src/node/registry.rs:701-745` (`send_to_all`), `751-787` (`send_to_all_blocking`).
+  Action: every RNS fan-out `get_response` and every data-channel `conn.send` is now bounded by a
+  detached-std-thread `bounded_send` (sync) or a `tokio::spawn_blocking` + `time::timeout`
+  (`bounded_send_async`) wrapper — `SEND_TIMEOUT = 5s`. A hung send degrades to `Err(ConnError::
+  Timeout)` instead of pinning the runtime/caller thread; the sync fan-out no longer assumes an
+  ambient tokio runtime.
+  Verify: `registry::tests::bounded_send_*` discriminators time out (not hang) on a 300 ms closure
+  under a 100 ms bound; full workspace green (579 passing, 0 failures).
 - [ ] **6.2 `send_to_all` observability + concurrency** — log (or count) every failed
   delivery with rhash and type (all sends are `let _ =` today); send concurrently; make
   `send_to_all_blocking` construct its own runtime instead of assuming one
-  (`registry.rs:585-594`).
+  (already done by 6.1: `send_to_all_blocking` is now `bounded_send` over a detached std thread,
+  no ambient runtime — `registry.rs:751-787`).
 - [ ] **6.3 Atomic registration admission** — capacity check + insert under one lock (close the
   check-then-insert TOCTOU with a blocking stake gap in the middle)
   (`src/node/registry.rs:157-161, 318-348`).

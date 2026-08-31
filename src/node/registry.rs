@@ -49,6 +49,57 @@ fn directory_response_signature_payload(
         .map_err(|e| PneumaticError::Encoding(e.to_string()))
 }
 
+/// Per-send bound for `NodeRegistry`'s fan-out (H7). A hung RNS route or
+/// blocked socket must not wedge the caller thread indefinitely: each send is
+/// capped here and degrades to `Err(ConnError::Timeout)` instead of hanging.
+/// Mirrors `CONNECT_TIMEOUT_SECS` in `conns::senders`.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run a blocking closure on a detached std thread and bound how long the
+/// caller waits for it (H7). Returns `Err(ConnError::Timeout)` if the work
+/// doesn't finish within `timeout`, `Err(ConnError::IO)` if the worker exits
+/// before producing a result (panic/detach-drop), or the work's `Ok` result
+/// otherwise. Runtime-independent — no ambient tokio runtime required — so it
+/// can be used from a plain `sync` context (as opposed to `bounded_send_async`).
+fn bounded_send<F, T>(timeout: Duration, work: F) -> Result<T, ConnError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<T>();
+    std::thread::spawn(move || {
+        let result = work();
+        // Best-effort: if the caller already timed out the receiver is gone, so
+        // this send fails and the result is dropped — the worker never blocks
+        // past the caller's bound.
+        let _ = tx.send(result);
+    });
+
+    rx.recv_timeout(timeout).map_err(|e| match e {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            ConnError::Timeout(format!("blocking send exceeded {timeout:?}"))
+        }
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            ConnError::IO("send worker exited before producing a result".into())
+        }
+    })
+}
+
+/// Async variant of `bounded_send`: runs the blocking closure off the runtime
+/// thread via `spawn_blocking` *and* bounds the wait with `time::timeout`
+/// (H7), so a hung send pins neither the tokio worker nor the caller. Works on
+/// both the multi-thread and the sentinel's `new_current_thread` runtimes.
+async fn bounded_send_async<F, T>(timeout: Duration, work: F) -> Result<T, ConnError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(work))
+        .await
+        .map_err(|_| ConnError::Timeout(format!("blocking send exceeded {timeout:?}")))?
+        .map_err(|_| ConnError::IO("send worker panicked before producing a result".into()))
+}
+
 impl NodeRegistry {
     pub fn init(
         config: Arc<Config>,
@@ -645,6 +696,8 @@ impl NodeRegistry {
     }
 
     /// Send data to all registered nodes of a given type (async, concurrent).
+    /// Each send is bounded by `SEND_TIMEOUT` so a hung route or socket can't
+    /// pin a tokio worker thread (H7).
     pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
@@ -659,8 +712,15 @@ impl NodeRegistry {
                 }
             }
             for rhash in rhashes {
-                let rns_sender = RnsSender::new(Arc::clone(network), rhash);
-                let _ = rns_sender.get_response(&data);
+                let network = Arc::clone(network);
+                let send_data = data.clone();
+                // Off the runtime thread (spawn_blocking) and bounded
+                // (time::timeout): a blocked RNS send degrades to Err(Timeout)
+                // instead of hanging the caller.
+                let _ = bounded_send_async(SEND_TIMEOUT, move || {
+                    let _ = RnsSender::new(network, rhash).get_response(&send_data);
+                })
+                .await;
             }
             return;
         }
@@ -675,7 +735,8 @@ impl NodeRegistry {
                 let send_data = data.clone();
                 async move {
                     if let Some(entry) = nodes_clone.get(&key) {
-                        let _ = entry.value().conn.send(&send_data).await;
+                        let send = entry.value().conn.send(&send_data);
+                        let _ = tokio::time::timeout(SEND_TIMEOUT, send).await;
                     }
                 }
             })
@@ -683,7 +744,10 @@ impl NodeRegistry {
         join_all(send_futs).await;
     }
 
-    /// Blocking version for sync contexts (runs async sends sequentially).
+    /// Blocking version for sync contexts (runs sends sequentially). Each send
+    /// is bounded by `SEND_TIMEOUT` and runs on a detached std thread, with no
+    /// ambient runtime assumed (H7): a hung RNS route or socket degrades to
+    /// `Err(ConnError::Timeout)` instead of hanging the caller.
     pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
@@ -698,23 +762,28 @@ impl NodeRegistry {
                 }
             }
             for rhash in rhashes {
-                let rns_sender = RnsSender::new(Arc::clone(network), rhash);
-                let _ = rns_sender.get_response(&data);
+                let network = Arc::clone(network);
+                let send_data = data.clone();
+                let _ = bounded_send(SEND_TIMEOUT, move || {
+                    let _ = RnsSender::new(network, rhash).get_response(&send_data);
+                });
             }
             return;
         }
 
-        let send_data = data.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            futures::executor::block_on(async {
-                let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
-                for key in keys {
-                    if let Some(entry) = nodes.get(&key) {
-                        let _ = entry.value().conn.send(&send_data).await;
-                    }
+        // Bound each blocking send independently on a detached std thread.
+        // (Replaces the previous spawn_blocking + block_on "double-box", which
+        // pinned the ambient runtime and was unbounded.)
+        let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
+        for key in keys {
+            let nodes_clone = Arc::clone(&nodes);
+            let send_data = data.clone();
+            let _ = bounded_send(SEND_TIMEOUT, move || {
+                if let Some(entry) = nodes_clone.get(&key) {
+                    let _ = entry.value().conn.send(&send_data);
                 }
-            })
-        });
+            });
+        }
     }
 }
 
@@ -1284,6 +1353,80 @@ mod tests {
         assert!(
             stored.last_seen < Instant::now() - Duration::from_secs(5),
             "a signature over a different rhash must not refresh last_seen"
+        );
+    }
+
+    // --- Phase 6.1: per-send blocking I/O timeouts (H7) ---
+    //
+    // The RNS fan-out can't be driven through the concrete `RnsNetwork` in a
+    // unit test (tests use `network: None`), so these test the bounding
+    // primitives the two fan-out methods delegate to. On revert (no bound) the
+    // slow-closure discriminators hang the suite instead of timing out.
+
+    /// Positive control: a fast closure returns its result promptly.
+    #[test]
+    fn bounded_send_fast_returns_ok() {
+        let start = Instant::now();
+        let result = bounded_send(Duration::from_secs(10), || vec![1u8, 2u8, 3u8]);
+        assert_eq!(result.unwrap(), vec![1u8, 2u8, 3u8]);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "fast send should return near-instantly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Discriminator (sync): a slow closure times out instead of hanging.
+    #[test]
+    fn bounded_send_slow_times_out() {
+        let start = Instant::now();
+        let result: Result<Vec<u8>, ConnError> = bounded_send(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_millis(300));
+            Vec::<u8>::new()
+        });
+        assert!(
+            matches!(result, Err(ConnError::Timeout(_))),
+            "expected a timeout, got {result:?}"
+        );
+        assert!(
+            start.elapsed() <= Duration::from_millis(100) + Duration::from_millis(100),
+            "timed out too late: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Positive control (async): a fast closure returns promptly.
+    #[tokio::test]
+    async fn bounded_send_async_fast_returns_ok() {
+        let start = Instant::now();
+        let result = bounded_send_async(Duration::from_secs(10), || vec![0u8]).await;
+        assert_eq!(result.unwrap(), vec![0u8]);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "fast async send should return near-instantly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Discriminator (async): a slow closure is cancelled at the bound rather
+    /// than hanging the caller. On revert this hangs.
+    #[tokio::test]
+    async fn bounded_send_async_slow_times_out() {
+        let start = Instant::now();
+        let result: Result<Vec<u8>, ConnError> =
+            bounded_send_async(Duration::from_millis(100), || {
+                std::thread::sleep(Duration::from_millis(300));
+                Vec::<u8>::new()
+            })
+            .await;
+        assert!(
+            matches!(result, Err(ConnError::Timeout(_))),
+            "expected a timeout, got {result:?}"
+        );
+        assert!(
+            start.elapsed() <= Duration::from_millis(100) + Duration::from_millis(100),
+            "timed out too late: took {:?}",
+            start.elapsed()
         );
     }
 }
