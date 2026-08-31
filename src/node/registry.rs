@@ -34,6 +34,14 @@ pub struct NodeRegistry {
     network: Option<Arc<RnsNetwork>>,
     stake_check: StakeCheck,
     evictor: Option<JoinHandle<()>>,
+    /// Per-(rhash, node_type) count of failed fan-out deliveries, so every lost
+    /// `send_to_all` / `send_to_all_blocking` result is observable (Phase 6.2).
+    /// Bounded by the number of registered nodes per type.
+    delivery_failures: Arc<DashMap<([u8; 16], NodeRegistryType), u64>>,
+    /// Per-send bound for the fan-out methods. Production is `SEND_TIMEOUT`;
+    /// `with_send_timeout` overrides it in tests so timeout-elapsed discriminators
+    /// run at ~50 ms instead of the 5 s production bound.
+    send_timeout: Duration,
 }
 
 /// Canonical bytes for a directory response's envelope signature: the full
@@ -54,6 +62,27 @@ fn directory_response_signature_payload(
 /// capped here and degrades to `Err(ConnError::Timeout)` instead of hanging.
 /// Mirrors `CONNECT_TIMEOUT_SECS` in `conns::senders`.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Record a failed fan-out delivery (Phase 6.2): bump the per-(rhash,
+/// node_type) counter and log it so every lost `send_to_all` /
+/// `send_to_all_blocking` result is observable. Takes `err` by value so the
+/// timeout arm can construct `ConnError::Timeout` directly. Mirrors the
+/// directory-response delivery-failure log below (`{:02x?}` rhash + type).
+fn record_delivery_failure(
+    failures: &Arc<DashMap<([u8; 16], NodeRegistryType), u64>>,
+    rhash: [u8; 16],
+    node_type: &NodeRegistryType,
+    err: ConnError,
+) {
+    failures
+        .entry((rhash, node_type.clone()))
+        .and_modify(|c| *c += 1)
+        .or_insert(1u64);
+    eprintln!(
+        "[pneumatic] delivery failed to {:02x?} as {:?}: {}",
+        rhash, node_type, err
+    );
+}
 
 /// Run a blocking closure on a detached std thread and bound how long the
 /// caller waits for it (H7). Returns `Err(ConnError::Timeout)` if the work
@@ -116,6 +145,8 @@ impl NodeRegistry {
             network: network.clone(),
             stake_check,
             evictor: None,
+            delivery_failures: Arc::new(DashMap::new()),
+            send_timeout: SEND_TIMEOUT,
         };
         let mut registry = registry;
         if network.is_some() {
@@ -696,12 +727,16 @@ impl NodeRegistry {
     }
 
     /// Send data to all registered nodes of a given type (async, concurrent).
-    /// Each send is bounded by `SEND_TIMEOUT` so a hung route or socket can't
-    /// pin a tokio worker thread (H7).
+    /// Each send is bounded by `self.send_timeout` so a hung route or socket
+    /// can't pin a tokio worker thread (H7), and every failed delivery is
+    /// recorded + logged via `record_delivery_failure` (Phase 6.2) so a lost
+    /// send is observable. Both the RNS and the direct branches fan out
+    /// concurrently (`join_all`).
     pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
-        // If RNS transport is available, send via RNS
+        // If RNS transport is available, send via RNS. Fan out concurrently —
+        // each peer's send is an independent `join_all` future.
         if let Some(network) = &self.network {
             // Collect rhashes to release DashMap guards
             let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
@@ -711,32 +746,54 @@ impl NodeRegistry {
                     rhashes.push(entry.value().rhash);
                 }
             }
-            for rhash in rhashes {
+            let send_futs: Vec<_> = rhashes.into_iter().map(|rhash| {
+                let node_type = node_type.clone();
+                let failures = Arc::clone(&self.delivery_failures);
                 let network = Arc::clone(network);
                 let send_data = data.clone();
-                // Off the runtime thread (spawn_blocking) and bounded
-                // (time::timeout): a blocked RNS send degrades to Err(Timeout)
-                // instead of hanging the caller.
-                let _ = bounded_send_async(SEND_TIMEOUT, move || {
-                    let _ = RnsSender::new(network, rhash).get_response(&send_data);
-                })
-                .await;
-            }
+                async move {
+                    // Off the runtime thread (spawn_blocking) and bounded
+                    // (time::timeout): a blocked RNS send degrades to
+                    // Err(Timeout) instead of hanging the caller.
+                    match bounded_send_async(self.send_timeout, move || {
+                        let _ = RnsSender::new(network, rhash).get_response(&send_data);
+                    })
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => record_delivery_failure(&failures, rhash, &node_type, e),
+                    }
+                }
+            }).collect();
+            join_all(send_futs).await;
             return;
         }
 
-        // Collect keys to release DashMap guards, then send
+        // Collect keys to release DashMap guards, then send concurrently.
         let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
 
-        // Use get() for each connection individually (simpler, avoids lifetime issues)
+        // Use get() for each connection individually (simpler, avoids lifetime issues).
+        // The `async_trait` `send` future borrows `&entry`, so the DashMap guard
+        // is held across the `.await` (same as before); copy `rhash` out first.
+        // Each future owns fresh clones of the shared state so it can record
+        // its own result without borrowing the enclosing scope.
         let send_futs: Vec<_> = keys.into_iter()
             .map(|key| {
+                let node_type = node_type.clone();
+                let failures = Arc::clone(&self.delivery_failures);
                 let nodes_clone = Arc::clone(&nodes);
                 let send_data = data.clone();
                 async move {
                     if let Some(entry) = nodes_clone.get(&key) {
-                        let send = entry.value().conn.send(&send_data);
-                        let _ = tokio::time::timeout(SEND_TIMEOUT, send).await;
+                        let rhash = entry.value().rhash;
+                        match tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => record_delivery_failure(&failures, rhash, &node_type, e),
+                            Err(_) => record_delivery_failure(
+                                &failures, rhash, &node_type,
+                                ConnError::Timeout(format!("direct send exceeded {:?}", self.send_timeout)),
+                            ),
+                        }
                     }
                 }
             })
@@ -745,9 +802,10 @@ impl NodeRegistry {
     }
 
     /// Blocking version for sync contexts (runs sends sequentially). Each send
-    /// is bounded by `SEND_TIMEOUT` and runs on a detached std thread, with no
+    /// is bounded by `self.send_timeout` and runs on a detached std thread, with no
     /// ambient runtime assumed (H7): a hung RNS route or socket degrades to
-    /// `Err(ConnError::Timeout)` instead of hanging the caller.
+    /// `Err(ConnError::Timeout)` instead of hanging the caller. Every failed
+    /// delivery is recorded + logged (Phase 6.2).
     pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
         let Some(nodes) = self.get_nodes(node_type) else { return };
 
@@ -761,29 +819,94 @@ impl NodeRegistry {
                     rhashes.push(entry.value().rhash);
                 }
             }
+            let failures = Arc::clone(&self.delivery_failures);
             for rhash in rhashes {
                 let network = Arc::clone(network);
                 let send_data = data.clone();
-                let _ = bounded_send(SEND_TIMEOUT, move || {
+                match bounded_send(self.send_timeout, move || {
                     let _ = RnsSender::new(network, rhash).get_response(&send_data);
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(e) => record_delivery_failure(&failures, rhash, node_type, e),
+                }
             }
             return;
         }
 
-        // Bound each blocking send independently on a detached std thread.
-        // (Replaces the previous spawn_blocking + block_on "double-box", which
-        // pinned the ambient runtime and was unbounded.)
+        // Direct-connection branch. This path must *actually* send, not drop a
+        // detached future: the `async_trait` `send` future needs a runtime to
+        // drive, and a detached std thread has none. Build a self-contained
+        // `current_thread` runtime here (no ambient runtime assumed — consistent
+        // with 6.1) and `block_on` each send. A failed send or elapsed bound is
+        // recorded + logged (Phase 6.2).
+        // Direct-connection branch. This path must *actually* send, not drop a
+        // detached future: the `async_trait` `send` future needs a runtime to
+        // drive, and a detached std thread has none. Build a self-contained
+        // `current_thread` runtime here (no ambient runtime assumed — consistent
+        // with 6.1) and `block_on` each send. A failed send or elapsed bound is
+        // recorded + logged (Phase 6.2).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build local runtime for blocking direct send");
+
+        // Collect (key, rhash) pairs up front to release DashMap guards before
+        // driving each send on the local runtime.
         let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
-        for key in keys {
-            let nodes_clone = Arc::clone(&nodes);
+        let peers: Vec<(Vec<u8>, [u8; 16])> = {
+            let mut v = Vec::new();
+            for key in keys {
+                if let Some(entry) = nodes.get(&key) {
+                    v.push((key, entry.value().rhash));
+                }
+            }
+            v
+        };
+
+        let failures = Arc::clone(&self.delivery_failures);
+        for (key, rhash) in peers {
+            let nodes_for_send = Arc::clone(&nodes);
             let send_data = data.clone();
-            let _ = bounded_send(SEND_TIMEOUT, move || {
-                if let Some(entry) = nodes_clone.get(&key) {
-                    let _ = entry.value().conn.send(&send_data);
+            let result = runtime.block_on(async move {
+                if let Some(entry) = nodes_for_send.get(&key) {
+                    tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
+                } else {
+                    Ok(Ok(()))
                 }
             });
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => record_delivery_failure(&failures, rhash, node_type, e),
+                Err(_) => record_delivery_failure(
+                    &failures, rhash, node_type,
+                    ConnError::Timeout(format!("direct send exceeded {:?}", self.send_timeout)),
+                ),
+            }
         }
+    }
+
+    /// Count of failed fan-out deliveries for a specific (rhash, node_type).
+    /// Test accessor for Phase 6.2 observability.
+    pub fn failure_count(&self, rhash: [u8; 16], node_type: &NodeRegistryType) -> u64 {
+        self.delivery_failures
+            .get(&(rhash, node_type.clone()))
+            .map(|c| *c.value())
+            .unwrap_or(0)
+    }
+
+    /// Total failed fan-out deliveries across every (rhash, node_type) key.
+    /// Test accessor for Phase 6.2 observability.
+    pub fn total_delivery_failures(&self) -> u64 {
+        self.delivery_failures.iter().map(|e| *e.value()).sum()
+    }
+}
+
+#[cfg(test)]
+impl NodeRegistry {
+    /// Override the per-send timeout so timeout-elapsed discriminators run at a
+    /// small bound instead of the 5 s production `SEND_TIMEOUT`.
+    pub fn with_send_timeout(&mut self, timeout: Duration) {
+        self.send_timeout = timeout;
     }
 }
 
@@ -1427,6 +1550,213 @@ mod tests {
             start.elapsed() <= Duration::from_millis(100) + Duration::from_millis(100),
             "timed out too late: took {:?}",
             start.elapsed()
+        );
+    }
+
+    // --- Phase 6.2: send_to_all observability + concurrency ---
+    use tokio::sync::mpsc;
+
+    /// A `Connection` whose `send` always fails, to exercise the failure-
+    /// recording arms of both fan-out methods.
+    struct FailingConnection;
+
+    #[async_trait::async_trait]
+    impl Connection for FailingConnection {
+        async fn send(&self, _data: &Vec<u8>) -> Result<(), ConnError> {
+            Err(ConnError::IO("FailingConnection.send".into()))
+        }
+    }
+
+    /// A `Connection` whose `send` sleeps `dur` before returning `Ok`, so a
+    /// bounded runtime lets `send_to_all`'s elapsed-timeout arm fire on a
+    /// current-thread runtime.
+    struct HangingConnection {
+        dur: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for HangingConnection {
+        async fn send(&self, _data: &Vec<u8>) -> Result<(), ConnError> {
+            tokio::time::sleep(self.dur).await;
+            Ok(())
+        }
+    }
+
+    /// A `Connection` whose `send` records the payload on an `mpsc` channel,
+    /// letting a test assert that the blocking branch *actually* delivered
+    /// rather than dropped the future.
+    struct RecordingConnection {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for RecordingConnection {
+        async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
+            self.tx
+                .try_send(data.clone())
+                .map_err(|_| ConnError::IO("RecordingConnection channel full".into()))
+        }
+    }
+
+    /// Discriminator (async direct, `Ok(Err)` arm): three failing peers each
+    /// record exactly one failure, keyed by (rhash, type). On revert (`let _ =`)
+    /// nothing is recorded and the counters stay 0.
+    #[tokio::test]
+    async fn direct_delivery_failure_is_recorded() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        for (i, rhash) in [(1u8, [1u8; 16]), (2, [2u8; 16]), (3, [3u8; 16])] {
+            reg.register_peer(
+                vec![i],
+                rhash,
+                &NodeRegistryType::Finalizer,
+                Box::new(FailingConnection),
+            );
+        }
+        reg.send_to_all(vec![9u8], &NodeRegistryType::Finalizer).await;
+        assert_eq!(reg.total_delivery_failures(), 3);
+        for rhash in [[1u8; 16], [2u8; 16], [3u8; 16]] {
+            assert_eq!(
+                reg.failure_count(rhash, &NodeRegistryType::Finalizer),
+                1,
+                "each peer must record exactly one failure"
+            );
+        }
+    }
+
+    /// Discriminator (blocking direct): the rewritten branch drives the async
+    /// `send` on a local runtime instead of dropping the future, so the peer
+    /// actually receives the payload. On revert (future dropped un-awaited)
+    /// nothing arrives on the channel and this panics.
+    #[test]
+    fn blocking_direct_actually_sends_data() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let payload = vec![42u8, 43, 44];
+        reg.register_peer(
+            vec![1],
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConnection { tx }),
+        );
+        reg.send_to_all_blocking(payload.clone(), &NodeRegistryType::Finalizer);
+        assert_eq!(
+            rx.try_recv().expect("peer should have received the payload"),
+            payload,
+            "blocking direct branch must actually send"
+        );
+    }
+
+    /// Discriminator (blocking direct, `Ok(Err)` arm): a failing peer's failure
+    /// is recorded. On revert the `let _ =` swallows it and the counter stays 0.
+    #[test]
+    fn blocking_direct_delivery_failure_is_recorded() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        reg.register_peer(
+            vec![1],
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(FailingConnection),
+        );
+        reg.send_to_all_blocking(vec![9u8], &NodeRegistryType::Finalizer);
+        assert_eq!(
+            reg.failure_count([1u8; 16], &NodeRegistryType::Finalizer),
+            1,
+            "blocking direct branch must record the failure"
+        );
+    }
+
+    /// Discriminator (async direct: both `Ok(Err)` and `Err(Elapsed)` arms): a
+    /// failing peer records on the `Ok(Err)` arm, a hanging peer records on the
+    /// elapsed-timeout arm. On revert the elapsed peer is never recorded.
+    #[tokio::test]
+    async fn direct_send_timeout_is_recorded_as_failure() {
+        let mut reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        reg.with_send_timeout(Duration::from_millis(50));
+        reg.register_peer(
+            vec![1],
+            [1u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(FailingConnection),
+        );
+        reg.register_peer(
+            vec![2],
+            [2u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(HangingConnection {
+                dur: Duration::from_secs(5),
+            }),
+        );
+        reg.send_to_all(vec![9u8], &NodeRegistryType::Finalizer).await;
+        assert_eq!(
+            reg.failure_count([1u8; 16], &NodeRegistryType::Finalizer),
+            1,
+            "immediate send error (Ok(Err)) must be recorded"
+        );
+        assert_eq!(
+            reg.failure_count([2u8; 16], &NodeRegistryType::Finalizer),
+            1,
+            "elapsed timeout (Err(Elapsed)) must be recorded"
+        );
+    }
+
+    /// Positive control: a successful fan-out records no failures, so the
+    /// counter cannot grow merely by sending.
+    #[tokio::test]
+    async fn successful_delivery_records_no_failure() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+        for (i, rhash) in [(1u8, [1u8; 16]), (2, [2u8; 16])] {
+            reg.register_peer(
+                vec![i],
+                rhash,
+                &NodeRegistryType::Finalizer,
+                Box::new(NullConnection),
+            );
+        }
+        reg.send_to_all(vec![9u8], &NodeRegistryType::Finalizer).await;
+        assert_eq!(
+            reg.total_delivery_failures(),
+            0,
+            "successful deliveries must not record failures"
+        );
+    }
+
+    /// Discriminator of the helper itself: failures accumulate per (rhash,
+    /// type). A no-op helper reverts to all-zero.
+    #[test]
+    fn record_delivery_failure_counts_by_rhash_and_type() {
+        let failures = Arc::new(DashMap::new());
+        let ft = NodeRegistryType::Finalizer;
+        record_delivery_failure(&failures, [1u8; 16], &ft, ConnError::IO("a".into()));
+        record_delivery_failure(
+            &failures,
+            [1u8; 16],
+            &ft,
+            ConnError::WriteError(Some("b".into())),
+        );
+        record_delivery_failure(
+            &failures,
+            [2u8; 16],
+            &ft,
+            ConnError::Timeout("c".into()),
+        );
+        assert_eq!(
+            failures
+                .get(&([1u8; 16], ft.clone()))
+                .map(|c| *c.value())
+                .unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            failures
+                .get(&([2u8; 16], ft.clone()))
+                .map(|c| *c.value())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            failures.iter().map(|e| *e.value()).sum::<u64>(),
+            3,
+            "total must be the sum across keys"
         );
     }
 }

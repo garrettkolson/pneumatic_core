@@ -681,11 +681,20 @@ agree on anything.*
   ambient tokio runtime.
   Verify: `registry::tests::bounded_send_*` discriminators time out (not hang) on a 300 ms closure
   under a 100 ms bound; full workspace green (579 passing, 0 failures).
-- [ ] **6.2 `send_to_all` observability + concurrency** — log (or count) every failed
-  delivery with rhash and type (all sends are `let _ =` today); send concurrently; make
-  `send_to_all_blocking` construct its own runtime instead of assuming one
-  (already done by 6.1: `send_to_all_blocking` is now `bounded_send` over a detached std thread,
-  no ambient runtime — `registry.rs:751-787`).
+- [x] **6.2 `send_to_all` observability + concurrency** — every failed `send_to_all` /
+  `send_to_all_blocking` delivery now recorded in a new `Arc<DashMap<([u8;16], NodeRegistryType),
+  u64>>` `delivery_failures` (keyed by rhash + node type) and logged via
+  `record_delivery_failure(...)` at `node/registry.rs:~130-140`. Async `send_to_all`'s RNS branch
+  converted from a sequential `for` loop to a concurrent `join_all` (parity with the direct path);
+  the direct path of both `send_to_all` and `send_to_all_blocking` now captures `Ok(Err(e))` and
+  timeout-`Elapsed` arms instead of swallowing them; the blocking direct-connection branch — which
+  previously dropped its un-awaited `conn.send()` future as a latent no-op — now drives each send
+  with a self-contained `current_thread` runtime + `block_on` (no ambient runtime, consistent with
+  6.1). Both methods still return `()` — no call-site or wire change. Test accessors `failure_count`
+  / `total_delivery_failures` + `with_send_timeout` builder. Verify: `registry::tests` discriminated
+  by 6 new tests (direct/blocking-failure recorded, blocking direct actually sends, timeout recorded
+  on both async+blocking paths, positive control, helper keyed by rhash+type) — each proven to fail
+  on temporary revert; full workspace green (585 passing, 0 failures).
 - [ ] **6.3 Atomic registration admission** — capacity check + insert under one lock (close the
   check-then-insert TOCTOU with a blocking stake gap in the middle)
   (`src/node/registry.rs:157-161, 318-348`).
