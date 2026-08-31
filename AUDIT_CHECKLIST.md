@@ -646,14 +646,27 @@ agree on anything.*
   bound it); implement or delete `TieFlagBoth`.
   Verify: a forged `proposer_key` on an incoming block cannot steer the resolution branch.
 
-- [ ] **5.9 Fix the self-signed token path or delete it** (audit: validation+tokens / sentinel)
-  Files: `sentinel/src/sentinel.rs:207-208` (`let _ = tx;` — path swallows the transaction),
-  `src/validation.rs:161-171` (owner rule inverted: owner is *banned*; String-vs-bytes encoding
-  mismatch), `TokenFactory` (never sets the `"owner"` metadata the check reads).
-  Action: either make owner operations actually work (owner set at mint, bytes-consistent
-  check, tx delivered) or remove the path and its specs.
-  Verify: an owner can execute a self-signed operation end-to-end (or the path no longer
-  exists).
+- [x] **5.9 Fix the self-signed token path — owner-operated tokens made real** (audit:
+  validation+tokens / sentinel)
+  Files: `src/tokens.rs:426-442` (`mint_user_token` now writes `owner` as `hex::encode(&owner)` —
+  a real 32-byte Ed25519 key isn't valid UTF-8, so it lives in the String `metadata` slot as hex);
+  `src/validation.rs:72-84` (owner-check now hex-decodes the stored owner and compares bytes;
+  missing **or** unparseable owner fails closed as `NotTokenOwner`, no `from_utf8`/`unwrap`);
+  `src/validation.rs:166-170` (removed the Executed spec's owner-ban — the contradiction; Executed
+  is now owner-agnostic, the owner gate lives only on the SelfSigned path); `sentinel/src/
+  transaction_validator.rs:46-78` (selects the spec from `token.is_self_verified`, not `tx.action`);
+  `sentinel/src/sentinel.rs:202-211` (routing is token-driven: `is_self_verified` routes to
+  `handle_self_signed`, which releases the pre-lock and enqueues to the committer's shared pool;
+  the `let _ = tx;` swallow and the obsolete `get_validation_spec_name` helper/tests removed).
+  Discriminator: `token.is_self_verified` (contract tokens default `block_validation_spec_name`
+  to "SelfSigned" but keep the flag `false`, so they stay on the standard pipeline — no misroute).
+  Verify: an owner can execute a self-signed operation end-to-end —
+  `sentinel::tests::handle_process_request_routes_self_verified_token_owner_operation`
+  (owner == sender → accepted, no executor/finalizer, lands in the pool) and
+  `handle_process_request_rejects_self_verified_tx_from_non_owner` (off-owner → `NotTokenOwner`,
+  not admitted). Both proven to fail on a temporary revert: removing the mint-time owner write
+  rejects the owner tx; removing the owner-check admits the off-owner tx. Full workspace **575
+  tests, 0 failures**; `cargo check --workspace` clean.
 
 ## Phase 6 — Infrastructure & reliability hardening
 *Closes: remaining Medium/Low items.*

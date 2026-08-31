@@ -191,13 +191,22 @@ impl Sentinel {
             return Err(SentinelError::TransactionInTerminalState(tx_id));
         }
 
-        // Step 4: Determine validation spec for this transaction.
-        // In production, load the token from DataProvider using tx.token_id
-        // and read its block_validation_spec_name.
-        let spec_name = self.get_validation_spec_name(&tx);
+        // Step 4: Route on the token's self-validation flag (AUDIT 5.9). Load the
+        // token by tx.token_id and read its `is_self_verified` flag — the genuine
+        // discriminator for a self-validated (owner-operated) token. Such a token is
+        // governed by the `SelfSigned` spec (its only gate is `sender == owner`) and
+        // skips Executor + Finalizer. Contract and other tokens default
+        // `block_validation_spec_name` to "SelfSigned" but keep
+        // `is_self_verified = false`, so routing on the flag keeps them on the
+        // standard pipeline.
+        let token = self
+            .data_provider
+            .get_token(&tx.token_id, &self.env_data.token_partition_id)
+            .map_err(SentinelError::from)?;
 
-        // Step 5: Self-signed check — if spec is SelfSigned, skip Executor/Finalizer
-        if spec_name == "SelfSigned" {
+        if token.is_self_verified {
+            // Step 5: Self-validated token — skip Executor/Finalizer, route toward
+            // commitment directly.
             return self.handle_self_signed(tx, gas_used);
         }
 
@@ -243,10 +252,10 @@ impl Sentinel {
         // Record gas used for this self-signed transaction
         self.registry.record_gas_used(&tx_id, gas_used);
 
-        // For self-signed tokens, the sentinel notifies Committers directly.
-        let _ = tx;
-
-        // Release lock — transaction can be cleaned up after commit
+        // Release the pre-lock so the committer's leader batch-proposal loop can
+        // pick the tx up from the ordered pool. Self-signed tokens have no
+        // Executor/Finalizer and no dedicated committer notifier — delivery is the
+        // shared pool, drained by the committer, exactly like the standard path.
         let _ = self.registry.release_transaction(&tx_id);
 
         Ok(())
@@ -552,14 +561,6 @@ impl Sentinel {
         Ok(())
     }
 
-    /// Determine which validation spec applies to this transaction.
-    fn get_validation_spec_name(&self, tx: &Transaction) -> String {
-        if tx.action.is_empty() {
-            return String::from("Executed");
-        }
-        tx.action.clone()
-    }
-
     /// Deterministically assign a finalizer for a transaction using the current
     /// stake snapshot. Returns the assigned finalizer's public key.
     ///
@@ -718,7 +719,7 @@ mod tests {
     use pneumatic_core::gossiper::Gossiper;
     use pneumatic_core::messages::Message;
     use pneumatic_core::registry::PendingTransactionRegistry;
-    use pneumatic_core::tokens::Token;
+    use pneumatic_core::tokens::{Token, TokenFactory};
     use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult};
     use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
@@ -908,46 +909,6 @@ mod tests {
         let (sentinel, _registry) = make_sentinel_fixture();
         // Just verify it was constructed without panic
         let _ = sentinel;
-    }
-
-    #[test]
-    fn get_validation_spec_name_empty_defaults_to_executed() {
-        let (sentinel, _registry) = make_sentinel_fixture();
-        let tx = Transaction {
-            id: "test".into(),
-            action: "".into(),
-            token_id: vec![],
-            bid: None,
-            sequence_number: 1,
-            sender: vec![1],
-            receiver: vec![],
-            amount: Some(100),
-            timestamp: 0,
-            result_hash: vec![],
-            sender_signature: vec![],
-        };
-        let name = sentinel.get_validation_spec_name(&tx);
-        assert_eq!(name, "Executed");
-    }
-
-    #[test]
-    fn get_validation_spec_name_nonempty_returns_action() {
-        let (sentinel, _registry) = make_sentinel_fixture();
-        let tx = Transaction {
-            id: "test".into(),
-            action: "Transfer".into(),
-            token_id: vec![],
-            bid: None,
-            sequence_number: 1,
-            sender: vec![1],
-            receiver: vec![],
-            amount: Some(100),
-            timestamp: 0,
-            result_hash: vec![],
-            sender_signature: vec![],
-        };
-        let name = sentinel.get_validation_spec_name(&tx);
-        assert_eq!(name, "Transfer");
     }
 
     // --- on_data_received routing ---
@@ -1184,14 +1145,11 @@ mod tests {
     #[test]
     fn sentinel_self_signed_token_flow_end_to_end() {
         let (_sentinel, registry) = make_sentinel_fixture();
-        let (token, _node_registry) = (
-            {
-                let mut token = Token::new();
-                token.set_metadata("owner".to_string(), "alice".to_string());
-                token
-            },
-            make_test_node_registry(),
-        );
+        // Mint an owner-operated token through the real path (AUDIT 5.9): the owner
+        // is recorded as a hex string in metadata, so the transaction-level
+        // `SelfSigned` spec can hex-decode it and check `sender == owner`.
+        let token = TokenFactory::mint_user_token(b"alice".to_vec(), vec![1], "test".into())
+            .expect("token mints");
 
         // Create a self-signed transaction (sender == owner)
         let tx = Transaction {
@@ -1786,6 +1744,110 @@ mod tests {
         let pool_txs = registry.get_ordered_transactions(&[1], 10).unwrap();
         assert!(!pool_txs.is_empty());
         assert_eq!(pool_txs[0].id, tx.id);
+    }
+
+    // --- AUDIT 5.9: token.is_self_verified drives routing through the pipeline ---
+
+    #[test]
+    fn handle_process_request_routes_self_verified_token_owner_operation() {
+        // An owner-operated (self-verified) token whose `owner` == the tx sender,
+        // with a *normal* action ("Transfer" — deliberately NOT "SelfSigned"),
+        // routes to `handle_self_signed`: no Executor/Finalizer, no Preload, and
+        // it lands in the committer's ordered pool. Routing is driven by
+        // `token.is_self_verified`, not by `tx.action`.
+        let sender_identity = NodeIdentity::generate_in_memory();
+        let sender_pk = sender_identity.ed25519.public_key().expect("sender pubkey");
+
+        // Build the token via the real mint path (AUDIT 5.9): owner is recorded as
+        // a hex string, is_self_verified = true.
+        let token =
+            TokenFactory::mint_user_token(sender_pk.clone(), vec![1], "test".into()).expect("token mints");
+
+        let dp = StubDataProvider::new().with_token(vec![1], "token".into(), token);
+        let (sentinel, registry) = make_sentinel_fixture_with_data_provider(dp);
+
+        // The owner signs a Process message (sender == owner, envelope sender == sender).
+        let mut tx = Transaction {
+            id: "tx_self_signed_owner".into(),
+            action: "Transfer".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: sender_pk.clone(),
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        c3_sign(&mut tx, &sender_identity);
+        let msg = c3_process_message(sender_pk.clone(), tx);
+
+        let result = sentinel.handle_process_request(msg);
+        assert!(result.is_ok(), "owner self-signed tx must be accepted, got {result:?}");
+
+        // Accepted, still registered, and admitted to the ordered pool (the
+        // self-signed path enqueues it for the committer; the executor-preload
+        // step is skipped).
+        assert!(
+            registry.contains("tx_self_signed_owner"),
+            "owner self-signed tx must remain in the registry"
+        );
+        let pool_txs = registry.get_ordered_transactions(&[1], 10).unwrap();
+        assert!(
+            pool_txs.iter().any(|t| t.id == "tx_self_signed_owner"),
+            "owner self-signed tx must land in the committer's ordered pool"
+        );
+    }
+
+    #[test]
+    fn handle_process_request_rejects_self_verified_tx_from_non_owner() {
+        // AUDIT 5.9: a self-verified token requires `sender == owner`. A tx whose
+        // sender is NOT the token owner is rejected by the SelfSigned spec's
+        // owner-gate (NotTokenOwner) and never admitted to the ordered pool — even
+        // though `tx.action` is a standard action and the envelope is correctly
+        // signed by the (non-owner) submitter. This is the discriminator: an
+        // action-based (or owner-agnostic) route would admit the tx.
+        let owner_identity = NodeIdentity::generate_in_memory();
+        let owner_pk = owner_identity.ed25519.public_key().expect("owner pubkey");
+
+        let token = TokenFactory::mint_user_token(owner_pk.clone(), vec![1], "test".into())
+            .expect("token mints");
+        let dp = StubDataProvider::new().with_token(vec![1], "token".into(), token);
+        let (sentinel, registry) = make_sentinel_fixture_with_data_provider(dp);
+
+        // A DIFFERENT identity submits the tx (sender != owner).
+        let attacker_identity = NodeIdentity::generate_in_memory();
+        let attacker_pk = attacker_identity.ed25519.public_key().expect("attacker pubkey");
+
+        let mut tx = Transaction {
+            id: "tx_self_signed_non_owner".into(),
+            action: "Transfer".into(),
+            token_id: vec![1],
+            bid: None,
+            sequence_number: 1,
+            sender: attacker_pk.clone(), // not the token owner
+            receiver: vec![],
+            amount: Some(100),
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
+        };
+        c3_sign(&mut tx, &attacker_identity);
+        let msg = c3_process_message(attacker_pk.clone(), tx);
+
+        // The check fails closed in-pipeline (transition_to_failed → Ok), but the
+        // tx must NOT be admitted to the pool.
+        let result = sentinel.handle_process_request(msg);
+        assert!(result.is_ok(), "rejection is handled in-pipeline, got {result:?}");
+        assert!(
+            !registry
+                .get_ordered_transactions(&[1], 10)
+                .unwrap()
+                .iter()
+                .any(|t| t.id == "tx_self_signed_non_owner"),
+            "non-owner tx must NOT be admitted to the ordered pool"
+        );
     }
 
     #[test]

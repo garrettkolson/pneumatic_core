@@ -63,9 +63,15 @@ impl TransactionValidationSpec for SelfSignedBlockValidatorSpec {
         token: &Token,
         _env_data: &EnvironmentMetadata,
     ) -> Result<TransactionValidationResult, PneumaticError> {
-        // Check that the transaction sender is the token owner
-        let token_owner = match token.metadata.get("owner") {
-            Some(owner) => owner.as_bytes().to_vec(),
+        // Check that the transaction sender is the token owner. The owner is
+        // stored as a hex string in metadata (AUDIT 5.9), so decode it to the
+        // real key bytes and compare against `tx.sender`. A missing owner fails
+        // closed; an unparseable owner also fails closed as NotTokenOwner — never
+        // `unwrap`/`from_utf8` on the decode path, since a real 32-byte Ed25519
+        // key is not valid UTF-8.
+        let token_owner = match token.metadata.get("owner").map(|o| o.as_str()) {
+            Some(hex_owner) => hex::decode(hex_owner)
+                .map_err(|_| PneumaticError::Validation(vec![ValidationFailureReason::NotTokenOwner]))?,
             None => return Err(PneumaticError::Validation(vec![
                 ValidationFailureReason::NotTokenOwner
             ])),
@@ -158,17 +164,10 @@ impl TransactionValidationSpec for ExecutedBlockValidatorSpec {
         token: &Token,
         env_data: &EnvironmentMetadata,
     ) -> Result<TransactionValidationResult, PneumaticError> {
-        // Check sender is not token owner (self-signed tokens use different spec)
-        let token_owner = token.metadata.get("owner")
-            .map(|o| o.as_bytes().to_vec());
-
-        if let Some(owner) = token_owner {
-            if tx.sender == owner {
-                return Err(PneumaticError::Validation(vec![
-                    ValidationFailureReason::NotTokenOwner
-                ]));
-            }
-        }
+        // The owner gate now lives only on the SelfSigned path (AUDIT 5.9); the
+        // Executed spec is owner-agnostic. `token` is retained for the trait
+        // signature but not consulted here.
+        let _ = token;
 
         // Validate basic transaction fields
         let mut failures = Vec::new();
@@ -396,12 +395,17 @@ mod tests {
     use crate::environment::EnvironmentMetadataSpec;
     use crate::transactions::{PendingTransaction, TransactionState};
     use crate::registry::PendingTransactionRegistry;
+    use crate::rns::identity::NodeIdentity;
+    use crate::crypto::AsymCryptoProvider;
 
     // --- helpers ---
 
     fn make_token_with_owner(owner: &[u8]) -> Token {
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(owner.to_vec()).unwrap());
+        // Owner is stored as hex (AUDIT 5.9): the tx-level SelfSigned spec decodes
+        // it with hex::decode. Using String::from_utf8 here would break the round
+        // trip for any non-UTF-8 key.
+        token.set_metadata("owner".to_string(), hex::encode(owner));
         token
     }
 
@@ -474,6 +478,72 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // --- AUDIT 5.9 discriminators: the owner is a hex-encoded key ---
+
+    #[test]
+    fn self_signed_accepts_real_ed25519_key_owner() {
+        // Audit acceptance: an owner can execute a self-signed operation. A real
+        // Ed25519 pubkey (32 bytes) is the owner, hex-encoded in metadata; the
+        // signer is that same key. This only works once the owner is a hex string
+        // rather than a raw-key String, since a 32-byte key is not valid UTF-8.
+        let identity = NodeIdentity::generate_in_memory();
+        let owner_pk = identity.ed25519.public_key().expect("owner public key");
+
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), hex::encode(&owner_pk));
+        let tx = make_tx(&owner_pk, &[], Some(100), 1);
+        let env = make_env_with_defaults();
+        let result =
+            TransactionValidationSpec::validate(&SelfSignedBlockValidatorSpec::new(), &tx, &token, &env);
+        assert!(result.is_ok(), "owner-key owner must be accepted, got {result:?}");
+    }
+
+    #[test]
+    fn self_signed_accepts_non_utf8_key_bytes() {
+        // Discriminator for the String-vs-bytes bug: a non-UTF-8 byte payload
+        // (0x80 has no valid UTF-8 meaning) can be stored only as hex. The old
+        // String::from_utf8(owner) round-trip would panic on it; hex::decode does
+        // not, so the owner (these exact bytes) validates as sender.
+        let owner: Vec<u8> = vec![0x80u8; 32];
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), hex::encode(&owner));
+        let tx = make_tx(&owner, &[], Some(100), 1);
+        let env = make_env_with_defaults();
+        let result =
+            TransactionValidationSpec::validate(&SelfSignedBlockValidatorSpec::new(), &tx, &token, &env);
+        assert!(result.is_ok(), "non-UTF-8 key owner must validate, got {result:?}");
+    }
+
+    #[test]
+    fn self_signed_rejects_unparseable_owner() {
+        // Fail closed: an owner that is not valid hex (e.g. a stray non-hex byte
+        // from a corrupt write) yields NotTokenOwner, never a panic or accept.
+        let mut token = Token::new();
+        token.set_metadata("owner".to_string(), "not-hex-value!".to_string());
+        let tx = make_tx(&[1, 2, 3], &[], Some(100), 1);
+        let env = make_env_with_defaults();
+        let result =
+            TransactionValidationSpec::validate(&SelfSignedBlockValidatorSpec::new(), &tx, &token, &env);
+        assert!(matches!(
+            result,
+            Err(PneumaticError::Validation(ref reasons))
+                if reasons.iter().any(|r| matches!(r, ValidationFailureReason::NotTokenOwner))
+        ), "unparseable owner must fail closed as NotTokenOwner, got {result:?}");
+    }
+
+    #[test]
+    fn executed_is_owner_agnostic_now() {
+        // The Executed spec no longer bans `sender == owner` (AUDIT 5.9). A token
+        // whose owner equals the sender now validates on the Executed spec like
+        // any other token — the owner gate now lives only on the SelfSigned path.
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let token = make_token_with_owner(&[1, 2, 3]);
+        let tx = make_tx(&[1, 2, 3], &[9], Some(100), 1);
+        let env = make_env_with_defaults();
+        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
+        assert!(result.is_ok(), "Executed spec must be owner-agnostic, got {result:?}");
+    }
+
     #[test]
     fn self_signed_risk_with_receiver_counts_two_parties() {
         let spec = SelfSignedBlockValidatorSpec::new();
@@ -491,16 +561,6 @@ mod tests {
     }
 
     // --- ExecutedBlockValidatorSpec ---
-
-    #[test]
-    fn executed_rejects_self_signed_sender() {
-        let spec = ExecutedBlockValidatorSpec::new(0);
-        let token = make_token_with_owner(&[1, 2, 3]);
-        let tx = make_tx(&[1, 2, 3], &[], Some(100), 1);
-        let env = make_env_with_defaults();
-        let result = TransactionValidationSpec::validate(&spec, &tx, &token, &env);
-        assert!(result.is_err());
-    }
 
     #[test]
     fn executed_rejects_empty_sender() {
@@ -598,9 +658,10 @@ mod tests {
 
     #[test]
     fn self_signed_token_flow_end_to_end() {
-        // Create token with owner metadata
+        // Create token with owner metadata. Owner is stored as hex (AUDIT 5.9)
+        // so hex::decode(b"alice") round-trips to the sender's real key bytes.
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), "alice".to_string());
+        token.set_metadata("owner".to_string(), hex::encode(b"alice"));
 
         // Create transaction with matching sender
         let tx = Transaction {
@@ -777,7 +838,7 @@ mod tests {
 
     fn make_self_signed_token(owner: &[u8]) -> Token {
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(owner.to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(owner));
         token.is_self_verified = true;
         token.block_validation_spec_name = String::from("SelfSigned");
         token
@@ -807,7 +868,7 @@ mod tests {
     fn self_signed_block_rejects_non_self_verified_token() {
         let spec = SelfSignedBlockValidatorSpec::new();
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(vec![1, 2, 3]));
         token.is_self_verified = false;
         token.block_validation_spec_name = String::from("SelfSigned");
         let signed_tx = make_signed_tx_with_fields(vec![], HashMap::new(), TransactionSignature {
@@ -836,7 +897,7 @@ mod tests {
     fn executed_block_validates_all_requirements() {
         let spec = ExecutedBlockValidatorSpec::new(0);
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(vec![1, 2, 3]));
         token.is_self_verified = false;
         token.block_validation_spec_name = String::from("Executed");
 
@@ -871,7 +932,7 @@ mod tests {
     fn executed_block_rejects_missing_result_hash() {
         let spec = ExecutedBlockValidatorSpec::new(0);
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(vec![1, 2, 3]));
         token.block_validation_spec_name = String::from("Executed");
 
         let signed_tx = make_signed_tx_with_fields(
@@ -902,7 +963,7 @@ mod tests {
     fn executed_block_rejects_missing_executor_sigs() {
         let spec = ExecutedBlockValidatorSpec::new(0);
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(vec![1, 2, 3]));
         token.block_validation_spec_name = String::from("Executed");
 
         let signed_tx = make_signed_tx_with_fields(
@@ -933,7 +994,7 @@ mod tests {
     fn executed_block_rejects_missing_finalizer_signature() {
         let spec = ExecutedBlockValidatorSpec::new(0);
         let mut token = Token::new();
-        token.set_metadata("owner".to_string(), String::from_utf8(vec![1, 2, 3].to_vec()).unwrap());
+        token.set_metadata("owner".to_string(), hex::encode(vec![1, 2, 3]));
         token.block_validation_spec_name = String::from("Executed");
 
         let mut executor_sigs = HashMap::new();

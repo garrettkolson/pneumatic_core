@@ -30,9 +30,12 @@ impl TransactionValidator {
         self
     }
 
-    /// Validate a transaction against its action's spec.
-    /// Looks up the spec by action name from the environment's registry.
-    /// Returns `Ok(())` if valid, `Err` with specific failure reasons otherwise.
+    /// Validate a transaction against its spec.
+    ///
+    /// The discriminating signal is the token's `is_self_verified` flag (AUDIT
+    /// 5.9): a self-validated (owner-operated) token is governed by the
+    /// `SelfSigned` spec, whose only gate is `sender == owner`. Every other token
+    /// uses its action's spec (falling back to `Executed`), exactly as before.
     pub fn validate_transaction(
         &self,
         tx: &Transaction,
@@ -40,25 +43,8 @@ impl TransactionValidator {
     ) -> Result<(), PneumaticError> {
         let specs = &self.env_data.transaction_validation_specs;
 
-        let spec_name = if !tx.action.is_empty() {
-            tx.action.clone()
-        } else {
-            return Err(PneumaticError::Validation(vec![
-                ValidationFailureReason::UnsupportedAction
-            ]));
-        };
-
-        let spec = match specs.get(&spec_name) {
-            Some(s) => s,
-            None => match specs.get("Executed") {
-                Some(s) => s,
-                None => return Err(PneumaticError::Validation(vec![
-                    ValidationFailureReason::UnsupportedAction
-                ])),
-            },
-        };
-
-        // Load the token from the data store to run full spec validation.
+        // Load the token first — its `is_self_verified` flag is the genuine
+        // discriminator for a self-validated (owner-operated) token.
         let token = match self.data_provider.get_token(&tx.token_id, &self.env_data.token_partition_id) {
             Ok(t) => t,
             Err(_) => return Err(PneumaticError::Validation(vec![
@@ -66,7 +52,32 @@ impl TransactionValidator {
             ])),
         };
 
-        // Delegate to the action's validation spec.
+        let spec = if token.is_self_verified {
+            // Self-validated token: the owner-check is the only gate.
+            match specs.get("SelfSigned") {
+                Some(s) => s,
+                None => return Err(PneumaticError::Validation(vec![
+                    ValidationFailureReason::UnsupportedAction
+                ])),
+            }
+        } else if !tx.action.is_empty() {
+            // Standard path: the action's spec, falling back to `Executed`.
+            match specs.get(&tx.action) {
+                Some(s) => s,
+                None => match specs.get("Executed") {
+                    Some(s) => s,
+                    None => return Err(PneumaticError::Validation(vec![
+                        ValidationFailureReason::UnsupportedAction
+                    ])),
+                },
+            }
+        } else {
+            return Err(PneumaticError::Validation(vec![
+                ValidationFailureReason::UnsupportedAction
+            ]));
+        };
+
+        // Delegate to the selected spec.
         let result = spec.validate(tx, &token, &self.env_data)?;
         if !result.is_valid {
             return Err(PneumaticError::Validation(result.failure_reasons));

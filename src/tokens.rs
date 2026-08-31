@@ -428,10 +428,16 @@ impl TokenFactory {
         id: Vec<u8>,
         environment_id: String,
     ) -> Result<Token, Error> {
+        // Record the owner so the transaction-level `SelfSigned` spec can verify
+        // `sender == owner`. Stored as a hex string — a real 32-byte Ed25519 key
+        // isn't valid UTF-8, so it can't live in the String-typed metadata slot as
+        // raw bytes (AUDIT 5.9). Encode it before `owner` is moved into `User`.
+        let owner_hex = hex::encode(&owner);
         let user = User::new(owner);
         let metadata = HashMap::from([
             ("is_self_verified".to_string(), "true".to_string()),
             ("token_type".to_string(), "user".to_string()),
+            ("owner".to_string(), owner_hex),
         ]);
         TokenFactory::mint_token(&user, id, &metadata, environment_id)
     }
