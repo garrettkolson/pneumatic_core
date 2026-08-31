@@ -83,6 +83,14 @@ struct TcpConnection {
 }
 
 impl TcpConnection {
+    #[cfg(test)]
+    // Expose the detached read-loop handle so tests can assert it terminates
+    // (i.e. that EOF is terminal rather than a busy-spin) instead of relying on
+    // the loop's internal behavior.
+    fn listening_thread(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.listening_thread.take()
+    }
+
     pub fn from_stream(stream: Box<dyn Stream>,
                           on_received: Arc<dyn Fn(Vec<u8>) + Send + Sync + 'static>)
         -> Result<Self, ConnError> {
@@ -91,8 +99,12 @@ impl TcpConnection {
             loop {
                 match get_data_async(&mut reader).await {
                     Ok(data) => on_received(data),
-                    Err(ConnError::ReadError(_)) => continue,
-                    _ => break
+                    // Any read error — including a clean peer-close (UnexpectedEof) — is
+                    // terminal. Break instead of `continue`, which busy-spun at 100% CPU
+                    // after the peer disconnected. tokio absorbs WouldBlock internally, so
+                    // get_data_async only errors on a broken/EOF connection; there is no
+                    // transient error worth retrying here.
+                    Err(_) => break,
                 }
             }
         });
@@ -228,7 +240,7 @@ mod conns_tests {
     use std::time::Duration;
 
     use crate::conns::streams::{CoreTcpStream, CoreUdsStream, Stream};
-    use crate::conns::{get_data, get_data_async, ConnError, MAX_FRAME_SIZE};
+    use crate::conns::{get_data, get_data_async, ConnError, MAX_FRAME_SIZE, TcpConnection};
 
     // SA_01 companion test: verify wire framing round-trip over TCP socket.
     // Uses "fire and observe" pattern: client writes, server reads and relays via channel.
@@ -595,5 +607,155 @@ mod conns_tests {
         assert_eq!(read_back.len(), test_limit);
 
         drop(server_handle);
+    }
+
+    // Phase 6.4 discriminator: a peer disconnect is terminal. The read loop must exit when the
+    // client closes. On the pre-fix `Err(_) => continue` the loop re-enters on the EOF ReadError
+    // and never completes, so the JoinHandle never resolves and this timeout fires -> test fails.
+    #[test]
+    fn tcp_connection_read_loop_exits_on_peer_disconnect() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let accept_handle = tokio::spawn(async move { listener.accept().unwrap() });
+            let client = TcpStream::connect(addr).unwrap();
+            let (server_raw, _echo) = accept_handle.await.unwrap();
+
+            // The frame payload is irrelevant here — we care only that the loop reaches the
+            // read error and stops (rather than re-entering and busy-spinning).
+            let (_tx, _rx) = mpsc::channel::<Vec<u8>>();
+            let on_received = std::sync::Arc::new(move |_data: Vec<u8>| {});
+            let mut conn = TcpConnection::from_stream(
+                Box::new(CoreTcpStream::from_stream(server_raw)),
+                on_received,
+            )
+            .unwrap();
+
+            // Close the peer: the server read should hit EOF and terminate the loop.
+            drop(client);
+
+            let handle = conn
+                .listening_thread()
+                .expect("read-loop task should exist");
+            let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            assert!(
+                result.is_ok(),
+                "read loop must terminate when the peer disconnects (was busy-spinning)"
+            );
+        });
+    }
+
+    // Phase 6.4 discriminator: EOF on the payload read (peer sent a length header then vanished
+    // mid-frame) must also terminate the loop, not spin.
+    #[test]
+    fn tcp_connection_read_loop_exits_on_partial_frame() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let accept_handle = tokio::spawn(async move { listener.accept().unwrap() });
+            let client = TcpStream::connect(addr).unwrap();
+            let (server_raw, _echo) = accept_handle.await.unwrap();
+
+            let (_tx, _rx) = mpsc::channel::<Vec<u8>>();
+            let on_received = std::sync::Arc::new(move |_data: Vec<u8>| {});
+            let mut conn = TcpConnection::from_stream(
+                Box::new(CoreTcpStream::from_stream(server_raw)),
+                on_received,
+            )
+            .unwrap();
+
+            // Write a length header claiming a payload we never send, then close. The server
+            // read must EOF while reading the payload and terminate.
+            let claimed_len = 4096u32;
+            let mut client_stream: Box<dyn Stream> =
+                Box::new(CoreTcpStream::from_stream(client));
+            let header = claimed_len.to_be_bytes().to_vec();
+            client_stream.write_all(&header).unwrap();
+            drop(client_stream); // closing the connection -> peer EOF on the payload read
+
+            let handle = conn
+                .listening_thread()
+                .expect("read-loop task should exist");
+            let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            assert!(
+                result.is_ok(),
+                "read loop must terminate on mid-frame EOF (was busy-spinning)"
+            );
+        });
+    }
+
+    // Phase 6.4 positive control: a live connection still delivers frames and the loop stays
+    // alive; it only exits once the peer actually closes. Proves the fix does not break normal
+    // framing or terminate prematurely.
+    #[test]
+    fn tcp_connection_healthy_then_disconnect() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let accept_handle = tokio::spawn(async move { listener.accept().unwrap() });
+            let client = TcpStream::connect(addr).unwrap();
+            let (server_raw, _echo) = accept_handle.await.unwrap();
+
+            // A tokio unbounded channel so the receive is a real future. A std mpsc
+            // `recv_timeout` here would block the current-thread runtime thread and starve
+            // the very read-loop task we are testing — it could never be polled to deliver.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let on_received = std::sync::Arc::new(move |data: Vec<u8>| {
+                let _ = tx.send(data);
+            });
+            let mut conn = TcpConnection::from_stream(
+                Box::new(CoreTcpStream::from_stream(server_raw)),
+                on_received,
+            )
+            .unwrap();
+
+            // Send one valid frame; the loop should deliver it and stay alive.
+            let payload = b"phase 6.4 healthy frame";
+            let mut frame = Vec::with_capacity(4 + payload.len());
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(payload);
+            let mut client_stream: Box<dyn Stream> =
+                Box::new(CoreTcpStream::from_stream(client));
+            client_stream.write_all(&frame).unwrap();
+
+            let got = rx
+                .recv()
+                .await
+                .expect("frame should be delivered on a live connection");
+            assert_eq!(got, payload);
+
+            // Now close the peer: the loop should finally exit.
+            drop(client_stream);
+
+            let handle = conn
+                .listening_thread()
+                .expect("read-loop task should exist");
+            let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            assert!(
+                result.is_ok(),
+                "read loop must terminate after delivering a frame and receiving a disconnect"
+            );
+        });
     }
 }

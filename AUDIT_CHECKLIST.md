@@ -710,8 +710,29 @@ agree on anything.*
   registrations against Sentinel cap 20 with a 5 ms stake gate and asserts `len() <= 20`; proven
   to fail on a temporary revert of the fix (over-admitted to 25); full workspace green (586
   passing, 0 failures).
-- [ ] **6.4 `TcpConnection` EOF is terminal** — `ReadError => continue` busy-spins at 100 % CPU
-  after peer disconnect; `break` on EOF (`src/conns.rs:89-97`).
+- [x] **6.4 `TcpConnection` EOF is terminal** — *done 2026-08-31*
+  File: `src/conns.rs` (`TcpConnection::from_stream`'s detached read loop; `listening_thread` test accessor).
+  Action: `Err(_) => break` on the read loop (`src/conns.rs:99-109`), so peer EOF is terminal.
+  Previously the loop was `Ok(data) => on_received(data); Err(ConnError::ReadError(_)) => continue; _ => break`
+  — a clean peer close surfaces as `io::ErrorKind::UnexpectedEof` → `ReadError`, and the loop re-entered
+  immediately, busy-spinning at ~100 % CPU until the process was killed. Now every read error breaks.
+  This is safe because `get_data_async` does a blocking `read_exact` over a non-blocking tokio stream:
+  tokio absorbs `WouldBlock` internally, so `read_exact` only errors on a genuinely broken/EOF connection,
+  never on a transient "not yet enough bytes" condition worth retrying. No wire-shape change — single
+  production code point; `listening_thread` is a `#[cfg(test)]` accessor exposing the detached `JoinHandle`
+  so tests assert termination (a resolved handle ⇒ the loop exited) rather than relying on the loop's
+  internal behavior. Verify: `src/conns.rs::conns_tests` discriminators — each proven to fail on a temporary
+  revert of the `break` (the loop never terminates, so the awaiting `JoinHandle` times out):
+  `tcp_connection_read_loop_exits_on_peer_disconnect` (client closes → EOF → loop exits),
+  `tcp_connection_read_loop_exits_on_partial_frame` (client writes a length header then vanishes mid-frame →
+  the payload read EOFs → loop exits; covers a half-frame close, not only a pre-frame close), and
+  `tcp_connection_healthy_then_disconnect` (positive control: a valid frame is delivered and the loop stays
+  alive, and it exits only after the peer closes — proves the fix neither breaks framing nor terminates early).
+  The positive control's delivery wait must be a futures-based receive (it runs on a `new_current_thread`
+  runtime and the read loop is a spawned task, so a std `mpsc::Receiver::recv_timeout` — a blocking call —
+  would starve that task and deadlock the test), so it uses `tokio::sync::mpsc::unbounded_channel` with
+  `rx.recv().await`. Full workspace green: **589** tests, 0 failures (Phase 6.3 baseline 586 + these 3);
+  `cargo check` clean.
 - [ ] **6.5 Environment spec loading: no panics, no fail-open** — missing Token/Slush partition
   is a boot `Result`, not `.expect()`; unknown validator spec names are logged (or rejected),
   never silently skipped (`src/environment.rs:146-156, 176, 188`).
