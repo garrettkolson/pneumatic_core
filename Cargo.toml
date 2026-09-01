@@ -5,6 +5,7 @@ members = [
     "executor",
     "finalizer",
     "committer",
+    "node-server",
 ]
 resolver = "2"
 

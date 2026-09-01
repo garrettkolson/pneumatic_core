@@ -1,0 +1,33 @@
+[package]
+name = "pneumatic_node_server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pneumatic_core = { path = ".." }
+tokio = { version = "1.44.2", features = ["full"] }
+# `NodeRegistryType::iter()` (role-selection iteration) requires the strum
+# `IntoEnumIterator` trait, which pneumatic_core derives but does not re-export.
+strum = "0.27.1"
+# The four role-plugins node-server hosts as role-plugins. The runtime host
+# depends on all four (and core): node-server sits at the top of the dependency
+# tree with no cycle — every role crate depends on core, none on node-server.
+pneumatic_committer = { path = "../committer" }
+pneumatic_sentinel = { path = "../sentinel" }
+pneumatic_executor = { path = "../executor" }
+pneumatic_finalizer = { path = "../finalizer" }
+# The shared DI bundle carries a token cache (`tokens: Arc<DashMap<Vec<u8>, Token>>`)
+# handed to Committer::new — same DashMap version the workspace pins.
+dashmap = "7.0.0-rc0"
+# Finalizer::new takes `ed25519_dalek` SigningKey/VerifyingKey (its on-chain
+# voter keys) — node-server constructs that plugin, so it needs the type.
+ed25519-dalek = { version = "2.0", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.20.0"
+# Built-only to parse a test environment spec into an `EnvironmentMetadata` in
+# unit tests — mirroring the committer/sentinel/finalizer test setups.
+serde_json = "1.0.140"
+# Needed only to build a `Config` in unit tests: `Config::new_for_testing`
+# takes a `DashMap` for its per-type config and environment registries.
+dashmap = "7.0.0-rc0"

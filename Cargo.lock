@@ -1064,6 +1064,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pneumatic_node_server"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "ed25519-dalek",
+ "pneumatic_committer",
+ "pneumatic_core",
+ "pneumatic_executor",
+ "pneumatic_finalizer",
+ "pneumatic_sentinel",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pneumatic_sentinel"
 version = "0.1.0"
 dependencies = [
