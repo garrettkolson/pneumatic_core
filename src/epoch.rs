@@ -325,11 +325,21 @@ pub fn deterministic_select(
     let mut rng = StdRng::from_seed(seed);
     let target: u64 = rng.gen_range(0..total);
 
-    // Deterministic iteration: sort keys lexicographically
-    let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+    // Deterministic iteration: sort keys lexicographically, skipping any staker
+    // with zero stake (AUDIT Phase 6.6). A zero-stake key contributes nothing to
+    // the cumulative range, but was still reachable as the `target == 0` winner
+    // (the first sorted key hits `cumulative(0) >= target(0)`) and could be
+    // elected as leader/finalizer with no stake at risk. Dropping zero keys
+    // guarantees a positive-stake key is returned whenever `total > 0`.
+    let mut keys: Vec<&Vec<u8>> = stakers
+        .stakers
+        .iter()
+        .filter(|kv| *kv.1 > 0)
+        .map(|kv| kv.0)
+        .collect();
     keys.sort();
 
-    let first_key = keys[0].clone(); // backup for fallback
+    let first_key = keys.first().map(|k| (*k).clone()); // backup: first positive-stake key
     let mut cumulative = 0u64;
     for key in keys {
         let stake = *stakers.stakers.get(key).unwrap();
@@ -338,8 +348,8 @@ pub fn deterministic_select(
             return Some(key.clone());
         }
     }
-    // Fallback: return the first staker (shouldn't happen if total > 0)
-    Some(first_key)
+    // Fallback: return the first positive-stake key (only reached if total == 0, already handled)
+    first_key
 }
 
 // ---------------------------------------------------------------------------
@@ -369,9 +379,16 @@ pub fn deterministic_select_shard(
         return None;
     }
     if shard_count == 1 {
-        // No sharding: return all executors, sorted so the set is identical regardless of the
-        // ExecutorSet's HashMap insertion order (C6).
-        let mut keys: Vec<Vec<u8>> = executors.executors.keys().cloned().collect();
+        // No sharding: return all *positive-stake* executors, sorted so the set is
+        // identical regardless of the ExecutorSet's HashMap insertion order (C6).
+        // AUDIT Phase 6.6: zero-stake executors are excluded so a slashed-to-zero
+        // (or never-staked) node is never listed as a responsible executor.
+        let mut keys: Vec<Vec<u8>> = executors
+            .executors
+            .iter()
+            .filter(|kv| *kv.1 > 0)
+            .map(|(key, _)| key.clone())
+            .collect();
         keys.sort();
         return Some(keys);
     }
@@ -389,12 +406,23 @@ pub fn deterministic_select_shard(
         return None;
     }
 
+    // AUDIT Phase 6.6: exclude zero-stake executors from the shard partition so a
+    // slashed-to-zero (or never-staked) node is never assigned to a shard as a
+    // responsible executor. If none remain, the shard selection yields nothing.
+    let positive: Vec<&Vec<u8>> = shuffled
+        .iter()
+        .filter(|key| executors.get_stake(key) > 0)
+        .collect();
+    if positive.is_empty() {
+        return None;
+    }
+
     // Stake-balanced round-robin: assign each executor to the shard
     // with the lowest current total stake
     let mut shard_stakes: Vec<u64> = vec![0; shard_count as usize];
     let mut shard_executors: Vec<Vec<Vec<u8>>> = vec![vec![]; shard_count as usize];
 
-    for key in shuffled {
+    for key in positive {
         let stake = executors.get_stake(key);
         // Find shard with lowest current stake
         let target_shard = (0..shard_count as usize)
@@ -1436,6 +1464,29 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn deterministic_select_skips_zero_stake_key() {
+        // AUDIT Phase 6.6: zero-stake `vec![0]` sorts first. With total==1 the random
+        // target is forced to 0, which hits the zero key first (cumulative(0) >= target(0)).
+        // The fix drops zero keys, so a positive-stake key is always returned.
+        let stakes = make_stake_set(vec![(vec![0], 0), (vec![1], 1)]);
+        for _ in 0..50 {
+            let result = deterministic_select(&stakes, FINALIZER_DOMAIN, b"tx1", 1, &[]);
+            assert_eq!(result, Some(vec![1]), "zero-stake key must never be selected");
+        }
+
+        // Mixed case: the zero key is neither-first nor alone — it must still be skipped.
+        let stakes = make_stake_set(vec![(vec![0], 0), (vec![1], 30), (vec![2], 70)]);
+        let mut saw_zero = false;
+        for i in 0..200u8 {
+            if deterministic_select(&stakes, FINALIZER_DOMAIN, &[i], 1, &[]).map(|k| k == vec![0]).unwrap_or(false)
+            {
+                saw_zero = true;
+            }
+        }
+        assert!(!saw_zero, "zero-stake key must never be selected even in a mixed set");
+    }
+
     // --- ExecutorSet tests ---
 
     #[test]
@@ -1534,6 +1585,41 @@ mod tests {
         assert!(result.is_some());
         let keys = result.unwrap();
         assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn deterministic_select_shard_excludes_zero_stake_executor() {
+        // AUDIT Phase 6.6: zero-stake `vec![0]` must never be listed as a responsible
+        // executor — not under the shard_count==1 shortcut, not under round-robin.
+        let exec0 = vec![0];
+        let exec1 = vec![1];
+        let exec2 = vec![2];
+        let es = ExecutorSet {
+            executors: vec![(exec0.clone(), 0u64), (exec1.clone(), 100), (exec2.clone(), 100)]
+                .into_iter()
+                .collect(),
+        };
+
+        // shard_count == 1: the shortcut returns only the sorted positive-stake keys.
+        let single = deterministic_select_shard(&es, 1, "any-tx", 1, &[]).unwrap();
+        assert_eq!(single, vec![exec1.clone(), exec2.clone()]);
+        assert!(!single.iter().any(|k| *k == exec0));
+
+        // shard_count > 1: round-robin must never place the zero-stake executor in the
+        // selected shard's key list (the result is a flat list of keys for that shard).
+        // A shard may legitimately be empty (None) when only 2 positive executors are
+        // spread over 3 shards — that is fine: nothing is assigned to it.
+        for shard_count in 2..4u32 {
+            for seed in 0..32u8 {
+                if let Some(shards) = deterministic_select_shard(&es, shard_count, "tx-shard", 1, &[seed]) {
+                    assert!(
+                        !shards.iter().any(|k| *k == exec0),
+                        "zero-stake executor leaked into the selected shard (shard_count={})",
+                        shard_count
+                    );
+                }
+            }
+        }
     }
 
     #[test]

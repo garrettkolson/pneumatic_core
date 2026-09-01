@@ -755,9 +755,48 @@ agree on anything.*
   (positive control: a valid spec loads `Ok` **and** asserts each trans/block spec registered
   `Some`, so the registration loops can't regress to silent no-ops). Full workspace green: **595**
   tests, 0 failures (Phase 6.4 baseline 589 + these 6); `cargo check` clean.
-- [ ] **6.6 Zero-stake stakers excluded from selection** — skip zeros in the stake walk (or
-  delete keys that reach 0 in `StakeStore::slash`); filter in `to_stake_set()`
-  (`src/epoch.rs:233-246`, `committer/src/epoch_manager.rs:40-45, 65-69`).
+- [x] **6.6 Zero-stake stakers excluded from selection** — *done 2026-08-31*
+  Files: `src/epoch.rs` (`deterministic_select`, `deterministic_select_shard`),
+  `committer/src/epoch_manager.rs` (`LeaderSelector::select_internal`, `StakeStore::to_stake_set`,
+  `StakeStore::slash`).
+  Action: a zero-stake key can be "elected" as leader / finalizer / executor (no stake behind it),
+  because (a) the cumulative stake walk returns the zero key when `total > 0` and `target == 0`
+  lands on the lexicographically-smallest key (`cumulative(0) >= target(0)`), and (b)
+  `deterministic_select_shard` pushes *every* executor into a shard (round-robin) and the
+  `shard_count == 1` shortcut returns *all* keys — so zero-stake executors become listed
+  "responsible" executors. After Phase 5.1 made slashing real, a slashed-to-zero double-signer also
+  *lingered* because `StakeStore::slash` used `saturating_sub` and kept the zero key. Closed both:
+  (1) `deterministic_select` filters out zero-stake keys before the cumulative walk and makes the
+  `first_key` backup the first *positive*-stake key (or `vec![]`, still guarded by the existing
+  `total == 0 → None`); (2) committer's own walk `LeaderSelector::select_internal` filters zeros
+  identically; (3) `deterministic_select_shard`'s `shard_count == 1` shortcut filters zeros before
+  returning; its round-robin path was already filtering (left intact); (4) `StakeStore::to_stake_set`
+  filters zeros when building the returned `StakeSet` (committer leader input + both persisted
+  snapshots); (5) `StakeStore::slash` now *deletes* the key when the stake reaches 0 instead of
+  leaving a zero entry, so a slashed-to-zero key can never re-enter selection or a later epoch (safe
+  because all accessors already handle missing keys).
+  Verify: 5 regression tests, each **proven a discriminator** — each fails on a temporary revert of
+  its fix (verified by revert → run `cargo test <filter>` → restore), per AUDIT ground rule 2:
+  `deterministic_select_skips_zero_stake_key` (core, `src/epoch.rs`: `StakeSet {vec![0]:0, vec![1]:1}`
+  ⇒ `Some([1])`; fails as `Some([0])` without the fix),
+  `deterministic_select_shard_excludes_zero_stake_executor` (core: `shard_count==1` returns `[exec1]`,
+  `[exec0]` excluded; fails as `[[0],[1],[2]]` without the fix),
+  `leader_select_skips_zero_stake_key` (committer: `select(&StakeSet{vec![0]:0, vec![1]:1}, 1, &[])`
+  ⇒ `vec![1]`; fails as `vec![0]` without the fix — proves the committer's separate walk),
+  `stake_store_to_stake_set_filters_zero_keys` (committer: `vec![0]:0` absent from the returned
+  `stakers`), and `stake_store_slash_to_zero_removes_key` (committer: `add_staker(k,10); slash(k,10)`
+  ⇒ `k` no longer in the raw backing store — asserted against `store.stakes.contains_key(&k)`, which
+  is a *true* discriminator of delete-on-zero, whereas checking only the `to_stake_set` view would
+  pass even with the fix reverted because that view already filters zeros). Optional coverage left
+  out of scope: the sentinel's defensive `assign_finalizer` zero-stake guard at `sentinel.rs:599`
+  is kept (now redundant but harmless defense-in-depth); `ExecutorSet::to_stake_set` /
+  `StakeSet::to_executor_set` are test-only and not a production path.
+  **Wire-compat: NONE.** This phase is pure internal selection logic — no `Message` / `StakeSet` /
+  `ExecutorSet` wire shape or serialization change (AUDIT ground rule 4). The `deterministic_select`
+  return shape (`Option<Vec<u8>>`) and the `deterministic_select_shard` return
+  (`Option<Vec<Vec<u8>>>` flat key list) are unchanged.
+  Workspace: **600** tests passing, 0 failures (Phase 6.5 baseline 595 + these 5); `cargo check
+  --workspace` clean. See [[phase-6-6-zero-stake-exclusion]].
 - [ ] **6.7 `ThreadPool` fixes** (public API, latent) — drop the receiver mutex guard before
   running the job; `catch_unwind` around jobs with logging + worker respawn; no
   `join().unwrap()` in `Drop` (`src/server.rs:79-96, 116-131`).

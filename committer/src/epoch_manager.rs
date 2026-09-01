@@ -40,7 +40,18 @@ impl StakeStore {
     pub fn slash(&self, key: &[u8], amount: u64) {
         if let Some(mut entry) = self.stakes.get_mut(key) {
             let new_stake = entry.saturating_sub(amount);
-            *entry = new_stake;
+            if new_stake == 0 {
+                // AUDIT Phase 6.6: drive a staker to zero stake removes the key
+                // entirely, so a slashed-to-zero (e.g. double-signing) key can never
+                // linger in or re-enter selection pools. get_stake already returns 0
+                // for a missing key, so callers are unaffected. drop the guard first
+                // so remove() can acquire the shard lock (DashMap shard locks are
+                // non-reentrant).
+                drop(entry);
+                self.stakes.remove(key);
+            } else {
+                *entry = new_stake;
+            }
         }
     }
 
@@ -63,8 +74,17 @@ impl StakeStore {
 
     /// Convert to a StakeSet for leader selection.
     pub fn to_stake_set(&self) -> StakeSet {
+        // AUDIT Phase 6.6: filter out zero-stake keys so the leader-selection input
+        // and both persisted snapshots (stake set + executor set) never carry dead
+        // weight. Selection walks already skip zeros (defense-in-depth); this keeps
+        // the persisted set itself clean.
         StakeSet {
-            stakers: self.stakes.iter().map(|e| (e.key().clone(), *e.value())).collect(),
+            stakers: self
+                .stakes
+                .iter()
+                .filter(|kv| *kv.value() > 0)
+                .map(|kv| (kv.key().clone(), *kv.value()))
+                .collect(),
         }
     }
 }
@@ -302,11 +322,20 @@ impl LeaderSelector {
         }));
         let target: u64 = rng.gen_range(0..total);
 
-        // Deterministic iteration: sort keys lexicographically
-        let mut keys: Vec<&Vec<u8>> = stakers.stakers.keys().collect();
+        // Deterministic iteration: sort keys lexicographically, skipping zero-stake
+        // stakers (AUDIT Phase 6.6). A zero-stake key adds nothing to the cumulative
+        // range but was reachable as the `target == 0` winner and could be elected
+        // leader with no stake at risk. With total > 0 at least one positive-stake
+        // key remains, so a non-empty key is always returned.
+        let mut keys: Vec<&Vec<u8>> = stakers
+            .stakers
+            .iter()
+            .filter(|(_, stake)| **stake > 0)
+            .map(|(key, _)| key)
+            .collect();
         keys.sort();
 
-        let first_key = keys[0].clone(); // backup for fallback
+        let first_key = keys.first().map(|k| (*k).clone()).unwrap_or_default(); // backup: first positive-stake key
         let mut cumulative = 0u64;
         for key in keys {
             let stake = *stakers.stakers.get(key).unwrap();
@@ -315,7 +344,7 @@ impl LeaderSelector {
                 return key.clone();
             }
         }
-        // Fallback: return the first staker (shouldn't happen if total > 0)
+        // Fallback: return the first positive-stake key (only reached if total == 0, already handled)
         first_key
     }
 }
@@ -335,13 +364,16 @@ mod tests {
     use std::sync::Arc;
 
     use pneumatic_core::blocks::{Block, FinalityStatus};
+    use pneumatic_core::crypto::BasicHashProvider;
+    use pneumatic_core::epoch::StakeSet;
+    use pneumatic_core::epoch::IEpochLeaderSelector;
     use pneumatic_core::data::{DataProvider, StubDataProvider};
     use pneumatic_core::epoch::{CandidateRegistry, IEpochReconciler};
     use pneumatic_core::epoch::StakingOp;
     use pneumatic_core::tokens::Token;
     use pneumatic_core::transactions::SignedTransaction;
 
-    use super::{EpochReconciler, Logger, StakingManager, StakeStore};
+    use super::{EpochReconciler, LeaderSelector, Logger, StakingManager, StakeStore};
     use pneumatic_core::epoch::IStakingManager;
 
     fn build_valid_block(prev_hash: Vec<u8>) -> Block {
@@ -653,5 +685,59 @@ mod tests {
         for res in &result {
             assert!(res.misshapen_tokens.is_empty());
         }
+    }
+
+    // --- AUDIT Phase 6.6: zero-stake exclusion ---
+
+    #[test]
+    fn leader_select_skips_zero_stake_key() {
+        // AUDIT Phase 6.6: the committer's OWN leader walk (select_internal) derives its
+        // seed from an injected HashProvider — a separate walk from core's deterministic_select —
+        // so it has its own zero-key exclusion. A zero-stake key `vec![0]` that sorts first
+        // must never win, even when total==1 (target is forced to 0).
+        let leader = LeaderSelector::new(Arc::new(BasicHashProvider::new()));
+        let stakes = StakeSet {
+            stakers: vec![(vec![0], 0u64), (vec![1], 1)].into_iter().collect(),
+        };
+        let result = leader.select(&stakes, 1, &[]);
+        assert_eq!(result, vec![1], "zero-stake key must never be elected leader");
+    }
+
+    #[test]
+    fn stake_store_to_stake_set_filters_zero_keys() {
+        // AUDIT Phase 6.6: to_stake_set drops zero-stake keys so the leader-selection
+        // input and the persisted stake snapshot never carry dead weight.
+        let store = StakeStore::new();
+        store.add_staker(vec![0], 0);
+        store.add_staker(vec![1], 50);
+        let set = store.to_stake_set();
+        assert_eq!(set.total_stake(), 50);
+        assert!(
+            !set.stakers.contains_key(&vec![0]),
+            "to_stake_set must not include the zero-stake key"
+        );
+        assert!(set.stakers.contains_key(&vec![1]));
+    }
+
+    #[test]
+    fn stake_store_slash_to_zero_removes_key() {
+        // AUDIT Phase 6.6: slashing to zero removes the key entirely (delete-on-zero)
+        // from the backing store, so a slashed-to-zero (e.g. double-signing) key can
+        // never linger in or re-enter selection. `get_stake` still returns 0 for the
+        // now-missing key, so callers are unaffected.
+        let store = StakeStore::new();
+        let key = vec![7];
+        store.add_staker(key.clone(), 10);
+        store.slash(&key, 10); // drive to zero
+        assert_eq!(store.get_stake(&key), 0, "get_stake returns 0 after delete-on-zero");
+        // Discriminator of the delete-on-zero fix: the backing store must drop the key.
+        // We assert against the raw store, not to_stake_set — the view filter excludes
+        // zeros independently and would mask this fix.
+        assert!(
+            !store.stakes.contains_key(&key),
+            "slash to zero must remove the key from the backing store"
+        );
+        // A no-op slash of an already-absent key must not panic.
+        store.slash(&key, 5);
     }
 }
