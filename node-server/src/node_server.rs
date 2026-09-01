@@ -393,7 +393,8 @@ fn load_stake_snapshot(
 // ---------------------------------------------------------------------------
 // RoleHandler impls — each installed role forwards its inbound bus actions to
 // its real handler. Committer/Executor/Sentinel delegate to their real inbound
-// method; the Finalizer's is wired in Phase 4 (its `initialize` is a stub).
+// method; the Finalizer routes `Sign` to `handle_signature` (audit C1) and
+// fails closed on any other inbound action.
 // ---------------------------------------------------------------------------
 
 impl RoleHandler for pneumatic_committer::Committer {
@@ -468,17 +469,28 @@ impl RoleHandler for pneumatic_finalizer::Finalizer {
     }
     fn handle<'a>(
         &'a self,
-        _message: Message,
+        message: Message,
     ) -> std::pin::Pin<
         std::boxed::Box<dyn std::future::Future<Output = Result<(), RoleError>> + Send + 'a>,
     > {
-        // Phase-3 stub: the finalizer's inbound is wired in Phase 4. A
-        // `Sign`/`Finalize` reaching the host now fails closed with a clear
-        // message rather than being silently accepted.
         Box::pin(async move {
-            Err(RoleError::Downstream(PneumaticError::Network(
-                "finalizer inbound not yet wired".to_string(),
-            )))
+            match message.action.as_str() {
+                // The voter inbound path: authenticate the executor's identity,
+                // verify + accumulate its signature, or optimistic-finalize on
+                // the first valid one. The real chokepoint for every voter
+                // signature (audit C1).
+                "Sign" => self
+                    .handle_signature(&message)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}")))),
+                // Any other action this role owns is not a voter signature; fail
+                // closed with a protocol-level error rather than silently
+                // accepting it.
+                other => Err(RoleError::Downstream(PneumaticError::Network(format!(
+                    "finalizer: unhandled inbound action {other:?}"
+                )))),
+            }
         })
     }
 }
@@ -492,13 +504,14 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use pneumatic_core::config::{BootstrapPeer, Config};
+    use pneumatic_core::errors::PneumaticError;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::messages::Message;
     use pneumatic_core::node::{NodeTypeConfig, NodeRegistryType};
 
     use crate::role_dispatcher::RoleError;
     use crate::role_selector::StakeProvider;
-    use super::{build_runtime, NodeServer};
+    use super::build_runtime;
 
     /// A complete, valid `EnvironmentMetadataSpec` — the canonical fixture used
     /// by the committer/sentinel integration tests, with `environment_id` set to
@@ -741,5 +754,53 @@ mod tests {
             server.dispatch(msg("Preload")).await,
             Err(RoleError::UnknownAction(_))
         ));
+    }
+
+    /// The Finalizer's inbound handler is the real voter chokepoint, not a stub:
+    /// a `Sign` reaching the host reaches `handle_signature`, which fails closed
+    /// on the empty/invalid body with a protocol error — never the Phase-3 stub's
+    /// `"finalizer inbound not yet wired"` error. Fails if the handler still
+    /// returns the stub.
+    #[tokio::test]
+    async fn finalizer_inbound_handler_not_stub() {
+        let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Finalizer));
+        let provider = Arc::new(MapStakeProvider::with_default(2000));
+        let server = build_runtime(cfg, provider).expect("host builds");
+
+        assert_eq!(server.installed_roles(), vec![NodeRegistryType::Finalizer]);
+
+        let outcome = server.dispatch(msg("Sign")).await;
+        // Reaching the real handler means `handle_signature` ran on the empty
+        // body and failed with a *different* protocol error (it errors on the
+        // very first deserialize); a reverted stub would surface exactly
+        // `"finalizer inbound not yet wired"`.
+        let Err(RoleError::Downstream(PneumaticError::Network(msg))) = outcome else {
+            panic!("finalizer 'Sign' must fail closed on the invalid body, got {outcome:?}");
+        };
+        assert_ne!(
+            msg, "finalizer inbound not yet wired",
+            "the finalizer inbound handler must be real, not the Phase-3 stub"
+        );
+    }
+
+    /// The Executor's inbound action is routed through the dispatcher to the
+    /// installed Executor (its `preload_for_transaction`), never routed to
+    /// `UnknownAction`. Fails if the dispatcher does not forward `Preload` to
+    /// the installed role.
+    #[tokio::test]
+    async fn executor_preload_routed_through_dispatcher() {
+        let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Executor));
+        let provider = Arc::new(MapStakeProvider::with_default(2000));
+        let server = build_runtime(cfg, provider).expect("host builds");
+
+        assert_eq!(server.installed_roles(), vec![NodeRegistryType::Executor]);
+
+        let outcome = server.dispatch(msg("Preload")).await;
+        match outcome {
+            // Reaches the Executor's real handler — Ok on success, Downstream on
+            // the empty body's protocol error — never UnknownAction.
+            Ok(()) | Err(RoleError::Downstream(_)) => {}
+            other => panic!("Preload should reach the Executor handler, got {other:?}"),
+        }
     }
 }

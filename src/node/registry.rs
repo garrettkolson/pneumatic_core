@@ -1717,6 +1717,34 @@ mod tests {
         }
     }
 
+    /// Discriminator (composite loopback assumption): `send_to_all` reaches a
+    /// node's own connection in its own bucket — there is no self-skip. The
+    /// composite node-server relies on this so cross-role messaging (e.g.
+    /// Executor→Finalizer via `send_to_all(&Finalizer)`) loops back over RNS to
+    /// the same process and is routed to the target role. On a revert that
+    /// filters the owning key out of the fan-out, nothing arrives on the channel.
+    #[tokio::test]
+    async fn send_to_all_includes_self() {
+        let reg = registry_with_capacity(&[(NodeRegistryType::Committer, 5)]);
+        let (tx, mut rx) = mpsc::channel(16);
+        // Register THIS node's own key (its real config public key) under its
+        // own bucket with a spy connection — the way a composite registers
+        // itself in every selected bucket.
+        let own_key = reg.get_config().public_key.clone();
+        reg.register_peer(
+            own_key,
+            [7u8; 16],
+            &NodeRegistryType::Committer,
+            Box::new(RecordingConnection { tx }),
+        );
+        reg.send_to_all(vec![5u8], &NodeRegistryType::Committer).await;
+        assert_eq!(
+            rx.try_recv().expect("own bucket must receive the payload"),
+            vec![5u8],
+            "send_to_all must not skip the node's own connection"
+        );
+    }
+
     /// Discriminator (blocking direct): the rewritten branch drives the async
     /// `send` on a local runtime instead of dropping the future, so the peer
     /// actually receives the payload. On revert (future dropped un-awaited)
