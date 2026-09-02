@@ -279,18 +279,19 @@ impl Finalizer {
             )));
         }
 
-        // (2) Role gate: the verified signer must be registered as an `Executor`.
-        match self
-            .node_registry
-            .find_node_type_by_public_key(&message.public_key)
-        {
-            Some(NodeRegistryType::Executor) => Ok(message.public_key.clone()),
-            Some(other_role) => Err(PneumaticError::Registry(format!(
+        // (2) Role gate: the verified signer must be registered as an `Executor`
+        // — among its full role set (Phase 6), so a composite voter registered
+        // as Executor (and other roles) still authenticates, while a signer
+        // with no Executor role is rejected (fail closed).
+        let roles = self.node_registry.find_node_types_by_public_key(&message.public_key);
+        match roles.is_empty() {
+            false if roles.contains(&NodeRegistryType::Executor) => Ok(message.public_key.clone()),
+            false => Err(PneumaticError::Registry(format!(
                 "sender {} is registered as {:?}, not an Executor",
                 bytes_to_hex(&message.public_key),
-                other_role
+                roles
             ))),
-            None => Err(PneumaticError::Registry(format!(
+            true => Err(PneumaticError::Registry(format!(
                 "sender {} is not registered as any node",
                 bytes_to_hex(&message.public_key)
             ))),

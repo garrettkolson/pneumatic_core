@@ -291,37 +291,46 @@ impl Committer {
             return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
         }
 
-        // (2) Registration: is the signer a known node, and of what role?
-        let Some(role) = self
+        // (2) Registration + role set (Phase 6): is the signer a known node? A
+        // composite identity may be registered under several roles — resolve the
+        // full set.
+        let roles = self
             .node_registry
-            .find_node_type_by_public_key(&message.public_key)
-        else {
+            .find_node_types_by_public_key(&message.public_key);
+        if roles.is_empty() {
             return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
-        };
+        }
 
-        // (3) Role gate.
+        // (3) Role gate: allowed-role(action) must intersect the node's role
+        // set — a composite identity registered for N roles may send actions
+        // for any of them. An action whose sole governing role the node is not
+        // under is rejected (intersection empty ⇒ fail closed).
         match allowed_senders_for(&message.action) {
-            AllowedSenders::Exact(expected) if role != expected => {
-                Err(CommitterError::UnauthorizedRole(format!(
-                    "{}: action={} role={:?}",
-                    bytes_to_hex(&message.public_key),
-                    message.action,
-                    role
-                )))
+            AllowedSenders::Exact(expected) => {
+                if self.node_registry.node_may_send_action(&message.public_key, &[expected.clone()]) {
+                    Ok(())
+                } else {
+                    Err(CommitterError::UnauthorizedRole(format!(
+                        "{}: action={} allowed={:?} node_roles={:?}",
+                        bytes_to_hex(&message.public_key),
+                        message.action,
+                        expected,
+                        roles
+                    )))
+                }
             }
             AllowedSenders::SelfOnly => {
                 if message.public_key != self.sender_public_key() {
                     Err(CommitterError::UnauthorizedRole(format!(
-                        "{}: action={} role={:?}",
+                        "{}: action={} role=SelfOnly",
                         bytes_to_hex(&message.public_key),
-                        message.action,
-                        role
+                        message.action
                     )))
                 } else {
                     Ok(())
                 }
             }
-            AllowedSenders::AnyRegistered | AllowedSenders::Exact(_) => Ok(()),
+            AllowedSenders::AnyRegistered => Ok(()),
         }
     }
 

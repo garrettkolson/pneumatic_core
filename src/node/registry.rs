@@ -229,6 +229,33 @@ impl NodeRegistry {
         })
     }
 
+    /// The set of registry types `key` is registered under, in registration
+    /// order (Committer, Sentinel, Executor, Finalizer, Archiver). Phase 6
+    /// multi-bucket: a composite identity may register across several buckets —
+    /// the `requester_types` a node declares in its binding is the full role
+    /// set, and the node lands under each qualifying type. This returns that
+    /// set. `find_node_type_by_public_key` is the first-match single-role view
+    /// of the same lookups — both read the live map, so for any type the key
+    /// holds, both agree it is present.
+    pub fn find_node_types_by_public_key(&self, key: &[u8]) -> Vec<NodeRegistryType> {
+        NodeRegistryType::iter()
+            .filter(|t| self.get_nodes(t).map(|nodes| nodes.contains_key(key)).unwrap_or(false))
+            .collect()
+    }
+
+    /// Role-set auth (Phase 6): `key` may send an action governed by
+    /// `allowed_roles` iff it is registered under at least one of them — the
+    /// generalized form of the old single-role `role != expected` gate. A
+    /// composite identity registered as both Committer and Executor may
+    /// therefore send actions for either role; an action whose sole governing
+    /// role the key is not under is rejected (intersection empty ⇒ fail
+    /// closed). `allowed_roles` is the `allowed_senders_for(action)` mapping
+    /// for the action in question, collapsed to the set of roles permitted.
+    pub fn node_may_send_action(&self, key: &[u8], allowed_roles: &[NodeRegistryType]) -> bool {
+        let roles = self.find_node_types_by_public_key(key);
+        !roles.is_empty() && roles.iter().any(|role| allowed_roles.contains(role))
+    }
+
     fn type_is_maxed_out(&self, node_type: &NodeRegistryType) -> bool {
         match self.get_nodes(node_type) {
             Some(nodes) => nodes.len() >= self.config.get_max_node_number(node_type),
@@ -267,23 +294,29 @@ impl NodeRegistry {
     }
 
     fn select_registration_node_type(&self, request: &NodeRequest) -> Option<NodeRegistryType> {
-        if self.can_select_this_type(request, NodeRegistryType::Finalizer) {
-            return Some(NodeRegistryType::Finalizer);
-        }
+        self.select_registration_node_types(request).into_iter().next()
+    }
 
-        if self.can_select_this_type(request, NodeRegistryType::Executor) {
-            return Some(NodeRegistryType::Executor);
-        }
-
-        if self.can_select_this_type(request, NodeRegistryType::Sentinel) {
-            return Some(NodeRegistryType::Sentinel);
-        }
-
-        if self.can_select_this_type(request, NodeRegistryType::Committer) {
-            return Some(NodeRegistryType::Committer);
-        }
-
-        None
+    /// Every registry type the node qualifies for in `requester_types`, in
+    /// selection priority (Finalizer > Executor > Sentinel > Committer). Phase
+    /// 6 multi-bucket: the node registers under *each* qualifying type rather
+    /// than the single priority one — so a composite identity lands in every
+    /// bucket it qualifies for. `select_registration_node_type` is the first of
+    /// these (the ack's highest-priority type).
+    fn select_registration_node_types(&self, request: &NodeRequest) -> Vec<NodeRegistryType> {
+        let priority = [
+            NodeRegistryType::Finalizer,
+            NodeRegistryType::Executor,
+            NodeRegistryType::Sentinel,
+            NodeRegistryType::Committer,
+        ];
+        priority
+            .into_iter()
+            .filter(|node_type| {
+                request.requester_types.contains(node_type)
+                    && !self.type_is_maxed_out(node_type)
+            })
+            .collect()
     }
 
     fn can_select_this_type(&self, request: &NodeRequest, node_type: NodeRegistryType) -> bool {
@@ -426,77 +459,117 @@ impl NodeRegistry {
             return;
         }
 
-        // Idempotent re-registration: refresh liveness under the type we
-        // already hold it, re-ack. Checked across all types — the node may
-        // sit under a priority-selected type, not its `requested_type`.
-        if let Some(existing_type) = self.find_node_type_by_public_key(&requester_key) {
-            self.refresh_last_seen(&requester_key, &existing_type);
-            self.reply_register_ack(requester_rhash, true, existing_type, "");
-            return;
+        // Phase 6 multi-bucket: a node declares its full role set in
+        // `requester_types` (binding-signed over that very set); register it
+        // under every qualifying type, not the single priority-selected one.
+        // The ack still reports a single (highest-priority) type on the wire.
+        let qualifying = self.select_registration_node_types(&request);
+
+        // Idempotent re-registration: refresh liveness under every bucket the
+        // key already sits under, so a live composite never ages out a role it
+        // already holds.
+        let already = self.find_node_types_by_public_key(&requester_key);
+        for node_type in &already {
+            self.refresh_last_seen(&requester_key, node_type);
         }
 
-        let Some(node_type) = self.select_registration_node_type(&request) else {
+        // Admit the key under each qualifying type it is not already under —
+        // each a fresh bucket for the same identity. The ack is accepted once
+        // the node is under at least one qualifying type.
+        let mut now_registered = already;
+        let mut accepted = !now_registered.is_empty();
+        let mut failed_stake = false;
+        for node_type in &qualifying {
+            if now_registered.contains(node_type) {
+                accepted = true;
+                continue;
+            }
+            let conn: Box<dyn Connection> = match &self.network {
+                Some(network) => Box::new(RnsConnection::new(requester_rhash, Arc::clone(network))),
+                None => Box::new(NullConnection),
+            };
+            if self.admit_node_under_type(&requester_key, requester_rhash, node_type.clone(), conn, &request) {
+                now_registered.push(node_type.clone());
+                accepted = true;
+            } else {
+                failed_stake = true;
+            }
+        }
+
+        if accepted {
+            // Ack the highest-priority type the node is actually registered
+            // under now (the receiver installs the peer under this type).
+            let primary = [
+                NodeRegistryType::Finalizer,
+                NodeRegistryType::Executor,
+                NodeRegistryType::Sentinel,
+                NodeRegistryType::Committer,
+            ]
+            .into_iter()
+            .find(|t| now_registered.contains(t))
+            .unwrap_or(request.requested_type);
+            self.reply_register_ack(requester_rhash, true, primary, "");
+        } else {
             self.reply_register_ack(
                 requester_rhash,
                 false,
                 request.requested_type,
-                "no registry type available",
+                if failed_stake { "insufficient stake" } else { "no registry type available" },
             );
-            return;
-        };
+        }
+    }
 
-        // Stake gate against the type we will actually register it under.
-        if !(self.stake_check)(&requester_key, &node_type) {
-            self.reply_register_ack(requester_rhash, false, node_type, "insufficient stake");
-            return;
+    /// Admit `requester_key` under `node_type`: fresh insert (stake gate +
+    /// atomic capacity check) when the key is not already present, otherwise
+    /// return true (a re-registration refresh is already handled by the caller,
+    /// so no second insert is needed). Returns whether the node is present
+    /// under the type. The capacity check and the insert run under one lock
+    /// (Phase 6.3), so the preceding stake gate and connection setup run
+    /// outside it.
+    fn admit_node_under_type(
+        &self,
+        requester_key: &Vec<u8>,
+        rhash: [u8; 16],
+        node_type: NodeRegistryType,
+        conn: Box<dyn Connection>,
+        request: &NodeRequest,
+    ) -> bool {
+        // Already present ⇒ a re-registration; no fresh insert needed.
+        if self.node_is_already_registered(requester_key, &node_type) {
+            return true;
         }
 
-        let conn: Box<dyn Connection> = match &self.network {
-            Some(network) => Box::new(RnsConnection::new(requester_rhash, Arc::clone(network))),
-            None => Box::new(NullConnection),
-        };
+        // Stake gate against the type we will register it under. Runs OUTSIDE
+        // the admission lock so it never contends the barrier.
+        if !(self.stake_check)(requester_key, &node_type) {
+            return false;
+        }
 
-        // Store the node's own rhash binding so we can vouch for it in
-        // directory responses. This is the only place a node has signed its
-        // rhash, so only directly-registered nodes are eligible to be listed.
-        let node = NodeRegistryNode::with_binding(
-            requester_rhash,
-            conn,
-            request.binding_signature.clone(),
-            request.requested_type.clone(),
-            request.requester_types.clone(),
-        );
         // Atomic admission (Phase 6.3): the capacity check and the insert run
         // under one lock, so two concurrent registrations can no longer both
-        // observe free capacity and over-admit this type past its limit. The
-        // blocking stake gate and connection setup above ran OUTSIDE this lock,
-        // so the critical section covers only the map len-check + insert.
+        // observe free capacity and over-admit past the limit.
         let lock = Arc::clone(&self.admission_lock);
         let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         match self.get_nodes(&node_type) {
-            None => {
-                drop(guard);
-                self.reply_register_ack(requester_rhash, false, node_type, "no registry for type");
-            }
+            None => false,
             Some(nodes) => {
                 if nodes.len() >= self.config.get_max_node_number(&node_type) {
-                    drop(guard);
-                    self.reply_register_ack(
-                        requester_rhash,
-                        false,
-                        node_type,
-                        "no registry type available",
-                    );
-                    return;
+                    return false;
                 }
-                debug_assert!(
-                    !nodes.contains_key(&requester_key),
-                    "key was absent at the existing-key check and must still be absent under the lock"
+                // Store the node's own rhash binding so we can vouch for it in
+                // directory responses. This is the only place a node has signed
+                // its rhash, so only directly-registered nodes are eligible to
+                // be listed.
+                let node = NodeRegistryNode::with_binding(
+                    rhash,
+                    conn,
+                    request.binding_signature.clone(),
+                    request.requested_type.clone(),
+                    request.requester_types.clone(),
                 );
-                nodes.insert(requester_key, node);
-                drop(guard);
-                self.reply_register_ack(requester_rhash, true, node_type, "");
+                nodes.insert(requester_key.clone(), node);
+                true
             }
         }
     }
@@ -1135,6 +1208,170 @@ mod tests {
         );
         let req = register_request(vec![NodeRegistryType::Finalizer]);
         assert_eq!(reg.select_registration_node_type(&req), None);
+    }
+
+    /// Drive the real `Register` path with a multi-type binding: register
+    /// `identity` under `types` (all of which must be configured in `reg`),
+    /// signing the binding over `(rhash, requested_type, types)` so
+    /// `handle_register` admits the identity under each qualifying bucket.
+    /// Returns the identity's public key.
+    fn register_multi_bucket(
+        reg: &NodeRegistry,
+        identity: &NodeIdentity,
+        requested_type: NodeRegistryType,
+        types: Vec<NodeRegistryType>,
+    ) -> Vec<u8> {
+        let key = identity.ed25519.public_key().unwrap();
+        let binding = identity
+            .sign_binding(&identity.rhash, &requested_type, &types)
+            .expect("sign binding");
+        let req = NodeRequest {
+            requester_key: key.clone(),
+            requester_rhash: identity.rhash,
+            request_type: NodeRequestType::Register,
+            requester_types: types,
+            requested_type,
+            binding_signature: binding,
+        };
+        reg.handle_register(req);
+        key
+    }
+
+    #[test]
+    fn find_node_types_by_public_key_returns_full_set() {
+        // Phase 6 discriminator: a composite identity registered across several
+        // buckets — the set-returning lookup returns the *full* set, not just
+        // the single priority-selected one. Reverting to the single-role
+        // `find_node_type_by_public_key` (first-match) records only the first
+        // (Committer) bucket ⇒ the Sentinel assertion fails.
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Committer, 5),
+            (NodeRegistryType::Sentinel, 5),
+        ]);
+        let id = NodeIdentity::generate_in_memory();
+        register_multi_bucket(
+            &reg,
+            &id,
+            NodeRegistryType::Committer,
+            vec![NodeRegistryType::Committer, NodeRegistryType::Sentinel],
+        );
+
+        let key = id.ed25519.public_key().unwrap();
+        // Registration order (Committer, Sentinel), per `NodeRegistryType::iter()`.
+        assert_eq!(
+            reg.find_node_types_by_public_key(&key),
+            vec![NodeRegistryType::Committer, NodeRegistryType::Sentinel]
+        );
+        // The single-role view still agrees the node is present under Committer
+        // (both read the same live map, so they cannot disagree on presence).
+        assert_eq!(
+            reg.find_node_type_by_public_key(&key),
+            Some(NodeRegistryType::Committer)
+        );
+        // And the set view reports nothing for a key registered nowhere.
+        assert!(reg.find_node_types_by_public_key(&vec![9, 9, 9]).is_empty());
+    }
+
+    #[test]
+    fn multi_bucket_registration_same_identity() {
+        // Phase 6 discriminator: a single identity registers across multiple
+        // buckets in ONE Register request (its `requester_types` declares all
+        // three). Reverting to single-bucket priority registration (the
+        // pre-fix path installs only the highest-priority qualifying type ⇒
+        // Executor) leaves the Committer + Sentinel buckets empty ⇒ both
+        // assertions fail.
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Committer, 5),
+            (NodeRegistryType::Sentinel, 5),
+            (NodeRegistryType::Executor, 5),
+            (NodeRegistryType::Finalizer, 5),
+        ]);
+        let id = NodeIdentity::generate_in_memory();
+        let key = register_multi_bucket(
+            &reg,
+            &id,
+            NodeRegistryType::Sentinel,
+            vec![
+                NodeRegistryType::Committer,
+                NodeRegistryType::Sentinel,
+                NodeRegistryType::Executor,
+            ],
+        );
+
+        // One identity, registered under every declared, qualifying bucket…
+        assert!(
+            reg.get_nodes(&NodeRegistryType::Committer)
+                .unwrap()
+                .contains_key(&key),
+            "composite identity must land under Committer"
+        );
+        assert!(
+            reg.get_nodes(&NodeRegistryType::Sentinel)
+                .unwrap()
+                .contains_key(&key),
+            "composite identity must land under Sentinel"
+        );
+        assert!(
+            reg.get_nodes(&NodeRegistryType::Executor)
+                .unwrap()
+                .contains_key(&key),
+            "composite identity must land under Executor"
+        );
+        // …and NOT under the one type it did NOT declare.
+        assert!(
+            !reg.get_nodes(&NodeRegistryType::Finalizer)
+                .unwrap()
+                .contains_key(&key),
+            "an undeclared role must not be registered"
+        );
+    }
+
+    #[test]
+    fn role_set_auth_rejects_foreign_action() {
+        // Phase 6 discriminator: role-set auth — a key may send an action only
+        // if it is registered under a role permitted to send that action. A
+        // composite identity registered as BOTH Committer and Executor may send
+        // either role's actions (the multi-role admission an attacker would use
+        // to hide a foreign role behind a benign one); an action whose sole
+        // governing role the key is not under is rejected. Reverting
+        // `node_may_send_action` to a single-role `find_node_type_by_public_key`
+        // check (only Committer, the first-match) reports the Executor action
+        // as forbidden ⇒ the "Executor action admitted" assertion fails.
+        let reg = registry_with_capacity(&[
+            (NodeRegistryType::Committer, 5),
+            (NodeRegistryType::Sentinel, 5),
+            (NodeRegistryType::Executor, 5),
+            (NodeRegistryType::Finalizer, 5),
+        ]);
+        let id = NodeIdentity::generate_in_memory();
+        let key = id.ed25519.public_key().unwrap();
+
+        // Composite identity: registered as Committer AND Executor.
+        register_multi_bucket(
+            &reg,
+            &id,
+            NodeRegistryType::Committer,
+            vec![NodeRegistryType::Committer, NodeRegistryType::Executor],
+        );
+
+        // An Executor-governed action is admitted — even though the first-match
+        // (single-role) view would only see Committer.
+        assert!(
+            reg.node_may_send_action(&key, &[NodeRegistryType::Executor]),
+            "a composite role must be able to send its secondary role's action"
+        );
+        // A Committer-governed action is admitted too.
+        assert!(
+            reg.node_may_send_action(&key, &[NodeRegistryType::Committer]),
+            "a composite role must be able to send its primary role's action"
+        );
+        // A Finalizer-only action is NOT permitted for this role set — rejected.
+        assert!(
+            !reg.node_may_send_action(&key, &[NodeRegistryType::Finalizer]),
+            "an action for a role the node is not registered under must be rejected"
+        );
+        // An unknown key is rejected (fail closed), not admitted.
+        assert!(!reg.node_may_send_action(&vec![1, 2, 3], &[NodeRegistryType::Committer]));
     }
 
     #[test]
