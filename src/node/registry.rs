@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,11 @@ pub struct NodeRegistry {
     /// `register_peer` with a `NullConnection`.
     network: Option<Arc<RnsNetwork>>,
     stake_check: StakeCheck,
-    evictor: Option<JoinHandle<()>>,
+    evictor: Mutex<Option<JoinHandle<()>>>,
+    /// Set by [`stop_eviction`] / [`Drop`]; the eviction loop exits when `true`.
+    shutdown: Arc<AtomicBool>,
+    /// Interval between eviction passes (Phase 6.7 tightened from 10 s to 1 s).
+    evict_interval: Duration,
     /// Per-(rhash, node_type) count of failed fan-out deliveries, so every lost
     /// `send_to_all` / `send_to_all_blocking` result is observable (Phase 6.2).
     /// Bounded by the number of registered nodes per type.
@@ -68,6 +73,12 @@ fn directory_response_signature_payload(
 /// capped here and degrades to `Err(ConnError::Timeout)` instead of hanging.
 /// Mirrors `CONNECT_TIMEOUT_SECS` in `conns::senders`.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Eviction-loop poll interval. Tightened from 10 s to 1 s (Phase 6.7): a
+/// node whose liveness has stalled is evicted within ~31 s (30 s cutoff + 1 s
+/// poll) instead of ~40 s, and a `Drop`-driven shutdown returns within one
+/// poll rather than up to 10 s.
+const EVICTION_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Record a failed fan-out delivery (Phase 6.2): bump the per-(rhash,
 /// node_type) counter and log it so every lost `send_to_all` /
@@ -150,7 +161,9 @@ impl NodeRegistry {
             config,
             network: network.clone(),
             stake_check,
-            evictor: None,
+            evictor: Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            evict_interval: EVICTION_INTERVAL,
             delivery_failures: Arc::new(DashMap::new()),
             send_timeout: SEND_TIMEOUT,
             admission_lock: Arc::new(std::sync::Mutex::new(())),
@@ -169,9 +182,17 @@ impl NodeRegistry {
         let executors = Arc::clone(&self.executors);
         let finalizers = Arc::clone(&self.finalizers);
         let archivers = Arc::clone(&self.archivers);
+        let shutdown = Arc::clone(&self.shutdown);
+        let interval = self.evict_interval;
         let handle = std::thread::spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_secs(10));
+                // Check before sleeping (mirrors `refresher_loop` in stake_index)
+                // so the loop exits within one poll once shutdown is set, rather
+                // than finishing a full sleep interval first.
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(interval);
                 evict_expired(&[
                     Arc::clone(&committers),
                     Arc::clone(&sentinels),
@@ -181,12 +202,16 @@ impl NodeRegistry {
                 ]);
             }
         });
-        self.evictor = Some(handle);
+        self.evictor = Mutex::new(Some(handle));
     }
 
-    /// Stop the eviction loop (called before the registry is dropped).
+    /// Stop the eviction loop. Sets the shutdown flag (so the detached thread
+    /// exits) and joins it; [`Drop`] invokes this automatically, so a dropped
+    /// registry no longer leaks its five registry `Arc`s. Safe to call more than
+    /// once — the `.take()` makes a second call a no-op.
     pub fn stop_eviction(&mut self) {
-        if let Some(handle) = self.evictor.take() {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.evictor.lock().unwrap().take() {
             let _ = handle.join();
         }
     }
@@ -1018,6 +1043,21 @@ impl NodeRegistry {
     pub fn with_stake_check(&mut self, stake: StakeCheck) {
         self.stake_check = stake;
     }
+
+    /// Override the eviction-loop poll interval so discriminators can drive the
+    /// loop at a small bound (production default is `EVICTION_INTERVAL`, 1 s).
+    pub fn with_evict_interval(&mut self, interval: Duration) {
+        self.evict_interval = interval;
+    }
+
+    /// Expose the eviction thread's join handle so tests can observe whether the
+    /// loop has exited — the same `listening_thread` accessor pattern used on
+    /// `TcpConnection`. The handle is moved out under the lock (JoinHandle is
+    /// not `Clone`); since [`Drop`] and [`stop_eviction`] still drive the
+    /// shutdown flag, the thread exits within one poll even when held here.
+    pub fn evictor_handle(&self) -> Option<JoinHandle<()>> {
+        self.evictor.lock().unwrap().take()
+    }
 }
 
 /// Connection for directory entries with no live transport (test mode, or
@@ -1028,6 +1068,17 @@ pub struct NullConnection;
 impl Connection for NullConnection {
     async fn send(&self, _data: &Vec<u8>) -> Result<(), ConnError> {
         Ok(())
+    }
+}
+
+/// Drop the registry cleanly. Joins the eviction thread via [`stop_eviction`]
+/// (Phase 6.7): the thread had no cancellation signal and leaked for the
+/// process lifetime, keeping its `Arc`s to all five registries pinned. Joining
+/// — rather than detaching — lets those captured `Arc`s release, closing the
+/// leak.
+impl Drop for NodeRegistry {
+    fn drop(&mut self) {
+        self.stop_eviction();
     }
 }
 
@@ -2117,5 +2168,108 @@ mod tests {
             3,
             "total must be the sum across keys"
         );
+    }
+
+    // --- Phase 6.7: stop the evictor on shutdown (Drop + shutdown flag) ---
+    //
+    // `registry_with_capacity` builds a registry with `network: None`, so `init`
+    // does not spawn the evictor; each test starts it explicitly with the
+    // private `start_eviction` (accessible from this nested module) after
+    // overriding the poll interval to ~20 ms via `with_evict_interval`. Each
+    // test fails *fast* (panics, not hangs) when the fix is reverted: without
+    // the shutdown flag the loop never exits, so `is_finished()` stays false
+    // and the final assert in each test fails fast (panics, not hangs).
+
+    /// Headline regression: the eviction thread is running before shutdown and
+    /// has exited once the registry is dropped — proving the new [`Drop`] impl
+    /// actually stops it and releases the captured registry `Arc`s.
+    #[test]
+    fn evictor_exits_on_drop() {
+        let mut reg = registry_with_capacity(&[(NodeRegistryType::Committer, 5)]);
+        reg.with_evict_interval(Duration::from_millis(20));
+        reg.start_eviction();
+
+        let handle = reg.evictor_handle().expect("evictor thread started");
+        assert!(!handle.is_finished(), "evictor must be running before shutdown");
+
+        drop(reg); // Drop -> stop_eviction sets the flag -> thread exits within one poll
+
+        // Wait (bounded) for the thread to observe the flag and exit. On revert
+        // (no flag) it never exits, so this exhausts the deadline and fails fast.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.is_finished(), "Drop must stop the eviction thread");
+    }
+
+    /// The explicit [`stop_eviction`] path sets the shutdown flag and returns
+    /// within one poll. It is gated on a receive timeout (so the test never
+    /// blocks), and the thread's exit is asserted via the cloned handle's
+    /// `is_finished()`; if the flag is missing the loop never exits and that
+    /// final assert fails fast.
+    #[test]
+    fn evictor_exits_on_stop_eviction() {
+        let mut reg = registry_with_capacity(&[(NodeRegistryType::Committer, 5)]);
+        reg.with_evict_interval(Duration::from_millis(20));
+        reg.start_eviction();
+
+        let running = reg.evictor_handle().expect("evictor thread started");
+        assert!(!running.is_finished(), "evictor must be running before shutdown");
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let stopper = std::thread::spawn(move || {
+            reg.stop_eviction();
+            tx.send(()).ok();
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("stop_eviction returned -> evictor exited");
+
+        stopper.join().expect("stop thread");
+
+        // Wait (bounded) for the thread to observe the flag and exit. On revert
+        // it never exits, so this exhausts the deadline and fails fast.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !running.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(running.is_finished(), "stop_eviction must stop the eviction thread");
+    }
+
+    /// Positive control: the running loop actually evicts an expired node
+    /// (backdated past the 30 s cutoff) rather than being a no-op. This is not a
+    /// discriminator of the shutdown fix — the eviction logic is unchanged — but
+    /// confirms the thread is doing real work before it is stopped.
+    #[test]
+    fn evictor_removes_expired_nodes() {
+        let mut reg = registry_with_capacity(&[(NodeRegistryType::Committer, 5)]);
+        let identity = NodeIdentity::generate_in_memory();
+        register_node(&reg, &identity, NodeRegistryType::Committer);
+        let key = identity.ed25519.public_key().unwrap();
+
+        // Backdate liveness well past the 30 s cutoff in `evict_expired`.
+        {
+            let mut nodes = reg.get_nodes(&NodeRegistryType::Committer).unwrap();
+            let mut stored = nodes.get_mut(&key).expect("committed");
+            stored.value_mut().last_seen = Instant::now() - Duration::from_secs(40);
+        }
+
+        reg.with_evict_interval(Duration::from_millis(20));
+        reg.start_eviction();
+
+        // Wait (bounded) for the loop to observe and remove the expired entry.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut evicted = false;
+        while Instant::now() < deadline {
+            let nodes = reg.get_nodes(&NodeRegistryType::Committer).unwrap();
+            if !nodes.contains_key(&key) {
+                evicted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(evicted, "the eviction loop should remove nodes past the cutoff");
+
+        reg.stop_eviction();
     }
 }

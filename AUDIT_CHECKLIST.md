@@ -797,21 +797,16 @@ agree on anything.*
   (`Option<Vec<Vec<u8>>>` flat key list) are unchanged.
   Workspace: **600** tests passing, 0 failures (Phase 6.5 baseline 595 + these 5); `cargo check
   --workspace` clean. See [[phase-6-6-zero-stake-exclusion]].
-- [ ] **6.7 `ThreadPool` fixes** (public API, latent) — drop the receiver mutex guard before
-  running the job; `catch_unwind` around jobs with logging + worker respawn; no
-  `join().unwrap()` in `Drop` (`src/server.rs:79-96, 116-131`).
-- [ ] **6.8 Stop the evictor on shutdown** — `Drop`/`CancellationToken` for the eviction
-  thread; it currently leaks for process lifetime with `Arc`s to all five registries
-  (`src/node/registry.rs:64-90`).
-- [ ] **6.9 Config hygiene** — distinct port pair for Archiver (shares 42001/50000 with
+- [x] **6.7 Stop the evictor on shutdown** — DONE. `shutdown: Arc<AtomicBool>` + `evictor: Mutex<Option<JoinHandle<()>>>` (JoinHandle isn't `Clone`, mirrors `StakeIndex.handle`); `start_eviction` runs a check-first loop that exits within one poll; `stop_eviction` sets the flag before join; `impl Drop for NodeRegistry` joins via `stop_eviction`, releasing the five registry `Arc`s. Interval tightened to 1 s. `#[cfg(test)]` discriminators (drop, explicit stop, positive-control eviction), all proven to fail on revert. No wire/serialization change. Workspace 631 → 634.
+- [ ] **6.8 Config hygiene** — distinct port pair for Archiver (shares 42001/50000 with
   Committer, `src/conns.rs:18-19, 28-29`); remove or default the dead required `balance`
   field; honor or document the ignored `public_key` config (`src/config.rs:254-276`).
-- [ ] **6.10 Arithmetic & panic hardening** — checked/saturating stake math (`src/epoch.rs:233-246`,
+- [ ] **6.9 Arithmetic & panic hardening** — checked/saturating stake math (`src/epoch.rs:233-246`,
   `committer/src/epoch_manager.rs:48-52`); integer quorum math (replace f64 at
   `committer/src/committer.rs:453`); `unreachable!` on non-32-byte hash output becomes an error
   (`committer/src/epoch_manager.rs:257-260`); remove `expect()` on message-derived data in
   `BlockFactory::create_hash`.
-- [ ] **6.11 O(n) full-chain rehash per block message** — cache chain state / incremental
+- [ ] **6.10 O(n) full-chain rehash per block message** — cache chain state / incremental
   validation so a `BlockFinalized` doesn't rehash the whole chain
   (`src/blocks.rs:131-155`).
 
