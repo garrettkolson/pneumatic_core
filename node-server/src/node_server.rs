@@ -7,7 +7,8 @@
 //! via `RoleDispatcher` (Phase 2). This is a fresh in-process layer —
 //! deliberately not the dead `pneumatic_core::server::ThreadPool` and not RNS.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex as TokioMutex;
 
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -30,7 +31,7 @@ use pneumatic_core::rns::wrapper::RnsNetwork;
 use pneumatic_committer::epoch_manager::{EpochReconciler, StakeStore, StakingManager, LeaderSelector};
 use pneumatic_committer::block_services::BlockServices;
 
-use super::role_dispatcher::{RoleDispatcher, RoleError, RoleHandler};
+use super::role_dispatcher::{RoleDispatcher, RoleError, RoleHandler, RoleHost};
 
 /// `action` strings the Committer owns on the inbound bus.
 const COMMITTER_ACTIONS: &'static [&'static str] = &["Commit"];
@@ -41,10 +42,17 @@ const SENTINEL_ACTIONS: &'static [&'static str] = &["Verify"];
 /// `action` strings the Finalizer owns (sign / finalize blocks).
 const FINALIZER_ACTIONS: &'static [&'static str] = &["Sign", "Finalize"];
 
-/// The composite runtime host. Owns the shared DI bundle plus the two
-/// in-process dispatch layers: `RoleSelector` (which roles this node installs
-/// from its stake) and `RoleDispatcher` (routes an inbound message to the one
-/// installed role that owns its action).
+/// The composite runtime host. Owns the shared DI bundle plus three in-process
+/// layers built across the composite plan: `RoleSelector` (Phase 1 — which roles
+/// this node installs from its stake), `RoleDispatcher` (Phase 2/4 — routes an
+/// inbound message to the one installed role that owns its action), and the
+/// **epoch coordinator** (Phase 5 — polls the shared `EpochBoundaryDetector` and
+/// fans each epoch advance to the installed plugins, and fans shutdown to them).
+///
+/// The installed role-plugins are held by the `RoleDispatcher` as `Box<dyn RoleHost>`
+/// (Phase 5): a single boxed handle that is both a `RoleHandler` (inbound routing)
+/// and a `RoleHost` (lifecycle), so the coordinator drives advance/shutdown through
+/// the dispatcher rather than retaining a second parallel handle.
 #[allow(dead_code)]
 pub struct NodeServer {
     // Held in the composite for the later phases rather than read in Phase 3:
@@ -58,8 +66,21 @@ pub struct NodeServer {
     network: Option<Arc<RnsNetwork>>,
     stake_index: Arc<StakeIndex>,
     node_registry: Arc<NodeRegistry>,
-    role_selector: super::role_selector::RoleSelector,
-    role_dispatcher: RoleDispatcher,
+    // Phase 1 selector behind a `std` mutex: only the coordinator touches it
+    // (`select` is `&mut`), never the hot path, so a plain sync mutex (no
+    // await-across-guard) suffices.
+    role_selector: StdMutex<super::role_selector::RoleSelector>,
+    // Phase 2/4 dispatcher behind a `tokio` mutex: `dispatch` is held across an
+    // await by the RNS bridge (Send-required), so the lock must be a
+    // Send-across-await `tokio` mutex. `roll_forward`/`initiate_all_shutdown`
+    // (the coordinator's lifecycle fan-outs, `&mut` on the boxed hosts) lock it
+    // too.
+    role_dispatcher: TokioMutex<RoleDispatcher>,
+    // Snapshot of the roles this host installed at boot — read by `installed_roles`
+    // synchronously without contending the `tokio` mutex (the tokio `Mutex` in the
+    // pinned workspace has no sync `lock_blocking`). The set does not change until
+    // Phase 6's deferred re-registration path, so a boot-time snapshot is faithful.
+    installed_roles: Vec<pneumatic_core::node::NodeRegistryType>,
     // Lifecycle seed carried for Phase 5 (epoch coordinator).
     epoch_boundary_detector: Arc<EpochBoundaryDetector>,
 }
@@ -67,19 +88,103 @@ pub struct NodeServer {
 impl NodeServer {
     /// The roles currently installed by this host, in registration order.
     pub fn installed_roles(&self) -> Vec<pneumatic_core::node::NodeRegistryType> {
-        self.role_dispatcher.installed_roles()
+        self.installed_roles.clone()
     }
 
     /// Route one inbound message to the single installed role that owns its
     /// action, fail-closed otherwise (mirrors `RoleDispatcher::dispatch`).
+    ///
+    /// The dispatcher lock is held across the handler await, so the method must
+    /// be `Send` (the RNS bridge awaits it inside `tokio::spawn`); the
+    /// `tokio` mutex (never `std`) is what makes the guard `Send`.
     pub async fn dispatch(&self, message: Message) -> Result<(), RoleError> {
-        self.role_dispatcher.dispatch(message).await
+        let guard = self.role_dispatcher.lock().await;
+        guard.dispatch(message).await
     }
 
     /// The full qualifying role set this node selected by stake on the last
     /// `select()`, in `NodeRegistryType` order.
     pub fn selected_roles(&self) -> Vec<pneumatic_core::node::NodeRegistryType> {
-        self.role_selector.selected_roles().to_vec()
+        self.role_selector.lock().unwrap().selected_roles().to_vec()
+    }
+
+    // --- Phase 5: epoch coordinator ----------------------------------------
+    // The installed role-plugins live in the `RoleDispatcher` as `Box<dyn
+    // RoleHost>`; the coordinator drives their lifecycle through the dispatcher.
+    // Every lifecycle method is `&self` and locks internally, so the spawned
+    // coordinator loop holds a single `Arc<Self>` and never takes a `&mut`
+    // (the boxed `RoleHost` gives the Finalizer's `&mut self` its mutable handle
+    // via the dispatcher's own `iter_mut` — no Mutex around the plugins).
+
+    /// The epoch number the shared `EpochBoundaryDetector` currently holds — the
+    /// epoch the Committer has last advanced it to (the Committer is the single
+    /// writer; the coordinator only reads). Exposed so tests and the lifecycle
+    /// coordinator can observe the current epoch.
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch_boundary_detector.current_epoch.epoch_number
+    }
+
+    /// Fan one epoch advance to every installed role (Phase 5, `advance_epoch`
+    /// fan-out on an epoch boundary). Delegates the fan-out to the dispatcher,
+    /// which visits every installed host (the Committer's `advance_epoch` is a
+    /// no-op that self-drives) and returns the roles visited.
+    pub async fn roll_forward(
+        &self,
+        epoch: u64,
+    ) -> Vec<pneumatic_core::node::NodeRegistryType> {
+        let mut guard = self.role_dispatcher.lock().await;
+        guard.roll_forward(epoch)
+    }
+
+    /// Recompute the role set this node qualifies for by stake, on an epoch
+    /// boundary — the selection is re-evaluated because stake can change per
+    /// epoch. Equivalent to a fresh `select()`; tracked by the coordinator so a
+    /// changed set can trigger re-registration (Phase 6).
+    pub fn recompute_role_set(&self) -> Vec<pneumatic_core::node::NodeRegistryType> {
+        self.role_selector.lock().unwrap().select()
+    }
+
+    /// The coordinator's single epoch tick: when the shared detector reports the
+    /// current epoch expired at `now`, advance — refresh the registration gate's
+    /// off-thread index via `StakeIndex::set_epoch`, fan `advance_epoch` to the
+    /// installed roles, and recompute the role set — and return `true`;
+    /// otherwise return `false` (no advance this tick). No sleep; the spawned
+    /// loop (`spawn_coordinator`) owns the cadence.
+    pub async fn poll_and_advance(&self, now: i64) -> bool {
+        if !self.epoch_boundary_detector.is_epoch_expired(now) {
+            return false;
+        }
+        let epoch = self.current_epoch();
+        self.stake_index.set_epoch(epoch);
+        self.roll_forward(epoch).await;
+        self.recompute_role_set();
+        true
+    }
+
+    /// Fan graceful shutdown to every installed role (Committer + Finalizer run
+    /// real shutdown; Sentinel + Executor no-op).
+    pub async fn initiate_all_shutdown(&self) {
+        let mut guard = self.role_dispatcher.lock().await;
+        guard.initiate_all_shutdown().await;
+    }
+
+    /// Spawn the epoch-coordinator background loop: poll `poll_and_advance`
+    /// every `interval_ms` until shutdown. The loop is thin glue (poll + sleep);
+    /// `poll_and_advance` carries the substantive advance logic and is covered by
+    /// the phase discriminators. The Committer's own `run_epoch_loop` (which
+    /// advances the shared detector this loop watches) is spawned by the caller
+    /// / Phase 7 end-to-end wiring.
+    pub fn spawn_coordinator(self: Arc<Self>, interval_ms: u64) {
+        tokio::spawn(async move {
+            loop {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                self.poll_and_advance(now).await;
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            }
+        });
     }
 }
 
@@ -217,10 +322,13 @@ pub fn build_runtime(
     // One plugin per role the node selected by stake (Phase 1). The DI bundle
     // above is dependency-ordered, so skipping an unselected role never
     // reorders it: the shared inputs are still built cheaply.
+    // The local selector is used to compute `role_set` here (plugin construction);
+    // the same instance is stored behind a `std` mutex on the host, so the
+    // coordinator's later `select()` recompute sees the same epoch/stake state.
     let mut role_selector = super::role_selector::RoleSelector::new(config.clone(), stake_provider);
     let role_set = role_selector.select();
 
-    let installed: Vec<Box<dyn RoleHandler>> = role_set
+    let installed: Vec<Box<dyn RoleHost>> = role_set
         .iter()
         .cloned()
         .filter_map(|role| {
@@ -241,10 +349,14 @@ pub fn build_runtime(
                 block_proposer.clone(),
                 block_services.clone(),
             )
-            .map(|p| p as Box<dyn RoleHandler>)
         })
         .collect();
-    let role_dispatcher = RoleDispatcher::new(installed);
+    // Snapshot the installed roles (boot-time; unchanged until Phase 6's
+    // deferred re-registration path) before moving `installed` into the locked
+    // dispatcher, so `installed_roles()` can report them synchronously.
+    let installed_roles: Vec<pneumatic_core::node::NodeRegistryType> =
+        installed.iter().map(|h| h.role()).collect();
+    let role_dispatcher = TokioMutex::new(RoleDispatcher::new(installed));
 
     Ok(NodeServer {
         config,
@@ -252,15 +364,18 @@ pub fn build_runtime(
         network,
         stake_index,
         node_registry,
-        role_selector,
+        role_selector: StdMutex::new(role_selector),
         role_dispatcher,
+        installed_roles,
         epoch_boundary_detector,
     })
 }
 
 /// Build the plugin for one selected role, or `None` for roles this host does
 /// not install (`Archiver`, which has no plugin). The returned value is a boxed
-/// `RoleHandler` so the `RoleDispatcher` can route to it.
+/// `RoleHost` (a `RoleHandler` for inbound routing *and* a `RoleHost` for the
+/// Phase-5 epoch-fan-out + shutdown) so the `RoleDispatcher` can route and
+/// drive lifecycle through a single handle.
 fn build_role_plugin(
     role: pneumatic_core::node::NodeRegistryType,
     config: Arc<Config>,
@@ -277,7 +392,7 @@ fn build_role_plugin(
     epoch_boundary_detector: Arc<EpochBoundaryDetector>,
     block_proposer: Arc<BlockProposer>,
     block_services: Arc<BlockServices>,
-) -> Option<Box<dyn RoleHandler>> {
+) -> Option<Box<dyn RoleHost>> {
     use pneumatic_core::node::NodeRegistryType;
     match role {
         NodeRegistryType::Committer => {
@@ -492,6 +607,78 @@ impl RoleHandler for pneumatic_finalizer::Finalizer {
                 )))),
             }
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RoleHost impls — Phase 5 lifecycle. `role()`/`allowed_actions()`/`handle`
+// come from each role's `impl RoleHandler` above; these impls supply only the
+// two lifecycle methods. Inherent calls use fully-qualified `Self::` so the
+// compiler resolves them to the *inherent* method (which has the same name)
+// rather than recursing into the trait method.
+// ---------------------------------------------------------------------------
+
+impl RoleHost for pneumatic_committer::Committer {
+    // The Committer self-drives its epoch via its own `run_epoch_loop` (the
+    // single writer of the epoch number), so the coordinator must not advance
+    // it — the fan-out visits the Committer, whose `advance_epoch` is a no-op.
+    fn advance_epoch(&mut self, _epoch: u64) {}
+
+    fn initiate_shutdown<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        std::boxed::Box<dyn std::future::Future<Output = ()> + Send + 'a>,
+    > {
+        // Inherent `Committer::initiate_shutdown(&self)`, reached via
+        // fully-qualified `Self::` so it does not recurse into this trait method.
+        Box::pin(async move { Self::initiate_shutdown(self).await; })
+    }
+}
+
+impl RoleHost for pneumatic_executor::Executor {
+    // The Executor has no epoch advance and no shutdown lifecycle — both no-ops.
+    fn advance_epoch(&mut self, _epoch: u64) {}
+
+    fn initiate_shutdown<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        std::boxed::Box<dyn std::future::Future<Output = ()> + Send + 'a>,
+    > {
+        Box::pin(async move {})
+    }
+}
+
+impl RoleHost for pneumatic_sentinel::Sentinel {
+    // Sentinel advances from the external epoch signal: guards monotonicity and
+    // invalidates its per-epoch caches.
+    fn advance_epoch(&mut self, epoch: u64) {
+        Self::advance_epoch(self, epoch);
+    }
+
+    // Sentinel has no shutdown lifecycle — a graceful no-op.
+    fn initiate_shutdown<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        std::boxed::Box<dyn std::future::Future<Output = ()> + Send + 'a>,
+    > {
+        Box::pin(async move {})
+    }
+}
+
+impl RoleHost for pneumatic_finalizer::Finalizer {
+    // The Finalizer bumps its internal epoch counter + invalidates its stake
+    // cache from the external signal. `advance_epoch(&mut self)`: the boxed
+    // host gives this the mutable handle it needs (no Mutex).
+    fn advance_epoch(&mut self, _epoch: u64) {
+        Self::advance_epoch(self);
+    }
+
+    fn initiate_shutdown<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        std::boxed::Box<dyn std::future::Future<Output = ()> + Send + 'a>,
+    > {
+        Box::pin(async move { Self::initiate_shutdown(self).await; })
     }
 }
 
