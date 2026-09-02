@@ -1,6 +1,6 @@
 # pneumatic_core
 
-**Pneumatic** is a Rust implementation of a proof-of-stake blockchain protocol for distributed worker node networks. It provides the full transaction pipeline — from submission through validation, execution, finalization, and commitment — with support for self-signed tokens, stake-weighted leader election, epoch-based consensus, deterministic per-transaction routing with stake snapshots, and hybrid AES-256-GCM encryption.
+**Pneumatic** is a Rust implementation of a proof-of-stake blockchain protocol for distributed worker node networks. It provides the full transaction pipeline — from submission through validation, execution, finalization, and commitment — with support for self-signed tokens, stake-weighted leader election, epoch-based consensus, deterministic per-transaction routing with stake snapshots, and hybrid AES-256-GCM encryption. At the deployment layer, a **composite node-server runtime** (`pneumatic_node_server`) hosts all four node roles — Sentinel, Executor, Finalizer, and Committer — as role-plugins inside a single process, with Reticulum Network Stack (RNS) as the external inter-node transport. See [Composite Node-Server Runtime](#composite-node-server-runtime).
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -12,8 +12,8 @@
 ```bash
 cargo check           # Verify compilation
 cargo build           # Build all workspace crates
-cargo test --workspace --lib   # Run 419 tests across 5 crate targets
-cargo test --workspace         # Run 425 tests (419 + 6 integration)
+cargo test --workspace --lib   # Run 618 tests across 6 crates
+cargo test --workspace         # Run 631 tests (618 unit + 6 integration + doc)
 cargo test <filter>   # Run a single test, e.g. cargo test leader_selector
 ```
 
@@ -26,6 +26,7 @@ pneumatic_core/
 ├── executor/                   # pneumatic_executor crate — contract execution
 ├── finalizer/                  # pneumatic_finalizer crate — quorum & block building
 ├── committer/                  # pneumatic_committer crate — chain commitment & epochs
+├── node-server/                # pneumatic_node_server crate — composite runtime (hosts Committer/Sentinel/Executor/Finalizer as role-plugins)
 ├── tests/                      # Offline integration tests (transport boundary)
 ├── Cargo.toml                  # Workspace root + core crate config
 ├── Cargo.lock
@@ -239,6 +240,8 @@ Data frames: 4-byte big-endian length header + MsgPack-serialized payload. Read 
 
 ## Sub-Crate Details
 
+These four crates hold the per-role logic; at runtime each is installed as a **role-plugin** by the composite node-server (see **Composite Node-Server Runtime**). The descriptions below cover the role each crate performs when installed.
+
 ### pneumatic_sentinel
 
 Transaction validation and routing node. Handles actions: `Process`, `Confirm`, `Reject`, `Register`, `Clear`.
@@ -291,6 +294,18 @@ Terminal node — commits validated blocks, manages epochs and staking.
 | `LeaderSelector` | Stake-weighted leader selection (replaced stub with real implementation) |
 | Epoch snapshot persistence | `handle_epoch_reconcile` and `advance_epoch` save frozen `StakeSet` via `DataProvider` for sentinel deterministic routing |
 
+## Composite Node-Server Runtime
+
+A single process — `pneumatic_node_server` (binary `node-server`) — *is* the runtime. Committer, Sentinel, Executor, and Finalizer are **role-plugins** it installs; Reticulum Network Stack (RNS) remains the external inter-node wire between nodes. Three in-process layers, built fresh (deliberately **not** the obsolete `pneumatic_core` `ThreadPool`, and **not** RNS):
+
+- **Role selection by stake (`RoleSelector`)** — `select()` walks `NodeRegistryType` order and admits a role only when the node's own stake meets **both** the protocol floor and the per-type floor (`config::meets_minimum_stake`, the same AND-of-two-floors primitive the registration gate enforces — a single source of truth). It is **fail-closed**: any cache miss or zero stake reports `0`, so the node qualifies for no role and installs nothing. The set is re-evaluated on each epoch advance (`set_epoch`), and `select_primary()` returns the single highest-priority qualifying role (`Finalizer > Executor > Sentinel > Committer`) for the single-role bootstrap path.
+
+- **In-process inbound routing (`RoleDispatcher`)** — routes an inbound `Message` by `action` to the single installed role that owns it, over two traits: `RoleHandler` (role + `allowed_actions` + async `handle`) and `RoleHost` (`advance_epoch` + `initiate_shutdown`). Routing is **fail-closed**: an unknown action raises `RoleError::UnknownAction` (logged, never dropped), and an action owned by two roles raises `RoleError::AmbiguousAction` rather than silently picking one. `roll_forward(epoch)` fans an epoch advance to every installed role; `initiate_all_shutdown()` fans shutdown.
+
+- **Host + epoch coordinator (`NodeServer`)** — owns the shared dependency-injection bundle and the installed plugins, and drives the lifecycle: `poll_and_advance` polls the shared `EpochBoundaryDetector` and fans each epoch advance out, `recompute_role_set` re-evaluates the role set by stake, and `spawn_coordinator` runs the background poll loop. `build_runtime(config, stake_provider)` generalizes the committer boot recipe to *N* role-plugins — one DI-ordered bundle is built once and shared by every installed plugin, and transport / data / stake-index boot failures are tolerated so a node can still come up and register once its peers arrive; a missing environment metadata is a hard error, since no node can run without it. RNS `on_packet` packets are bridged into `route_data_plane` → `RoleDispatcher::dispatch`.
+
+Unit coverage: 27 tests across the three layers.
+
 ## Development
 
 ### Adding a New Validation Spec
@@ -317,9 +332,9 @@ Terminal node — commits validated blocks, manages epochs and staking.
 
 ```bash
 cargo test --workspace --lib
-# 419 tests: 299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer
+# 618 tests: 405 core + 66 committer + 56 sentinel + 54 finalizer + 27 node-server + 10 executor
 cargo test --workspace
-# 425 tests: 419 lib + 6 integration (transport boundary, offline)
+# 631 tests: 618 lib + 6 integration + doc-tests
 ```
 
 ---
@@ -330,7 +345,7 @@ This roadmap tracks the work from current foundation state through a production-
 
 ### Phase 0: Foundation ✅
 
-**Status: COMPLETE** — 419 tests passing across 5 crate targets (299 core + 40 sentinel + 42 finalizer + 9 executor + 29 committer), all core types and traits implemented, RNS transport fully integrated.
+**Status: COMPLETE** — 631 tests passing across 6 crates, all core types and traits implemented, RNS transport fully integrated, and a composite node-server runtime hosts the four node roles as role-plugins. See [Composite Node-Server Runtime](#composite-node-server-runtime).
 
 - Workspace structure, error types, transaction state machine, crypto provider, validation spec system, registries, gossiper, action router, epoch types
 - BlockProposer, LeaderSelector, EpochBoundaryDetector, conflict resolution
@@ -619,6 +634,24 @@ Replace legacy TCP-only peer discovery with encrypted RNS transport: identity ke
 **Sub-total**: 25h / ~3 days (SA_01 + SA_02 + SA_03 + SA_04 + SA_05 + SA_06 + SA_07 + SA_08 complete — 9h saved)
 
 **Tracking:** Full audit remediation plan with code-level details in [TASKS.md](TASKS.md) section "Security Audit Remediation".
+
+---
+
+### Composite Node-Server Runtime (Phases 1–7) ✅ COMPLETE
+
+**Status: COMPLETE** — **631 tests** passing across 6 crates (405 core + 66 committer + 56 sentinel + 54 finalizer + 27 node-server + 10 executor). The standalone worker crates were reframed as **role-plugins** hosted by a single in-process runtime (`pneumatic_node_server`); RNS stays the external inter-node wire. Built as a fresh in-process layer — not the obsolete `pneumatic_core` `ThreadPool` and not RNS:
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| **1** | `RoleSelector` — role-selection-by-stake; `select()` admits a role only when own stake meets both the protocol floor and the per-type floor (`config::meets_minimum_stake`); fail-closed on zero stake; re-evaluated per epoch; `select_primary()` for single-role bootstrap | **DONE** |
+| **2** | `RoleDispatcher` — in-process inbound router over `RoleHandler`/`RoleHost` traits; `dispatch()` routes by `action` to the single installed role, fail-closed on unknown/ambiguous action; `roll_forward` + `initiate_all_shutdown` fan-out | **DONE** |
+| **3** | `NodeServer::build_runtime` — generalizes the committer `main.rs` boot recipe to N role-plugins; one DI-ordered bundle shared by all installed plugins; bootstrap tolerated (transport/data/stake-index failures don't block boot) | **DONE** |
+| **4** | Inbound wiring — Finalizer stub → real Sign/handle_signature; Executor transaction preload; `send_to_all` includes self; multi-role auth | **DONE** |
+| **5** | `RoleHost` lifecycle trait + `roll_forward`/`initiate_all_shutdown` fan-out + `NodeServer` epoch coordinator (`poll_and_advance`, `recompute_role_set`, `spawn_coordinator`) | **DONE** |
+| **6** | Set-returning `find_node_types_by_public_key` + multi-bucket `handle_register` + role-set intersection auth in each role | **DONE** |
+| **7** | RNS data-plane bridge — `build_runtime` `on_packet` bridge → `route_data_plane` → `RoleDispatcher` (control→registry, data→installed role) | **DONE** |
+
+**Ethos:** every inbound message is routed fail-closed — unknown actions are logged and never silently dropped, and an action claimed by two installed roles is rejected as a wiring bug rather than silently resolved.
 
 ---
 
