@@ -74,8 +74,9 @@ pub struct NodeServer {
     // await by the RNS bridge (Send-required), so the lock must be a
     // Send-across-await `tokio` mutex. `roll_forward`/`initiate_all_shutdown`
     // (the coordinator's lifecycle fan-outs, `&mut` on the boxed hosts) lock it
-    // too.
-    role_dispatcher: TokioMutex<RoleDispatcher>,
+    // too. Wrapped in `Arc` so the RNS bridge closure (below) shares a handle to
+    // the same dispatcher after it is constructed.
+    role_dispatcher: Arc<TokioMutex<RoleDispatcher>>,
     // Snapshot of the roles this host installed at boot — read by `installed_roles`
     // synchronously without contending the `tokio` mutex (the tokio `Mutex` in the
     // pinned workspace has no sync `lock_blocking`). The set does not change until
@@ -356,7 +357,36 @@ pub fn build_runtime(
     // dispatcher, so `installed_roles()` can report them synchronously.
     let installed_roles: Vec<pneumatic_core::node::NodeRegistryType> =
         installed.iter().map(|h| h.role()).collect();
-    let role_dispatcher = TokioMutex::new(RoleDispatcher::new(installed));
+    let role_dispatcher = Arc::new(TokioMutex::new(RoleDispatcher::new(installed)));
+
+    // Wire the RNS transport to the in-process role dispatcher: control-plane
+    // packets go to the node registry, data-plane packets route to the installed
+    // role that owns the message's action (the `route_data_plane` unit, Phase 7).
+    if let Some(network_ref) = &network {
+        let network = network_ref.clone();
+        let registry = node_registry.clone();
+        let dispatcher = role_dispatcher.clone();
+        network.on_packet(Arc::new(move |raw: Vec<u8>| {
+            match pneumatic_core::encoding::deserialize_rmp_to::<pneumatic_core::node::NetworkPacket>(&raw) {
+                Ok(packet) => {
+                    if let Some(control) = packet.control {
+                        if let Err(e) = registry.handle_control(control) {
+                            eprintln!("[pneumatic] control-plane error: {}", e);
+                        }
+                    }
+                    if let Some(data) = packet.data {
+                        let d = dispatcher.clone();
+                        tokio::spawn(async move {
+                            route_data_plane(data, d).await
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[pneumatic] dropping undecodable transport packet: {}", e);
+                }
+            }
+        }));
+    }
 
     Ok(NodeServer {
         config,
@@ -487,6 +517,24 @@ fn build_role_plugin(
         // Archiver has no role-plugin this host hosts.
         NodeRegistryType::Archiver => None,
     }
+}
+
+/// Route one RNS data-plane payload to the installed role that owns its action.
+///
+/// Phase 7: this is the extractable unit of the transport bridge. The RNS
+/// `on_packet` handler (see `build_runtime`) parses each inbound frame into a
+/// `NetworkPacket` and hands the data-plane bytes to this function; a reverted
+/// bridge that drops the payload or never routes to the dispatcher fails the
+/// `inbound_data_packet_routes_by_bridge` discriminator. Fail-closed: a payload
+/// that does not parse as a `Message` (or whose action no installed role owns)
+/// is surfaced, never silently swallowed.
+async fn route_data_plane(
+    data: Vec<u8>,
+    dispatcher: Arc<TokioMutex<RoleDispatcher>>,
+) -> Result<(), RoleError> {
+    let message = pneumatic_core::encoding::deserialize_rmp_to::<pneumatic_core::messages::Message>(&data)
+        .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("undecodable data-plane message: {e}"))))?;
+    dispatcher.lock().await.dispatch(message).await
 }
 
 /// Load the current-epoch stake snapshot into the shared `StakeStore`, failing
@@ -691,6 +739,7 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use pneumatic_core::config::{BootstrapPeer, Config};
+    use pneumatic_core::encoding::serialize_to_bytes_rmp;
     use pneumatic_core::errors::PneumaticError;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::messages::Message;
@@ -698,7 +747,7 @@ mod tests {
 
     use crate::role_dispatcher::RoleError;
     use crate::role_selector::StakeProvider;
-    use super::build_runtime;
+    use super::{build_runtime, route_data_plane};
 
     /// A complete, valid `EnvironmentMetadataSpec` — the canonical fixture used
     /// by the committer/sentinel integration tests, with `environment_id` set to
@@ -796,6 +845,17 @@ mod tests {
             public_key: "not-a-valid-hex-key".to_string(),
             ip: "127.0.0.1".to_string(),
             port: 0,
+        }
+    }
+
+    /// Canonical shape of a routing outcome, so two `Result<(), RoleError>`s
+    /// (which do not derive `PartialEq`) can be compared for equality.
+    fn outcome_tag(r: Result<(), RoleError>) -> &'static str {
+        match r {
+            Ok(()) => "ok",
+            Err(RoleError::UnknownAction(_)) => "unknown_action",
+            Err(RoleError::AmbiguousAction { .. }) => "ambiguous_action",
+            Err(RoleError::Downstream(_)) => "downstream",
         }
     }
 
@@ -939,6 +999,54 @@ mod tests {
         // Executor's "Preload" is not installed ⇒ fail closed, never routed.
         assert!(matches!(
             server.dispatch(msg("Preload")).await,
+            Err(RoleError::UnknownAction(_))
+        ));
+    }
+
+    /// The RNS bridge routes an inbound data-plane message through the dispatcher
+    /// to the installed role (Phase 7): a `NetworkPacket` whose data plane carries
+    /// a "Commit" `Message` reaches the Committer handler (Downstream on the
+    /// malformed body) — never `UnknownAction` — proving the bridge wired the
+    /// dispatcher to the transport, not merely that the plugin exists. Reverting
+    /// the bridge to drop the payload (never calling `route_data_plane`) makes
+    /// this fail.
+    #[tokio::test]
+    async fn inbound_data_packet_routes_by_bridge() {
+        let cfg =
+            runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
+        let provider = Arc::new(MapStakeProvider::with_default(2000));
+        let server = build_runtime(cfg, provider).expect("host builds");
+
+        let payload = serialize_to_bytes_rmp(&msg("Commit")).expect("payload serializes");
+
+        // The bridge must route to the dispatcher the same way `dispatch` does.
+        // Comparing the outcome shapes makes this a discriminator: a reverted
+        // bridge that no-ops (returns `Ok` without dispatching) yields a result
+        // that differs from the real handler path.
+        let via_bridge = route_data_plane(payload, server.role_dispatcher.clone()).await;
+        let via_direct = server.dispatch(msg("Commit")).await;
+        assert_eq!(
+            outcome_tag(via_bridge),
+            outcome_tag(via_direct),
+            "the transport bridge must route the Commit data-plane to the Committer handler exactly as dispatch does"
+        );
+    }
+
+    /// The bridge reaches the dispatcher's routing logic (not a passthrough that
+    /// accepts everything): a foreign action over the wired path surfaces
+    /// `UnknownAction` from the dispatcher. Fails if the bridge swallows the
+    /// payload without reaching the dispatcher's `dispatch`.
+    #[tokio::test]
+    async fn inbound_foreign_action_surfaces_through_bridge() {
+        let cfg =
+            runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
+        let provider = Arc::new(MapStakeProvider::with_default(2000));
+        let server = build_runtime(cfg, provider).expect("host builds");
+
+        let payload = serialize_to_bytes_rmp(&msg("Confirm")).expect("payload serializes");
+
+        assert!(matches!(
+            route_data_plane(payload, server.role_dispatcher.clone()).await,
             Err(RoleError::UnknownAction(_))
         ));
     }

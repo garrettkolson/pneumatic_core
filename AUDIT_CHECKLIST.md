@@ -815,6 +815,146 @@ agree on anything.*
   validation so a `BlockFinalized` doesn't rehash the whole chain
   (`src/blocks.rs:131-155`).
 
+## Composite node-server — runtime host + role plugins
+
+> Separate architecture effort from the audit-remediation phases above (its **phase numbering 0–7 is the
+> plan's own**, independent of the C*/H*/M*/L* audit phases). Plan:
+> `create-an-implementation-plan-shimmering-gosling.md`. Ground rule from this checklist: every new behavior
+> ships with ≥1 **discriminator test that fails on a temporary revert** of the fix. Each item below records
+> the discriminators proven that way. Workspace progression: **600 → 617 (P3) → 620 (P4) → 626 (P5) → 629
+> (P6) → 631 (P7)**; 0 failures throughout; `node-server` crate warning-clean.
+
+- [x] **CNS 0–2 — scaffold + `RoleSelector` (role-selection-by-stake) + `RoleDispatcher` backbone** — *done 2026-09-01*
+  New workspace member `node-server/` (lib + `[[bin]] name="node-server"`), no dependency cycle (`node-server`
+  depends on core + all four role crates; the four depend only on core). Modules `boot / role_selector /
+  role_dispatcher / node_server`. **`RoleSelector::select()`** — the headline new behavior: own stake
+  (`own_stake_for(public_key)`, fail-closed → 0 ⇒ empty set) filtered through `meets_minimum_stake`
+  (reused from `src/config.rs:318`, one AND-of-two-floors source of truth with the registration gate) and
+  `get_min_type_stake`/`get_global_min_stake` (`src/config.rs:213/226`). Re-evaluated at boot and on epoch
+  advance, never on the hot path. **`RoleHandler`** trait (`role()` / `allowed_actions()` / `async handle`)
+  + **`RoleDispatcher::dispatch(msg)`** — fail-closed inbound router between the RNS `on_packet` bridge and
+  the plugins: match `message.action` against each installed role's `allowed_actions`; **0 matches →
+  `UnknownAction`**, 2+ → `AmbiguousAction` (reuses the `ActionRouter::route` action→role pattern, forwarding
+  to the installed plugin instead of re-validating token coordination). **Dead-ThreadPool gate:**
+  `ThreadPool` (`src/server.rs`) stays dead (zero external call sites) — node-server dispatch is a fresh layer
+  (`RoleDispatcher` + `tokio::spawn` per message + `StakeIndex` refresher thread). Verify:
+  `role_selector_fails_closed_on_zero_stake`, `role_selector_requires_both_floors`,
+  `role_selector_reevaluates_on_epoch_advance`, `role_selector_single_source_of_truth` (CountingProvider ⇒ 0
+  data-service calls on `select()`), `dispatcher_rejects_unknown_action`, `dispatcher_routes_to_installed_role_only`
+  (Preload rejected without Executor, routed with it) + single/multi-role routing. Discriminators proven by
+  temp-revert (`let role_set = Vec::new()` / `EXECUTOR_ACTIONS` emptied → the asserts fail). Wire-compat: none
+  (no `Message` shape change).
+
+- [x] **CNS 3 — `build_runtime` — the 14-step committer boot generalized to N role-plugins** — *done 2026-09-01*
+  File: `node-server/src/node_server.rs:89`.
+  `build_runtime(config: Arc<Config>, stake: Arc<dyn StakeProvider>) -> Result<NodeServer, PneumaticError>`
+  generalizes `committer/src/main.rs`: env metadata (**hard error if missing**) → RNS transport (**boot
+  tolerated** if it fails) → `DefaultDataProvider` → `StakeIndex` + registration `StakeCheck` →
+  `NodeRegistry` → one shared DI bundle (StakeStore/StakingManager/EpochReconciler/LeaderSelector/
+  CandidateRegistry/Epoch/EpochBoundaryDetector/BlockProposer/BlockServices/tokens/pending_registry) →
+  `role_selector.select()` → one `build_role_plugin` per selected role → `RoleDispatcher::new(installed)`.
+  **NodeServer** owns the bundle + selectors; `installed_roles()`/`dispatch(msg)`/`selected_roles()` (read
+  directly; the bundle fields carry `#[allow(dead_code)]`, held for CNS-5 lifecycle). **RoleHandler impls**
+  for all four plugins: Committer→`handle_message`→Downstream, Executor→`preload_for_transaction`,
+  Sentinel→`on_data_received`, Finalizer→**Phase-3 stub** (inbound wired in CNS-4). Verify (discriminators,
+  each proven on temp-revert): `build_runtime_no_transport_booted_cleanly` (RNS fails ⇒ host still
+  constructible), `build_runtime_wires_stake_gate`, `build_runtime_initializes_epoch` (dispatch("Commit")
+  reaches Committer handler → Downstream, never UnknownAction), `build_runtime_installs_only_selected_roles`.
+  Gotcha: committer/finalizer test env-spec JSON is missing required `EnvironmentMetadataSpec` fields so
+  `from_str` silently drops them — use the complete fixture from
+  `committer/tests/pipeline_integration.rs:104` instead. Wire-compat: no `Message`/`DataOp` change; bootstrap
+  multiplies `Register` requests (one per selected role) but keeps the `NodeRequest` shape. Workspace **617**.
+
+- [x] **CNS 4 — close the executor/finalizer wiring gaps + `send_to_all` self-loopback** — *done 2026-09-01*
+  File: `node-server/src/node_server.rs` (`RoleHandler for Finalizer`); additive test in
+  `src/node/registry.rs` (no core change).
+  Finalizer stub → **real voter chokepoint**: inbound `Sign` → `finalizer.handle_signature(&message)` (audit
+  C1: authenticate executor, verify + accumulate, optimistic finalize on first valid); any other inbound
+  action fails closed with a `Downstream` error (route is by `message.action.as_str()`, and since `Sign`
+  borrows the message it is not consumed for the fall-through arm). Executor `Preload`→`preload_for_transaction`
+  confirmed by its own discriminator. **`send_to_all`-includes-self** (verified assumption, additive test
+  only — **no core change**): `NodeRegistry::send_to_all` iterates every registered node under the type with
+  **no self-skip**, so a node's own connection in its own bucket is reached — this is the composite loopback
+  (cross-role messaging loops back over RNS to the same process → `on_packet` → dispatcher). The composite
+  registering *itself* in every selected bucket is CNS-6, not here. Verify (discriminators, proven on
+  temp-revert): `finalizer_inbound_handler_not_stub` (reverted to stub → both sides return the stub string),
+  `executor_preload_routed_through_dispatcher` (empty `EXECUTOR_ACTIONS` → `UnknownAction("Preload")`),
+  `send_to_all_includes_self` (filter own key out of the fan-out → empty receive channel). Wire-compat: none.
+  Workspace **620**.
+
+- [x] **CNS 5 — `RoleHost` lifecycle trait + epoch/epoch-boundary coordinator** — *done 2026-09-02*
+  Files: `node-server/src/role_dispatcher.rs` (`RoleHost`), `node-server/src/node_server.rs` (`NodeServer`).
+  **`RoleHost: RoleHandler`** extends the erased handle with `advance_epoch(&mut self, u64)` + a
+  `Pin<Box<dyn Future<Output=()> + Send + 'a>>` `initiate_shutdown` (boxed-Send future — not native async fn —
+  so it is `Send`-posable in the erased `dyn` handle across a `.await`). The coordinator drives it over
+  `Vec<Box<dyn RoleHost>>` via `iter_mut()`; that boxed handle supplies the Finalizer's `&mut self` a mutable
+  handle **without a Mutex** on plugins. **`RoleDispatcher`** gains `roll_forward(epoch)` (fans `advance_epoch`
+  to every installed role — the Committer's is a no-op but still visited) + `initiate_all_shutdown()`.
+  **`NodeServer`** gains `current_epoch()`/`roll_forward`/`poll_and_advance` (`&self` async;
+  `!is_epoch_expired(now) => false`, else set the gate's epoch → roll forward → recompute role set → true)/
+  `recompute_role_set()`/`initiate_all_shutdown()`/`spawn_coordinator(Arc<Self>, interval_ms)`.
+  `impl RoleHost for` each plugin: Committer `advance_epoch` no-op (self-drives via its own `run_epoch_loop`)
+  + real `initiate_shutdown`; Executor both no-op; Sentinel real `advance_epoch` (guards monotonic +
+  invalidates caches) + empty shutdown; Finalizer both real. Verify (discriminators, each proven on
+  temp-revert): dispatcher `roll_forward_fans_to_all_hosts` + `initiate_all_shutdown_fans_to_all_hosts` (via a
+  two-impl **SpyHost** double — the original single `impl RoleHost` put `RoleHandler` methods on the trait
+  impl → E0407/E0277, so split `impl RoleHandler for SpyHost` + `impl RoleHost for SpyHost`); real-plugin
+  `epoch_advance_fans_out_to_all_roles`, `epoch_advance_poll_triggers_advance` (asserts both no-op when live
+  and advance when expired), `epoch_advance_recomputes_role_set` (also asserts zero-stake admits nothing),
+  `shutdown_initiates_on_all_plugins`. Gotcha: `matches!`-with-guard is nightly-only (E0658) — use plain
+  `match`/`assert_ne!`. Wire-compat: none. Workspace **626**.
+
+- [x] **CNS 6 — composite registration + multi-role auth** — *done 2026-09-02*
+  File: `src/node/registry.rs` (+ committer/finalizer auth call sites).
+  Set-returning **`find_node_types_by_public_key(&self, key)`** → the node's full role set in registration
+  order (Committer, Sentinel, Executor, Finalizer, Archiver); the existing first-match
+  `find_node_type_by_public_key` is untouched (the first-match view of the same live lookups). **`node_may_send_action`**
+  (role-set auth): `key` may send an action iff it is registered under ≥1 of the action's allowed roles;
+  intersection empty ⇒ fail closed. **Multi-bucket `handle_register`** admits one identity across every
+  qualifying bucket (`select_registration_node_types` returns ALL qualifying types; refresh existing buckets
+  + admit fresh `NodeRegistryNode::with_binding` under each new type; capacity+insert under one
+  `admission_lock`, stake gate OUTSIDE the lock). Ack still reports ONE type on the wire (unchanged `NodeRequest`
+  shape — the highest-priority type the key is actually under now). Committer `authenticate_message` /
+  Finalizer `authenticate_signature_message` switch from single-role `role != expected` to set intersection.
+  Verify (discriminators, each proven on temp-revert): `find_node_types_by_public_key_returns_full_set`
+  (revert to first-match-only → `[Committer,Sentinel]` becomes `[Committer]`; also breaks `role_set_auth`),
+  `multi_bucket_registration_same_identity` (revert `select_registration_node_types` to single-priority-type →
+  Committer+Sentinel fail; a naive recursive `plural=singular.next()` **stack overflows** — the single-bucket
+  revert must be an explicit priority scan), `role_set_auth_rejects_foreign_action` (composite role must send
+  its SECONDARY role's action; first-match only sees the primary). Gotcha: `NodeRegistryType` derives `Clone`,
+  NOT `Copy` — iterate `&` and `.clone()` the value (E0507 on a `for &… in`); `Config::get_max_node_number`
+  returns 0 for an unconfigured type ⇒ `type_is_maxed_out` ⇒ need `registry_with_capacity(&[...])` in
+  discriminators. Wire-compat: **purely additive** `find_node_types_by_public_key` + a role-set auth path —
+  no serialization or on-wire field change (the `NodeRequest` shape is unchanged). Workspace **629**.
+
+- [x] **CNS 7 — end-to-end integration: RNS data-plane bridge routes inbound `Message` to the right role** — *done 2026-09-02*
+  File: `node-server/src/node_server.rs`.
+  `build_runtime` now bridges the transport to the dispatcher: after the DI bundle + role install,
+  `if let Some(network)` registers one `on_packet` closure mirroring the committer `main.rs` split —
+  `deserialize_rmp_to::<NetworkPacket>`; `packet.control` → `NodeRegistry::handle_control` (control-plane
+  never touches the dispatcher), `packet.data` → spawn `route_data_plane(data, dispatcher)` (data-plane never
+  hits the registry). **`route_data_plane(data, dispatcher: Arc<TokioMutex<RoleDispatcher>>) ->
+  Result<(), RoleError>`** — the extractable Phase-7 unit: deserialize the data-plane bytes as a `Message`
+  (fail-closed → `Downstream` if it does not parse) then lock the dispatcher and `dispatch` it; returned from
+  the function so the discriminators observe it. **`role_dispatcher` is `Arc<TokioMutex<RoleDispatcher>>`**
+  (bare `TokioMutex` does not derive `Clone` — the field is wrapped in `Arc` to share a handle with the
+  `on_packet` closure AND keep the existing `dispatch`/`roll_forward` callers working via `self.role_dispatcher.lock()`;
+  the closure takes a per-packet `Arc` clone). Verify (discriminators, both proven on temp-revert of
+  `route_data_plane` to a no-op returning `Ok(())`): `inbound_data_packet_routes_by_bridge` (serializes a
+  `Commit` Message as the data-plane payload and asserts the bridge returns the **same outcome shape** as a
+  direct `server.dispatch(Commit)` — compared via a canonical `outcome_tag()` `&'static str` because `RoleError`
+  does not derive `PartialEq`; note a naive "accept Ok|Downstream" version would **not** discriminate, since a
+  no-op bridge also returns `Ok`, so it compares against the direct path shape),
+  `inbound_foreign_action_surfaces_through_bridge` (serializes a `Confirm` Message — no installed role owns it;
+  Committer owns only `Commit`) and asserts `UnknownAction` — the discriminating proof that the bridge reaches
+  the dispatcher's routing logic rather than being a passthrough that accepts everything). Both run over a
+  real built runtime (bad-peer bootstrap ⇒ RNS transport fails cleanly and is `None`; the bridge wiring is
+  guarded by `if let Some(network)`, so the tests exercise `route_data_plane` directly against the real
+  dispatcher). Gotcha: `route_data_plane` takes the data-plane payload, not the `NetworkPacket` — the tests
+  serialize the `Message` payload directly and must not wrap it in a `NetworkPacket`; both closure and field
+  need an `Arc` handle (E0599 without the `Arc` wrap). Wire-compat: none (control-plane and data-plane shapes
+  unchanged). Workspace **631**.
+
 ## Phase 7 — Test coverage the audit found missing
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the
 repo.*
