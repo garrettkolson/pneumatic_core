@@ -236,7 +236,7 @@ A stake snapshot frozen at each epoch boundary enables each transaction to be ro
 
 ### Wire Protocol
 
-Data frames: 4-byte big-endian length header + MsgPack-serialized payload. Read in two steps — first 4 bytes for length, then read that many bytes. Each node registry type has dedicated external and internal port numbers (e.g., Committer = 42001 external, 50000 internal).
+Data frames: 4-byte big-endian length header + MsgPack-serialized payload. Read in two steps — first 4 bytes for length, then read that many bytes. Each node registry type has a dedicated external and internal port (Phase 6.8 gave the Archiver its own pair, distinct from the Committer): Committer = 42001/50000, Sentinel = 42002/50001, Executor = 42003/50002, Finalizer = 42004/50003, Archiver = 42005/50004.
 
 ## Sub-Crate Details
 

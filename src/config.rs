@@ -30,6 +30,13 @@ pub struct BootstrapPeer {
 
 #[derive(Clone)]
 pub struct Config {
+    /// This node's public key (RNS / Ed25519 identity).
+    ///
+    /// Always derived from the persistent identity (`identity.ed25519`) at
+    /// boot — never from `config.json`. A `public_key` in `config.json` is
+    /// accepted but intentionally ignored (see `ConfigSpec.public_key`); the
+    /// node must sign with its identity's private key, so a config-supplied
+    /// public key has no matching key and must not be honored.
     pub public_key: Vec<u8>,
     pub ip_address: IpAddr,
     pub rest_api_version: usize,
@@ -321,11 +328,16 @@ pub fn meets_minimum_stake(stake: u64, global_min: u64, type_min: u64) -> bool {
 
 #[derive(Serialize, Deserialize)]
 pub struct ConfigSpec {
+    /// Accepted but intentionally IGNORED. Honoring a config-supplied public
+    /// key is infeasible (the node signs with its identity's private key,
+    /// which is not stored here), so the value is dropped and `Config.public_key`
+    /// is derived from the keystore identity instead. Kept so that a future
+    /// `#[serde(deny_unknown_fields)]` does not turn this into a hard parse
+    /// error and break existing config.json files.
     #[serde(default)]
     public_key: Vec<u8>,
     is_full_node: bool,
     rest_api_version: usize,
-    balance: u64,
     environments: Vec<String>,
     main_env_id: String,
     reconciliation_partition_id: String,
@@ -341,4 +353,75 @@ pub struct ConfigSpec {
     /// Relay/gateway mode (default false = leaf).
     #[serde(default)]
     transport_enabled: bool
+}
+
+#[cfg(test)]
+mod config_tests {
+    use std::sync::Arc;
+
+    use dashmap::DashMap;
+
+    use crate::config::{Config, ConfigSpec};
+    use crate::crypto::AsymCryptoProvider;
+
+    /// Minimal valid `config.json` shape: only the five required fields
+    /// (`environments` is required-but-unused — it must be present or the
+    /// spec fails to parse for the wrong reason).
+    fn base_spec() -> serde_json::Value {
+        serde_json::json!({
+            "is_full_node": true,
+            "rest_api_version": 1,
+            "environments": [],
+            "main_env_id": "env",
+            "reconciliation_partition_id": "default"
+        })
+    }
+
+    // Phase 6.8 config hygiene: removing the dead required `balance` field
+    // means config.json no longer has to carry a meaningless value. This is
+    // the true discriminator — re-adding `balance` (no serde default) makes
+    // from_value return Err("missing field \"balance\"") → is_ok() fails.
+    #[test]
+    fn config_spec_parses_without_balance() {
+        let result = serde_json::from_value::<ConfigSpec>(base_spec());
+        assert!(result.is_ok(), "spec must parse without a balance field");
+    }
+
+    // Removing the field must not add strictness: a spec that still carries
+    // `balance` keeps parsing (serde ignores it).
+    #[test]
+    fn config_spec_still_accepts_balance_field() {
+        let mut spec = base_spec();
+        spec["balance"] = serde_json::json!(42u64);
+        let result = serde_json::from_value::<ConfigSpec>(spec);
+        assert!(result.is_ok(), "spec must still parse with a balance field");
+    }
+
+    // The (kept, documented) `public_key` field is tolerated and ignored —
+    // proves no `#[serde(deny_unknown_fields)]` was introduced.
+    #[test]
+    fn config_spec_public_key_field_is_tolerated() {
+        let mut spec = base_spec();
+        spec["public_key"] = serde_json::json!([1u8, 2, 3]);
+        let result = serde_json::from_value::<ConfigSpec>(spec);
+        assert!(result.is_ok(), "spec must parse with a public_key field");
+    }
+
+    // `Config.public_key` is identity-authoritative, never config-derived
+    // (honoring a config public_key would break message auth). Reverting the
+    // assignment to anything other than the identity flips this assertion.
+    #[test]
+    fn config_public_key_is_identity_authoritative() {
+        let config = Config::new_for_testing(
+            "env".into(),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        );
+        let identity_key = config
+            .identity
+            .ed25519
+            .public_key()
+            .expect("in-memory identity yields a real key");
+        assert_eq!(config.public_key, identity_key);
+    }
 }

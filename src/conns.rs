@@ -17,7 +17,9 @@ use crate::node::NodeRegistryType;
 pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
     match node_type {
         NodeRegistryType::Committer => COMMITTER_PORT_INTERNAL,
-        NodeRegistryType::Archiver => COMMITTER_PORT_INTERNAL,
+        // Distinct from Committer (Phase 6.8 config hygiene); no callers yet,
+        // so this only makes the port table correct for archiver networking.
+        NodeRegistryType::Archiver => ARCHIVER_PORT_INTERNAL,
         NodeRegistryType::Sentinel => SENTINEL_PORT_INTERNAL,
         NodeRegistryType::Executor => EXECUTOR_PORT_INTERNAL,
         NodeRegistryType::Finalizer => FINALIZER_PORT_INTERNAL
@@ -27,7 +29,9 @@ pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
 pub fn get_external_port(node_type: &NodeRegistryType) -> u16 {
     match node_type {
         NodeRegistryType::Committer => COMMITTER_PORT,
-        NodeRegistryType::Archiver => COMMITTER_PORT,
+        // Distinct from Committer (Phase 6.8 config hygiene); no callers yet,
+        // so this only makes the port table correct for archiver networking.
+        NodeRegistryType::Archiver => ARCHIVER_PORT,
         NodeRegistryType::Sentinel => SENTINEL_PORT,
         NodeRegistryType::Executor => EXECUTOR_PORT,
         NodeRegistryType::Finalizer => FINALIZER_PORT
@@ -224,12 +228,13 @@ pub const COMMITTER_PORT: u16 = 42001;
 pub const SENTINEL_PORT: u16 = 42002;
 pub const EXECUTOR_PORT: u16 = 42003;
 pub const FINALIZER_PORT: u16 = 42004;
-pub const BEACON_PORT: u16 = 42005;
+pub const ARCHIVER_PORT: u16 = 42005;
 
 const COMMITTER_PORT_INTERNAL: u16 = 50000;
 const SENTINEL_PORT_INTERNAL: u16 = 50001;
 const EXECUTOR_PORT_INTERNAL: u16 = 50002;
 const FINALIZER_PORT_INTERNAL: u16 = 50003;
+const ARCHIVER_PORT_INTERNAL: u16 = 50004;
 
 #[cfg(test)]
 mod conns_tests {
@@ -240,7 +245,60 @@ mod conns_tests {
     use std::time::Duration;
 
     use crate::conns::streams::{CoreTcpStream, CoreUdsStream, Stream};
-    use crate::conns::{get_data, get_data_async, ConnError, MAX_FRAME_SIZE, TcpConnection};
+    use crate::conns::{get_data, get_data_async, get_external_port, get_internal_port, ConnError, ARCHIVER_PORT, ARCHIVER_PORT_INTERNAL, MAX_FRAME_SIZE, TcpConnection};
+    use crate::node::NodeRegistryType;
+
+    // Phase 6.8 config hygiene: the Archiver must not share the Committer's
+    // port pair. Both accessors below have no callers yet, so the discriminator
+    // exercises the table directly. Revert the two Archiver arms to COMMITTER_*
+    // and both `assert`s below flip to the Committer values → test fails.
+    #[test]
+    fn archiver_no_longer_shares_committer_ports() {
+        assert_eq!(get_external_port(&NodeRegistryType::Archiver), ARCHIVER_PORT);
+        assert_eq!(get_internal_port(&NodeRegistryType::Archiver), ARCHIVER_PORT_INTERNAL);
+        assert_ne!(
+            get_external_port(&NodeRegistryType::Archiver),
+            get_external_port(&NodeRegistryType::Committer),
+            "Archiver external port must differ from Committer"
+        );
+        assert_ne!(
+            get_internal_port(&NodeRegistryType::Archiver),
+            get_internal_port(&NodeRegistryType::Committer),
+            "Archiver internal port must differ from Committer"
+        );
+    }
+
+    // Every registry type owns a distinct (internal, external) port pair.
+    // Reverting the Archiver arms to Committer's values makes two types share a
+    // pair → the pairwise-distinct assertions fail.
+    #[test]
+    fn every_type_has_distinct_port_pair() {
+        let types = [
+            NodeRegistryType::Committer,
+            NodeRegistryType::Sentinel,
+            NodeRegistryType::Executor,
+            NodeRegistryType::Finalizer,
+            NodeRegistryType::Archiver,
+        ];
+        let externals: Vec<u16> = types.iter().map(|t| get_external_port(t)).collect();
+        let internals: Vec<u16> = types.iter().map(|t| get_internal_port(t)).collect();
+        for pair in externals.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate external port in {pair:?}");
+        }
+        for pair in internals.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate internal port in {pair:?}");
+        }
+        for (i, ti) in types.iter().enumerate() {
+            for (j, tj) in types.iter().enumerate().skip(i + 1) {
+                let shared_external = get_external_port(ti) == get_external_port(tj);
+                let shared_internal = get_internal_port(ti) == get_internal_port(tj);
+                assert!(
+                    !(shared_external && shared_internal),
+                    "{ti:?} and {tj:?} share both ports"
+                );
+            }
+        }
+    }
 
     // SA_01 companion test: verify wire framing round-trip over TCP socket.
     // Uses "fire and observe" pattern: client writes, server reads and relays via channel.
