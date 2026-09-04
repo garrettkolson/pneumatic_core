@@ -107,6 +107,28 @@ impl BlockFactory {
     /// sorted-key (BTreeMap) forms that ignore a random-seeded iteration order; `proposer_key`
     /// and `epoch_number` are newly bound into the input.
     pub fn create_hash(block: &Block) -> Result<Vec<u8>, PneumaticError> {
+        // AUDIT Phase 6.10: test-only instrumentation to prove the append path does O(1) hashing
+        // per block (a single create_hash), not the O(n) full-chain re-hash. Precedent:
+        // AUDIT Phase 6.10: test-only instrumentation. Count every create_hash so the discriminator
+        // test can prove the append path hashes one block per append (O(1)) rather than re-hashing the
+        // whole chain (O(n)). The count is guarded by a re-entrant guard (see `HashGuard`): the outermost
+        // create_hash on a thread inside the discriminator's critical section holds HASH_LOCK for the
+        // whole nested chain, isolating the count from parallel tests — while a re-entrant create_hash
+        // on the same thread sees depth>0 and never tries to re-acquire the (non re-entrant) std Mutex.
+        #[cfg(test)]
+        {
+            let _outer = HASH_GUARD_DEPTH.with(|depth| {
+                let first = *depth.borrow() == 0;
+                *depth.borrow_mut() += 1;
+                if first {
+                    Some(HASH_LOCK.lock().unwrap_or_else(|p| p.into_inner()))
+                } else {
+                    None
+                }
+            });
+            HASH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HASH_GUARD_DEPTH.with(|depth| *depth.borrow_mut() -= 1);
+        }
         let mut input = block.previous_hash.clone();
 
         let mut time_bytes = crate::encoding::serialize_to_bytes_rmp(&block.timestamp)
@@ -189,23 +211,27 @@ impl Blockchain {
     /// Validate `block` against this chain and append it, **under a single `&mut self` borrow**
     /// (AUDIT Phase 3.3 / C5).
     ///
-    /// The read of the tip (`get_current_chain_state`) and the append (`push_back`) happen inside
+    /// The read of the tip (`cached_tip`) and the append (`push_back`) happen inside
     /// this one `&mut self` call — there is no window in which another writer can append a sibling
     /// block between the linkage check and the append. This is the same atomic read-tip-then-append
     /// shape `Token::commit_block` uses on the `Commit` path.
+    ///
+    /// AUDIT Phase 6.10: the tip is read via `cached_tip()` (the last block's already-computed
+    /// `current_hash`, O(1)) rather than recomputing the whole chain via `get_current_chain_state`.
     ///
     /// Linkage (`previous_hash` == tip, or both empty for genesis) is non-fatal: a non-tip sibling
     /// is dropped rather than rejected, preserving the existing gossip semantics. An internally
     /// inconsistent block (recomputed hash != `current_hash`) is fatal.
     pub fn append_validated_block(&mut self, block: &Block) -> AppendOutcome {
-        let current_state = self.get_current_chain_state();
+        // AUDIT Phase 6.10: O(1) tip read — never re-hash the whole chain for a single append.
+        let tip = self.cached_tip();
 
         // Linkage (non-fatal): block does not chain onto the current tip — the receiver is behind
         // or this is a sibling block. Drop it, don't reject.
-        let linkage_ok = if current_state.last_hash_in.is_empty() {
+        let linkage_ok = if tip.is_empty() {
             block.previous_hash.is_empty()
         } else {
-            current_state.last_hash_in == block.previous_hash
+            tip == block.previous_hash
         };
         if !linkage_ok {
             return AppendOutcome::LinkageMismatch;
@@ -258,6 +284,19 @@ impl Blockchain {
     /// the whole block.
     pub fn last_block(&self) -> Option<&Block> {
         self.chain.back()
+    }
+
+    /// Current tip hash — the last block's already-computed `current_hash` (computed once when the
+    /// block was appended, so this is O(1) and never re-hashes the chain).
+    ///
+    /// AUDIT Phase 6.10: replaces the O(n) `get_current_chain_state().last_hash_in` on the
+    /// append/propose/commit hot paths. Returns `vec![]` for an empty chain, which is the genesis
+    /// prev-hash and matches the value `get_current_chain_state` used to return. The value is the
+    /// block's own `current_hash`, not a recomputation, so a chain whose blocks are well-formed
+    /// (the only production case — every block is validated+hashed on entry) yields the identical
+    /// result the full walk would.
+    pub fn cached_tip(&self) -> Vec<u8> {
+        self.chain.back().map(|b| b.current_hash.clone()).unwrap_or_default()
     }
 
     pub fn get_current_chain_state(&self) -> ChainState {
@@ -366,6 +405,58 @@ impl ChainState {
             is_valid: true,
             last_hash_in: vec![],
         }
+    }
+}
+
+// AUDIT Phase 6.10: test-only instrumentation. Counts every `BlockFactory::create_hash` call so a
+// test can prove the hot append path hashes exactly one block per append (O(1)) rather than the
+// whole chain (O(n)). The count is isolated from parallel tests by a re-entrant `HashGuard` — see
+// `append_validated_block_is_constant_time_per_append`.
+#[cfg(test)]
+static HASH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Acquired once per `HashGuard` scope (outermost on the thread). A Mutex (not re-entrant), so the
+// re-entrancy is layered on top of `HASH_GUARD_DEPTH`.
+#[cfg(test)]
+static HASH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Per-thread nesting depth of guarded `create_hash` calls. The outermost call (depth 0 -> 1) takes
+// HASH_LOCK; deeper calls don't re-acquire the non re-entrant std Mutex.
+#[cfg(test)]
+thread_local! {
+    static HASH_GUARD_DEPTH: std::cell::RefCell<u32> = std::cell::RefCell::new(0);
+}
+
+/// AUDIT Phase 6.10: isolate a discriminator test's `create_hash` count from parallel tests.
+///
+/// Constructing a `HashGuard` takes HASH_LOCK for the scope's lifetime (on the outermost
+/// construction on the thread), so create_hash from other parallel tests blocks until it drops.
+/// Depth in `HASH_GUARD_DEPTH` keeps re-entrant create_hash (and the guarded test's own) from
+/// trying to re-acquire the (non re-entrant) std Mutex. Poison-safe: a mutex locked by a panicked
+/// thread is recovered, not re-poisoned.
+#[cfg(test)]
+struct HashGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl HashGuard {
+    fn new() -> Self {
+        let lock = HASH_GUARD_DEPTH.with(|depth| {
+            let first = *depth.borrow() == 0;
+            *depth.borrow_mut() += 1;
+            if first {
+                Some(HASH_LOCK.lock().unwrap_or_else(|p| p.into_inner()))
+            } else {
+                None
+            }
+        });
+        HashGuard(lock)
+    }
+}
+
+#[cfg(test)]
+impl Drop for HashGuard {
+    fn drop(&mut self) {
+        HASH_GUARD_DEPTH.with(|depth| *depth.borrow_mut() -= 1);
     }
 }
 
@@ -721,5 +812,80 @@ pub mod tests {
             blockchain.get_block_at(0).unwrap().current_hash,
             b1.current_hash
         );
+    }
+
+    // --- Phase 6.10 (AUDIT checklist) — cached_tip + O(1) append_validated_block ---
+
+    /// AUDIT Phase 6.10 — the headline discriminator.
+    ///
+    /// `append_validated_block` must hash exactly one block per append (O(1)), never re-hash the
+    /// whole chain (O(n)). We append `n` blocks and assert the total number of `create_hash`
+    /// invocations is exactly `2 * n`: one per `Block::test_block` (the test's own hash) plus one
+    /// per `append_validated_block` (the appended block). On a revert to the O(n) implementation the
+    /// append re-hashes the whole chain, so the count is ~5150 for `n = 100` and the assertion
+    /// fails. The old and new code produce identical results for valid chains, so the only way to
+    /// distinguish them is to count re-hashes — hence the `HASH_COUNTER` instrumentation on
+    /// `BlockFactory::create_hash`.
+    #[test]
+    fn append_validated_block_is_constant_time_per_append() {
+        // Isolate the count from parallel tests: HashGuard takes HASH_LOCK for this scope, so
+        // create_hash from other tests queues behind it. The guarded test's own create_hash calls
+        // (via test_block + append) see depth>0 and never try to re-acquire the non re-entrant Mutex.
+        let _guard = HashGuard::new();
+        HASH_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut blockchain = Blockchain::new();
+        let n = 100usize;
+
+        for _ in 0..n {
+            let prev = blockchain.cached_tip(); // O(1) tip — no hashing
+            let block = Block::test_block(prev); // 1 create_hash (test's own)
+            blockchain.append_validated_block(&block); // 1 create_hash if O(1), ~len+1 if reverted
+        }
+
+        // n test_block hashes + n append hashes == 2n iff each append is O(1). On a revert the append
+        // re-hashes the whole chain, so the count is ~5150 and the assertion fails — proven discriminator.
+        assert_eq!(HASH_COUNTER.load(std::sync::atomic::Ordering::SeqCst), 2 * n as u64);
+    }
+
+    /// `cached_tip` returns the last block's already-computed `current_hash`.
+    #[test]
+    fn cached_tip_returns_tip_hash() {
+        let mut blockchain = Blockchain::new();
+        let genesis = Block::test_block(Vec::<u8>::new());
+        blockchain.add_block(genesis.clone());
+        let b1 = Block::test_block(genesis.current_hash.clone());
+        blockchain.add_block(b1.clone());
+
+        assert_eq!(blockchain.cached_tip(), b1.current_hash);
+    }
+
+    /// `cached_tip` is empty for an empty chain — matches `get_current_chain_state` (genesis prev-hash).
+    #[test]
+    fn cached_tip_empty_for_empty_chain() {
+        let blockchain = Blockchain::new();
+
+        assert!(blockchain.cached_tip().is_empty());
+        // Equivalent to the value the O(n) walk returns for the empty chain.
+        assert_eq!(blockchain.cached_tip(), blockchain.get_current_chain_state().last_hash_in);
+    }
+
+    /// `cached_tip` advances by one block per append and reflects a tip rollback (remove_block).
+    #[test]
+    fn cached_tip_follows_append_and_rollback() {
+        let mut blockchain = Blockchain::new();
+        let genesis = Block::test_block(Vec::<u8>::new());
+        blockchain.add_block(genesis.clone());
+
+        assert_eq!(blockchain.cached_tip(), genesis.current_hash);
+
+        let b1 = Block::test_block(genesis.current_hash.clone());
+        blockchain.add_block(b1.clone());
+        assert_eq!(blockchain.cached_tip(), b1.current_hash);
+
+        // Rolling back the tip surfaces the previous block's hash — the same value
+        // `get_current_chain_state().last_hash_in` would now return.
+        blockchain.remove_block();
+        assert_eq!(blockchain.cached_tip(), genesis.current_hash);
     }
 }

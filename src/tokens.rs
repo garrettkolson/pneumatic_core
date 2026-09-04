@@ -200,7 +200,10 @@ impl Token {
         let prev_hash = match self.blockchain.get_count() {
             // Genesis convention: block 1 has an empty previous_hash.
             0 => Vec::<u8>::new(),
-            _ => self.blockchain.get_current_chain_state().last_hash_in,
+            // AUDIT Phase 6.10: O(1) tip read — the last block's `current_hash`, never the whole
+            // chain. Only `.last_hash_in` is used here, so `cached_tip` is equivalent for a valid
+            // chain and avoids the O(n) re-hash per propose.
+            _ => self.blockchain.cached_tip(),
         };
         let proposer_key = signed_tx.proposer_key.clone();
 
@@ -245,7 +248,8 @@ impl Token {
         // the real tip). The removed block is remembered so a rejected winner can restore the
         // chain — a conflict winner that ultimately fails validation must never truncate the tip.
         let removed_for_restore: Option<Block> = match rollback_tip_hash {
-            Some(loser_hash) if self.blockchain.get_current_chain_state().last_hash_in == loser_hash => {
+            // AUDIT Phase 6.10: O(1) tip read for the rollback-conflict comparison.
+            Some(loser_hash) if self.blockchain.cached_tip() == loser_hash => {
                 self.blockchain.remove_block()
             }
             _ => None,
