@@ -334,7 +334,8 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
         0,
     );
     block.previous_hash = tip.last_hash_in.clone();
-    block.current_hash = BlockFactory::create_hash(&block);
+    block.current_hash = BlockFactory::create_hash(&block)
+        .expect("well-formed test block hash");
 
     let mut bc = pneumatic_core::blocks::Blockchain::new();
     bc.add_block(block);
@@ -437,7 +438,8 @@ async fn test_pipeline_no_conflict() {
     };
 
     // Compute valid block hash
-    let expected_hash = BlockFactory::create_hash(&block);
+    let expected_hash = BlockFactory::create_hash(&block)
+        .expect("well-formed test block hash");
     let block = Block {
         current_hash: expected_hash,
         ..block
@@ -531,7 +533,7 @@ async fn commit_from_empty_registry_materializes_and_commits() {
         epoch_number: 0,
     };
     let block = Block {
-        current_hash: BlockFactory::create_hash(&block),
+        current_hash: BlockFactory::create_hash(&block).expect("well-formed test block hash"),
         ..block
     };
 
@@ -684,8 +686,10 @@ async fn test_pipeline_conflict_and_slashing() {
     };
 
     // Compute valid block hashes
-    let block1_hash = BlockFactory::create_hash(&block1);
-    let block2_hash = BlockFactory::create_hash(&block2);
+    let block1_hash = BlockFactory::create_hash(&block1)
+        .expect("well-formed test block hash");
+    let block2_hash = BlockFactory::create_hash(&block2)
+        .expect("well-formed test block hash");
 
     let block1 = Block {
         current_hash: block1_hash,

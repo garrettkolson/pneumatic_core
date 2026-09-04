@@ -2200,7 +2200,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+            .expect("well-formed test block hash");
         token.blockchain.add_block(block);
         token
     }

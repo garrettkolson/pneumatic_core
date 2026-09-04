@@ -4,6 +4,7 @@ use std::vec;
 use chrono::{Utc, prelude::*};
 use serde::{Deserialize, Serialize};
 use crate::crypto::{BasicHashProvider, HashProvider};
+use crate::errors::PneumaticError;
 use crate::tokens::Token;
 use crate::transactions::SignedTransaction;
 
@@ -82,7 +83,8 @@ impl Block {
             epoch_number: 0,
         };
 
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hashes");
         block
     }
 }
@@ -104,30 +106,30 @@ impl BlockFactory {
     /// `signed_trans` and `token_metadata` are `HashMap`-backed, so they are serialized through
     /// sorted-key (BTreeMap) forms that ignore a random-seeded iteration order; `proposer_key`
     /// and `epoch_number` are newly bound into the input.
-    pub fn create_hash(block: &Block) -> Vec<u8> {
+    pub fn create_hash(block: &Block) -> Result<Vec<u8>, PneumaticError> {
         let mut input = block.previous_hash.clone();
 
         let mut time_bytes = crate::encoding::serialize_to_bytes_rmp(&block.timestamp)
-            .expect("Block timestamp couldn't be serialized.");
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
         input.append(&mut time_bytes);
 
         let mut trans_bytes = crate::transactions::canonical_signed_trans_bytes(&block.signed_trans)
-            .expect("Block signed transaction couldn't be canonicalized.");
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
         input.append(&mut trans_bytes);
 
         let mut metadata_bytes = canonical_map_bytes(&block.token_metadata)
-            .expect("Block token metadata couldn't be canonicalized.");
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
         input.append(&mut metadata_bytes);
 
         let mut proposer_bytes = crate::encoding::serialize_to_bytes_rmp(&block.proposer_key)
-            .expect("Block proposer_key couldn't be serialized.");
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
         input.append(&mut proposer_bytes);
 
         let mut epoch_bytes = crate::encoding::serialize_to_bytes_rmp(&block.epoch_number)
-            .expect("Block epoch_number couldn't be serialized.");
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
         input.append(&mut epoch_bytes);
 
-        BasicHashProvider::new().hash(&input)
+        Ok(BasicHashProvider::new().hash(&input))
     }
 }
 
@@ -212,7 +214,14 @@ impl Blockchain {
         // Hash (fatal): the block is internally inconsistent — its recomputed hash differs from its
         // claimed `current_hash` (tampered), or its `previous_hash` does not match the recomputed
         // tip. Reject, do not silently pass.
-        if BlockFactory::create_hash(block) != block.current_hash {
+        let computed_hash = match BlockFactory::create_hash(block) {
+            Ok(h) => h,
+            // AUDIT Phase 6.9 (Item D): a hash path that can no longer `expect()` — any
+            // serialization failure is treated as an invalid block (fail closed), never
+            // a panic.
+            Err(_) => return AppendOutcome::InvalidHash,
+        };
+        if computed_hash != block.current_hash {
             return AppendOutcome::InvalidHash;
         }
 
@@ -257,7 +266,12 @@ impl Blockchain {
         }
 
         let mut prev_block = &self.chain[0];
-        let prev_hash = BlockFactory::create_hash(&prev_block);
+        // AUDIT Phase 6.9 (Item D): the hash path can no longer `expect()`; an impossible
+        // canonicalization failure is treated as an invalid chain (fail closed), never a panic.
+        let prev_hash = match BlockFactory::create_hash(&prev_block) {
+            Ok(h) => h,
+            Err(_) => return ChainState::invalid(),
+        };
         let mut valid = prev_block.current_hash == prev_hash;
 
         for (i, _) in self.chain.iter().enumerate() {
@@ -268,8 +282,12 @@ impl Blockchain {
                 return ChainState::new(true, prev_block);
             }
 
+            let next_hash = match BlockFactory::create_hash(&self.chain[next_index]) {
+                Ok(h) => h,
+                Err(_) => return ChainState::invalid(),
+            };
             valid = self.chain[next_index].previous_hash == prev_block.current_hash
-                && BlockFactory::create_hash(&self.chain[next_index]) == self.chain[next_index].current_hash;
+                && next_hash == self.chain[next_index].current_hash;
 
             prev_block = &self.chain[next_index];
         }
@@ -291,7 +309,13 @@ impl Blockchain {
             current_state.last_hash_in == next_block.previous_hash
         };
 
-        linkage_ok && BlockFactory::create_hash(next_block) == next_block.current_hash
+        // AUDIT Phase 6.9 (Item D): a hash that cannot be computed fails the linkage
+        // check (fail closed), rather than panicking.
+        let hash_ok = match BlockFactory::create_hash(next_block) {
+            Ok(h) => h == next_block.current_hash,
+            Err(_) => false,
+        };
+        linkage_ok && hash_ok
     }
 
     /// Get a block by index. Returns None if out of range.
@@ -585,7 +609,8 @@ pub mod tests {
             proposer_key: vec![3, 1, 4],
             epoch_number: 17,
         };
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hashes");
         block
     }
 
@@ -640,7 +665,8 @@ pub mod tests {
         let mut b: Block = crate::encoding::deserialize_rmp_to(&bytes).unwrap();
         // Recompute as the pipeline does (it sets current_hash = create_hash(block)); the
         // deserialized block carries the same contents in a fresh, re-seeded HashMap state.
-        b.current_hash = BlockFactory::create_hash(&b);
+        b.current_hash =
+            BlockFactory::create_hash(&b).expect("well-formed test block hashes");
         assert_eq!(a.current_hash, b.current_hash);
     }
 
@@ -650,12 +676,14 @@ pub mod tests {
         // Same everything, only proposer_key differs → hash must change (proposer_key is bound in).
         let mut b = populated_block(metadata_forward(), sigs_forward());
         b.proposer_key = vec![9, 9, 9];
-        b.current_hash = BlockFactory::create_hash(&b); // recompute after the field change
+        b.current_hash =
+            BlockFactory::create_hash(&b).expect("well-formed test block hashes"); // recompute after the field change
         assert_ne!(a.current_hash, b.current_hash);
         // Same everything, only epoch_number differs → hash must change (epoch_number is bound in).
         let mut c = populated_block(metadata_forward(), sigs_forward());
         c.epoch_number = 18;
-        c.current_hash = BlockFactory::create_hash(&c); // recompute after the field change
+        c.current_hash =
+            BlockFactory::create_hash(&c).expect("well-formed test block hashes"); // recompute after the field change
         assert_ne!(a.current_hash, c.current_hash);
     }
 

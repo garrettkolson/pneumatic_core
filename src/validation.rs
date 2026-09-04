@@ -818,7 +818,8 @@ mod tests {
                 proposer_key: vec![1],
                 epoch_number: 0,
             };
-            gen_block.current_hash = BlockFactory::create_hash(&gen_block);
+            gen_block.current_hash =
+                BlockFactory::create_hash(&gen_block).expect("well-formed test block hash");
             blockchain.add_block(gen_block);
         }
         let prev_hash = blockchain.get_current_chain_state().last_hash_in;
@@ -832,7 +833,8 @@ mod tests {
             proposer_key,
             epoch_number: 0,
         };
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hash");
         block
     }
 

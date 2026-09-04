@@ -84,9 +84,12 @@ impl SignatureCollector {
             return Ok(false);
         }
 
-        // Integer arithmetic: sig_count * 100 >= total_voters * quorum_percentage
-        // Avoids floating point rounding issues
-        let reached = (sig_count as f32 / self.total_voters as f32) * 100.0 >= self.quorum_percentage;
+        // AUDIT Phase 6.9 (Item B): exact-integer quorum, matching the stake comparison
+        // above — sig_count / total_voters >= quorum/100  <=>  sig_count * 100 >=
+        // total_voters * quorum in u128 (these operand counts are small, so no overflow).
+        // quorum_percentage is f32 validated to (0,100]; round() to nearest whole percent.
+        let quorum_pct = self.quorum_percentage.round() as u128;
+        let reached = (sig_count as u128) * 100 >= (self.total_voters as u128) * quorum_pct;
         Ok(reached)
     }
 
@@ -131,9 +134,13 @@ impl SignatureCollector {
         }
 
         // Supermajority threshold: accumulate stake until reaching quorum%.
-        // Uses the same comparison as check_quorum for consistency:
-        // cumulative >= total_stake * quorum_percentage / 100
-        let quorum_threshold = total_stake as f64 * (self.quorum_percentage as f64) / 100.0;
+        // AUDIT Phase 6.9 (Item B): exact-integer comparison. Casting u64 stake to f64
+        // truncates above 2^52, so the f64 threshold can be off-by-one at the boundary —
+        // an adversarial stake set could reach/miss quorum wrongly. cumulative >=
+        // total_stake * quorum/100  <=>  cumulative*100 >= total_stake*quorum in u128
+        // (u64::MAX * 100 fits). quorum_percentage is f32 validated to (0,100]; round()
+        // to the nearest whole percent.
+        let quorum_pct = self.quorum_percentage.round() as u128;
 
         let mut cumulative = 0u64;
         let mut winning = Vec::new();
@@ -147,7 +154,8 @@ impl SignatureCollector {
                 signature: sig.clone(),
                 stake: *stake,
             });
-            if (cumulative as f64) >= quorum_threshold {
+            let reached = (cumulative as u128) * 100 >= (total_stake as u128) * quorum_pct;
+            if reached {
                 winning_finalizer = executor_key.clone();
                 conflict_resolved = true;
                 break;
@@ -266,6 +274,38 @@ mod tests {
 
         let quorum = collector.check_quorum("tx_1").unwrap();
         assert!(!quorum);
+    }
+
+    // AUDIT Phase 6.9 (Item B, precision discriminator — finalizer stake walk).
+    // three executors: A = 2^52, B = 2^51, C = 2^51 + 1, so total = 2^53 + 1 (not
+    // representable in f64; rounds down to 2^53). quorum_percentage = 50%.
+    // reconcile_signatures sorts descending: A is largest and is walked FIRST.
+    //   integer (new): A alone -> 2^52 * 100 = 450359962737049600 <
+    //                  total * 50 = 450359962737049650 -> A does NOT reach -> A is not the winner.
+    //   f64 (old): A's cumulative 2^52 >= threshold total_f64*50/100 = 2^53*0.5 = 2^52 -> A reaches
+    //             immediately -> A becomes winning_finalizer.
+    // So under the fixed integer math A is NOT the winner. Temp-reverting to f64 makes A the
+    // winner -> assert fails.
+    #[test]
+    fn test_reconcile_signatures_precision_big_stakes() {
+        let registry = make_registry();
+        // 50% quorum so the 2^52 boundary is exactly reachable under f64.
+        let collector = SignatureCollector::new(registry.clone(), 50.0, 3);
+
+        let a_stake: u64 = 4503599627370496; // 2^52
+        let b_stake: u64 = 2251799813685248; // 2^51
+        let c_stake: u64 = 2251799813685249; // 2^51 + 1
+        // total = 9007199254740993 = 2^53 + 1
+
+        collector.add_signature("tx_big", b"A".to_vec(), make_sample_signature("tx_big", b"A", a_stake)).unwrap();
+        collector.add_signature("tx_big", b"B".to_vec(), make_sample_signature("tx_big", b"B", b_stake)).unwrap();
+        collector.add_signature("tx_big", b"C".to_vec(), make_sample_signature("tx_big", b"C", c_stake)).unwrap();
+
+        let reconciled = collector.reconcile_signatures("tx_big").unwrap();
+        // Under exact integer arithmetic, A's lone 2^52 stake falls one unit short of the 50%
+        // threshold, so A must not be declared the winning finalizer.
+        assert_ne!(reconciled.winning_finalizer, b"A".to_vec(),
+            "integer quorum must not reach at A's 2^52 stake; f64 rounding bug would make A the winner");
     }
 
     #[test]

@@ -95,7 +95,9 @@ pub struct StakeSet {
 
 impl StakeSet {
     pub fn total_stake(&self) -> u64 {
-        self.stakers.values().sum()
+        // AUDIT Phase 6.9: saturating_add so an adversarial stake sum saturates to u64::MAX
+        // instead of panicking on overflow — a panic in the selection path is a node DoS.
+        self.stakers.values().fold(0u64, |acc, &v| acc.saturating_add(v))
     }
 
     /// Get the stake for a specific public key
@@ -152,7 +154,9 @@ pub struct ExecutorSet {
 
 impl ExecutorSet {
     pub fn total_stake(&self) -> u64 {
-        self.executors.values().sum()
+        // AUDIT Phase 6.9: saturating_add (overflow panics in debug) so the sum degrades to
+        // u64::MAX rather than panicking — shard/finalizer selection never crashes on stake.
+        self.executors.values().fold(0u64, |acc, &v| acc.saturating_add(v))
     }
 
     pub fn len(&self) -> usize {
@@ -343,7 +347,9 @@ pub fn deterministic_select(
     let mut cumulative = 0u64;
     for key in keys {
         let stake = *stakers.stakers.get(key).unwrap();
-        cumulative += stake;
+        // AUDIT Phase 6.9: saturating add — cumulative is compared `>= target` (target < total),
+        // so a saturated cumulative still resolves the walk without panicking on overflow.
+        cumulative = cumulative.checked_add(stake).unwrap_or(u64::MAX);
         if cumulative >= target {
             return Some(key.clone());
         }
@@ -428,7 +434,8 @@ pub fn deterministic_select_shard(
         let target_shard = (0..shard_count as usize)
             .min_by_key(|&i| shard_stakes[i])
             .unwrap_or(0);
-        shard_stakes[target_shard] += stake;
+        // AUDIT Phase 6.9: saturating add (overflow panics in debug) — degrade to u64::MAX.
+        shard_stakes[target_shard] = shard_stakes[target_shard].checked_add(stake).unwrap_or(u64::MAX);
         shard_executors[target_shard].push(key.clone());
     }
 
@@ -1015,6 +1022,15 @@ mod tests {
         assert_eq!(stakes.total_stake(), 60);
     }
 
+    // AUDIT Phase 6.9 (Item A, discriminator): two 2^63 stakes overflow u64::MAX.
+    // old .sum() panics in debug; saturating fold must return u64::MAX, no panic.
+    #[test]
+    fn stake_set_total_stake_saturates_on_overflow() {
+        let large: u64 = 1 << 63;
+        let stakes = make_stake_set(vec![(vec![1], large), (vec![2], large)]);
+        assert_eq!(stakes.total_stake(), u64::MAX);
+    }
+
     #[test]
     fn stake_set_get_stake_returns_zero_for_missing_key() {
         let stakes = make_stake_set(vec![(vec![1], 10)]);
@@ -1487,6 +1503,22 @@ mod tests {
         assert!(!saw_zero, "zero-stake key must never be selected even in a mixed set");
     }
 
+    // AUDIT Phase 6.9 (Item A, discriminator): cumulative walk over two 2^63 stakes
+    // would overflow u64. old `cumulative += stake` panics in debug; checked_add must
+    // resolve the walk to Some(_), no panic.
+    #[test]
+    fn deterministic_select_no_panic_on_overflowing_stakes() {
+        let large: u64 = 1 << 63;
+        let stakes = make_stake_set(vec![(vec![1], large), (vec![2], large)]);
+        let mut saw_zero = false;
+        for i in 0..200u8 {
+            match deterministic_select(&stakes, FINALIZER_DOMAIN, &[i], 1, &[]) {
+                Some(k) => assert!(!saw_zero || k == vec![1] || k == vec![2], "overflow walk picks a real key"),
+                None => panic!("overflow set has total>0, selection must not be None"),
+            }
+        }
+    }
+
     // --- ExecutorSet tests ---
 
     #[test]
@@ -1505,6 +1537,17 @@ mod tests {
         };
         assert_eq!(es.total_stake(), 60);
         assert_eq!(es.len(), 3);
+    }
+
+    // AUDIT Phase 6.9 (Item A, discriminator): ExecutorSet::total_stake over 2^63 + 2^63
+    // overflows u64::MAX. old .sum() panics in debug; saturating fold must return u64::MAX.
+    #[test]
+    fn executor_set_total_stake_saturates_on_overflow() {
+        let large: u64 = 1 << 63;
+        let es = ExecutorSet {
+            executors: [(b"a".to_vec(), large), (b"b".to_vec(), large)].into_iter().collect(),
+        };
+        assert_eq!(es.total_stake(), u64::MAX);
     }
 
     #[test]
@@ -1634,6 +1677,20 @@ mod tests {
         let shard = result.unwrap();
         assert!(shard.len() >= 1 && shard.len() <= 4,
             "shard size {} should be between 1 and 4", shard.len());
+    }
+
+    // AUDIT Phase 6.9 (Item A, discriminator): round-robin stake accumulation over four
+    // 2^63 executors across 2 shards sums one shard to 2^64 (overflow). old `+= stake`
+    // panics in debug; checked_add(...) must saturate without panicking.
+    #[test]
+    fn deterministic_select_shard_no_panic_on_overflowing_stakes() {
+        let large: u64 = 1 << 63;
+        let mut executors = ExecutorSet::default();
+        for i in 0..4 {
+            executors.executors.insert(format!("exec{}", i).into_bytes(), large);
+        }
+        let result = deterministic_select_shard(&executors, 2, "tx-overflow", 1, &[]);
+        assert!(result.is_some(), "overflowing-stake shard walk must still return a shard");
     }
 
     #[test]

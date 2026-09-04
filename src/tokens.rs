@@ -233,7 +233,8 @@ impl Token {
         // checks the self-hash, and fresh blocks arrive with
         // current_hash = vec![]. (create_hash does not include current_hash
         // in its input, so this is a no-op for already-hashed blocks.)
-        block.current_hash = crate::blocks::BlockFactory::create_hash(&block);
+        block.current_hash = crate::blocks::BlockFactory::create_hash(&block)
+            .map_err(|e| BlockCommitError::Hash(format!("create_hash: {e:?}")))?;
 
         // AUDIT Phase 5.2 / H2: roll back a conflicting tip BEFORE validating. The winner of a
         // resolved conflict is a *sibling* of the loser — its `previous_hash` links to the parent
@@ -1015,4 +1016,8 @@ pub enum BlockCommitError {
     TokenWriteLockPoisoned,
     FromDataError(DataError),
     BlockValidationError(BlockValidationError),
+    /// A block's hash could not be computed (AUDIT Phase 6.9 / Item D —
+    /// `create_hash`'s serialization path now surfaces as an error rather than a
+    /// panic; a block whose hash cannot be computed is rejected, never accepted).
+    Hash(String),
 }

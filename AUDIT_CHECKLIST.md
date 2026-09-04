@@ -799,11 +799,34 @@ agree on anything.*
   --workspace` clean. See [[phase-6-6-zero-stake-exclusion]].
 - [x] **6.7 Stop the evictor on shutdown** — DONE. `shutdown: Arc<AtomicBool>` + `evictor: Mutex<Option<JoinHandle<()>>>` (JoinHandle isn't `Clone`, mirrors `StakeIndex.handle`); `start_eviction` runs a check-first loop that exits within one poll; `stop_eviction` sets the flag before join; `impl Drop for NodeRegistry` joins via `stop_eviction`, releasing the five registry `Arc`s. Interval tightened to 1 s. `#[cfg(test)]` discriminators (drop, explicit stop, positive-control eviction), all proven to fail on revert. No wire/serialization change. Workspace 631 → 634.
 - [x] **6.8 Config hygiene** — DONE. Renamed the unused `BEACON_PORT`→`ARCHIVER_PORT` (value 42005) and added `ARCHIVER_PORT_INTERNAL=50004`; `get_internal_port`/`get_external_port` now map `Archiver` to that distinct pair (Phase 6.8 gave it its own ports, no longer the Committer's shared 42001/50000). Removed the dead required `ConfigSpec.balance` (a boot-footgun: config.json had to carry a meaningless value); kept the ignored `ConfigSpec.public_key` and documented — on both `ConfigSpec.public_key` and `Config.public_key` — that the public key is derived from the keystore identity and a config `public_key` is intentionally ignored (honoring it is infeasible/unsafe: no matching private key). Added 4 `config_tests` — `config_spec_parses_without_balance` (true discriminator), `config_spec_still_accepts_balance_field`, `config_spec_public_key_field_is_tolerated`, `config_public_key_is_identity_authoritative` — and 2 `conns_tests` — `archiver_no_longer_shares_committer_ports`, `every_type_has_distinct_port_pair`; each proven to fail on a temporary revert. README:239 port mapping updated. No wire/serialization change. Workspace 634 → 640.
-- [ ] **6.9 Arithmetic & panic hardening** — checked/saturating stake math (`src/epoch.rs:233-246`,
+- [x] **6.9 Arithmetic & panic hardening** — checked/saturating stake math (`src/epoch.rs:233-246`,
   `committer/src/epoch_manager.rs:48-52`); integer quorum math (replace f64 at
   `committer/src/committer.rs:453`); `unreachable!` on non-32-byte hash output becomes an error
   (`committer/src/epoch_manager.rs:257-260`); remove `expect()` on message-derived data in
   `BlockFactory::create_hash`.
+  Done. Item A — checked/saturating stake math: `deterministic_select` and `select_internal` use
+  `checked_add().unwrap_or(u64::MAX)`, the shard walk and `to_stake_set`/`total_stake` use
+  saturating arithmetic, and the slash function drops the key at zero (Phase 6.6). Item B — integer
+  quorum math replaces the f64 cast (u64→f64 truncates above 2^52) with integer `cumulative*100 >=
+  total*quorum` in u128 (`committer/src/committer.rs:900-901`) plus the finalizer-side
+  `total_voters*quorum` (`finalizer/src/signature_collector.rs:89`). Item C — the `unreachable!` on
+  the leader-selection hash seed becomes a typed error that returns an empty selection
+  (`committer/src/epoch_manager.rs:326-339`). Item D — `BlockFactory::create_hash` now returns
+  `Result<Vec<u8>, PneumaticError>` (was `Vec<u8>`); the last `expect()` on message-derived data was
+  removed — `BlockBuilder::create_block`/`create_block_optimistic` now propagate the error through
+  their callers (`finalizer/src/finalizer.rs:473,573`) while test helpers keep `.expect()` on
+  locally-built blocks (verified only when tests compile, since `cargo check` skips `#[cfg(test)]`).
+  Discriminators across all items (each proven to fail on a temporary revert):
+  `deterministic_select_no_panic_on_overflowing_stakes`,
+  `deterministic_select_shard_no_panic_on_overflowing_stakes`,
+  `stake_set_total_stake_saturates_on_overflow`,
+  `executor_set_total_stake_saturates_on_overflow`, `leader_select_internal_no_panic_on_overflowing_stakes`,
+  `stake_store_reward_saturates_on_overflow`, `check_and_commit_validated_saturates_on_overflow`,
+  `check_and_commit_gas_exceeds_balance_saturates`, `concurrent_block_finalized_submissions_no_panic`,
+  `handle_block_confirmed_vote_quorum_precision_big_stakes`,
+  `test_reconcile_signatures_precision_big_stakes`,
+  `leader_select_returns_empty_on_non_32_byte_hash`. Internal-API change only (create_hash /
+  create_block signatures) — no wire/serialization change. Workspace 640 → 650.
 - [ ] **6.10 O(n) full-chain rehash per block message** — cache chain state / incremental
   validation so a `BlockFinalized` doesn't rehash the whole chain
   (`src/blocks.rs:131-155`).
@@ -947,6 +970,8 @@ agree on anything.*
   serialize the `Message` payload directly and must not wrap it in a `NetworkPacket`; both closure and field
   need an `Arc` handle (E0599 without the `Arc` wrap). Wire-compat: none (control-plane and data-plane shapes
   unchanged). Workspace **631**.
+
+# TODO: figure out post-quantum encryption
 
 ## Phase 7 — Test coverage the audit found missing
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the

@@ -470,7 +470,7 @@ impl Finalizer {
 
         // Step 7: Create the Block, chained to the token's current chain tip.
         let previous_hash = self.resolve_previous_hash(&transaction.token_id);
-        let block = self.block_builder.create_block(signed_tx.clone(), previous_hash, self.current_epoch);
+        let block = self.block_builder.create_block(signed_tx.clone(), previous_hash, self.current_epoch)?;
 
         // Step 8: Send the commit to all Committers
         let block_hash = block.current_hash.clone();
@@ -570,7 +570,7 @@ impl Finalizer {
             signed_tx.clone(),
             previous_hash,
             self.current_epoch,
-        );
+        )?;
 
         // Step 7: Send the commit to all Committers
         let block_hash = block.current_hash.clone();
@@ -1262,7 +1262,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash = BlockFactory::create_hash(&block)
+            .expect("well-formed test block hash");
         block
     }
 

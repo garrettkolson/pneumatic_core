@@ -178,7 +178,7 @@ impl BlockBuilder {
         signed_tx: SignedTransaction,
         previous_hash: Vec<u8>,
         epoch_number: u64,
-    ) -> Block {
+    ) -> Result<Block, PneumaticError> {
         // Phase 2.3 (C2): proposer_key is the block's identity in the hash + conflict resolution,
         // so read it from the signed transaction (the same field `Block::from_transaction` uses).
         let proposer_key = signed_tx.proposer_key.clone();
@@ -192,9 +192,13 @@ impl BlockBuilder {
             proposer_key: proposer_key.clone(),
             epoch_number,
         };
-        // Compute the block hash
-        let current_hash = BlockFactory::create_hash(&block);
-        Block {
+        // Compute the block hash.
+        // AUDIT Phase 6.9 (Item D): create_hash now returns Result; a serialization failure on the
+        // locally-built block surfaces as an error rather than panicking, so this propagates it
+        // (this helper now returns Result) instead of expect()-ing message-derived data.
+        let current_hash = BlockFactory::create_hash(&block)
+            .map_err(|e| PneumaticError::Encoding(format!("create_hash: {e:?}")))?;
+        Ok(Block {
             signed_trans: block.signed_trans,
             token_metadata: block.token_metadata,
             previous_hash: block.previous_hash,
@@ -203,7 +207,7 @@ impl BlockBuilder {
             finality_status: FinalityStatus::Optimistic,
             proposer_key,
             epoch_number,
-        }
+        })
     }
 
     /// Build a SignedTransaction from a single executor's optimistic signature.
@@ -262,7 +266,7 @@ impl BlockBuilder {
         signed_tx: SignedTransaction,
         previous_hash: Vec<u8>,
         epoch_number: u64,
-    ) -> Block {
+    ) -> Result<Block, PneumaticError> {
         self.create_block(signed_tx, previous_hash, epoch_number)
     }
 }
@@ -417,7 +421,8 @@ mod tests {
             .block_on(async { builder.sign_finalizer_block(&mut signed).await.unwrap() });
         signed.finalizer_sig = finalizer_sig;
 
-        let block = builder.create_block(signed, vec![10, 20, 30], 0);
+        let block = builder.create_block(signed, vec![10, 20, 30], 0)
+            .expect("well-formed test block hash");
 
         assert!(!block.current_hash.is_empty());
         assert_eq!(block.previous_hash, vec![10, 20, 30]);
@@ -517,7 +522,8 @@ mod tests {
             vec![4, 5, 6],
             vec![7, 7, 7],
         );
-        let finalizer_block = builder.create_block(signed.clone(), vec![1, 2, 3], 17);
+        let finalizer_block = builder.create_block(signed.clone(), vec![1, 2, 3], 17)
+            .expect("well-formed test block hash");
         assert_eq!(finalizer_block.proposer_key, vec![3, 1, 4]);
 
         // Core: Token::create_block.

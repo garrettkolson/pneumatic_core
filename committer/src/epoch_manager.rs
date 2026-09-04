@@ -58,7 +58,9 @@ impl StakeStore {
     /// Reward a staker with additional stake.
     pub fn reward(&self, key: &[u8], amount: u64) {
         if let Some(mut entry) = self.stakes.get_mut(key) {
-            *entry += amount;
+            // AUDIT Phase 6.9: saturating_add — an adversarial reward amount degrades to u64::MAX
+            // instead of panicking on overflow (a panic in the staking path is a node DoS).
+            *entry = entry.saturating_add(amount);
         }
     }
 
@@ -303,10 +305,15 @@ impl LeaderSelector {
     /// Select leader(s) from the current stake set using
     /// stake-weighted deterministic selection, bound to the mined chain tip
     /// (Phase 5.3 / AUDIT H3).
-    fn select_internal(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8> {
+    fn select_internal(
+        &self,
+        stakers: &StakeSet,
+        epoch_number: u64,
+        prev_block_hash: &[u8],
+    ) -> Result<Vec<u8>, PneumaticError> {
         let total = stakers.total_stake();
         if total == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         // Domain-separated seed bound to the mined tip:
@@ -316,10 +323,21 @@ impl LeaderSelector {
         input.extend_from_slice(&epoch_number.to_be_bytes());
         input.extend_from_slice(prev_block_hash);
         let seed = self.hash_provider.hash(&input);
-        let mut rng = rand::rngs::StdRng::from_seed(seed.try_into().unwrap_or_else(|_| {
-            // SHA-256 produces 32 bytes, exactly fits [u8; 32]
-            unreachable!("hash provider always produces 32 bytes")
-        }));
+        // AUDIT Phase 6.9 (Item C): fail closed on a hash provider that does not
+        // yield 32 bytes instead of panicking (a panic = DoS). Seed construction
+        // now returns an Err which the thin `select` wrapper maps to the empty
+        // "no leader" outcome, preserving the trait contract.
+        let seed_len = seed.len();
+        let seed_bytes: [u8; 32] = match seed.try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(PneumaticError::Epoch(format!(
+                    "hash provider produced {} bytes, expected 32",
+                    seed_len
+                )))
+            }
+        };
+        let mut rng = rand::rngs::StdRng::from_seed(seed_bytes);
         let target: u64 = rng.gen_range(0..total);
 
         // Deterministic iteration: sort keys lexicographically, skipping zero-stake
@@ -339,19 +357,23 @@ impl LeaderSelector {
         let mut cumulative = 0u64;
         for key in keys {
             let stake = *stakers.stakers.get(key).unwrap();
-            cumulative += stake;
+            // AUDIT Phase 6.9: saturating add — cumulative is compared `>= target` (target < total),
+            // so a saturated cumulative still resolves the walk without panicking on overflow.
+            cumulative = cumulative.checked_add(stake).unwrap_or(u64::MAX);
             if cumulative >= target {
-                return key.clone();
+                return Ok(key.clone());
             }
         }
         // Fallback: return the first positive-stake key (only reached if total == 0, already handled)
-        first_key
+        Ok(first_key)
     }
 }
 
 impl IEpochLeaderSelector for LeaderSelector {
     fn select(&self, stakers: &StakeSet, epoch_number: u64, prev_block_hash: &[u8]) -> Vec<u8> {
-        self.select_internal(stakers, epoch_number, prev_block_hash)
+        // AUDIT Phase 6.9 (Item C): any internal selection error maps to the
+        // empty "no leader" outcome — never panic.
+        self.select_internal(stakers, epoch_number, prev_block_hash).unwrap_or_default()
     }
 }
 
@@ -365,6 +387,7 @@ mod tests {
 
     use pneumatic_core::blocks::{Block, FinalityStatus};
     use pneumatic_core::crypto::BasicHashProvider;
+    use pneumatic_core::crypto::HashProvider;
     use pneumatic_core::epoch::StakeSet;
     use pneumatic_core::epoch::IEpochLeaderSelector;
     use pneumatic_core::data::{DataProvider, StubDataProvider};
@@ -388,7 +411,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+            .expect("well-formed test block hashes");
         block
     }
 
@@ -701,6 +725,68 @@ mod tests {
         };
         let result = leader.select(&stakes, 1, &[]);
         assert_eq!(result, vec![1], "zero-stake key must never be elected leader");
+    }
+
+    // AUDIT Phase 6.9 (Item C, discriminator helper): a HashProvider that yields a
+    // fixed non-32-byte Vec, to drive the seed-construction path that previously
+    // hit `unreachable!`.
+    struct FixedLenHashProvider(usize);
+    impl HashProvider for FixedLenHashProvider {
+        fn hash(&self, _data: &[u8]) -> Vec<u8> {
+            vec![0u8; self.0]
+        }
+    }
+
+    // AUDIT Phase 6.9 (Item C, discriminator): a hash provider that yields a
+    // non-32-byte Vec must make `select` return the empty "no leader" outcome
+    // WITHOUT panicking. With the fix this assertion holds; a revert to the old
+    // `unreachable!` panics inside `select_internal`, so the test panics and fails.
+    // (Documented limitation: the thin `select` wrapper maps any error to `vec![]`,
+    // so this guards the no-panic / fail-closed contract rather than surfacing the
+    // Err value, which is invisible through the trait's `Vec<u8>` return.)
+    #[test]
+    fn leader_select_returns_empty_on_non_32_byte_hash() {
+        let leader = LeaderSelector::new(Arc::new(FixedLenHashProvider(16)));
+        let stakes = StakeSet {
+            stakers: vec![(vec![1], 100u64), (vec![2], 100u64)]
+                .into_iter()
+                .collect(),
+        };
+        let result = leader.select(&stakes, 1, &[0u8]);
+        assert!(result.is_empty(), "non-32-byte hash provider must yield no leader, not panic");
+    }
+
+    // AUDIT Phase 6.9 (Item A, discriminator): rewarding u64::MAX twice overflows.
+    // old `*entry += amount` panics on the second add; saturating_add must hold at u64::MAX.
+    #[test]
+    fn stake_store_reward_saturates_on_overflow() {
+        let key = vec![9];
+        let store = StakeStore::new();
+        store.add_staker(key.clone(), 1);
+        store.reward(&key, u64::MAX);
+        store.reward(&key, u64::MAX);
+        assert_eq!(store.get_stake(&key), u64::MAX, "reward must saturate, not panic");
+    }
+
+    // AUDIT Phase 6.9 (Item A, discriminator): the committer's OWN leader walk
+    // (select_internal) sums stake independently of core. Two 2^63 stakes overflow u64::MAX;
+    // the checked_add walk must still resolve to a non-empty leader without panicking.
+    #[test]
+    fn leader_select_internal_no_panic_on_overflowing_stakes() {
+        let large: u64 = 1 << 63;
+        let leader = LeaderSelector::new(Arc::new(BasicHashProvider::new()));
+        let stakes = StakeSet {
+            stakers: vec![(vec![1], large), (vec![2], large)]
+                .into_iter()
+                .collect(),
+        };
+        for i in 0..200u8 {
+            let leader_key = leader.select(&stakes, 1, &[i]);
+            assert!(
+                leader_key == vec![1] || leader_key == vec![2],
+                "overflow walk must return a real positive-stake leader"
+            );
+        }
     }
 
     #[test]

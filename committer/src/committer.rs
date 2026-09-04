@@ -885,8 +885,21 @@ impl Committer {
             };
 
             if let Some(total) = total_stake {
-                let quorum_threshold = total as f64 * (self.env_data.quorum_percentage as f64) / 100.0;
-                if cumulative_stake as f64 >= quorum_threshold {
+                // AUDIT Phase 6.9 (Item B, discriminator): exact-integer quorum. Casting
+                // u64 stake to f64 truncates above 2^52, so the f64 threshold can be off by
+                // one at the boundary — an adversarial stake could reach or miss quorum
+                // wrongly. cumulative/total >= quorum/100  <=>  cumulative*100 >= total*quorum,
+                // all in u128 (u64::MAX * 100 fits in u128). quorum_percentage is f32
+                // validated to (0,100]; round() to nearest whole percent.
+                // AUDIT Phase 6.9 (Item B, discriminator): exact-integer quorum. Casting
+                // u64 stake to f64 truncates above 2^52, so the f64 threshold can be off by
+                // one at the boundary — an adversarial stake could reach or miss quorum
+                // wrongly. cumulative/total >= quorum/100  <=>  cumulative*100 >= total*quorum,
+                // all in u128 (u64::MAX * 100 fits in u128). quorum_percentage is f32
+                // validated to (0,100]; round() to nearest whole percent.
+                let quorum_pct = self.env_data.quorum_percentage.round() as u128;
+                let reached = (cumulative_stake as u128) * 100 >= (total as u128) * quorum_pct;
+                if reached {
                     // Quorum reached — broadcast status to all peers
                     let _ = self.broadcast_quorum_reached(&block_hash).await;
                 }
@@ -1695,7 +1708,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+            .expect("well-formed test block hashes");
         block
     }
 
@@ -1721,7 +1735,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        genesis.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis);
+        genesis.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis)
+            .expect("well-formed test block hashes");
 
         if let Some(mut entry) = committer.tokens.get_mut(&vec![1]) {
             entry.value_mut().blockchain.add_block(genesis);
@@ -2225,7 +2240,8 @@ mod tests {
                 proposer_key: vec![],
                 epoch_number: 0,
             };
-            let genesis_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis);
+            let genesis_hash = pneumatic_core::blocks::BlockFactory::create_hash(&genesis)
+                .expect("well-formed test block hashes");
             if let Some(mut entry) = committer.tokens.get_mut(&id) {
                 genesis.current_hash = genesis_hash;
                 entry.value_mut().blockchain.add_block(genesis);
@@ -2701,7 +2717,8 @@ mod tests {
                     proposer_key: vec![],
                     epoch_number: 0,
                 };
-                block.current_hash = BlockFactory::create_hash(&block);
+                block.current_hash =
+                    BlockFactory::create_hash(&block).expect("well-formed test block hashes");
                 previous_hash = block.current_hash.clone();
                 token.blockchain.add_block(block);
             }
@@ -2851,7 +2868,8 @@ mod tests {
             proposer_key,
             epoch_number: 0,
         };
-        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block);
+        block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+            .expect("well-formed test block hashes");
         block
     }
 
@@ -3621,7 +3639,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hashes");
         block
     }
 
@@ -4178,7 +4197,8 @@ mod tests {
             proposer_key: vec![],
             epoch_number: 0,
         };
-        block.current_hash = BlockFactory::create_hash(&block);
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hashes");
         block
     }
 
@@ -4263,6 +4283,131 @@ mod tests {
         let (keys, cumulative) = votes.get(&block_hash).expect("block_hash should have votes");
         assert_eq!(keys.len(), 2);
         assert_eq!(*cumulative, 150);
+    }
+
+    // AUDIT Phase 6.9 (Item B, positive-boundary discriminator): with total=200 @67%
+    // (threshold 134), a lone alice vote (100) must NOT reach quorum and a bob vote
+    // pushing cumulative to 150 MUST. Asserts the observable broadcast, so the exact
+    // integer comparison is exercised end-to-end.
+    #[tokio::test]
+    async fn handle_block_confirmed_vote_quorum_broadcast_boundary() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (committer, _registry, _logger) = make_test_committer(dp);
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        let block = make_gossip_block(&committer, "quorum_boundary", b"vote".to_vec());
+        let block_hash = block.current_hash.clone();
+
+        let mut stake_set = StakeSet::default();
+        stake_set.stakers.insert(b"alice".to_vec(), 100);
+        stake_set.stakers.insert(b"bob".to_vec(), 50);
+        stake_set.stakers.insert(b"charlie".to_vec(), 50); // total = 200, 67% = 134
+        committer.stake_set_cache.lock().await
+            .insert(block_hash.clone(), stake_set.clone());
+
+        // Sentinel records outbound messages so we can observe the quorum broadcast.
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        assert!(committer.node_registry.register_peer(
+            vec![0xCC; 32],
+            [3u8; 16],
+            &NodeRegistryType::Sentinel,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        fn quorum_broadcasts(recorder: &Arc<Mutex<Vec<Vec<u8>>>>) -> usize {
+            recorder.lock().unwrap().iter().filter(|raw| {
+                matches!(deserialize_rmp_to::<Message>(raw), Ok(m) if m.action == "BlockQuorumReached")
+            }).count()
+        }
+
+        // Vote as alice: cumulative 100 < 134 → no broadcast.
+        let body_alice = serialize_to_bytes_rmp(&(block_hash.clone(), b"alice".to_vec())).expect("serialize");
+        committer.handle_block_confirmed_vote(Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body: body_alice,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        }).await.expect("alice vote accepted");
+        assert_eq!(quorum_broadcasts(&recorder), 0, "alice's 100 stake is below the 134 quorum");
+
+        // Vote as bob: cumulative 150 >= 134 → broadcast fires.
+        let body_bob = serialize_to_bytes_rmp(&(block_hash.clone(), b"bob".to_vec())).expect("serialize");
+        committer.handle_block_confirmed_vote(Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body: body_bob,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        }).await.expect("bob vote accepted");
+        assert_eq!(quorum_broadcasts(&recorder), 1, "bob pushes cumulative to 150, crossing quorum");
+    }
+
+    // AUDIT Phase 6.9 (Item B, precision discriminator — the real f64 bug).
+    // voter = 2^52, other = 2^52 + 1, so total = 2^53 + 1. quorum_percentage = 50.0.
+    // total is NOT representable in f64 (max exact integer is 2^53), so it rounds down
+    // to 2^53. A lone voter vote:
+    //   f64 (old): total as f64 rounds 2^53+1 -> 2^53; threshold = 2^53 * 50/100 = 2^52;
+    //              cumulative = 2^52;  2^52 >= 2^52 -> REACHED (broadcast wrongly fires).
+    //   integer (new): voter*100 = 450359962737049600 <
+    //                  total*50 = 9007199254740993*50 = 450359962737049650 -> NOT reached.
+    // Assert NO broadcast. Temp-reverting to f64 makes the broadcast fire -> assert fails.
+    #[tokio::test]
+    async fn handle_block_confirmed_vote_quorum_precision_big_stakes() {
+        let dp = Arc::new(TestDataProvider::new());
+        let (mut committer, _registry, _logger) = make_test_committer(dp);
+
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+
+        // Override to 50% so the 2^52/2^52 boundary is exactly reachable under f64.
+        let mut env = (*committer.env_data).clone();
+        env.quorum_percentage = 50.0;
+        committer.env_data = Arc::new(env);
+
+        let block = make_gossip_block(&committer, "quorum_precision", b"vote".to_vec());
+        let block_hash = block.current_hash.clone();
+
+        // two adjacent values whose sum 2^53+1 is not representable in f64 (rounds to 2^53).
+        let voter: u64 = 4503599627370496; // 2^52
+        let other: u64 = 4503599627370497; // 2^52 + 1
+        let mut stake_set = StakeSet::default();
+        stake_set.stakers.insert(b"voter".to_vec(), voter);
+        stake_set.stakers.insert(b"other".to_vec(), other);
+        committer.stake_set_cache.lock().await
+            .insert(block_hash.clone(), stake_set.clone());
+
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        assert!(committer.node_registry.register_peer(
+            vec![0xCC; 32],
+            [3u8; 16],
+            &NodeRegistryType::Sentinel,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        // A lone voter vote: integer math says NOT reached (no broadcast).
+        let body_voter = serialize_to_bytes_rmp(&(block_hash.clone(), b"voter".to_vec())).expect("serialize");
+        committer.handle_block_confirmed_vote(Message {
+            chain_id: "test".to_string(),
+            action: String::from("BlockConfirmed"),
+            body: body_voter,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        }).await.expect("voter vote accepted");
+
+        let reached = recorder.lock().unwrap().iter().any(|raw| {
+            matches!(deserialize_rmp_to::<Message>(raw), Ok(m) if m.action == "BlockQuorumReached")
+        });
+        assert!(!reached, "integer quorum must NOT be reached for a 2^53 vote on a 2^53+1 total at 50%");
     }
 
     // -----------------------------------------------------------------------
