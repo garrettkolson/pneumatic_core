@@ -70,7 +70,7 @@ pub fn acknowledge() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::Ed25519Provider;
+    use crate::crypto::{Ed25519Provider, ED25519_SIG_LEN};
 
     fn verify(message: &Message, expected_public_key: &[u8]) -> bool {
         Ed25519Provider::generate()
@@ -91,15 +91,23 @@ mod tests {
     }
 
     #[test]
-    fn signed_message_is_deterministic_for_same_identity_and_body() {
+    fn signed_message_ed25519_half_is_deterministic() {
         let identity = NodeIdentity::generate_in_memory();
         let body = vec![9, 8, 7];
         let a = Message::signed("env".into(), "Process", body.clone(), None, &identity).unwrap();
         let b = Message::signed("env".into(), "Process", body, None, &identity).unwrap();
 
-        // Deterministic Ed25519: identical (key, body) → identical signature bytes.
-        // The gossiper's signature-byte dedup relies on this.
-        assert_eq!(a.signature, b.signature);
+        // Both signatures verify under the identity's Ed25519 key.
+        assert!(verify(&a, &identity.ed25519.public_key().unwrap()));
+        assert!(verify(&b, &identity.ed25519.public_key().unwrap()));
+
+        // Ed25519 is deterministic (RFC 8032): identical (key, body) → identical
+        // 64-byte Ed25519 signature bytes. The full hybrid signature is NOT
+        // byte-identical across the two calls, though — ML-DSA-44 in this build
+        // draws a fresh CSPRNG nonce per signature (secure, non-deterministic),
+        // so the ML-DSA half varies. The gossiper dedups on hash(sender_key,
+        // body), not on signature bytes, so this non-determinism is harmless.
+        assert_eq!(&a.signature[..ED25519_SIG_LEN], &b.signature[..ED25519_SIG_LEN]);
     }
 
     #[test]

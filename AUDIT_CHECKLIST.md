@@ -969,7 +969,67 @@ agree on anything.*
   need an `Arc` handle (E0599 without the `Arc` wrap). Wire-compat: none (control-plane and data-plane shapes
   unchanged). Workspace **631**.
 
-# TODO: figure out post-quantum encryption
+## Phase 8 — Post-quantum (hybrid) crypto migration
+
+Supersedes the `# TODO: figure out post-quantum encryption` item above. (The plan numbers this work
+"Phase 7"; the label is "Phase 8" here to avoid colliding with the audit's own "Phase 7 — Test
+coverage the audit found missing" block, which is a separate concern and is left untouched.)
+
+Strategy: the hybrid **"N = N+1"** approach used by TLS 1.3 / WireGuard / Cloudflare in 2026 — the
+classical scheme is **combined with** (not replaced by) a NIST PQC scheme. A forgery must break BOTH
+halves; a break in one still leaves the other protecting traffic; and a classical peer can verify the
+Ed25519 half of a PQC peer's signature (and vice versa), preserving interop.
+
+### Which primitives moved (and which did not)
+| Primitive | Purpose | Quantum threat | Action |
+|-----------|---------|----------------|--------|
+| Ed25519 signatures | identity, message/auth, block & finalizer signatures, RNS→chain binding | **Critical** — Shor recovers the private key from an exposed public key | Hybridized: `(Ed25519 · ML-DSA-44)` |
+| X25519 DH + AES-256-GCM | data self / cross-recipient encryption | **Critical** — Shor recovers the DH shared secret | Hybridized KEM: `(X25519 · ML-KEM-768)` |
+| SHA-256 | block hash, selection seed, fingerprint | **Safe** — Grover only halves the budget (128 eff. bits); still adequate | **Untouched** |
+
+Schemes adopted per the Ledger Donjon / NIST analysis: ML-DSA-44 (FIPS 204, signature) and
+ML-KEM-768 (FIPS 203, KEM) via the rustpq / PQClean bindings
+(`pqcrypto-mldsa`, `pqcrypto-mlkem`, `pqcrypto-traits`). Falcon and SPHINCS+ deliberately rejected
+(Relic forward-compat + floating-point side-channel; 8–17 kB signatures too large for a
+per-transaction wire protocol).
+
+### Done
+- [x] **8.1 Hybrid signature provider** (`src/crypto.rs`, `Ed25519Provider`). `sign_data` emits
+    `[Ed25519 sig(64) · ML-DSA-44 pk(1312) · ML-DSA-44 sig(2420)] = 3796 B`; `check_signature`
+    requires BOTH halves to verify (hybrid "both-halves-must-verify", not "either half"). Half-checkers
+    `check_ed25519_half` / `check_ml_dsa_half` expose each half for interop / test.
+- [x] **8.2 Hybrid KEM** (`src/crypto.rs`). `encrypt` / `encrypt_to` produce
+    `[X25519 eph pk(32) · ML-KEM encapsulation(1088) · ML-KEM recipient pk(1184) · nonce(12) · ct+tag(16)]`
+    (2332 B for empty plaintext); the AES-256 key is HKDF-SHA256 over `[X25519 ss(32) · ML-KEM ss(32)]` —
+    an attacker must reconstruct **both** to recover the key. `decrypt` / `decrypt_from` reverse it.
+- [x] **8.3 Regression discriminators** (22 `crypto::tests`, all green): each half verifies independently;
+    the ML-DSA half does not verify under an Ed25519 key; hybrid length is fixed at 3796 B;
+    encrypt→decrypt roundtrip; wrong-recipient decrypt errors; Ed25519 half deterministic. Full workspace
+    green (657 tests).
+
+### Wire-compat note (ground rule 4)
+The `Message.signature` field grows from 64 B (Ed25519 only) to 3796 B
+`[Ed25519 · ML-DSA-44]`. Intentional and interoperable:
+- Hybrid verify: a node verifies the Ed25519 half AND the ML-DSA half. A classical peer (Ed25519 only)
+  accepts the Ed25519 half of a PQC peer's signature; a PQC peer accepts either half. No other wire
+  fields (`body`, `public_key`, `action`, `stake_set`) change.
+- **Both ends must ship Phase 8.1+ for the ML-DSA half to be exercised.** Until then, classical
+  interop is preserved by the Ed25519 half. (Mixed-version nodes cannot verify each other's ML-DSA
+  half, but fall back to the Ed25519 half for interop.)
+- **Non-determinism (security-preserving, not a defect):** this PQClean ML-DSA-44 build draws a fresh
+  CSPRNG nonce per signature (`randombytes(rnd, RNDBYTES)` → `rhoprime` → per-signature `y` vector in
+  `crypto_sign_signature`), so it is not FIPS-204-deterministic. Independent signings of the same
+  (key, body) yield different ML-DSA halves. The gossiper dedups on `hash(sender_key, body)` — **not**
+  on signature bytes — so this is harmless. The Ed25519 half IS deterministic (RFC 8032); confirmed by
+  `messages::tests::signed_message_ed25519_half_is_deterministic`.
+
+### Pending (follow-up node-server / keystore phase — not part of this session)
+- [ ] Persist the ML-DSA-44 and ML-KEM-768 seeds into `IdentityFile` (add `mldsa_seed` / `mlkem_seed`
+    hex fields, mirroring `ed25519_seed`) so the PQC keypairs survive restarts. Currently
+    `Ed25519Provider::from_seed` regenerates the ML-DSA/ML-KEM keypairs fresh on every boot; the Ed25519
+    key is the stable on-chain identity and the ML-DSA half still verifies (its public key is embedded
+    in the signature). Persisting the seeds makes the ML-DSA half a true stable identity attribute.
+    (Keystore write/load path in `src/rns/identity.rs`.)
 
 ## Phase 7 — Test coverage the audit found missing
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the

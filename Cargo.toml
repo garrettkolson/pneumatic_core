@@ -39,6 +39,14 @@ aes-gcm = "0.11.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 hkdf = "0.12"
 sha2 = "0.10"
+
+# Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
+# (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives
+# in the "hybrid / N = N+1" strategy (see src/crypto.rs Phase 7). Bound to the PQClean
+# reference implementations via the rustpq FFI bindings (MIT/Apache-2.0).
+pqcrypto-mldsa = "0.1.2"
+pqcrypto-mlkem = "0.1.1"
+pqcrypto-traits = "0.3"
 # Shared-secret auth over the data channel (HMAC-SHA256). hmac re-exports
 # `digest` 0.10, which sha2 already pins — so no version divergence.
 hmac = "0.12"
