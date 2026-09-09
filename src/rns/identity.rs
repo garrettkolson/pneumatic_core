@@ -15,7 +15,10 @@ use rns_crypto::identity::Identity;
 use rns_crypto::OsRng;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{sha256, AsymCryptoProvider, Ed25519Provider};
+use crate::crypto::{
+    sha256, AsymCryptoProvider, Ed25519Provider, MLDSA_PK_LEN, MLDSA_SK_LEN, MLKEM_PK_LEN,
+    MLKEM_SK_LEN,
+};
 use crate::encoding::serialize_to_bytes_rmp;
 use crate::errors::PneumaticError;
 use crate::node::NodeRegistryType;
@@ -177,6 +180,10 @@ pub struct NodeIdentity {
 struct IdentityFile {
     rns_private_key: String,
     ed25519_seed: String,
+    mldsa_secret_key: String,
+    mldsa_public_key: String,
+    mlkem_secret_key: String,
+    mlkem_public_key: String,
 }
 
 impl NodeIdentity {
@@ -305,6 +312,70 @@ impl NodeIdentity {
                 hint
             ))
         })?;
+        let mldsa_sk = hex::decode(&file.mldsa_secret_key).map_err(|e| {
+            PneumaticError::CryptoError(format!(
+                "corrupt ML-DSA-44 secret key in {}: {}; {}",
+                path.display(),
+                e,
+                hint
+            ))
+        })?;
+        let mldsa_pk = hex::decode(&file.mldsa_public_key).map_err(|e| {
+            PneumaticError::CryptoError(format!(
+                "corrupt ML-DSA-44 public key in {}: {}; {}",
+                path.display(),
+                e,
+                hint
+            ))
+        })?;
+        let mlkem_sk = hex::decode(&file.mlkem_secret_key).map_err(|e| {
+            PneumaticError::CryptoError(format!(
+                "corrupt ML-KEM-768 secret key in {}: {}; {}",
+                path.display(),
+                e,
+                hint
+            ))
+        })?;
+        let mlkem_pk = hex::decode(&file.mlkem_public_key).map_err(|e| {
+            PneumaticError::CryptoError(format!(
+                "corrupt ML-KEM-768 public key in {}: {}; {}",
+                path.display(),
+                e,
+                hint
+            ))
+        })?;
+        let mldsa_sk: [u8; MLDSA_SK_LEN] = mldsa_sk.try_into().map_err(|_| {
+            PneumaticError::CryptoError(format!(
+                "ML-DSA-44 secret key in {} must be {} bytes; {}",
+                path.display(),
+                MLDSA_SK_LEN,
+                hint
+            ))
+        })?;
+        let mldsa_pk: [u8; MLDSA_PK_LEN] = mldsa_pk.try_into().map_err(|_| {
+            PneumaticError::CryptoError(format!(
+                "ML-DSA-44 public key in {} must be {} bytes; {}",
+                path.display(),
+                MLDSA_PK_LEN,
+                hint
+            ))
+        })?;
+        let mlkem_sk: [u8; MLKEM_SK_LEN] = mlkem_sk.try_into().map_err(|_| {
+            PneumaticError::CryptoError(format!(
+                "ML-KEM-768 secret key in {} must be {} bytes; {}",
+                path.display(),
+                MLKEM_SK_LEN,
+                hint
+            ))
+        })?;
+        let mlkem_pk: [u8; MLKEM_PK_LEN] = mlkem_pk.try_into().map_err(|_| {
+            PneumaticError::CryptoError(format!(
+                "ML-KEM-768 public key in {} must be {} bytes; {}",
+                path.display(),
+                MLKEM_PK_LEN,
+                hint
+            ))
+        })?;
 
         let rns = Identity::from_private_key(&rns_sk);
         let rns_pub = rns
@@ -316,7 +387,16 @@ impl NodeIdentity {
                     hint
                 ))
             })?;
-        let ed25519 = Ed25519Provider::from_seed(ed_seed);
+        // from_persisted (not from_seed): the PQC keypairs are the persisted
+        // identity, so reload must reconstruct the *same* keys rather than
+        // regenerating fresh ones.
+        let ed25519 = Ed25519Provider::from_persisted(
+            ed_seed,
+            mldsa_sk,
+            mldsa_pk,
+            mlkem_sk,
+            mlkem_pk,
+        )?;
 
         Ok(NodeIdentity {
             rns,
@@ -329,9 +409,6 @@ impl NodeIdentity {
     /// operator-facing keys.
     fn create_and_persist(path: &Path) -> Result<Self, PneumaticError> {
         let rns = Identity::new(&mut OsRng);
-        let rns_sk = rns.get_private_key().ok_or_else(|| {
-            PneumaticError::CryptoError("RNS key generation: no private key".to_string())
-        })?;
         let rns_pub = rns.get_public_key().ok_or_else(|| {
             PneumaticError::CryptoError("RNS key generation: no public key".to_string())
         })?;
@@ -342,26 +419,33 @@ impl NodeIdentity {
         let ed25519 = Ed25519Provider::from_seed(ed_seed);
         let ed_pub = ed25519.public_key()?;
 
-        Self::write_file(path, &rns_sk, &ed_seed)?;
-
         let rhash = rhash_from_public_key(&rns_pub);
+        let identity = NodeIdentity { rns, ed25519, rhash };
+
+        Self::write_file(path, &identity)?;
+
         eprintln!("[pneumatic] New node identity created at {}", path.display());
         eprintln!("[pneumatic]   rhash:          {}", hex::encode(rhash));
         eprintln!("[pneumatic]   ed25519 public: {}", hex::encode(ed_pub));
+        eprintln!("[pneumatic]   ml-dsa-44 public: {}", hex::encode(identity.ed25519.mldsa_public_key()?));
+        eprintln!("[pneumatic]   ml-kem-768 public: {}", hex::encode(identity.ed25519.mlkem_public_key()?));
         eprintln!("[pneumatic]   rns public:     {}", hex::encode(rns_pub));
         eprintln!("[pneumatic] Record the rns public key in peers' `bootstrap_peers` to link this node.");
 
-        Ok(NodeIdentity {
-            rns,
-            ed25519,
-            rhash,
-        })
+        Ok(identity)
     }
 
-    fn write_file(path: &Path, rns_sk: &[u8; 64], ed_seed: &[u8; 32]) -> Result<(), PneumaticError> {
+    fn write_file(path: &Path, identity: &NodeIdentity) -> Result<(), PneumaticError> {
+        let rns_sk = identity.rns.get_private_key().ok_or_else(|| {
+            PneumaticError::CryptoError("RNS key generation: no private key".to_string())
+        })?;
         let file = IdentityFile {
             rns_private_key: hex::encode(rns_sk),
-            ed25519_seed: hex::encode(ed_seed),
+            ed25519_seed: hex::encode(identity.ed25519.ed25519_seed()?),
+            mldsa_secret_key: hex::encode(identity.ed25519.mldsa_secret_key()?),
+            mldsa_public_key: hex::encode(identity.ed25519.mldsa_public_key()?),
+            mlkem_secret_key: hex::encode(identity.ed25519.mlkem_secret_key()?),
+            mlkem_public_key: hex::encode(identity.ed25519.mlkem_public_key()?),
         };
         let raw =
             serde_json::to_string_pretty(&file).map_err(|e| PneumaticError::Encoding(e.to_string()))?;
@@ -529,6 +613,36 @@ mod tests {
         assert_eq!(first_rns, second.rns.get_public_key().unwrap());
     }
 
+    // --- Phase 8: PQC keypair persistence ----------------------------------
+    //
+    // Discriminator for the keystore's PQC persistence: without it, `load`
+    // regenerates fresh ML-DSA/ML-KEM keypairs via `from_seed`, so the PQC
+    // public keys differ across reloads.
+
+    #[test]
+    fn test_pqc_keys_survive_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("node_identity.json");
+
+        // Capture the PQC public keys immediately after persistence.
+        let first = NodeIdentity::create_and_persist(&path).expect("create");
+        let mldsa_pk_before = first.ed25519.mldsa_public_key().unwrap();
+        let mlkem_pk_before = first.ed25519.mlkem_public_key().unwrap();
+
+        // Reload from disk; the PQC public keys must be byte-identical.
+        let second = NodeIdentity::load(&path).expect("reload");
+        assert_eq!(
+            second.ed25519.mldsa_public_key().unwrap(),
+            mldsa_pk_before,
+            "ML-DSA-44 public key must survive keystore reload"
+        );
+        assert_eq!(
+            second.ed25519.mlkem_public_key().unwrap(),
+            mlkem_pk_before,
+            "ML-KEM-768 public key must survive keystore reload"
+        );
+    }
+
     #[test]
     fn test_corrupt_keystore_is_hard_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -584,53 +698,35 @@ mod tests {
     // `NodeIdentity::write_file` *directly*, otherwise they would silently pass
     // against a build where overwrite was never implemented.
 
-    /// A fresh, valid 64-byte RNS private key.
-    fn fresh_rns_sk() -> [u8; 64] {
-        NodeIdentity::generate_in_memory()
-            .rns
-            .get_private_key()
-            .expect("rns private key")
-    }
-
-    /// A random 32-byte Ed25519 seed.
-    fn fresh_ed_seed() -> [u8; 32] {
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).expect("ed25519 seed");
-        seed
-    }
-
     #[test]
     fn test_write_file_writes_backup_on_overwrite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("node_identity.json");
         let bak = dir.path().join("node_identity.json.bak");
 
-        let seed1 = fresh_ed_seed();
-        let k1 = Ed25519Provider::from_seed(seed1).public_key().unwrap();
-        let sk1 = fresh_rns_sk();
-        let sk2 = fresh_rns_sk();
-        let seed2 = fresh_ed_seed();
+        let id1 = NodeIdentity::generate_in_memory();
+        let id2 = NodeIdentity::generate_in_memory();
 
         // First write: no prior file, so no backup yet.
-        NodeIdentity::write_file(&path, &sk1, &seed1).expect("create v1");
+        NodeIdentity::write_file(&path, &id1).expect("create v1");
         assert!(!bak.exists(), "no backup on first write");
 
         // Overwrite: the prior good keystore is backed up before replacement.
-        NodeIdentity::write_file(&path, &sk2, &seed2).expect("overwrite v2");
+        NodeIdentity::write_file(&path, &id2).expect("overwrite v2");
         assert!(bak.exists(), "backup created on overwrite");
         assert!(path.exists(), "primary present after overwrite");
 
-        // Backup holds v1, primary holds v2.
+        // Backup holds v1, primary holds v2 (the full identity, PQC included).
         let backup_loaded = NodeIdentity::load(&bak).expect("load backup");
         assert_eq!(
-            k1,
-            backup_loaded.ed25519.public_key().unwrap(),
-            "backup holds the prior good keystore"
+            id1.rhash,
+            backup_loaded.rhash,
+            "backup holds the prior good keystore exactly"
         );
         let primary_loaded = NodeIdentity::load(&path).expect("load primary");
         assert_ne!(
-            k1,
-            primary_loaded.ed25519.public_key().unwrap(),
+            id1.rhash,
+            primary_loaded.rhash,
             "primary holds the new keystore"
         );
     }
@@ -641,8 +737,10 @@ mod tests {
         let path = dir.path().join("node_identity.json");
         let bak = dir.path().join("node_identity.json.bak");
 
-        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("v1");
-        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("v2 -> .bak");
+        let id1 = NodeIdentity::generate_in_memory();
+        let id2 = NodeIdentity::generate_in_memory();
+        NodeIdentity::write_file(&path, &id1).expect("v1");
+        NodeIdentity::write_file(&path, &id2).expect("v2 -> .bak");
         assert!(bak.exists());
 
         // Clobber the primary; boot must fail closed and name the backup.
@@ -696,7 +794,8 @@ mod tests {
         fs::write(&path, b"{}").expect("precreate");
         fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("set 0644");
 
-        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("overwrite");
+        let id = NodeIdentity::generate_in_memory();
+        NodeIdentity::write_file(&path, &id).expect("overwrite");
 
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "overwrite must force 0600 on a pre-existing file");
@@ -707,7 +806,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("node_identity.json");
 
-        NodeIdentity::write_file(&path, &fresh_rns_sk(), &fresh_ed_seed()).expect("write");
+        let id = NodeIdentity::generate_in_memory();
+        NodeIdentity::write_file(&path, &id).expect("write");
         NodeIdentity::load_or_create(&path).expect("load");
 
         // A successful atomic write leaves exactly one identity file and no
@@ -732,8 +832,7 @@ mod tests {
         let path = dir.path().join("node_identity.json");
 
         let id1 = NodeIdentity::generate_in_memory();
-        NodeIdentity::write_file(&path, &id1.rns.get_private_key().unwrap(), &fresh_ed_seed())
-            .expect("v1");
+        NodeIdentity::write_file(&path, &id1).expect("v1");
 
         // Simulate an abandoned, partially written temp from a crashed write.
         let tmp = dir.path().join(format!("node_identity.{}-1.tmp", std::process::id()));

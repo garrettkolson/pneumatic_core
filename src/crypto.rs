@@ -21,6 +21,7 @@ use pqcrypto_traits::kem::{
 };
 use pqcrypto_traits::sign::{
     DetachedSignature as SignDetachedSignatureTrait, PublicKey as SignPublicKeyTrait,
+    SecretKey as SignSecretKeyTrait,
 };
 use ring::digest;
 use serde::{Deserialize, Serialize};
@@ -72,10 +73,12 @@ pub const ED25519_SIG_LEN: usize = 64;
 pub const MLDSA_PK_LEN: usize = 1312;
 pub const MLDSA_SIG_LEN: usize = 2420;
 pub const MLDSA_FULL_SIG_LEN: usize = ED25519_SIG_LEN + MLDSA_PK_LEN + MLDSA_SIG_LEN; // 3796
+pub const MLDSA_SK_LEN: usize = 2560; // ML-DSA-44 secret key (persisted in the keystore)
 
 pub const X25519_PK_LEN: usize = 32;
 pub const MLKEM_CT_LEN: usize = 1088;
 pub const MLKEM_PK_LEN: usize = 1184;
+pub const MLKEM_SK_LEN: usize = 2400; // ML-KEM-768 secret key (persisted in the keystore)
 pub const NONCE_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 
@@ -196,6 +199,46 @@ impl Ed25519Provider {
             mldsa_keypair: RwLock::new((mldsa_pk, mldsa_sk)),
             mlkem_keypair: RwLock::new((mlkem_pk, mlkem_sk)),
         }
+    }
+
+    /// Reconstruct a provider from keystore-persisted material.
+    ///
+    /// The Ed25519 seed fully determines the on-chain key (recovered exactly as
+    /// in `from_seed`). The X25519 static secret is regenerated — it is not
+    /// persisted, unchanged from `from_seed`. The ML-DSA-44 and ML-KEM-768
+    /// **secret + public keys** are taken verbatim, so the PQC public keys the
+    /// node advertises are stable across restarts (see `load` in
+    /// `src/rns/identity.rs`). The persisted blobs are exact-length per scheme,
+    /// so `from_bytes` doubles as corruption validation.
+    pub fn from_persisted(
+        ed_seed: [u8; 32],
+        mldsa_sk: [u8; MLDSA_SK_LEN],
+        mldsa_pk: [u8; MLDSA_PK_LEN],
+        mlkem_sk: [u8; MLKEM_SK_LEN],
+        mlkem_pk: [u8; MLKEM_PK_LEN],
+    ) -> Result<Self, PneumaticError> {
+        let signing_key = SigningKey::from_bytes(&ed_seed);
+        let verifying_key = signing_key.verifying_key();
+        let x25519_static_key = StaticSecret::random();
+        let mldsa_sk = MldsaSecretKey::from_bytes(&mldsa_sk).map_err(|e| {
+            PneumaticError::CryptoError(format!("ML-DSA-44 secret key: {:?}", e))
+        })?;
+        let mldsa_pk = MldsaPublicKey::from_bytes(&mldsa_pk).map_err(|e| {
+            PneumaticError::CryptoError(format!("ML-DSA-44 public key: {:?}", e))
+        })?;
+        let mlkem_sk = MLKemSecretKey::from_bytes(&mlkem_sk).map_err(|e| {
+            PneumaticError::CryptoError(format!("ML-KEM-768 secret key: {:?}", e))
+        })?;
+        let mlkem_pk = MLKemPublicKey::from_bytes(&mlkem_pk).map_err(|e| {
+            PneumaticError::CryptoError(format!("ML-KEM-768 public key: {:?}", e))
+        })?;
+        Ok(Ed25519Provider {
+            signing_key: RwLock::new(signing_key),
+            verifying_key: RwLock::new(verifying_key),
+            x25519_static_key: RwLock::new(x25519_static_key),
+            mldsa_keypair: RwLock::new((mldsa_pk, mldsa_sk)),
+            mlkem_keypair: RwLock::new((mlkem_pk, mlkem_sk)),
+        })
     }
 
     // ---------------------------------------------------------------------
@@ -562,6 +605,35 @@ impl Ed25519Provider {
         })?;
         let mlkem_pk = &mlkem_keys.0;
         Ok(mlkem_pk.as_bytes().to_vec())
+    }
+
+    /// Return the ML-DSA-44 secret key (2560 bytes). Persisted in the keystore
+    /// so the node's PQC signature key survives restarts.
+    pub fn mldsa_secret_key(&self) -> Result<Vec<u8>, PneumaticError> {
+        let mldsa_keys = self.mldsa_keypair.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
+        let mldsa_sk = &mldsa_keys.1;
+        Ok(mldsa_sk.as_bytes().to_vec())
+    }
+
+    /// Return the ML-KEM-768 secret key (2400 bytes). Persisted in the keystore
+    /// so the node's PQC key-exchange key survives restarts.
+    pub fn mlkem_secret_key(&self) -> Result<Vec<u8>, PneumaticError> {
+        let mlkem_keys = self.mlkem_keypair.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
+        let mlkem_sk = &mlkem_keys.1;
+        Ok(mlkem_sk.as_bytes().to_vec())
+    }
+
+    /// Return the 32-byte Ed25519 seed — the persisted on-chain identity.
+    /// Recovered from the signing key; used by the keystore write path.
+    pub fn ed25519_seed(&self) -> Result<[u8; 32], PneumaticError> {
+        let signing_key = self.signing_key.read().map_err(|e| {
+            PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
+        })?;
+        Ok(signing_key.to_bytes())
     }
 }
 

@@ -1006,6 +1006,33 @@ per-transaction wire protocol).
     the ML-DSA half does not verify under an Ed25519 key; hybrid length is fixed at 3796 B;
     encrypt→decrypt roundtrip; wrong-recipient decrypt errors; Ed25519 half deterministic. Full workspace
     green (657 tests).
+- [x] **8.4 Stable PQC identity across restarts** (`src/crypto.rs` `from_persisted` + secret-key
+    accessors; `src/rns/identity.rs` `IdentityFile` + `load` + `write_file`). The PQ half was
+    **ephemeral** before: `Ed25519Provider::from_seed` called the pqcrypto crates' randomized
+    `keypair()` on every boot, so the ML-DSA-44 / ML-KEM-768 public keys changed on every restart
+    (only the Ed25519 key was the stable on-chain identity). Now the full PQC keypairs are persisted
+    in the keystore and reconstructed with `from_persisted`.
+
+    **Why persist the full secret + public keys (not seeds):** the `pqcrypto-mldsa` / `pqcrypto-mlkem`
+    crates expose only the randomized `keypair()` — the seed-keypair FFI variants
+    (`crypto_sign_keypair_sk_pk`, `crypto_kem_keypair_seed`) are not bound and are not even in the
+    compiled PQClean archives, so binding them would require extending `pqcrypto-internals` codegen.
+    Persisted layout per scheme (secret · public): ML-DSA-44 `2560 · 1312` B, ML-KEM-768 `2400 · 1184`
+    B — all hex-encoded in the keystore (`mldsa_secret_key`, `mldsa_public_key`, `mlkem_secret_key`,
+    `mlkem_public_key`). Keystore file grew ~10.5 kB total (was classical + Ed25519 seed). Reconstruction
+    uses `SecretKey::from_bytes` / `PublicKey::from_bytes`, which enforce exact scheme length
+    (`InvalidLength` on mismatch) — free corruption validation, formatted into `PneumaticError::CryptoError`.
+    X25519 static key stays `StaticSecret::random()` (not persisted — unchanged).
+
+    **Fail-closed on legacy keystores:** the four PQC fields are **non-optional** (`#[serde(default)]`
+    absent) — a keystore written before Phase 8.4 hits serde's "missing field" path and becomes a hard
+    error: `"corrupt identity file … (missing field mldsa_secret_key); refusing to regenerate …"`, file
+    untouched. No rewrite-on-load migration. Safe because the protocol is not deployed; the existing
+    `test_corrupt_keystore_is_hard_error` (classical-only keystore) covers this path.
+
+    **Discriminator:** `rns/identity::tests::test_pqc_keys_survive_reload` — capture the PQC public
+    keys right after `create_and_persist`, reload via `load`, assert byte-identical. Fails on a temp
+    revert to `from_seed` (fresh keys each boot). Full workspace green (core +1; 658 → 659 workspace).
 
 ### Wire-compat note (ground rule 4)
 The `Message.signature` field grows from 64 B (Ed25519 only) to 3796 B
@@ -1023,13 +1050,17 @@ The `Message.signature` field grows from 64 B (Ed25519 only) to 3796 B
   on signature bytes — so this is harmless. The Ed25519 half IS deterministic (RFC 8032); confirmed by
   `messages::tests::signed_message_ed25519_half_is_deterministic`.
 
-### Pending (follow-up node-server / keystore phase — not part of this session)
-- [ ] Persist the ML-DSA-44 and ML-KEM-768 seeds into `IdentityFile` (add `mldsa_seed` / `mlkem_seed`
-    hex fields, mirroring `ed25519_seed`) so the PQC keypairs survive restarts. Currently
-    `Ed25519Provider::from_seed` regenerates the ML-DSA/ML-KEM keypairs fresh on every boot; the Ed25519
-    key is the stable on-chain identity and the ML-DSA half still verifies (its public key is embedded
-    in the signature). Persisting the seeds makes the ML-DSA half a true stable identity attribute.
-    (Keystore write/load path in `src/rns/identity.rs`.)
+### Keystore-file-format change — NOT a wire-protocol change (ground rule 4)
+
+Phase 8.4 changes the **keystore file format** (`node_identity.json` gains four PQC hex fields), not
+the wire protocol. The `Message.signature` shape `[Ed25519 sig · ML-DSA pk · ML-DSA sig]` and every
+other wire field (`public_key`, `body`, `action`, `stake_set`) are **unchanged** — the ML-DSA public
+key still rides *inside* the signature, so peers binding it see no new wire field. There is therefore
+**no mixed-version interop caveat** for this change and no AUDIT ground-rule-4 wire note to file:
+nodes that only differ by Phase 8.4 exchange identical frames. The only version-sensitivity is local —
+a Phase 8.4 keystore won't `load` on a pre-8.4 binary (missing fields ⇒ hard error), and a pre-8.4
+keystore won't load on an 8.4 binary for the same reason. This is a keystore-versioning constraint,
+not a wire constraint.
 
 ## Phase 7 — Test coverage the audit found missing
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the
