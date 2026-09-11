@@ -1,0 +1,843 @@
+# Implementation Plan — Pneumatic Shielded Value Transfer (Tier 1)
+
+## Context
+
+`pneumatic-shielded-roadmap.md` (repo root) specifies Zcash-style privacy for
+Pneumatic: a user sends a token transfer where the network confirms validity
+(correct spend authority, no double-spend, balance conservation) without any
+node — Sentinel, Executor, Finalizer, or Committer — ever seeing sender,
+receiver, or amount. The deliverable is **Tier 1 only: shielded value
+transfer of self-signed tokens.** Tier 2 (private contract execution) is
+explicitly out of scope per the roadmap — it is a separate research
+initiative, not a line item.
+
+Six design decisions in roadmap Part 2 are locked and drive this plan:
+- **2.1** Proving happens client-side (new `pneumatic_prover` crate); the
+  network only *verifies* proofs. The Executor stage is skipped entirely for
+  shielded transactions.
+- **2.2** Halo2 (no trusted setup, Rust-native) over Groth16/BN254.
+- **2.3** Note-based (UTXO-like) state model, not shielded account balances.
+- **2.4** ONE shared global shielded pool (single Merkle commitment tree +
+  one nullifier set), not per-token shielding — per-token anonymity sets
+  would be negligible.
+- **2.5** The nullifier set is a consensus-critical, append-only, durable,
+  globally-agreed data structure — first-class in `committer`, not a
+  bolt-on `HashSet`.
+- **2.6** Viewing keys (compliance/audit escape hatch) included from the
+  start. **Decided with the product owner: full in v1** — dual-recipient
+  note encryption (S1.5) and the prover's `scan_for_notes` scanning API
+  (S3.3). The remaining product question is *policy only* (who may hold
+  viewing keys), tracked in Open questions below.
+
+### Ground rules (from AUDIT_CHECKLIST.md — govern every item below)
+
+1. `cargo check` + **full workspace test suite** must pass after **every
+   item**, not just at phase boundaries.
+2. Every item ships **≥1 regression test that fails without the change**
+   (a "discriminator" test, proven by temporarily reverting the fix).
+3. Existing tests encoding old behavior must be updated as part of the item.
+4. **No wire message shape changes without a wire-compat note** appended.
+5. **Fail closed, not open** — missing/unknown validator, spec, identity,
+   nullifier state, or proof input is an error; never a silent accept.
+
+Checklist item format used throughout: **Files / Action / Verify / Done
+(with discriminator + workspace test-count progression)**.
+
+### Baseline (measured when this plan was written)
+
+- Fresh `cargo test --workspace` run: **exit 0, 0 failures**. Exact
+  suite-level counts: core lib **429**, committer lib **71** +
+  `pipeline_integration` **9**, sentinel **56**, finalizer **55**, executor
+  **10**, node-server **27**, `transport_integration` **6** (+1 ignored
+  `rns_live`). **Workspace total: 663 passed.** The AUDIT_CHECKLIST's last
+  recorded count (659, Phase 8.4) is slightly stale; **663 is the baseline
+  for this plan's test-count progression**. The roadmap's "267 tests" figure
+  is far stale and must not be used.
+- **No SNARK dependencies exist**: `Cargo.lock` (227 packages) contains no
+  halo2/halo2curves/pasta/ark/poseidon entries. S1.1 must confirm
+  coexistence with `ed25519-dalek` 2.0, `ring` 0.17, `aes-gcm` 0.11, and the
+  `pqcrypto-*` crates in a single workspace build.
+
+### Roadmap-vs-reality reconciliations (the roadmap predates these)
+
+| Roadmap assumption | Current reality | Plan consequence |
+|---|---|---|
+| "X25519 + AES-256-GCM hybrid encryption" for notes | Hybrid is now **PQC**: sigs `(Ed25519 · ML-DSA-44)` = 3796 B; KEM `(X25519 · ML-KEM-768)` + AES-256-GCM = 2332 B empty | Note encryption reuses `Ed25519Provider::encrypt_to`/`decrypt_from` as-is (stronger than planned); **note ciphertext is ~2.3 KB, not ~44 B** — wire and pool sizing must account for this |
+| Four node crates only | **`node-server`** composite crate hosts all roles: `RoleDispatcher`, per-role `allowed_actions`, `route_data_plane`, `build_runtime` | S5 routing changes must update role `allowed_actions` sets and `RoleDispatcher`; any new action string must be added to the committer's `authenticate_message` role→action map (fail-closed gate from Phase 1.3) |
+| Self-signed tokens skip Executor+Finalizer, go straight to Committer | Routing is spec-selected on `token.is_self_verified`; shielded routing is a *third* branch | Shielded branch keyed off `action == "ShieldedTransfer"` (see wire note), not off token type — the shielded pool is global and token-agnostic |
+| Sender signatures / nonces | Phase 3.1: sender Ed25519 sig over `canonical_signature_bytes()`; Phase 5.6: durable `(token_id, sender, seq)` nonce dedup in `PendingTransactionRegistry::used_nonces` | Shielded txs carry a *different* integrity anchor: the proof + nullifiers (the sender identity is hidden). `sequence_number`/`sender` fields on `ShieldedTransaction` are not used for dedup — **nullifier uniqueness replaces nonce dedup** (this is the double-spend defense; see S4.2) |
+| 16 MiB RNS resource transfer exists | Yes (Phase: RNS data-plane bridge; 16 MiB ceiling) | Halo2 proof (~1–2 KB) + nullifiers + commitments + note ciphertexts (~2.3 KB each) fit comfortably in one frame; no resource-transfer dependency |
+| Pool state implied to ride the block implicitly | `BlockFactory::create_hash` (blocks.rs:132-154) hashes exactly `(previous_hash, timestamp, canonical_signed_trans_bytes, token_metadata, proposer_key, epoch_number)` — `Block` has NO pool-state field | The pool update is hash-bound by riding **inside `signed_trans`**: new additive `SignedTransaction.shielded: Option<ShieldedTransaction>` field (S3.1). Consequences: (a) the finalizer's signature (block_builder.rs:134-170 hashes `rmp(signed_tx)`) and the block hash both bind the exact nullifiers/commitments; (b) pool state becomes a pure function of committed block history — any node can rebuild its view by replaying blocks (S5.1/S5.3 split-deployment views); (c) conflict rollback of a block unwinds exactly that block's hash-bound pool update |
+| Finalizer votes were assumed to be "finalizers signing public outputs" generically | Today the **executors** are the voters: `handle_signature` (finalizer.rs:346) authenticates the sender as a registered **Executor** (C1), verifies its inner sig over `sig.transaction_hash`, stamps stake from the epoch snapshot, feeds `SignatureCollector`; first valid sig triggers the optimistic path; quorum is stake-weighted | Shielded flow: **finalizers are the voters** (Executor is skipped). New `handle_sign_shielded`/`handle_shielded_vote` handlers follow the C1 pattern verbatim but authenticate voters as registered **Finalizers**; `SignatureCollector` + stake-weighted quorum math (Phase 6.9 integer u128) reused as-is; no optimistic fast path for shielded (quorum-gated by design — roadmap 2.1) |
+
+### Wire-compat note (ground rule 4) — read once, applies to S3–S5
+
+All wire changes in this plan are **additive**:
+- New action strings (confirmed routing, S3.2):
+  - `"ShieldedTransfer"` — client → Sentinel, a new **inner** action in the
+    sentinel's `on_data_received` match (sentinel.rs:110-124; alongside
+    `Process`/`Confirm`/...). In the composite node the outer envelope
+    action stays `"Verify"` (the sentinel's only dispatcher-level action)
+    with the shielded message as the inner body — same shape as `Process`.
+  - `"SignShielded"` — Sentinel → Finalizers (vote request carrying the
+    `ShieldedTransaction`); new entry in `FINALIZER_ACTIONS`
+    (node_server.rs:43).
+  - `"ShieldedVote"` — Finalizer → collector Finalizer (carrying a
+    `TransactionSignature` vote); new entry in `FINALIZER_ACTIONS`.
+  - **No new committer actions** — the finalizer→committer commit reuses
+    `"Commit"`/`"BlockFinalized"`, already `Exact(Finalizer)` in the
+    committer's `allowed_senders_for` map (committer.rs:68-78).
+  Old nodes see any new action as unknown and **fail closed** (reject,
+  never silent accept), per the existing `authenticate_message`
+  unknown-action rejection and the dispatcher's `UnknownAction` path.
+- `Transaction` struct: unchanged. Shielded transactions use a **new**
+  `ShieldedTransaction` struct (S3.1), not new fields on `Transaction` —
+  this keeps every existing `#[serde]` shape and every canonical-serialization
+  byte sequence (`canonical_signature_bytes`, `canonical_signed_trans_bytes`,
+  `Transaction::hash`) identical to today.
+- `SignedTransaction` gains ONE additive field:
+  `shielded: Option<ShieldedTransaction>` (serde `default` +
+  `skip_serializing_if = Option::is_none`). Old decoders skip the unknown
+  map key (serde default behavior); for every non-shielded block the field
+  is absent, so all existing canonical byte sequences
+  (`canonical_signed_trans_bytes`, `Transaction::hash`, block hashes) are
+  byte-identical to today. When present, the field's canonical bytes ARE
+  added to `canonical_signed_trans_bytes` (and to the finalizer-sig input)
+  — that only happens in shielded blocks, which no pre-upgrade node can
+  produce or validate.
+- New MsgPack payload schemas ride the existing 4-byte-length-prefixed
+  framing; no framing change.
+- **Rollout order is implicit**: shielded txs are only valid once every
+  committer is on a build containing S4/S5; until then the network rejects
+  them fail-closed (unknown action / unregistered spec), which is the safe
+  direction. No upgrade dance required.
+
+### Error variants (single item, S4.1)
+
+Extend `src/errors.rs` `ValidationFailureReason` (additive enum variants —
+serde-tagged, old decoders hitting a new variant is covered by the fail-closed
+unknown-action gate, but the variant additions themselves are backward-safe
+for new→new): `InvalidShieldedProof`, `UnknownNullifier`, `StaleNullifier`
+(spent/replayed), `StaleMerkleRoot`, `InvalidCommitment`,
+`ValueBalanceMismatch` (should be caught by the proof; belt-and-suspenders
+public check where possible). And a `PneumaticError` variant `Shielded(String)`
+for pool/tree/registry-level failures distinct from `Validation(...)`.
+
+---
+
+## Phase S1: Cryptographic primitives (blocks everything else)
+
+All in `src/crypto.rs` (new module or inline, matching the file's section
+style) unless noted. Every primitive gets its own item with its own
+discriminator. No live proving in unit tests (roadmap Part 5): primitives are
+tested directly; the circuit tests in S2 use a stub verifier.
+
+### S1.1 — Integrate Halo2 into the workspace
+- **Files**: root `Cargo.toml` (workspace deps), new `src/shielded/mod.rs`
+  (or `src/shielded.rs`) declaring the shielded module tree, `Cargo.lock`
+  (regenerated).
+- **Action**: Add `halo2_proofs` (or `halo2curves` + `halo2_gadgets` if we
+  want to reuse Orchard's note/commitment gadgets — decide at implementation
+  time based on which builds cleanest alongside the existing dep tree;
+  prefer the smaller surface first). Confirm `cargo check --workspace` and a
+  full `cargo test --workspace` pass with the new deps present (they may
+  conflict on `group`/`ff`/`subgroup` versions with `pqcrypto-*`/`ed25519-dalek`).
+  Write a minimal smoke test that instantiates a trivial circuit, proves and
+  verifies it **once** — gated so it is the only test in the workspace that
+  does a live prove (mirrors roadmap Part 5's benchmark-only-live-proving
+  rule; keep it in the `shielded` module's test module).
+- **Verify**: `cargo check --workspace` clean; workspace suite green;
+  discriminator: a test that the trivial circuit's proof verifies and that a
+  tampered witness fails.
+- **Risk note**: this item can hit dependency-version conflict; if
+  `halo2_proofs`'s curve crates clash with anything in the lockfile, resolve
+  with `cargo update -p <pkg>` for the smallest possible lockfile delta and
+  record it in the checklist entry.
+
+### S1.2 — Poseidon hash in `crypto`
+- **Files**: `src/crypto.rs` (or `src/shielded/poseidon.rs` re-exported from
+  crypto).
+- **Action**: Add a Poseidon hash over the curve Halo2 uses (Pasta `pallas`
+  base field), alongside `BasicHashProvider` (SHA-256 stays untouched — it is
+  used for block hashing and must not change). Expose
+  `fn poseidon_hash(inputs: &[Fr]) -> Fr` (or a `PoseidonHashProvider`
+  implementing a small local trait — do NOT implement the SHA-256
+  `HashProvider` trait, the field types don't match). In-circuit version
+  comes in S2; this item is the off-circuit reference implementation.
+- **Verify**: known-answer test with a published Poseidon-on-Pasta test
+  vector; discriminator: tamper one input → different hash; deterministic
+  across calls.
+
+### S1.3 — Note commitment
+- **Files**: `src/shielded/note.rs` (new).
+- **Action**: Define `ShieldedNote { value: u64, owner_pk: [u8;32], rho: Fr, rcm: Fr }`
+  and `commit(note) -> Fr` following Orchard's note structure as reference:
+  commitment = Poseidon- or Pedersen-style binding of (value, owner_pk, rho)
+  with `rcm` as the blinding factor (exact formulation decided by the S1.1
+  crate choice; document the formula in the module doc). `owner_pk` is the
+  *spend* authorization key (a new 32-byte keypair, Ed25519-style, derived
+  from the spend key — NOT the node identity key). Commitment must be
+  deterministic given the note fields (rcm is part of the note, not
+  randomized per-commit).
+- **Verify**: same note → same commitment; any field change → different
+  commitment; discriminator: changing `value` by 1 changes the commitment.
+
+### S1.4 — Nullifier derivation
+- **Files**: `src/shielded/note.rs`.
+- **Action**: `nullifier(note, spend_key) -> [u8;32]` = `H(nullifier_domain ||
+  spend_key || rho)` (Poseidon or SHA-256 — must be **deterministic and
+  unlinkable to the commitment without the spend key**; the `rho` binding is
+  what makes two spends of the same note yield the same nullifier, and the
+  spend-key mixing is what hides which note). Document the domain byte.
+- **Verify**: same (note, spend_key) → same nullifier; different note (diff
+  rho) → different nullifier; different spend_key → different nullifier;
+  nullifier is not derivable from (commitment, spend_key) alone without rho
+  (structural test: no shared components).
+
+### S1.5 — Note encryption (reuse hybrid crypto)
+- **Files**: `src/shielded/note.rs`, uses `src/crypto.rs`.
+- **Action**: `encrypt_note(plaintext: NotePlaintext, recipient: &Ed25519Provider) -> Vec<u8>`
+  wrapping `recipient.encrypt_to(recipient.x25519_public_key(),
+  recipient.mlkem_public_key(), plaintext)` — the existing hybrid
+  `encrypt_to`/`decrypt_from` are reused **verbatim** (they are now PQC
+  hybrid, stronger than the roadmap assumed). `NotePlaintext { value,
+  memo: Vec<u8>, sender_pk_hint: Option<[u8;32]> }` serde'd to bytes.
+  **Viewing key** (roadmap 2.6): a note is additionally encrypted to the
+  recipient's *viewing key* (a separate 32-byte key derived at keygen);
+  viewing-key holders can decrypt, cannot spend (they lack the spend key).
+  Key derivation (spend key → spend auth key + viewing key) is part of the
+  prover-crate key model in S3.3; this item just defines the encrypt-to-two-
+  recipients helper.
+- **Verify**: encrypt→decrypt roundtrip for both spend-key holder and
+  viewing-key holder; a spend-key-only holder of a *different* account
+  cannot decrypt (fail closed on GCM tag); discriminator: corrupt ciphertext
+  → `Err`, never garbage plaintext.
+- **Sizing note for S3/S5**: one note ciphertext ≈ 2.3 KB (ML-KEM share) +
+  payload; a typical 2-note transfer carries ~4.6 KB.
+
+### S1.6 — Incremental Merkle tree over commitments
+- **Files**: `src/shielded/tree.rs` (new).
+- **Action**: Append-only incremental (binary, fixed depth — start 32,
+  parameterized) Merkle tree over `Fr` commitments: `append(commitment) ->
+  (new_root, membership_proof(index))`; `verify_proof(commitment, proof,
+  root) -> bool`; Poseidon node hashing (S1.2). Efficient: O(log n) root
+  update and proof generation. Also: **root serialization** for wire
+  (32-byte canonical encoding of the `Fr` root) and a `tree_state` snapshot
+  type (root + leaf count + last-appended commitments since last snapshot)
+  for S5 committer persistence.
+- **Verify**: root changes on append; proof verifies against new root,
+  fails against previous root; known-structure test (manually computed
+  4-leaf tree matches); discriminator: swap a sibling in a proof → verify
+  false; append twice with same commitment → two distinct leaves (dupes
+  allowed at the tree level — dedup is the nullifier set's job, S4.2).
+
+**S1 sub-total: ~54h** (matches roadmap; S1.1 is the schedule-risk item —
+dependency conflicts or a slow first prove can blow the 4h estimate).
+
+---
+
+## Phase S2: Circuit design — *highest schedule risk in Tier 1*
+
+One combined **Action circuit** (spend + outputs together, Orchard pattern),
+NOT separate spend/output circuits (roadmap S2 recommendation).
+
+### S2.1 — Action circuit
+- **Files**: `src/shielded/circuit.rs`, `src/shielded/circuit_test.rs`
+  (test harness per roadmap Part 5: known-good witnesses/proofs, stub
+  verifier for unit tests).
+- **Action**: Single Halo2 circuit proving, with public inputs (nullifiers,
+  new commitments, referenced Merkle root, and the value-balance check):
+  1. **Spend**: (a) knowledge of a note opening `(value, owner_pk, rho, rcm)`
+     for a commitment at a known index in the tree at the referenced root
+     (Merkle path verified in-circuit with S1.2 Poseidon); (b) correct
+     nullifier derivation per S1.4; (c) knowledge of spend authority —
+     in-circuit check that the spend auth key matches the note's `owner_pk`
+     (signature over the nullifier/commitment is done off-circuit as a
+     witness relation; the circuit proves the *binding* of keys).
+  2. **Outputs**: each new commitment is well-formed (value ≤ max, owner_pk
+     is a valid field encoding, rcm ≠ 0 where required).
+  3. **Value balance**: sum(input values) = sum(output values) + fee, with
+     values hidden inside the commitments (the commitments are
+     Pedersen-style in value, so the homomorphic sum check closes in
+     circuit; fee is a public constant, configurable, default 0 for v1).
+  **Fail-closed circuit construction**: any public input that cannot be
+  embedded (root too deep, more nullifiers than circuit capacity) is a
+  prover/verifier error, never a skipped constraint.
+- **Verify**: happy-path prove+verify (the ONE live-prove test, kept here or
+  in S1.1's smoke — decide at impl time, must not run in every unit test);
+  negative witnesses: wrong note opening, wrong nullifier derivation, value
+  imbalance of 1, commitment not in tree, wrong root → all fail to produce
+  a verifying proof (soundness spot-checks, not full soundness proofs);
+  discriminator: flip one constraint (comment it out) → a previously-rejected
+  invalid witness now verifies, proving the constraint was load-bearing.
+- **Budget guard**: roadmap allocates 92h here and says to budget *extra
+  review time* rather than compress. If circuit debugging exceeds ~1.5× the
+  phase estimate, stop and report back rather than silently extending.
+
+### S2.2 — Verification API (network side)
+- **Files**: `src/shielded/verify.rs`.
+- **Action**: `verify_shielded_proof(proof_bytes, public_inputs) ->
+  Result<bool, PneumaticError>` — the ONLY function the node crates call.
+  Loads the verifying key (compiled once, cached in `once_cell`), parses
+  public inputs, verifies. **Never panics on untrusted input** — malformed
+  proof bytes are `Err(Shielded(...))` / `Validation([InvalidShieldedProof])`,
+  matching the `verify_sender_signature` idiom (never panics on untrusted
+  data). The verifying key is a build-time constant for v1 (Halo2's
+  transparent setup derives VK from the circuit; no ceremony).
+- **Verify**: valid proof → Ok(true); truncated proof → Err; proof for a
+  different root → false/Err; discriminator: corrupt one proof byte →
+  rejected, and the rejection is an `Err` or `false`, never a panic or
+  silent `true`.
+
+**S2 sub-total: ~92h + review buffer.**
+
+---
+
+## Phase S3: Wire format & transaction types
+
+### S3.1 — `ShieldedTransaction` type
+- **Files**: `src/transactions.rs` (additive — `Transaction` struct
+  unchanged, ground rule 4 respected).
+- **Action**:
+  ```rust
+  #[derive(Serialize, Deserialize, Debug, Clone)]
+  pub struct ShieldedTransaction {
+      pub id: String,               // unique tx id (uuid, like Transaction)
+      pub action: String,           // always "ShieldedTransfer"
+      pub token_id: Vec<u8>,        // the self-signed token being transferred
+      pub nullifiers: Vec<[u8;32]>, // spent notes' nullifiers (≤ circuit cap)
+      pub commitments: Vec<Fr-as-[u8;32]>, // new notes
+      pub merkle_root: [u8;32],     // referenced pool root
+      pub proof: Vec<u8>,           // Halo2 proof bytes
+      pub note_ciphertexts: Vec<Vec<u8>>, // encrypted to recipients (S1.5)
+      pub fee: u64,                 // public; 0 for v1
+  }
+  ```
+  Plus `canonical_signature_bytes`-style canonical serializer (BTreeMap-free,
+  serde round-trip stable) and `hash()` (SHA-256 over canonical bytes,
+  mirroring `Transaction::hash`) — the Finalizer/Committer sign and compare
+  these bytes (Phase 3.5's hash-match pattern applies directly).
+  **Block carrier (the consensus-binding step)**: `SignedTransaction`
+  (transactions.rs:335+ `CanonicalSignedTransaction`, :353-372
+  `canonical_signed_trans_bytes`) gains `shielded: Option<ShieldedTransaction>`
+  (serde `default` + `skip_serializing_if`); `canonical_signed_trans_bytes`
+  appends the canonical shielded bytes when `Some`. A shielded block's
+  `SignedTransaction.transaction` holds a **deterministic placeholder**
+  `Transaction` — `id` = shielded tx id, `action` = `"ShieldedTransfer"`,
+  `token_id` copied, all other fields empty/zero — so the block's hash
+  (blocks.rs:132-154, via `canonical_signed_trans_bytes`) binds exactly
+  (nullifiers, commitments, referenced root, proof, ciphertexts). This is
+  what makes the pool update consensus-bound, replayable from block history,
+  and unwound atomically by tip rollback.
+- **Verify**: serde roundtrip byte-identical for the canonical form;
+  `hash()` stable across deserialization; a non-shielded `SignedTransaction`
+  (field absent) produces byte-identical `canonical_signed_trans_bytes` to
+  today (regression — run existing blocks.rs hash tests untouched);
+  discriminator: field reorder in source → hash unchanged (canonical form
+  is struct-field ordered, not map-ordered — same property that made
+  `Transaction` canonical safe); discriminator 2: flipping one nullifier
+  byte changes the block hash.
+
+### S3.2 — Message wiring
+- **Files**: `src/messages.rs` (action constants, if any), `sentinel/src/
+  sentinel.rs` (`on_data_received` match, :110-124), `finalizer/src/
+  finalizer.rs` + `finalizer/src/message_dispatcher.rs` (outbound
+  `SignShielded`/`ShieldedVote` helpers), `node-server/src/node_server.rs`
+  (`FINALIZER_ACTIONS` :43; finalizer `handle` match :626-659).
+- **Action**: Three new action strings, confirmed against the dispatcher:
+  - `"ShieldedTransfer"` (client → Sentinel): new arm in the sentinel's
+    `on_data_received` inner-action match. In the composite node the outer
+    envelope action is still `"Verify"` (sentinel's only dispatcher-level
+    action) with the shielded message as inner body — identical shape to
+    how `Process` arrives today.
+  - `"SignShielded"` (Sentinel → Finalizers): vote request carrying the
+    `ShieldedTransaction`; add to `FINALIZER_ACTIONS` and to the finalizer
+    plugin's `handle` match (node_server.rs:626-659 currently: `"Sign"` →
+    `handle_signature`, else fail-closed).
+  - `"ShieldedVote"` (Finalizer → collector Finalizer): carries a
+    `TransactionSignature` vote; add to `FINALIZER_ACTIONS` + handle match.
+  - **No committer-side changes**: the finalizer→committer commit reuses
+    `"Commit"`/`"BlockFinalized"`, already `Exact(Finalizer)` in
+    `allowed_senders_for` (committer.rs:68-78) — the fail-closed role→action
+    map (Phase 1.3) needs no new entries.
+  **Every new entry is fail-closed by default** — an action not in a role's
+  `allowed_actions` is rejected by `RoleDispatcher::dispatch`
+  (role_dispatcher.rs:139-159, `UnknownAction`), which is the existing
+  behavior for unknown actions.
+- **Verify**: wire roundtrip of a `Message` carrying `ShieldedTransaction`
+  via the existing length-prefixed framing; a message with the new action
+  sent to a role that doesn't allow it → rejected (not silently dropped);
+  discriminator: remove the role-map entry → the message is rejected
+  (proves the gate is load-bearing, not cosmetic).
+
+### S3.3 — `pneumatic_prover` crate
+- **Files**: new workspace member `prover/` (`pneumatic_prover`); root
+  `Cargo.toml` `members`.
+- **Action**: Client-side crate (NOT a node crate — no network code):
+  - **Key model**: `SpendKey` (32 B, seed) → derives (a) spend auth keypair
+    (32 B pk/sk — the note's `owner_pk`; Ed25519 keys are fine here, this is
+    *value* authorization not node identity), (b) viewing key (32 B, can
+    decrypt, can't spend), (c) a *note-scoped* randomization scheme is NOT
+    needed beyond per-note `rho`.
+  - `create_note(value, recipient_spend_or_viewing_pk) -> (ShieldedNote,
+    ciphertexts)`, `build_shielded_tx(inputs: &[ShieldedNote], outputs:
+    &[NoteOutput], spend_keys, merkle_proofs, root) -> ShieldedTransaction`
+    (calls S2 proving; the roadmap's public API shape), `scan_for_notes(
+    ciphertexts, viewing_key) -> Vec<ShieldedNote>` (viewing-key
+    compliance/audit path, roadmap 2.6).
+  - Reuses `pneumatic_core` for S1 primitives — depends on `pneumatic_core`
+    the way the node crates do.
+- **Verify**: key derivation determinism (same seed → same keys);
+  build_shielded_tx on a two-in/two-out produces a tx whose S2.2
+  verification passes; viewing-key scan finds the note, spend-key scan
+  (wrong key) does not; discriminator: spending a note with the *wrong*
+  spend key → proof construction fails (Err, not a garbage tx).
+
+**S3 sub-total: ~32h.**
+
+---
+
+## Phase S4: Validation layer
+
+### S4.1 — `ShieldedValidationSpec`
+- **Files**: `src/validation.rs` (additive), `src/errors.rs` (error
+  variants — see Context).
+- **Action**: Implement `TransactionValidationSpec` (name `"Shielded"`):
+  the trait takes `&Transaction` — the shielded path needs
+  `&ShieldedTransaction`. **Resolution**: the spec receives the shielded tx
+  via a new trait method with a default impl, OR the pipeline carries both
+  types and the spec is registered under the shielded action with a small
+  adapter. Decide by reading how `ActionRouter`/sentinel invoke specs; the
+  constraint is: `SelfSigned`/`Executed` specs and `register_defaults()` are
+  **untouched**, the new spec is registered explicitly (fail-closed: a
+  `"Shielded"` tx with no registered spec → `Err`, mirroring Phase 3.2's
+  reject-unknown-validator behavior).
+  Checks, in order, all fail-closed:
+  1. Structural: field bounds (nullifier/commitment counts ≤ circuit
+     capacity, non-empty, valid encodings, nullifiers pairwise distinct
+     within the tx) → `InvalidCommitment`.
+  2. Nullifier set: each nullifier not already in the set → `StaleNullifier`
+     (the double-spend check; see S4.2).
+  3. Merkle root freshness: `merkle_root` equals the pool's current root OR
+     a root within the accepted recency window (S4.3) → `StaleMerkleRoot`.
+  4. Proof: `verify_shielded_proof` (S2.2) → `InvalidShieldedProof`.
+  `calculate_risk`: shielded txs report a **fixed, neutral** risk factor
+  (amount unknown by design — use `affected_parties: 2, amount: 0`); the
+  environment's `max_risk` gate still applies to the fixed value.
+  Register via `ValidationSpecRegistry`/`BlockValidatorSpecRegistry` in the
+  same places `register_defaults()` runs (but as a separate
+  `register_shielded()` — do not put it in `register_defaults`, so a
+  non-shielded deployment doesn't pay for the verifying key).
+- **Verify**: each of the four checks has its own rejection test with the
+  exact `ValidationFailureReason`; a fully valid shielded tx passes;
+  discriminator per check: e.g., pre-insert the nullifier into the set →
+  `StaleNullifier` (proves check 2 runs, not just check 4).
+
+### S4.2 — Nullifier-set registry
+- **Files**: `src/registry.rs` (new struct alongside `PendingTransactionRegistry`).
+- **Action**: `NullifierRegistry` — DashMap-based, mirroring the
+  `PendingTransactionRegistry` conventions (every method `Result`, atomic
+  `insert`-returning-old-value for the check-or-insert so there is **no
+  TOCTOU window** — the same fix `add_transaction` and `used_nonces` got):
+  `try_mark_spent(nullifier) -> Result<(), PneumaticError>` (Err
+  `StaleNullifier` if present), `contains(nullifier)`, `mark_many_atomic(
+  &[nullifier])` (all-or-nothing: check all, then insert all — a tx with 2
+  nullifiers must not spend one and reject on the other), plus the
+  `used_nonces`-style "never evicted" comment: **nullifiers are never
+  removed** (roadmap 2.5: a rollback that un-spends a nullifier is a
+  double-spend). Growth handling: v1 is unbounded (documented; the set is
+  32 B/spend — 10M spends ≈ 320 MB, flag as a future compaction item, NOT
+  built now).
+- **Verify**: double-mark rejected; atomic batch: 2nd nullifier already
+  spent → 1st not marked (all-or-nothing discriminator); concurrent
+  `std::thread::spawn` + `Arc` stress test (N threads, 1 nullifier →
+  exactly 1 success — mirrors `concurrent_add_signature_same_executor_one_
+  succeeds`).
+
+### S4.3 — Merkle-root freshness
+- **Files**: `src/shielded/` (root state), `src/validation.rs` (the check).
+- **Action**: The pool root only advances as commitments land in committed
+  blocks (S5.3). A shielded tx references the root it was proved against.
+  Accept if `referenced_root == current_root`; also accept roots within the
+  last K committed pool states (K configurable, default small, e.g. 10 —
+  mirrors the orphan-buffer's tolerance for near-tip blocks, Phase 3.4
+  pattern). Older → `StaleMerkleRoot`, fail-closed.
+- **Verify**: current root accepted; root from K-1 states back accepted;
+  K+1 back rejected; discriminator: set K=0 in a test → the K-1 case now
+  rejects (proves the window logic, not just equality).
+
+**S4 sub-total: ~28h.**
+
+---
+
+## Phase S5: Pipeline rewiring
+
+Touch points confirmed against the code (Explore pass): sentinel inner-action
+match at sentinel.rs:110-124; finalizer voting at `handle_signature`
+(finalizer.rs:346) + `BlockBuilder::sign_finalizer_block` (block_builder.rs:
+134-170); committer commit at `handle_commit` (committer.rs:432) →
+`check_and_commit_transaction_results` (:461, H12 hash-match at :519,
+conflict+commit at :527-535) and the `handle_block_finalized` append path
+(:672); composite wiring at node_server.rs:36-43 (action constants),
+:204-402 (`build_runtime` DI bundle), :409-520 (`build_role_plugin`).
+Structural fact driving S5.3: the block hash binds only
+`(previous_hash, timestamp, signed_trans, metadata, proposer, epoch)`, so
+the pool update is hash-bound by living in `signed_trans.shielded` (S3.1).
+
+### S5.1 — Sentinel: shielded routing branch
+- **Files**: `sentinel/src/sentinel.rs` (inner-action match `on_data_received`
+  :110-124 — new `"ShieldedTransfer"` arm; new `handle_shielded_transfer`),
+  `src/registry.rs` (parallel shielded map, see Action).
+- **Action**: Third routing branch alongside SelfSigned (→ Committer direct)
+  and Standard (→ Executor → Finalizer): **shielded → proof verification
+  (S4.1) → Finalizer directly, bypassing Executor/preload entirely**
+  (roadmap 2.1). `handle_shielded_transfer`:
+  1. Deserialize `ShieldedTransaction` from the inner body (encoding error
+     → fail-closed `Encoding`).
+  2. Run `ShieldedValidationSpec` (S4.1) — **advisory pre-check**: it
+     rejects obvious garbage (bad proof, already-spent nullifier, stale
+     root) before any finalizer work, but is NOT the consensus gate — the
+     authoritative re-check is the committer's guarded apply (S5.3).
+  3. Token lookup: `token_id` must reference an existing, `is_self_verified`,
+     shielded-opt-in token (fail-closed `TokenNotFound` / `NotSelfVerified`).
+     The sentinel does NOT fetch token data for the *amount* — it has no
+     balance data to check and none is revealed.
+  4. Register in a new parallel map on `PendingTransactionRegistry`:
+     `shielded_transactions: DashMap<String, ShieldedTransaction>`
+     (mirrors the `used_nonces` side-map pattern; never evicted — the
+     committer's H12-style hash match, S5.3, compares against it). No new
+     `TransactionState` variant: shielded txs are not `Transaction`s and do
+     not ride the `Pending → … → Committed` state machine.
+  5. Send `Message::signed("SignShielded", shielded_tx_bytes)` to the
+     finalizer set — the deterministic finalizer-assignment machinery
+     (TASKS Phase 3) picks the collector, same as standard txs.
+  **Pool view**: the sentinel needs the pool's nullifier set + root history
+  for step 2. Design: ONE authoritative `ShieldedPool` (S5.3) is the
+  committer's structure; in the **composite node** (primary deployment —
+  node-server hosts all roles) the sentinel/finalizer/committer share one
+  `Arc<ShieldedPool>` from the `build_runtime` DI bundle (sentinel and
+  finalizer read-only). In **split deployments** the pool state is a pure
+  function of committed block history (S3.1: the update is hash-bound
+  inside `signed_trans.shielded`), so a sentinel/finalizer rebuilds and
+  maintains its local view by replaying the shielded update of every
+  received distributed/finalized block — deterministic, no extra sync
+  message, and the K-recency window (S4.3) absorbs view lag.
+- **Verify**: shielded tx reaches Finalizer without Executor dispatch
+  (assert no executor message sent); non-shielded paths unchanged
+  (regression: existing sentinel routing tests all pass untouched);
+  discriminator: point a shielded tx at a non-self-verified token →
+  rejected fail-closed.
+
+### S5.2 — Finalizer: sign over public outputs
+- **Files**: `finalizer/src/finalizer.rs` (new `handle_sign_shielded` +
+  `handle_shielded_vote`, siblings of `handle_signature` :346),
+  `finalizer/src/signature_collector.rs`, `finalizer/src/block_builder.rs`
+  (shielded variant of `build_signed_transaction` :78-125;
+  `sign_finalizer_block` :134-170), `finalizer/src/message_dispatcher.rs`
+  (outbound `ShieldedVote` fan-out to peers).
+- **Action**: Two new handlers on the finalizer, following the
+  `handle_signature` C1 pattern (finalizer.rs:346) verbatim but
+  authenticating the sender as a registered **Finalizer** (not Executor —
+  the Executor stage is skipped for shielded txs):
+  - `handle_sign_shielded` (vote request, from the sentinel):
+    1. Authenticate the envelope sender as a registered Finalizer (C1:
+       envelope sig + registry lookup) — unknown voter → reject,
+       fail-closed.
+    2. **Re-run `verify_shielded_proof` (S2.2) over the tx's own public
+       inputs** — each finalizer verifies independently; the sentinel's
+       verdict is never relayed (a compromised sentinel cannot forge
+       quorum — Phase 1.3/1.4 authenticate-don't-trust). Verification
+       fails → reject, no vote (fail-closed).
+    3. Local pool view must accept the tx's referenced root (K-recency,
+       S4.3) — stale locally → reject, no vote.
+    4. If this finalizer is the assigned collector: record the tx and fan
+       out `Message::signed("ShieldedVote", ...)` to the other finalizers
+       (each performs the same re-verify-and-vote procedure).
+  - `handle_shielded_vote` (vote, to the collector): authenticate the
+    sender as a registered Finalizer (C1), verify the inner vote signature
+    (the Phase 1.4 discipline — negated verify result checked, no bare
+    `?` on the verify boolean), stamp `current_stake` from the epoch
+    snapshot (never self-reported), feed `SignatureCollector` — reused
+    as-is.
+  **What a finalizer signs**: Ed25519 over `ShieldedTransaction::hash()`
+  (SHA-256 of the canonical shielded bytes, S3.1 — binds nullifiers,
+  commitments, referenced (pre) root, proof, ciphertexts, tx id). The
+  proof-valid boolean is **not** part of the signature input: it is a pure
+  function of the tx's public inputs, so any node — notably the committer
+  (S5.3, step 0) — recomputes it instead of trusting a voter. The vote's
+  job is identity + exact-bytes binding + quorum weight, nothing more.
+  Carried in a `TransactionSignature { transaction_hash:
+  ShieldedTransaction::hash(), signature, current_stake }` — no new wire
+  struct. The vote binds the **referenced (pre) root, not a post root**:
+  the post-commit pool root is computed by the Committer at append time
+  (S5.3) — signing a value no voter can independently recompute would be a
+  consensus hole. Quorum math (stake-weighted, integer u128 per Phase 6.9)
+  reused as-is; **no optimistic fast path** — the `signature_count == 1`
+  branch of `try_finalize_optimistic` (finalizer.rs:512) does not apply; a
+  shielded tx commits only at stake-weighted quorum (roadmap 2.1:
+  quorum-gated by design).
+  **On quorum** (collector finalizer, mirroring the `try_finalize` tail,
+  finalizer.rs:415-494): build the `SignedTransaction` with the S3.1
+  placeholder `Transaction` + `shielded: Some(tx)` + the collected votes in
+  `executor_sigs` (keyed by voting finalizer public keys — the map is the
+  canonical voter-sig carrier in shielded blocks; the field name is
+  historical. A dedicated `finalizer_votes` field was considered and
+  rejected to keep the canonical schema change to exactly one additive
+  field) → `sign_finalizer_block` (block_builder.rs:134-170) — its formula
+  `SHA256(SHA256(rmp(signed_tx)) || SHA256(sorted-concat sigs))` is
+  **unchanged**: `rmp(signed_tx)` already covers the `shielded` field and
+  the sig-concat covers the votes (sorted by key, as today) →
+  `create_block` → `TransactionCommit` → `send_to_committers` +
+  `send_block_finalized` (existing tail, finalizer.rs:476-494).
+  **Impl-time check**: confirm the `SelfSigned` block-validation spec
+  (the spec shielded-opt-in tokens route through, Phase 5.9) does not
+  require non-empty `executor_sigs`; if it does, gate that check on
+  `signed_trans.shielded.is_none()` (additive, fail-closed guard).
+- **Verify**: quorum reached → commit message carries the signed public
+  outputs (placeholder + shielded field + votes); below-quorum → no commit
+  (existing behavior); discriminator 1: mutate one commitment in the signed
+  set after signatures are collected → `sign_finalizer_block` hash mismatch
+  → rejected (proves the signature binds the exact bytes); discriminator 2:
+  a finalizer that receives `SignShielded` for a tx it cannot verify (bad
+  proof, or root stale against its local view) sends no vote → quorum
+  unreachable in the test → no commit (proves each voter's own check gates
+  its vote).
+
+### S5.3 — Committer: pool state persistence + nullifier commit
+- **Files**: `committer/src/committer.rs` (`handle_commit` :432 →
+  `check_and_commit_transaction_results` :461 — H12 extension at :519,
+  conflict+commit dispatch :527-535; `handle_block_finalized` :672 —
+  second hook site), `committer/src/block_services.rs` (`commit_block`
+  :67-105 — commit-path hook site), `committer/src/epoch_manager.rs`
+  (only if the pool state rides the epoch snapshots — Phase 5.4's
+  attested-snapshot pattern with SHA-256 envelopes is the model to copy),
+  `src/data.rs` (new `DataOp`s for pool-state load/save).
+- **Action**: **Cross-token ordering** (the design point the roadmap leaves
+  implicit — blocks are per-token lattice chains, the pool is global, so
+  there is no inherent global block order): the pool is ONE global
+  committer structure behind a **single-writer guard** (the Phase 5.4
+  "single epoch writer" pattern — one lock, no concurrent root advances).
+  It holds (a) the Merkle tree (S1.6), (b) the nullifier set (S4.2), and
+  (c) an **applied-update map** `(block_hash → {leaves appended, nullifiers
+  marked})` — the per-block delta that makes replay idempotent and rollback
+  exact. A shielded block carries `(referenced_root, commitments,
+  nullifiers)`; at commit the guarded `apply_pool_update(block)` runs, in
+  order:
+  0. **Re-run `verify_shielded_proof` (S2.2) over the block's public
+     inputs** — the committer's own check is the final, authoritative
+     consensus gate; the sentinel pre-check (S5.1) and the finalizer votes
+     (S5.2) are availability/advisory layers, not soundness layers. Proof
+     invalid → reject the commit (deterministic on every committer).
+  1. **Idempotency**: if `block.current_hash` is already in the
+     applied-update map → **no-op** (legitimate replay: a block can reach
+     the pool via both the `Commit` path and `BlockFinalized`, and via
+     re-gossip). This no-op is what makes double-delivery safe.
+  2. **Double-spend**: else if ANY of the block's nullifiers is already in
+     the set (which, given step 1, means it was marked by a DIFFERENT
+     block) → reject `StaleNullifier` (commit error, fail-closed). Steps
+     1+2 together are what make the apply both idempotent AND
+     first-spent-wins.
+  3. **Freshness**: `referenced_root` within the K-recency window (S4.3).
+     K is a **consensus parameter** — it lives in the environment spec and
+     every node must run the same value; the window absorbs per-token
+     chain lag when blocks interleave and split-deployment view lag.
+  4. **Apply**: `mark_many_atomic` (S4.2, all-or-nothing) + append
+     commitments + compute the post root + record `(block_hash, delta)` in
+     the applied-update map — atomically with the chain append, under the
+     same guard. The block does NOT assert a post root; the committer
+     computes it (consistent with S5.2 — finalizers sign the referenced
+     root only). First-spent-wins is global by construction:
+     `mark_many_atomic`'s all-or-nothing check runs under the pool guard,
+     so two shielded blocks (even on different tokens) claiming the same
+     note can never both pass.
+  **Hook sites** (both must call `apply_pool_update` under the guard,
+  before the block is reported committed): the commit path —
+  `check_and_commit_transaction_results` → `block_services.commit_block`
+  (committer.rs:529-532, block_services.rs:67-105) — and the
+  `handle_block_finalized` append path (committer.rs:672, Phase 3.3's
+  `append_validated_block`).
+  **H12 extension**: alongside the existing hash-match at committer.rs:519
+  (`transaction.hash() !=` wire tx `hash()` → `TransactionPayloadMismatch`),
+  a shielded commit additionally hash-matches the wire
+  `signed_trans.shielded` against the validated registry entry (S5.1's
+  `shielded_transactions` map) — mismatch → same
+  `TransactionPayloadMismatch` error.
+  **Conflict/rollback**: pool state is applied as part of the commit unit,
+  so when `resolve_block_conflict()` rolls a block back (Phase 5.2's
+  tip-rollback path), the pool update unwinds in the same code path and
+  under the same guard — inverse op: pop this block's appended leaves,
+  remove exactly this block's nullifiers (a later block's spends of notes
+  introduced by the loser are inherently invalidated by the root rewind,
+  the same way chain rollback invalidates branch builds today — expected
+  UTXO semantics, not a bug to solve).
+  Persistence via the data provider (`SaveOp`/`GetOp`), with the Phase 5.4
+  snapshot-integrity pattern (hash-verified envelope, persist errors
+  surfaced, not swallowed). **Durability ordering** (roadmap 2.5):
+  nullifiers are marked durable BEFORE the block is reported committed to
+  peers — a node that reports commit must have the nullifiers durably
+  written, else a crash-and-restart could un-spend. Load at boot:
+  missing/corrupt pool state → fail closed (boot error, like Phase 6.5's
+  spec-load behavior), never "start empty."
+- **Verify**: commit → tree root advances, nullifiers marked, persisted;
+  restart → identical pool state (roundtrip test); mismatched wire payload
+  → rejected with the payload-mismatch error; **idempotency**: applying
+  the same block twice (Commit, then BlockFinalized) → second apply is a
+  no-op, root unchanged, nullifiers marked exactly once; **cross-block
+  double-spend**: two distinct blocks spending the same nullifier → first
+  commits, second rejected `StaleNullifier`; **authoritative re-check**: a
+  tx with a full finalizer quorum but an invalid proof → committer still
+  rejects (proves soundness does not depend on trusting voters);
+  discriminator: skip the durability ordering (mark nullifiers after
+  reporting commit) in a test simulating crash-after-report →
+  double-spend window opens (the test exists to PROVE the ordering
+  matters, and the real code is then shown to close it).
+- **Epoch check** (roadmap S5.4): confirm `resolve_block_conflict()` and
+  epoch-boundary logic behave correctly when blocks carry shielded pool
+  updates — verify with a targeted test, don't assume. The conflict
+  machinery itself needs no epoch-logic changes (pool updates ride inside
+  the block; the single-writer guard serializes them); what IS new and must
+  be tested: the rollback path unwinds pool state in lockstep with
+  `blockchain.remove_block()` — add a test where a shielded block loses a
+  conflict and assert: loser's commitments gone from the tree, loser's
+  nullifiers unmarked, winner's update intact, root consistent.
+
+### S5.4 — Node-server role wiring
+- **Files**: `node-server/src/node_server.rs` (action constants :36-43,
+  finalizer `handle` match :626-659, `build_runtime` :204-402,
+  `build_role_plugin` :409-520); `node-server/src/role_dispatcher.rs`
+  (UNCHANGED — listed because its fail-closed `dispatch` :139-159 is what
+  the regression test pins).
+- **Action**:
+  1. `FINALIZER_ACTIONS` (node_server.rs:43, currently `&["Sign",
+     "Finalize"]`) += `"SignShielded"`, `"ShieldedVote"`; the finalizer
+     `handle` match (:626-659) gains `"SignShielded"` →
+     `handle_sign_shielded` and `"ShieldedVote"` → `handle_shielded_vote`
+     (S5.2); `"Sign"` → `handle_signature` and the else-fail-closed arm
+     are untouched.
+  2. `SENTINEL_ACTIONS` (`&["Verify"]`, :41) and `COMMITTER_ACTIONS`
+     (`&["Commit"]`, :37) are **unchanged** — shielded transfers arrive
+     as an inner action under the `Verify` envelope (S3.2), and shielded
+     commits ride the existing `Commit`/`BlockFinalized` actions whose
+     auth is already `Exact(Finalizer)` in `allowed_senders_for`
+     (committer.rs:68-78) — no new committer map entries.
+  3. `build_runtime` (:204-402): construct the `ShieldedPool` (S1.6 tree +
+     S4.2 nullifier registry + applied-update map, under the
+     single-writer guard) as a shared `Arc` in the DI bundle alongside
+     `tokens` (:295) / `pending_registry` (:296); `build_role_plugin`
+     (:409-520) threads it into the Sentinel plugin (read-only view for
+     S5.1 step 2), the Finalizer plugin (read-only, for the K-recency
+     check in S5.2), and the Committer plugin / `BlockServices` (write
+     path, S5.3).
+  4. `route_data_plane` (:531-538): no special-casing — shielded payloads
+     are ordinary length-prefixed messages (size note: ~4.6 KB for a
+     typical 2-in/2-out transfer with PQC-hybrid note ciphertexts, well
+     under the 16 MiB frame cap).
+- **Verify**: composite node (all roles) routes a shielded tx end-to-end in
+  the in-process pipeline test; a role receiving an action outside its set
+  → rejected (fail-closed regression preserved); discriminator: remove
+  `"SignShielded"` from `FINALIZER_ACTIONS` in a test build → vote
+  requests rejected by `RoleDispatcher` (`UnknownAction`) — proves the
+  gate is load-bearing.
+
+**S5 sub-total: ~48h.**
+
+---
+
+## Phase S6: Testing & hardening
+
+### S6.1 — End-to-end integration test
+- **Files**: `tests/shielded_pipeline.rs` (new integration test, following
+  `committer/tests/pipeline_integration.rs` fixture conventions).
+- **Action**: Full pipeline in-process: prover crate builds a real proof
+  (the ONE live-prove integration test — allowed to be slow) → Sentinel
+  verifies + routes → Finalizer quorum over public outputs → Committer
+  appends block, updates tree + nullifier set → assert: balance conservation
+  (sum of outputs = inputs, via decrypting with viewing keys), commitments
+  in tree, nullifiers marked, observer-visible surface contains ONLY
+  (nullifiers, commitments, root, proof, hash) — **no sender/receiver/amount
+  bytes anywhere on the wire** (assert by scanning the serialized messages).
+- **Verify**: test passes; the privacy assertion (no plaintext on wire) is
+  the headline discriminator — a regression that leaks a field fails it.
+
+### S6.2 — Double-spend & adversarial tests
+- **Files**: `tests/shielded_attacks.rs` (or in-crate test modules per the
+  item's location).
+- **Action**: (a) replay a spent nullifier → `StaleNullifier`; (b) two
+  concurrent txs spending the same note (same nullifier) → exactly one
+  commits; (c) proof against a stale root (beyond K) → `StaleMerkleRoot`;
+  (d) malformed/truncated proof → `Err`, no panic; (e) value-imbalance
+  witness (if S2 produced a test vector for it) → rejected; (f) shielded
+  tx to a non-shielded token → rejected.
+- **Verify**: all six rejected with the exact named errors; discriminator
+  for (b): the concurrency test asserting exactly-one-commit is itself the
+  discriminator (a TOCTOU in `mark_many_atomic` fails it).
+
+### S6.3 — Concurrency stress
+- **Files**: `src/registry.rs` (nullifier registry stress), `src/shielded/
+  tree.rs` (concurrent read-while-append).
+- **Action**: `std::thread::spawn` + `Arc` per the `registry.rs`
+  conventions: 50 threads hammering `try_mark_spent` on mixed unique/dup
+  nullifiers → exactly the unique ones marked; concurrent
+  `verify_proof` + `append` on the tree → no data race (also run under
+  `cargo test` with `--release` once, and if Miri is feasible on the small
+  tree test, add it as a documented follow-up, not a gate).
+- **Verify**: stress assertions hold; no panics (same standard as
+  `concurrent_acquire_release_stress_50`).
+
+### S6.4 — Proving/verification benchmarks
+- **Files**: `prover/benches/` or `tests/shielded_bench.rs` (bench-gated,
+  excluded from the default suite run like the live-prove tests).
+- **Action**: Measure client-side proving time and network-side verification
+  time at the final circuit size; record both in the checklist entry and
+  **report back to the roadmap owner** (roadmap Part 7: confirming seconds-
+  scale proving is acceptable for wallet UX is an open product question).
+- **Verify**: numbers recorded; verification time is asserted to be < 100ms
+  (network-side budget — if the circuit blows it, that's a circuit-design
+  finding to escalate, not a silent accept).
+
+**S6 sub-total: ~46h.**
+
+---
+
+## Total & sequencing
+
+**~300h** (matches the roadmap's Tier 1 estimate). Parallelizable: S1.2–S1.6
+once S1.1 lands; S3.1–S3.2 in parallel with S2 (types don't need the
+circuit, only S3.3's `build_shielded_tx` and S6.1 do); S4 after S2.2; S5
+after S3+S4; S6 last, with S6.1 gated on a working S3.3.
+
+**Hard boundary (roadmap Part 0)**: if this work expands toward hiding
+contract logic/state (Tier 2), stop and report — that is a separate
+research initiative (zk-VM territory), not an extension of this plan.
+
+## Open questions to flag to the roadmap owner (roadmap Part 7 — NOT
+decided here)
+
+1. **Circuit audit**: before this touches real value, the Action circuit
+   needs external review/audit (zk constraint bugs are a different risk
+   class from Rust bugs — silently-accepting invalid proofs).
+2. **Viewing-key policy**: scope is DECIDED — full in v1 (confirmed with
+   the product owner). Remaining: who may hold viewing keys (owner-only vs.
+   compliance parties) is a policy decision after ship — the technical path
+   (S1.5/S3.3) supports both.
+3. **Proving UX**: S6.4's measured prove time determines whether client-
+   side proving is acceptable on the intended hardware class.
+4. **Anonymity-set bootstrap**: the shared pool only provides real privacy
+   with real usage — an adoption concern to surface, not an engineering
+   blocker.
+
+## Verification (whole-plan)
+
+- After **every item**: `cargo check --workspace` + `cargo test --workspace`
+  green, test count monotonically increasing from the 663 baseline, each
+  increment named with its discriminator in the AUDIT_CHECKLIST-format
+  "Done" note.
+- Phase gates: S1 done = primitives unit-tested, no live prove in default
+  suite. S2 done = circuit + test vectors + stub-verifier unit tests green.
+  S3 done = wire roundtrips + prover crate builds a verifying tx (one live
+  prove). S4 done = all four fail-closed checks individually demonstrated.
+  S5 done = in-process pipeline moves a shielded tx end-to-end. S6 done =
+  S6.1–S6.4 green, benchmarks recorded, open questions reported.
+- Final: `cargo test --workspace` full run, record final count in
+  AUDIT_CHECKLIST.md following the existing phase-entry format, with the
+  wire-compat note from the Context section reproduced in the entry.
