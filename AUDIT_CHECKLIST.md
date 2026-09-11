@@ -1066,43 +1066,66 @@ not a wire constraint.
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the
 repo.*
 
-- [x] **7.1 Wire-path end-to-end test** — *partially done; the RNS transport path is now exercised,
-  but a full real-transaction (`BlockFinalized`) send over RNS is blocked by a hard protocol
-  incompatibility — see the finding below.* The existing e2e suite calls
-  `committer.handle_message` directly and has never exercised the wire path:
-  `committer/tests/pipeline_integration.rs`. **What now runs** (`committer/tests/pipeline_integration.rs`,
-  `wire_*`):
-  - `wire_rns_transport_delivers_network_packet` — drives a well-formed `NetworkPacket` frame end-to-end
-    over the **real RNS loopback** (identity-encrypted UDP, rhash addressing, the 4-thread decrypt
-    worker pool) and asserts the committer's `on_packet` callback receives the decrypted bytes
-    byte-for-byte. This is the transport the audit flagged; it would fail if the RNS transport or
-    bridge were reverted (ground rule 2).
-  - `wire_undecodable_frame_dropped_by_bridge` — an undecodable frame is dropped by the bridge
-    without panic/append (bridge robustness).
+- [x] **7.1 Wire-path end-to-end test** — **DONE; the flagged incompatibility is now remediated**
+  (see RESOLVED finding below). The existing e2e suite calls `committer.handle_message` directly and
+  has never exercised the wire path: `committer/tests/pipeline_integration.rs`. **What now runs:**
+  - `wire_rns_transport_delivers_network_packet` (`committer/tests/pipeline_integration.rs`) — drives a
+    well-formed, **in-limit** `NetworkPacket` frame end-to-end over the **real RNS loopback**
+    (identity-encrypted UDP, rhash addressing, the 4-thread decrypt worker pool) and asserts the
+    committer's `on_packet` callback receives the decrypted bytes byte-for-byte. This is the largest
+    shape RNS's *direct packet* path can carry; it would fail if the RNS transport or bridge were
+    reverted (ground rule 2).
+  - `wire_undecodable_frame_dropped_by_bridge` — an undecodable frame is dropped by the bridge without
+    panic/append (bridge robustness).
+  - `resource_over_mtu_roundtrip` (`src/rns/wrapper.rs`) — **the discriminator for the finding.** A
+    **~3.8 KB payload (3805 B on the wire)** — larger than RNS's 500 B packet cap — is driven over the
+    Reticulum **Resource transfer** path and reassembles **byte-identical** at the receiver (the
+    negation of the audit finding). The direct `send_packet` path returns `ExceedsMtu` for this
+    payload; the Resource path does not.
+  - `send_resource_no_link_errors` (`src/rns/wrapper.rs`) — fail-closed: `send_resource_to` with no
+    established link returns `PneumaticError::Resource` rather than silently dropping the payload.
 
-  > **FINDING — a real pneumatic `Message` cannot traverse RNS (PQC signature vs. RNS MTU).**
-  > `RnsNetwork::send_to` → `rns_net::RnsNode::send_packet` → `rns_core::packet::RawPacket::pack`,
-  > which caps the framed packet at `rns_core::constants::MTU = 500` bytes with **no** configurable
-  > MTU and **no** app-level fragmentation. Every pneumatic `Message.signature` is the full
+  > **FINDING — RESOLVED — a real pneumatic `Message` could not traverse RNS (PQC signature vs. RNS
+  > MTU).** `RnsNetwork::send_to` → `rns_net::RnsNode::send_packet` → `rns_core::packet::RawPacket::pack`,
+  > which caps the framed packet at `rns_core::constants::MTU = 500` bytes with **no** configurable MTU
+  > and **no** app-level fragmentation. Every pneumatic `Message.signature` is the full
   > Ed25519·ML-DSA-44 hybrid signature (`crypto.rs`: `[Ed25519 64 | ML-DSA-PK 1312 | ML-DSA-sig 2420]`
   > = `MLDSA_FULL_SIG_LEN` = **3796 B**), so even a zero-body `Message` serializes to ≈3.8 KB — far
-  > above the 500 B cap. Measured in the failing draft: a `BlockFinalized` frame was ~27 KB. The
-  > route *does* establish over the loopback (hops=1, confirmed); only the size gate rejects the send
-  > (`SendError`). So RNS plumbing works; it cannot currently carry any real pneumatic data-plane
-  > `Message`.
-  > **Remediation (either; both are production changes beyond a test):**
-  > (a) *pneumatic-side* — fragment/compress the `NetworkPacket` before handing it to RNS and
-  > reassemble on receive (a pneumatic wire-shape change — see wire-compat note below), or
-  > (b) *RNS-side* — raise the packet cap by patching `rns-core` `constants::MTU` and
-  > `rns-net`'s `send_packet` pack MTU (a vendored-protocol change with system-wide link-framing
-  > impact). (a) is the smaller blast radius.
+  > above the 500 B cap. The direct packet path is therefore still a hard 500 B gate; a real Message
+  > still cannot use it. **Remediation adopted — option (a) variant A1: Reticulum's native Resource
+  > transfer (no wire-shape change, no RNS patch).** Instead of fragment/compressing the `NetworkPacket`
+  > (the audit's option (a), which *would* have been a wire-shape change) or patching `rns-core`
+  > `constants::MTU` + `send_packet` pack MTU (option (b), a vendored-protocol change), the payload
+  > rides Reticulum's native Resource layer — an opaque byte buffer RNS fragments into ~464 B SDUs with
+  > its own retransmit/flow-control (`RESOURCE_SDU = MDU = 464`). The rmp-serialized `NetworkPacket`
+  > (carrying the `Message`) goes straight into the resource's opaque `data` field, so the `Message`
+  > wire format and `NetworkPacket` framing stay **byte-identical**. Scope: `src/rns/wrapper.rs`
+  > (explicit link establishment — `register_link_destination` + `create_link`, `send_resource_to`
+  > waits for the link to go Active, `wait_for_link_active` helper) and `src/errors.rs` (new
+  > `PneumaticError::Resource` variant). **Gotcha that blocked it (now fixed):**
+  > `RnsNode::send_resource` is a *silent no-op on a non-Active link*
+  > (`link_manager::send_resource_with_auto_compress`: `if link.engine.state() != LinkState::Active {
+  > return Vec::new() }` — no error, no callback, payload vanishes), and `create_link` is optimistic —
+  > it returns the link_id the moment the LINKREQUEST is *enqueued*, before the handshake completes. So
+  > `send_resource_to` now waits for `on_link_established` to record the link (fires exactly when the
+  > link engine transitions to Active) before sending, plus a short settle so the responder — which
+  > activates ~1 RTT later — is Active and has `AcceptAll` configured. **Ceiling:** RNS is still
+  > bounded by a deliberate **16 MiB** cap (`RESOURCE_MAX_BYTES = MAX_FRAME_SIZE`), enforced at the
+  > receiver's memory-receive-mode max; over-declared sizes are rejected at the receiver, not
+  > allocated, so this is a DoS-safe policy bound, not an arbitrary one. A real `Message` (~3.8 KB)
+  > clears it with ~4× headroom. **Why not (b):** option (b) means patching the pinned
+  > `rns-net = "=0.7.0"` (Cargo.toml flags version bumps as API-migration events) and changing Reticulum
+  > internals; the native Resource layer already does what (b) wanted via a public API, so (b) is
+  > redundant and higher-risk — deferred.
 
-  **Wire-compat (AUDIT ground rule 4):** *no wire-message shape was changed.* The 4 original wire
-  tests (BlockFinalized positive + tampered + unregistered + undecodable) were removed because the
-  first three are impossible to send as-is (the message is >500 B and RNS rejects it), and replaced
-  with the two tests above that exercise the transport within its size limits. No serialization,
-  `Message`, `NetworkPacket`, or `RnsNetwork` change was introduced. If remediation (a) is adopted,
-  it *would* be a wire-shape change and needs the compatibility note called out there.
+  **Wire-compat (AUDIT ground rule 4):** *no wire-message shape changed.* The `Message` and
+  `NetworkPacket` serialize byte-identically — the payload rides inside the resource's opaque `data`
+  field (a strictly larger pipe), not a new app framing. The 4 original wire tests (BlockFinalized
+  positive + tampered + unregistered + undecodable) were removed because the first three are impossible
+  on the *direct packet* path (message >500 B, RNS rejects) and replaced with the transport-exercising
+  tests above. Because the remediation does not alter the wire shape, the AUDIT compatibility note
+  called out in the original finding's option (a) is **not** required here. Full workspace suite green
+  (429+ tests); `cargo check` clean.
 - [ ] **7.2 Cross-process determinism fixture** — same stake set in different key orders /
   serializations → identical leader, shards, and finalizer selection; same logical block →
   identical hash (guards 2.1/2.2 permanently).
