@@ -60,3 +60,17 @@ rns-core = "=0.1.16"
 
 [dev-dependencies]
 tempfile = "3.20.0"
+# S1.1 (shielded Tier 1): Halo2 proving/verifying stack, used only by the
+# gated live-prove smoke test in `src/shielded/mod.rs` `#[cfg(test)]`. Kept as a
+# dev-dependency so `cargo check --workspace` (non-test) stays clean and the
+# halo2 curve crates don't enter the production link graph. When the network
+# verifier (`src/shielded/verify.rs`, S2.2) and the circuit (`circuit.rs`, S2.1)
+# move halo2 into non-test code, promote it to `[dependencies]` and note that
+# move in that item's Done note. Pinned exactly to avoid an API surprise between
+# halo2 releases (mirrors the `=`-pin philosophy used for rns-* here).
+halo2_proofs = "=0.3.5"
+# `ff`'s `Field` trait (bound on `halo2_proofs::Circuit<F>` and used for field
+# arithmetic on the pasta `Fp` field in the gated smoke test). `ff 0.13.1` is
+# already pulled in transitively by halo2_proofs (via pasta_curves), so pinning
+# it here as a direct dependency adds zero new packages to Cargo.lock.
+ff = "=0.13.1"

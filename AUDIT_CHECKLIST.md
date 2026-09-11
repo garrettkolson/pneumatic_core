@@ -22,6 +22,89 @@ full exploit scenarios and reasoning).
   5. Fail closed, not open: a missing/unknown validator, spec, or identity is an error, never a
      silent accept.
 
+## Phase S1 — Cryptographic primitives
+
+*Closes Phase-S1.1 of the Pneumatic Shielded Value Transfer (Tier 1) plan
+(`pneumatic-shielded-implementation-plan.md`). S1.1 is the schedule-risk item: the only thing that
+can block the whole program before any shielded logic exists is a dependency-version conflict between
+`halo2`'s curve crates and the existing `ed25519-dalek` / `ring` / `aes-gcm` / `pqcrypto-*` tree, or a
+toolchain that won't compile halo2. S1.1's job is to remove that uncertainty and prove the proving
+stack actually links, builds, and produces a verifiable proof over the pasta `Fp` field — in a single
+workspace that already builds 663 tests green. Ground rules carried into this item from
+`AUDIT_CHECKLIST.md` and the approved plan: `cargo check --workspace` **and** full `cargo test
+--workspace` both pass; ≥1 discriminator proven to fail by reverting the change; no wire-shape change
+without a wire-compat note; fail closed, never silent-accept; only ONE gated live-proving test in the
+workspace (roadmap Part 5 — proving is benchmark-only).*
+
+- [x] **S1.1 Integrate Halo2 into the workspace** — *done 2026-09-11*
+  Files: root `Cargo.toml` (halo2 as a **dev-dependency** + a direct `ff` dep), `Cargo.lock`
+  (regenerated — the halo2 tree is added with no downgrade of `ed25519-dalek` / `ring` / `aes-gcm`
+  / `pqcrypto-*`), `src/shielded/mod.rs` (new, **directory form** — `src/shielded/` is where S1.3
+  (`note.rs`), S1.6 (`tree.rs`), S2 (`circuit.rs`, `circuit_test.rs`), and S2.2 (`verify.rs`) will
+  land), and `src/lib.rs` (`pub mod shielded;`, matching the flat one-line module style at the bottom
+  of the file).
+  Action: added `halo2_proofs = "=0.3.5"` (pinned **exactly**, mirroring the `=`-pin philosophy used
+  for `rns-net`/`rns-crypto`/`rns-core` here) and a direct `ff = "=0.13.1"` to `[dev-dependencies]` of
+  `pneumatic_core`. The `ff` `Field` trait is bound on `halo2_proofs::Circuit<F>` and used for field
+  arithmetic on the pasta `Fp` field in the gated smoke test — and `ff 0.13.1` is already pulled in
+  transitively by halo2 (via `pasta_curves`), so the direct pin **adds zero new packages** to the
+  lock. halo2 stays a **dev-dependency**: it is used *only* inside `src/shielded/mod.rs`'s
+  `#[cfg(test)]` module, so `cargo check --workspace` (the non-test graph) is clean and the halo2
+  curve crates never enter the production link graph. Promotion is a **later** step — when S2.2
+  (`src/shielded/verify.rs`) and S2.1 (`src/shielded/circuit.rs`) move halo2 into non-test code that
+  node crates call, `halo2_proofs` must move from `[dev-dependencies]` to `[dependencies]`, and that
+  move is to be recorded in this item's Done note then. The gated smoke test implements the canonical
+  single-gate Halo2 circuit over the pasta `Fp` field — `a * b = out` — on two advice columns
+  (`a`, `b`); the product reuses advice column `a` at `Rotation::next`, one instance column (`out`) is
+  the public input exposed via `layouter.constrain_instance`, and a single `s_mul` selector enforces
+  `s_mul * (a·b − prod)`. The whole thing was finalized against the pinned `halo2_proofs 0.3.5`
+  layout-based `Circuit` API (`type Config` / `type FloorPlanner` / `without_witnesses` /
+  `configure` / `synthesize`), the free-function keygen (`keygen_vk` / `keygen_pk`),
+  `Params<EqAffine>::new(K)` (the `EqAffine` Vesta affine backend, `C::Scalar = Fp`), the
+  `Blake2bWrite`/`Blake2bRead` transcript + `Challenge255` prover/verifier path (`create_proof` →
+  `finalize` → `verify_proof` with `SingleVerifier::new(params)`, `Output = ()`), and
+  `Selector::enable` / `AssignedCell::cell` (used to capture the `Cell` — `Cell` is `Copy` — out of the
+  region for the post-region instance binding). Two tests:
+  - `shielded_setup_and_mock_verify` (**counted**, runs in the default `cargo test`): builds `Params`,
+    derives the proving/verifying keys, and checks satisfiability with `MockProver` (a local witness
+    checker, *not* a cryptographic proof) — the satisfying witness (`out = 2·3 = 6`) verifies, a
+    tampered instance (`7 ≠ 6`) is rejected. No real proof is produced in the default run (roadmap
+    Part 5: proving is benchmark-only).
+  - `shielded_live_prove_smoke` (`#[ignore]`d, the **one** live cryptographic prove/verify in the
+    workspace): run on demand with
+    `cargo test --workspace -- --ignored shielded_live_prove_smoke`; it produces a real proof, verifies
+    a satisfying witness, then proves the verifier rejects a tampered instance (fails closed — never
+    silently `Ok`).
+  Verify: `cargo check --workspace` clean (halo2 not compiled in the non-test graph); `cargo test
+  --workspace` green (the counted test counted, the live-prove smoke `#[ignore]`d but present);
+  `--ignored` run proves + verifies + rejects tamper.
+  **Done:** `halo2_proofs = "=0.3.5"` + `ff = "=0.13.1"` added to `[dev-dependencies]` of
+  `pneumatic_core`; `Cargo.lock` regenerated — the halo2 tree (`halo2_proofs`, `pasta_curves`, `ff`,
+  `group`) is *new* in the lock with **no downgrade** of `ed25519-dalek` / `ring` / `aes-gcm 0.11.0`
+  (still pinned) / `pqcrypto-*`; the tiny one-gate `a*b=out` circuit compiles on the pinned `0.3.5`
+  layout API and both tests pass. Discriminators — each proven to fail when its fix is reverted:
+  removing the `halo2_proofs` dev-dependency **and** `src/shielded/mod.rs` makes both tests fail to
+  compile (proving the item is load-bearing); `shielded_live_prove_smoke` additionally proves the
+  proving *and* verifying paths link and behave correctly — a build that compiles but links the wrong
+  proving stack would fail the verify-fail-on-tamper step (step 5), not the setup step (step 1).
+  **Wire-neutral:** no `Message`, `Transaction`, action string, or serialization touched — verified by
+  the unchanged existing wire tests passing untouched. Test count: the default-run passing count rises
+  **+1 (663 → 664)** — the counted `shielded_setup_and_mock_verify` — and the gated live-prove test
+  adds a second, `#[ignore]`d test that is present but not run by default (the workspace's `cargo test`
+  now reports **2 ignored**; the live-prove smoke is the only new ignored). Net **2 new test
+  functions** (matches the plan); no other crate's test count changed.
+
+### Open decisions (resolved at implementation time)
+- **Version chosen:** `halo2_proofs = "=0.3.5"` pinned on crates.io — builds clean on the Rust
+  1.87.0 toolchain, so the git-`main` fallback (`halo2 = { git = …, branch = "main" }` pinned to a
+  commit) was **not** needed.
+- **Gating chosen:** `#[ignore]` (not a cargo feature) for the live prove — keeps it discoverable and
+  runnable via `-- --ignored` while ensuring the default `cargo test` does zero cryptographic proving.
+- **Clash resolution:** none required — `halo2`'s `ff`/`group`/`pasta_curves` coexist with the
+  existing `ed25519-dalek 2.2` / `curve25519-dalek` / `ring` / `aes-gcm` / `pqcrypto-*` / `rand_core
+  0.6.4` / `getrandom 0.2` graph without any downgrade; the smallest possible delta (the +halo2-tree
+  packages, all new) was applied.
+
 ## Phase 1 — Wire integrity: sign, verify, dedup correctly
 *Closes: C1, C4, C7, L1. This is the highest-leverage phase — it makes the wire path actually
 work and removes forgeable identity from the consensus path.*

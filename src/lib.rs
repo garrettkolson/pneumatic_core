@@ -24,3 +24,4 @@ pub use epoch::ExecutorSet;
 pub mod action_router;
 pub mod user;
 pub mod rns;
+pub mod shielded;
