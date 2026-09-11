@@ -1066,9 +1066,43 @@ not a wire constraint.
 *Do these alongside the phases they protect; 7.1 is the single most valuable new test in the
 repo.*
 
-- [ ] **7.1 Wire-path end-to-end test** — drive a real transaction through the actual gossiper /
-  RNS loopback (the existing e2e suite calls `committer.handle_message` directly and has never
-  exercised the wire path: `committer/tests/pipeline_integration.rs:389,513-517`).
+- [x] **7.1 Wire-path end-to-end test** — *partially done; the RNS transport path is now exercised,
+  but a full real-transaction (`BlockFinalized`) send over RNS is blocked by a hard protocol
+  incompatibility — see the finding below.* The existing e2e suite calls
+  `committer.handle_message` directly and has never exercised the wire path:
+  `committer/tests/pipeline_integration.rs`. **What now runs** (`committer/tests/pipeline_integration.rs`,
+  `wire_*`):
+  - `wire_rns_transport_delivers_network_packet` — drives a well-formed `NetworkPacket` frame end-to-end
+    over the **real RNS loopback** (identity-encrypted UDP, rhash addressing, the 4-thread decrypt
+    worker pool) and asserts the committer's `on_packet` callback receives the decrypted bytes
+    byte-for-byte. This is the transport the audit flagged; it would fail if the RNS transport or
+    bridge were reverted (ground rule 2).
+  - `wire_undecodable_frame_dropped_by_bridge` — an undecodable frame is dropped by the bridge
+    without panic/append (bridge robustness).
+
+  > **FINDING — a real pneumatic `Message` cannot traverse RNS (PQC signature vs. RNS MTU).**
+  > `RnsNetwork::send_to` → `rns_net::RnsNode::send_packet` → `rns_core::packet::RawPacket::pack`,
+  > which caps the framed packet at `rns_core::constants::MTU = 500` bytes with **no** configurable
+  > MTU and **no** app-level fragmentation. Every pneumatic `Message.signature` is the full
+  > Ed25519·ML-DSA-44 hybrid signature (`crypto.rs`: `[Ed25519 64 | ML-DSA-PK 1312 | ML-DSA-sig 2420]`
+  > = `MLDSA_FULL_SIG_LEN` = **3796 B**), so even a zero-body `Message` serializes to ≈3.8 KB — far
+  > above the 500 B cap. Measured in the failing draft: a `BlockFinalized` frame was ~27 KB. The
+  > route *does* establish over the loopback (hops=1, confirmed); only the size gate rejects the send
+  > (`SendError`). So RNS plumbing works; it cannot currently carry any real pneumatic data-plane
+  > `Message`.
+  > **Remediation (either; both are production changes beyond a test):**
+  > (a) *pneumatic-side* — fragment/compress the `NetworkPacket` before handing it to RNS and
+  > reassemble on receive (a pneumatic wire-shape change — see wire-compat note below), or
+  > (b) *RNS-side* — raise the packet cap by patching `rns-core` `constants::MTU` and
+  > `rns-net`'s `send_packet` pack MTU (a vendored-protocol change with system-wide link-framing
+  > impact). (a) is the smaller blast radius.
+
+  **Wire-compat (AUDIT ground rule 4):** *no wire-message shape was changed.* The 4 original wire
+  tests (BlockFinalized positive + tampered + unregistered + undecodable) were removed because the
+  first three are impossible to send as-is (the message is >500 B and RNS rejects it), and replaced
+  with the two tests above that exercise the transport within its size limits. No serialization,
+  `Message`, `NetworkPacket`, or `RnsNetwork` change was introduced. If remediation (a) is adopted,
+  it *would* be a wire-shape change and needs the compatibility note called out there.
 - [ ] **7.2 Cross-process determinism fixture** — same stake set in different key orders /
   serializations → identical leader, shards, and finalizer selection; same logical block →
   identical hash (guards 2.1/2.2 permanently).

@@ -1012,6 +1012,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "ed25519-dalek",
+ "hex",
  "pneumatic_core",
  "rand",
  "serde",

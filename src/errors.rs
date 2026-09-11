@@ -14,6 +14,11 @@ pub enum PneumaticError {
     Data(DataError),
     /// Network/connection failures
     Network(String),
+    /// RNS Resource-transfer failures (large-payload transport over an
+    /// established link — see `RnsNetwork::send_resource_to`). Distinct from
+    /// `Network` (single-packet send failures); a dedicated variant keeps the
+    /// over-MTU resource path's errors surfaced cleanly.
+    Resource(String),
     /// Transaction validation failures with specific reasons
     Validation(Vec<ValidationFailureReason>),
     /// Registry operation failures (add, remove, acquire)
@@ -44,6 +49,7 @@ impl std::fmt::Display for PneumaticError {
             PneumaticError::Encoding(msg) => write!(f, "Encoding({})", msg),
             PneumaticError::Data(e) => write!(f, "Data({})", e),
             PneumaticError::Network(msg) => write!(f, "Network({})", msg),
+            PneumaticError::Resource(msg) => write!(f, "Resource({})", msg),
             PneumaticError::Validation(reasons) => write!(f, "Validation({:?})", reasons),
             PneumaticError::Registry(msg) => write!(f, "Registry({})", msg),
             PneumaticError::Epoch(msg) => write!(f, "Epoch({})", msg),
@@ -273,6 +279,13 @@ mod tests {
             PneumaticError::Encoding(msg) => assert_eq!(msg, "test io error"),
             _ => panic!("expected Encoding variant, got {:?}", err),
         }
+    }
+
+    #[test]
+    fn resource_variant_display() {
+        let err = PneumaticError::Resource("no established link".to_string());
+        assert!(err.to_string().contains("Resource"));
+        assert!(err.to_string().contains("no established link"));
     }
 
     #[test]
