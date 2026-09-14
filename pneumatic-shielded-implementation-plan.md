@@ -132,7 +132,7 @@ style) unless noted. Every primitive gets its own item with its own
 discriminator. No live proving in unit tests (roadmap Part 5): primitives are
 tested directly; the circuit tests in S2 use a stub verifier.
 
-### S1.1 — Integrate Halo2 into the workspace
+### S1.1 — Integrate Halo2 into the workspace (DONE)
 - **Files**: root `Cargo.toml` (workspace deps), new `src/shielded/mod.rs`
   (or `src/shielded.rs`) declaring the shielded module tree, `Cargo.lock`
   (regenerated).

@@ -1163,6 +1163,7 @@ dependencies = [
  "libc",
  "moka",
  "once_cell",
+ "pasta_curves",
  "pqcrypto-mldsa",
  "pqcrypto-mlkem",
  "pqcrypto-traits",

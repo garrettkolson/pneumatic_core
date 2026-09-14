@@ -32,6 +32,16 @@
 //!
 //! See `pneumatic-shielded-implementation-plan.md`.
 
+//! Phase S1.2 — off-circuit Poseidon1 reference hash over the Pallas base
+//! field `Fp` (`poseidon::poseidon_hash`, `poseidon::PoseidonHasher`). Kept as a
+//! production dependency (`pasta_curves`, `ff`) rather than a dev-dependency:
+//! the S3 prover crate calls the hash on the wire path, so it must be live in
+//! non-test builds. It does **not** implement the SHA-256 `HashProvider` trait
+//! (`crypto.rs:645`) — its I/O is `&[Fp]`, not `&[u8]`.
+
+mod poseidon;
+pub use poseidon::{poseidon_hash, PoseidonHashProvider, PoseidonHasher};
+
 #[cfg(test)]
 mod tests {
     use halo2_proofs::{

@@ -7126,3 +7126,43 @@
 2026-09-11 18:55:22.562732 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
 2026-09-11 18:55:22.658037 UTC: Committed block to token [01] (chain length: 2, seq: 1)
 2026-09-11 18:55:22.659552 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-11 23:12:36.881314 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-11 23:12:36.883880 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-11 23:12:37.000131 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-11 23:12:37.002939 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-11 23:24:13.057600 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-11 23:24:13.059840 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-11 23:24:13.154573 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-11 23:24:13.156432 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-11 23:24:30.666618 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-11 23:24:30.669499 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-11 23:24:30.756806 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-11 23:24:30.758872 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-12 02:28:03.569719 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-12 02:28:03.574290 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-12 02:28:03.739646 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-12 02:28:03.741614 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 19:43:26.730978 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 19:43:26.733828 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 19:43:26.840969 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 19:43:26.843562 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 19:44:24.599962 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 19:44:24.602573 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 19:44:24.709888 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 19:44:24.711663 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 19:48:43.042073 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 19:48:43.045036 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 19:48:43.130975 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 19:48:43.132697 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 19:50:24.754134 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 19:50:24.756848 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 19:50:24.842309 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 19:50:24.844191 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 19:56:33.785657 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 19:56:33.789504 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 19:56:33.885467 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 19:56:33.887164 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-14 21:16:43.515133 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-14 21:16:43.518958 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-14 21:16:43.631157 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-14 21:16:43.633691 UTC: Attempted to distribute block to archivers (hash: )

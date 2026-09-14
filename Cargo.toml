@@ -39,6 +39,15 @@ aes-gcm = "0.11.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 hkdf = "0.12"
 sha2 = "0.10"
+# S1.2 (shielded Tier 1): the off-circuit Poseidon1 reference hash over the
+# Pasta base field Fp (`src/shielded/poseidon.rs`). `ff` provides the `Field` /
+# `PrimeField` / `Algebra` traits it calls directly (inverse, from_repr, square);
+# `pasta_curves` is the base-field crate. Both are already resolved transitively
+# by halo2_proofs (a dev-dependency, S1.1), so promoting only these two small
+# crates adds zero new packages to Cargo.lock and `halo2_proofs` itself never
+# enters the production link graph. Pinned to the versions already resolved.
+pasta_curves = "=0.5.2"
+ff = "=0.13.1"
 
 # Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
 # (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives
