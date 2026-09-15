@@ -182,7 +182,7 @@ tested directly; the circuit tests in S2 use a stub verifier.
 - **Verify**: same note → same commitment; any field change → different
   commitment; discriminator: changing `value` by 1 changes the commitment.
 
-### S1.4 — Nullifier derivation
+### S1.4 — Nullifier derivation (DONE)
 - **Files**: `src/shielded/note.rs`.
 - **Action**: `nullifier(note, spend_key) -> [u8;32]` = `H(nullifier_domain ||
   spend_key || rho)` (Poseidon or SHA-256 — must be **deterministic and

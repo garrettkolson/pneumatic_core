@@ -1,4 +1,5 @@
 //! Phase S1.3 — Note commitment (Pedersen-style over Pallas Ep).
+//! Phase S1.4 — Nullifier derivation (Poseidon over Pallas Fp).
 //!
 //! Commitment formula:
 //!   C = G_v · value + G_o · owner_pk_scalar + G_r · rcm + G_rho · rho
@@ -25,11 +26,11 @@
 //! value-balance check requires the group-addition structure that a
 //! Poseidon hash to Fp does not provide.
 
-use ff::{Field, FromUniformBytes};
+use ff::{Field, FromUniformBytes, PrimeField};
 use group::{Curve, Group};
 use once_cell::sync::Lazy;
 use pasta_curves::arithmetic::CurveExt;
-use pasta_curves::pallas::{Affine as EpAffine, Point as Ep, Scalar as Fq};
+use pasta_curves::pallas::{Affine as EpAffine, Base as Fp, Point as Ep, Scalar as Fq};
 
 /// A shielded note: the atomic unit of value in the shielded pool.
 /// Mirrors Orchard's note structure (value, owner, rho, rcm).
@@ -101,6 +102,47 @@ pub fn commit(note: &ShieldedNote) -> EpAffine {
         + G_RHO.clone() * note.rho;
 
     c.to_affine()
+}
+
+// ── Phase S1.4: Nullifier derivation ──────────────────────────────────────────
+
+/// Domain separator for nullifier derivation. Distinct from the commitment
+/// generator domain (`"pneumatic_note_commitment"`).
+static NULLIFIER_DOMAIN: Lazy<Fp> = Lazy::new(|| Fp::from(0x01u64));
+
+/// Convert a 32-byte value to an `Fp` field element via uniform-byte reduction.
+/// The 32 bytes are placed in the low 32 bytes of a 64-byte little-endian
+/// buffer (high 32 bytes zero), then reduced mod p.
+fn bytes32_to_fp(bytes: &[u8; 32]) -> Fp {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(bytes);
+    Fp::from_uniform_bytes(&buf)
+}
+
+/// Derive the nullifier for a note given the spender's secret key.
+///
+/// `nullifier = poseidon_hash([domain, spend_key_fp, rho_fp]).to_repr()`
+///
+/// Properties:
+/// - **Deterministic**: same (note, spend_key) → same nullifier, always.
+/// - **rho-bound**: two spends of the same note (same rho) yield the same
+///   nullifier; different notes (different rho) yield different nullifiers.
+/// - **Spend-key mixed**: the spend key is mixed into the hash, so the
+///   nullifier reveals nothing about which note was spent without the key.
+/// - **Unlinkable to commitment**: given (commitment, spend_key), the nullifier
+///   cannot be derived without rho, because the Pedersen commitment is
+///   one-way (discrete-log hardness).
+///
+/// The nullifier depends only on (spend_key, rho) — not on value or owner_pk —
+/// so it identifies the note *instance* and the authorized spender, not the
+/// note's contents.
+pub fn nullifier(note: &ShieldedNote, spend_key: &[u8; 32]) -> [u8; 32] {
+    let spend_key_fp = bytes32_to_fp(spend_key);
+    let rho_bytes = note.rho.to_repr();
+    let rho_fp = bytes32_to_fp(&rho_bytes);
+
+    let h = crate::shielded::poseidon::poseidon_hash(&[*NULLIFIER_DOMAIN, spend_key_fp, rho_fp]);
+    h.to_repr()
 }
 
 #[cfg(test)]
@@ -244,6 +286,73 @@ mod tests {
         // Also verify n_combined (with summed rho/rcm/value) produces the
         // same point when owner_pk is handled via the scalar sum.
         let _ = n_combined; // silence unused warning; the real check is above
+    }
+
+    // ── Phase S1.4: Nullifier tests ───────────────────────────────────────────
+
+    fn make_spend_key() -> [u8; 32] {
+        [0xAB; 32]
+    }
+
+    fn make_alt_spend_key() -> [u8; 32] {
+        [0xCD; 32]
+    }
+
+    #[test]
+    fn nullifier_deterministic() {
+        let note = make_note();
+        let key = make_spend_key();
+        assert_eq!(
+            nullifier(&note, &key),
+            nullifier(&note, &key),
+            "same (note, spend_key) must yield same nullifier"
+        );
+    }
+
+    #[test]
+    fn nullifier_rho_discriminator() {
+        let a = make_note();
+        let b = make_note_rho_changed();
+        let key = make_spend_key();
+        assert_ne!(
+            nullifier(&a, &key),
+            nullifier(&b, &key),
+            "different rho must yield different nullifier"
+        );
+    }
+
+    #[test]
+    fn nullifier_spend_key_discriminator() {
+        let note = make_note();
+        assert_ne!(
+            nullifier(&note, &make_spend_key()),
+            nullifier(&note, &make_alt_spend_key()),
+            "different spend_key must yield different nullifier"
+        );
+    }
+
+    #[test]
+    fn nullifier_independent_of_value() {
+        let a = make_note();
+        let b = make_note_value_plus_1();
+        let key = make_spend_key();
+        assert_eq!(
+            nullifier(&a, &key),
+            nullifier(&b, &key),
+            "nullifier must not depend on value"
+        );
+    }
+
+    #[test]
+    fn nullifier_independent_of_owner_pk() {
+        let a = make_note();
+        let b = make_note_owner_changed();
+        let key = make_spend_key();
+        assert_eq!(
+            nullifier(&a, &key),
+            nullifier(&b, &key),
+            "nullifier must not depend on owner_pk"
+        );
     }
 
     /// KAT: known 32-byte input → known Fq output.
