@@ -31,6 +31,10 @@ use group::{Curve, Group};
 use once_cell::sync::Lazy;
 use pasta_curves::arithmetic::CurveExt;
 use pasta_curves::pallas::{Affine as EpAffine, Base as Fp, Point as Ep, Scalar as Fq};
+use serde::{Deserialize, Serialize};
+
+use crate::crypto::{AsymCryptoProvider, Ed25519Provider};
+use crate::errors::PneumaticError;
 
 /// A shielded note: the atomic unit of value in the shielded pool.
 /// Mirrors Orchard's note structure (value, owner, rho, rcm).
@@ -143,6 +147,78 @@ pub fn nullifier(note: &ShieldedNote, spend_key: &[u8; 32]) -> [u8; 32] {
 
     let h = crate::shielded::poseidon::poseidon_hash(&[*NULLIFIER_DOMAIN, spend_key_fp, rho_fp]);
     h.to_repr()
+}
+
+// ── Phase S1.5: Note encryption (reuse hybrid crypto) ─────────────────────────
+
+/// The plaintext payload of a shielded note, encrypted to the recipient(s)
+/// before being placed on the wire. Serialized with rmp-serde before
+/// encryption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotePlaintext {
+    /// Value in base units.
+    pub value: u64,
+    /// Arbitrary memo bytes (application-defined).
+    pub memo: Vec<u8>,
+    /// Optional sender public-key hint (32 bytes) for the recipient to
+    /// identify the sender without breaking unlinkability.
+    pub sender_pk_hint: Option<[u8; 32]>,
+}
+
+/// Serialize a `NotePlaintext` to MsgPack bytes.
+fn note_plaintext_to_bytes(pt: &NotePlaintext) -> Result<Vec<u8>, PneumaticError> {
+    crate::encoding::serialize_to_bytes_rmp(pt)
+        .map_err(|e| PneumaticError::CryptoError(format!("NotePlaintext serialization failed: {}", e)))
+}
+
+/// Deserialize MsgPack bytes to a `NotePlaintext`.
+fn bytes_to_note_plaintext(bytes: &[u8]) -> Result<NotePlaintext, PneumaticError> {
+    crate::encoding::deserialize_rmp_to::<NotePlaintext>(&bytes.to_vec())
+        .map_err(|e| PneumaticError::CryptoError(format!("NotePlaintext deserialization failed: {}", e)))
+}
+
+/// Encrypt a note plaintext to a single recipient using the hybrid
+/// `(X25519 · ML-KEM-768)` scheme.
+///
+/// Returns the ciphertext bytes. The recipient decrypts with
+/// [`decrypt_note`] using their own `Ed25519Provider`.
+pub fn encrypt_note(
+    plaintext: &NotePlaintext,
+    recipient: &Ed25519Provider,
+) -> Result<Vec<u8>, PneumaticError> {
+    let bytes = note_plaintext_to_bytes(plaintext)?;
+    let x25519_pk = recipient.x25519_public_key()?;
+    let mlkem_pk = recipient.mlkem_public_key()?;
+    recipient.encrypt_to(&x25519_pk, &mlkem_pk, bytes)
+}
+
+/// Decrypt a note ciphertext produced by [`encrypt_note`] and deserialize the
+/// `NotePlaintext`.
+///
+/// Returns `Err(CryptoError)` on GCM tag failure (wrong key, corrupted
+/// ciphertext) — never returns garbage plaintext.
+pub fn decrypt_note(
+    ciphertext: &[u8],
+    recipient: &Ed25519Provider,
+) -> Result<NotePlaintext, PneumaticError> {
+    let bytes = recipient.decrypt_from(ciphertext.to_vec())?;
+    bytes_to_note_plaintext(&bytes)
+}
+
+/// Encrypt a note plaintext independently to two recipients (spend-key holder
+/// and viewing-key holder). Returns `(spend_ct, viewing_ct)`.
+///
+/// The two ciphertexts are independent hybrid encryptions — no key-sharing
+/// between them. A holder of either key can decrypt their own ciphertext;
+/// cross-decryption fails closed.
+pub fn encrypt_note_to_two(
+    plaintext: &NotePlaintext,
+    spend_recipient: &Ed25519Provider,
+    viewing_recipient: &Ed25519Provider,
+) -> Result<(Vec<u8>, Vec<u8>), PneumaticError> {
+    let spend_ct = encrypt_note(plaintext, spend_recipient)?;
+    let viewing_ct = encrypt_note(plaintext, viewing_recipient)?;
+    Ok((spend_ct, viewing_ct))
 }
 
 #[cfg(test)]
@@ -371,5 +447,114 @@ mod tests {
         let mut two_pk = [0u8; 32];
         two_pk[1] = 1;
         assert_eq!(owner_pk_to_scalar(&two_pk), Fq::from(256));
+    }
+
+    // ── Phase S1.5: Note encryption tests ─────────────────────────────────────
+
+    fn make_note_plaintext() -> NotePlaintext {
+        NotePlaintext {
+            value: 1000,
+            memo: b"hello note".to_vec(),
+            sender_pk_hint: Some([0x42; 32]),
+        }
+    }
+
+    #[test]
+    fn note_encrypt_decrypt_roundtrip_spend_key() {
+        let provider = Ed25519Provider::generate();
+        let pt = make_note_plaintext();
+        let ct = encrypt_note(&pt, &provider).expect("encrypt_note must succeed");
+        let decrypted = decrypt_note(&ct, &provider).expect("decrypt_note must succeed");
+        assert_eq!(pt, decrypted, "roundtrip must preserve NotePlaintext");
+    }
+
+    #[test]
+    fn note_encrypt_decrypt_roundtrip_viewing_key() {
+        let spend_provider = Ed25519Provider::generate();
+        let viewing_provider = Ed25519Provider::generate();
+        let pt = make_note_plaintext();
+        let (_, viewing_ct) =
+            encrypt_note_to_two(&pt, &spend_provider, &viewing_provider)
+                .expect("encrypt_note_to_two must succeed");
+        let decrypted = decrypt_note(&viewing_ct, &viewing_provider)
+            .expect("viewing-key decrypt must succeed");
+        assert_eq!(pt, decrypted, "viewing-key roundtrip must preserve NotePlaintext");
+    }
+
+    #[test]
+    fn note_wrong_recipient_fails_closed() {
+        let provider_a = Ed25519Provider::generate();
+        let provider_b = Ed25519Provider::generate();
+        let pt = make_note_plaintext();
+        let ct = encrypt_note(&pt, &provider_a).expect("encrypt_note must succeed");
+        let result = decrypt_note(&ct, &provider_b);
+        assert!(
+            result.is_err(),
+            "decryption with wrong recipient must fail (GCM tag mismatch)"
+        );
+    }
+
+    #[test]
+    fn note_corrupt_ciphertext_fails_closed() {
+        let provider = Ed25519Provider::generate();
+        let pt = make_note_plaintext();
+        let mut ct = encrypt_note(&pt, &provider).expect("encrypt_note must succeed");
+        // Flip the last byte (inside the GCM tag).
+        let last = ct.len() - 1;
+        ct[last] ^= 0xff;
+        let result = decrypt_note(&ct, &provider);
+        assert!(
+            result.is_err(),
+            "corrupted ciphertext must fail (GCM tag mismatch), never return garbage"
+        );
+    }
+
+    #[test]
+    fn note_two_recipient_independence() {
+        let spend_provider = Ed25519Provider::generate();
+        let viewing_provider = Ed25519Provider::generate();
+        let pt = make_note_plaintext();
+        let (spend_ct, viewing_ct) =
+            encrypt_note_to_two(&pt, &spend_provider, &viewing_provider)
+                .expect("encrypt_note_to_two must succeed");
+
+        // Ciphertexts must differ (independent encryptions, different keys).
+        assert_ne!(
+            spend_ct, viewing_ct,
+            "two independent encryptions to different recipients must produce distinct ciphertexts"
+        );
+
+        // Each recipient can decrypt their own ciphertext.
+        assert_eq!(
+            decrypt_note(&spend_ct, &spend_provider).expect("spend decrypt"),
+            pt
+        );
+        assert_eq!(
+            decrypt_note(&viewing_ct, &viewing_provider).expect("viewing decrypt"),
+            pt
+        );
+
+        // Cross-decrypt must fail.
+        assert!(
+            decrypt_note(&spend_ct, &viewing_provider).is_err(),
+            "spend ciphertext must not decrypt with viewing key"
+        );
+        assert!(
+            decrypt_note(&viewing_ct, &spend_provider).is_err(),
+            "viewing ciphertext must not decrypt with spend key"
+        );
+    }
+
+    #[test]
+    fn note_empty_memo_roundtrip() {
+        let provider = Ed25519Provider::generate();
+        let pt = NotePlaintext {
+            value: 0,
+            memo: vec![],
+            sender_pk_hint: None,
+        };
+        let ct = encrypt_note(&pt, &provider).expect("encrypt_note must succeed");
+        let decrypted = decrypt_note(&ct, &provider).expect("decrypt_note must succeed");
+        assert_eq!(pt, decrypted, "empty-memo NotePlaintext must roundtrip");
     }
 }

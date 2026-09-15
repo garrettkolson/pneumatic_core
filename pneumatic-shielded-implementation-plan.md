@@ -194,7 +194,7 @@ tested directly; the circuit tests in S2 use a stub verifier.
   nullifier is not derivable from (commitment, spend_key) alone without rho
   (structural test: no shared components).
 
-### S1.5 — Note encryption (reuse hybrid crypto)
+### S1.5 — Note encryption (reuse hybrid crypto) (DONE)
 - **Files**: `src/shielded/note.rs`, uses `src/crypto.rs`.
 - **Action**: `encrypt_note(plaintext: NotePlaintext, recipient: &Ed25519Provider) -> Vec<u8>`
   wrapping `recipient.encrypt_to(recipient.x25519_public_key(),

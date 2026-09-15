@@ -40,7 +40,9 @@
 //! (`crypto.rs:645`) — its I/O is `&[Fp]`, not `&[u8]`.
 
 mod note;
-pub use note::{commit, nullifier, ShieldedNote};
+pub use note::{
+    commit, decrypt_note, encrypt_note, encrypt_note_to_two, nullifier, NotePlaintext, ShieldedNote,
+};
 
 mod poseidon;
 pub use poseidon::{poseidon_hash, PoseidonHashProvider, PoseidonHasher};
