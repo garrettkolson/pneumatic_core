@@ -47,6 +47,11 @@ pub use note::{
 mod poseidon;
 pub use poseidon::{poseidon_hash, PoseidonHashProvider, PoseidonHasher};
 
+mod tree;
+pub use tree::{
+    bytes_to_root, root_to_bytes, IncrementalMerkleTree, MembershipProof, TreeState, DEFAULT_DEPTH,
+};
+
 #[cfg(test)]
 mod tests {
     use halo2_proofs::{

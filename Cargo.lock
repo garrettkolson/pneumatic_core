@@ -1179,6 +1179,7 @@ dependencies = [
  "sha2",
  "strum",
  "strum_macros",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-macros",

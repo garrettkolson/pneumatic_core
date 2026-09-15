@@ -215,7 +215,7 @@ tested directly; the circuit tests in S2 use a stub verifier.
 - **Sizing note for S3/S5**: one note ciphertext ≈ 2.3 KB (ML-KEM share) +
   payload; a typical 2-note transfer carries ~4.6 KB.
 
-### S1.6 — Incremental Merkle tree over commitments
+### S1.6 — Incremental Merkle tree over commitments (DONE)
 - **Files**: `src/shielded/tree.rs` (new).
 - **Action**: Append-only incremental (binary, fixed depth — start 32,
   parameterized) Merkle tree over `Fr` commitments: `append(commitment) ->

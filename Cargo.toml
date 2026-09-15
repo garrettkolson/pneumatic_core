@@ -54,6 +54,11 @@ ff = "=0.13.1"
 # pasta_curves, so adding it as a direct dependency introduces no new
 # package into Cargo.lock.
 group = "=0.13.0"
+# S1.6 (shielded Tier 1): `subtle` provides `CtOption`, the constant-time
+# optional type returned by `Fp::from_repr`. Needed to convert the result to
+# a plain `Option<Fp>` for fail-closed deserialization in `src/shielded/tree.rs`.
+# Already resolved transitively by pasta_curves/ff.
+subtle = "=2.6.1"
 
 # Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
 # (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives
