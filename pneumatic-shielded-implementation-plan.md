@@ -154,7 +154,7 @@ tested directly; the circuit tests in S2 use a stub verifier.
   with `cargo update -p <pkg>` for the smallest possible lockfile delta and
   record it in the checklist entry.
 
-### S1.2 — Poseidon hash in `crypto`
+### S1.2 — Poseidon hash in `crypto` (DONE)
 - **Files**: `src/crypto.rs` (or `src/shielded/poseidon.rs` re-exported from
   crypto).
 - **Action**: Add a Poseidon hash over the curve Halo2 uses (Pasta `pallas`
@@ -168,7 +168,7 @@ tested directly; the circuit tests in S2 use a stub verifier.
   vector; discriminator: tamper one input → different hash; deterministic
   across calls.
 
-### S1.3 — Note commitment
+### S1.3 — Note commitment (DONE)
 - **Files**: `src/shielded/note.rs` (new).
 - **Action**: Define `ShieldedNote { value: u64, owner_pk: [u8;32], rho: Fr, rcm: Fr }`
   and `commit(note) -> Fr` following Orchard's note structure as reference:

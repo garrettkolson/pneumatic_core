@@ -1156,6 +1156,7 @@ dependencies = [
  "file-lock",
  "futures",
  "getrandom 0.2.15",
+ "group",
  "halo2_proofs",
  "hex",
  "hkdf",

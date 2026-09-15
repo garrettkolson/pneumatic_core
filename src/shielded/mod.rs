@@ -39,6 +39,9 @@
 //! non-test builds. It does **not** implement the SHA-256 `HashProvider` trait
 //! (`crypto.rs:645`) — its I/O is `&[Fp]`, not `&[u8]`.
 
+mod note;
+pub use note::{commit, ShieldedNote};
+
 mod poseidon;
 pub use poseidon::{poseidon_hash, PoseidonHashProvider, PoseidonHasher};
 

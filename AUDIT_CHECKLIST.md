@@ -94,6 +94,32 @@ workspace (roadmap Part 5 — proving is benchmark-only).*
   now reports **2 ignored**; the live-prove smoke is the only new ignored). Net **2 new test
   functions** (matches the plan); no other crate's test count changed.
 
+- [x] **S1.3 Note commitment** — *done 2026-09-14*
+  Files: `src/shielded/note.rs` (new), `src/shielded/mod.rs` (added `mod note;` + re-export),
+  root `Cargo.toml` (added `group = "=0.13.0"` to `[dependencies]` — already in Cargo.lock
+  transitively via `pasta_curves`, so no new package).
+  Action: `ShieldedNote { value: u64, owner_pk: [u8;32], rho: Fq, rcm: Fq }` +
+  `commit(note) -> EpAffine`. Pedersen-style commitment over Pallas Ep:
+  `C = G_v·value + G_o·owner_pk_scalar + G_r·rcm + G_rho·rho`. Four generators
+  derived via `CurveExt::hash_to_curve("pneumatic_note_commitment")` with distinct
+  input bytes (`b"Gv"`, `b"Go"`, `b"Gr"`, `b"Grho"`) — deterministic, no trusted
+  setup. `owner_pk` → `Fq` via `Fq::from_uniform_bytes` (32-byte key in low 32
+  bytes of a 64-byte LE buffer, reduced mod q). **Deviation from plan stub:**
+  return type is `EpAffine` (curve point), not `Fr` (field element) — a Pedersen
+  commitment is a group element, and S2.1's homomorphic value-balance check
+  requires the group-addition structure a Poseidon hash to Fp does not provide.
+  Documented in the module doc.
+  Verify: `cargo check --workspace` clean; `cargo test --workspace` green,
+  **677 passed** (up from the 670 post-S1.2 baseline; 7 new note tests).
+  **Done:** 7 tests in `src/shielded/note.rs`: determinism, value/owner_pk/rho/rcm
+  discriminators (each field change → different commitment), homomorphic property
+  (`C(n1)+C(n2) == C(summed scalars)` — load-bearing for S2.1, fails if commitment
+  is non-homomorphic), and `owner_pk_to_scalar` KAT (zero key → 0, low-byte-1 key → 1,
+  byte[1]-1 key → 256). Discriminator proven: removing the `G_RHO` term from
+  `commit()` makes `commit_rho_discriminator` fail (rho no longer affects the
+  commitment). **Wire-neutral:** no `Message`, `Transaction`, action string, or
+  serialization touched.
+
 ### Open decisions (resolved at implementation time)
 - **Version chosen:** `halo2_proofs = "=0.3.5"` pinned on crates.io — builds clean on the Rust
   1.87.0 toolchain, so the git-`main` fallback (`halo2 = { git = …, branch = "main" }` pinned to a

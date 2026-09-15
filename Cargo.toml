@@ -48,6 +48,12 @@ sha2 = "0.10"
 # enters the production link graph. Pinned to the versions already resolved.
 pasta_curves = "=0.5.2"
 ff = "=0.13.1"
+# S1.3 (shielded Tier 1): `group` provides the `Group` trait (generator,
+# identity, scalar multiplication) needed for the Pedersen commitment over
+# Pallas Ep in `src/shielded/note.rs`. Already resolved transitively by
+# pasta_curves, so adding it as a direct dependency introduces no new
+# package into Cargo.lock.
+group = "=0.13.0"
 
 # Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
 # (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives
