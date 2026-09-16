@@ -17,8 +17,8 @@ use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::{PendingTransactionRegistry, TransactionSignatureRegistry};
 use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::transactions::{
-    PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature,
-    TransactionState, TransactionValidationResult,
+    PendingTransaction, ShieldedTransaction, SignedTransaction, Transaction, TransactionCommit,
+    TransactionSignature, TransactionState, TransactionValidationResult,
 };
 
 use crate::block_builder::BlockBuilder;
@@ -401,6 +401,38 @@ impl Finalizer {
         // Subsequent signatures — just acknowledge (stake accumulates in background)
         // If quorum is eventually reached, the transaction will be confirmed
         Ok(pneumatic_core::messages::acknowledge())
+    }
+
+    /// Handle a `"SignShielded"` vote request from the Sentinel (Phase S3.2).
+    ///
+    /// STUB — replaced wholesale by S5.2 (independent re-verification of the
+    /// `ShieldedTransaction` proof, local root-freshness check, and, for the
+    /// assigned collector, fan-out of `"ShieldedVote"`). For S3.2 this only
+    /// proves the inbound arm exists, that the body is a wire-serializable
+    /// `ShieldedTransaction`, and that the path fails closed. `TransactionSignature`
+    /// is imported for the sibling `handle_shielded_vote` stub.
+    pub async fn handle_sign_shielded(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
+        let _tx: ShieldedTransaction =
+            deserialize_rmp_to(&message.body).map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+        Err(PneumaticError::Network(
+            "shielded sign not wired yet (S5.2)".to_string(),
+        ))
+    }
+
+    /// Handle a `"ShieldedVote"` vote from a voter to the collector Finalizer
+    /// (Phase S3.2).
+    ///
+    /// STUB — replaced by S5.2 (authenticate the voter as a registered Finalizer,
+    /// verify the inner vote signature, stamp stake, feed `SignatureCollector`).
+    /// For S3.2 it proves the arm exists and fails closed; the body is a
+    /// `TransactionSignature` vote, reusing the existing voter payload struct —
+    /// no new wire type.
+    pub async fn handle_shielded_vote(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
+        let _vote: TransactionSignature =
+            deserialize_rmp_to(&message.body).map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+        Err(PneumaticError::Network(
+            "shielded vote not wired yet (S5.2)".to_string(),
+        ))
     }
 
     /// Attempt to finalize a transaction after quorum is reached.

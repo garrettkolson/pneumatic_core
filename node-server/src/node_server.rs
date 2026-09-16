@@ -40,7 +40,21 @@ const EXECUTOR_ACTIONS: &'static [&'static str] = &["Preload"];
 /// `action` strings the Sentinel owns (verify inbound transactions).
 const SENTINEL_ACTIONS: &'static [&'static str] = &["Verify"];
 /// `action` strings the Finalizer owns (sign / finalize blocks).
-const FINALIZER_ACTIONS: &'static [&'static str] = &["Sign", "Finalize"];
+///
+/// `"SignShielded"` / `"ShieldedVote"` are the shielded-transfer vote request
+/// and vote (Phase S3.2, pneumatic-shielded-implementation-plan.md). They are
+/// fail-closed by default: an action not listed here is rejected by
+/// `RoleDispatcher::dispatch` (`UnknownAction`). The arm bodies in `handle`
+/// route to stub handlers that fail closed until S5.2 swaps in the real logic.
+/// `action` strings the Finalizer owns (sign / finalize blocks).
+///
+/// `"SignShielded"` / `"ShieldedVote"` are the shielded-transfer vote request
+/// and vote (Phase S3.2, pneumatic-shielded-implementation-plan.md). They are
+/// fail-closed by default: an action not listed here is rejected by
+/// `RoleDispatcher::dispatch` (`UnknownAction`). The arm bodies in `handle`
+/// route to stub handlers that fail closed until S5.2 swaps in the real logic.
+const FINALIZER_ACTIONS: &'static [&'static str] =
+    &["Sign", "Finalize", "SignShielded", "ShieldedVote"];
 
 /// The composite runtime host. Owns the shared DI bundle plus three in-process
 /// layers built across the composite plan: `RoleSelector` (Phase 1 — which roles
@@ -647,9 +661,25 @@ impl RoleHandler for pneumatic_finalizer::Finalizer {
                     .await
                     .map(|_| ())
                     .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}")))),
-                // Any other action this role owns is not a voter signature; fail
-                // closed with a protocol-level error rather than silently
-                // accepting it.
+                // Shielded-transfer vote request from the Sentinel (S3.2). The
+                // body is a `ShieldedTransaction`; the real verification + voting
+                // logic lands in S5.2 — for now the stub fails closed.
+                "SignShielded" => self
+                    .handle_sign_shielded(&message)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}")))),
+                // Shielded-transfer vote from a voter to the collector Finalizer
+                // (S3.2). Body is a `TransactionSignature` vote; real handling is
+                // S5.2 — stub fails closed for now.
+                "ShieldedVote" => self
+                    .handle_shielded_vote(&message)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}")))),
+                // Any other action this role owns is not a handled inbound
+                // action; fail closed with a protocol-level error rather than
+                // silently accepting it.
                 other => Err(RoleError::Downstream(PneumaticError::Network(format!(
                     "finalizer: unhandled inbound action {other:?}"
                 )))),
@@ -744,6 +774,7 @@ mod tests {
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::messages::Message;
     use pneumatic_core::node::{NodeTypeConfig, NodeRegistryType};
+    use pneumatic_core::transactions::ShieldedTransaction;
 
     use crate::role_dispatcher::RoleError;
     use crate::role_selector::StakeProvider;
@@ -1198,5 +1229,60 @@ mod tests {
         );
         // The dispatcher lock survived the fan-out — the host still routes.
         assert!(server.dispatch(msg("Commit")).await.is_err());
+    }
+
+    /// The `"SignShielded"` vote request reaches the installed Finalizer's real
+    /// plugin and its S3.2 stub (`handle_sign_shielded`) — not `UnknownAction`
+    /// (action not registered in `FINALIZER_ACTIONS`) and not the else-fail-closed
+    /// arm ("unhandled inbound action"). The stub returns a distinct fail-closed
+    /// `Network` error, proving the message traversed dispatcher → plugin → match
+    /// arm. Reverted (arm or `FINALIZER_ACTIONS` entry removed) this surfaces
+    /// `UnknownAction` instead.
+    #[tokio::test]
+    async fn signshielded_request_reaches_finalizer_plugin_stub() {
+        let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Finalizer));
+        let provider = Arc::new(MapStakeProvider::with_default(2000));
+        let server = build_runtime(cfg, provider).expect("host builds");
+
+        assert_eq!(server.installed_roles(), vec![NodeRegistryType::Finalizer]);
+
+        // A wire-serializable `ShieldedTransaction` body so the stub proceeds past
+        // deserialization to its fail-closed return (an empty body would only
+        // prove the `Encoding` path; this proves the *arm* ran).
+        let shielded_tx = ShieldedTransaction {
+            id: "tx-shielded-1".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: vec![1, 2, 3],
+            nullifiers: vec![[0u8; 32]],
+            commitments: vec![[1u8; 32]],
+            merkle_root: [2u8; 32],
+            proof: vec![9, 9, 9],
+            note_ciphertexts: vec![vec![7u8; 64]],
+            fee: 0,
+        };
+        let body = serialize_to_bytes_rmp(&shielded_tx).expect("body serializes");
+        let message = Message {
+            chain_id: "env".to_string(),
+            action: "SignShielded".to_string(),
+            body,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+
+        match server.dispatch(message).await {
+            // Routing reached the stub, which fails closed with its distinct gate
+            // error. Match the whole error (its Display binds the inner string
+            // cleanly) and confirm it is the stub's, not a routing failure.
+            Err(RoleError::Downstream(e)) => {
+                let s = e.to_string();
+                assert!(
+                    s.contains("shielded sign not wired yet"),
+                    "expected the stub's fail-closed gate error, got {s:?}"
+                );
+                assert!(!s.contains("UnknownAction"), "must route, not reject as unknown");
+            }
+            other => panic!("expected the stub's fail-closed Network error, got {other:?}"),
+        }
     }
 }

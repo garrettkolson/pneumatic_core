@@ -71,6 +71,8 @@ pub fn acknowledge() -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::crypto::{Ed25519Provider, ED25519_SIG_LEN};
+    use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+    use crate::transactions::ShieldedTransaction;
 
     fn verify(message: &Message, expected_public_key: &[u8]) -> bool {
         Ed25519Provider::generate()
@@ -152,5 +154,88 @@ mod tests {
 
         assert!(msg.stake_set.is_some());
         assert!(verify(&msg, &identity.ed25519.public_key().unwrap()));
+    }
+
+    /// A `Message` carrying a `ShieldedTransaction` (Phase S3.2) round-trips over
+    /// the existing length-prefixed MsgPack framing: signing, serializing,
+    /// deserializing, and re-verifying preserves the action string, the body, and
+    /// the `ShieldedTransaction::hash()`. The body (with ~2.3 KB PQC note
+    /// ciphertexts per output) stays far under the 16 MiB frame cap — the assert
+    /// guards that sizing.
+    ///
+    /// Discriminator: tampering one byte of the serialized message breaks either
+    /// the Ed25519 envelope verification or the recovered `hash()`, so a
+    /// swapped/forge body is rejected, never silently accepted.
+    #[test]
+    fn shielded_message_wire_roundtrip() {
+        let identity = NodeIdentity::generate_in_memory();
+        let shielded_tx = ShieldedTransaction {
+            id: "tx-shielded-rt".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: vec![5, 6, 7],
+            nullifiers: vec![[1u8; 32], [2u8; 32]],
+            commitments: vec![[3u8; 32]],
+            merkle_root: [4u8; 32],
+            proof: vec![8, 9, 10, 11],
+            note_ciphertexts: vec![vec![200u8; 512], vec![201u8; 512]],
+            fee: 0,
+        };
+        let body = serialize_to_bytes_rmp(&shielded_tx).expect("body serializes");
+
+        let msg = Message::signed("env".to_string(), "SignShielded", body.clone(), None, &identity)
+            .expect("message signs");
+
+        // The whole message serialized (the length-prefixed framing).
+        let raw = serialize_to_bytes_rmp(&msg).expect("message serializes");
+        assert!(
+            raw.len() < 16 * 1024 * 1024,
+            "the shielded body must fit comfortably in one frame"
+        );
+
+        // Verify the envelope signature over the (un)serialized body.
+        let public_key = identity.ed25519.public_key().unwrap();
+        let verify_body = |m: &Message| {
+            Ed25519Provider::generate()
+                .check_signature(&m.signature, &public_key, &m.body)
+                .unwrap_or(false)
+        };
+        assert!(verify_body(&msg));
+
+        // Deserialize and check the action + recovered body hash are intact.
+        let recovered: Message = deserialize_rmp_to(&raw).expect("message deserializes");
+        assert_eq!(recovered.action, "SignShielded");
+        assert!(verify_body(&recovered));
+        let recovered_tx: ShieldedTransaction =
+            deserialize_rmp_to(&recovered.body).expect("body deserializes");
+        assert_eq!(recovered_tx.hash().unwrap(), shielded_tx.hash().unwrap());
+
+        // Discriminator: a tampered BODY — carried under the ORIGINAL signature,
+        // which bound the original body — must fail verification (and must change
+        // the recovered hash), so a swapped/forge body is rejected, never
+        // silently accepted. (Tampering an arbitrary *wire* byte is unreliable:
+        // the middle of the frame lands in the ~2.3 KB identity signature, not
+        // the body, so the body hash/signature would be unaffected.)
+        let mut tampered_tx = shielded_tx.clone();
+        tampered_tx.nullifiers[0][0] ^= 0xFF;
+        let tampered_body = serialize_to_bytes_rmp(&tampered_tx).expect("tampered body serializes");
+        let tampered_msg = Message {
+            chain_id: "env".to_string(),
+            action: "SignShielded".to_string(),
+            body: tampered_body,
+            signature: msg.signature.clone(),
+            public_key: msg.public_key.clone(),
+            stake_set: None,
+        };
+        assert!(
+            !verify_body(&tampered_msg),
+            "a tampered body must fail signature verification"
+        );
+        let recovered_tampered: ShieldedTransaction =
+            deserialize_rmp_to(&tampered_msg.body).unwrap();
+        assert_ne!(
+            recovered_tampered.hash().unwrap(),
+            shielded_tx.hash().unwrap(),
+            "a tampered body must produce a different hash"
+        );
     }
 }

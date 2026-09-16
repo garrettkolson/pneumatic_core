@@ -414,4 +414,43 @@ mod tests {
             vec!["Finalizer:shutdown".to_string()]
         );
     }
+
+    /// The Finalizer's `allowed_actions` admit the shielded-transfer vote
+    /// actions (`"SignShielded"` / `"ShieldedVote"`, Phase S3.2): a message with
+    /// either is routed to the installed Finalizer, not rejected. Fails if the
+    /// actions are not registered in the role's allowed set.
+    #[tokio::test]
+    async fn routes_signshielded_and_shieldedvote_to_finalizer() {
+        let (f, spy_f) = spy_host(
+            NodeRegistryType::Finalizer,
+            &["Sign", "Finalize", "SignShielded", "ShieldedVote"],
+            false,
+        );
+        let d = RoleDispatcher::new(vec![f]);
+
+        assert!(d.dispatch(msg("SignShielded")).await.is_ok());
+        assert!(d.dispatch(msg("ShieldedVote")).await.is_ok());
+        assert_eq!(
+            spy_f.lock().unwrap().clone(),
+            vec![
+                "Finalizer:SignShielded".to_string(),
+                "Finalizer:ShieldedVote".to_string(),
+            ]
+        );
+    }
+
+    /// The load-bearing gate (Phase S3.2 discriminator): a Finalizer whose
+    /// allowed set does NOT list `"SignShielded"` must reject the message with
+    /// `UnknownAction`, never silently accept it. Removing the entry ⇒
+    /// rejection proves the gate is real, not cosmetic.
+    #[tokio::test]
+    async fn rejects_shielded_action_when_not_in_allowed_set() {
+        let (f, _spy) = spy_host(NodeRegistryType::Finalizer, &["Sign", "Finalize"], false);
+        let d = RoleDispatcher::new(vec![f]);
+
+        match d.dispatch(msg("SignShielded")).await {
+            Err(RoleError::UnknownAction(a)) => assert_eq!(a, "SignShielded"),
+            other => panic!("expected UnknownAction, got {other:?}"),
+        }
+    }
 }

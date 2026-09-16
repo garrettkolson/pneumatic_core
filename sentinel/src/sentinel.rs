@@ -12,7 +12,7 @@ use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::{NodeRegistryRequest, NodeRegistryType, registry::NodeRegistry};
 use pneumatic_core::registry::PendingTransactionRegistry;
-use pneumatic_core::transactions::{Transaction, TransactionState};
+use pneumatic_core::transactions::{ShieldedTransaction, Transaction, TransactionState};
 
 use super::executor_set_cache::ExecutorSetCache;
 use super::stake_snapshot_cache::StakeSnapshotCache;
@@ -118,8 +118,34 @@ impl Sentinel {
             "Register" => self.handle_register_request(message),
             "Clear" | "Delete" => self.handle_clear_request(message),
             "BlockFinalized" => self.handle_block_finalized_for_epoch(message),
+            // Shielded value transfer (Phase S3.2). Inner action under the
+            // `"Verify"` envelope — identical shape to how `"Process"` arrives
+            // today (the composite Sentinel plugin calls `on_data_received`
+            // with the inner message body, ignoring the outer `"Verify"` action
+            // that `SENTINEL_ACTIONS` already gated). Real validation + routing
+            // is S5.1; this arm's body is a fail-closed stub that only proves the
+            // routing + inner-body deserialization for S3.2.
+            "ShieldedTransfer" => self.handle_shielded_transfer(message),
             action => Err(SentinelError::UnknownAction(action.to_string())),
         }
+    }
+
+    /// Handle a `"ShieldedTransfer"` inner action from the Sentinel's client
+    /// (Phase S3.2).
+    ///
+    /// STUB — replaced by S5.1 (deserialize the `ShieldedTransaction`, run the
+    /// advisory `ShieldedValidationSpec` pre-check, verify `token_id` references
+    /// a self-verified shielded-opt-in token, register in a parallel
+    /// `shielded_transactions` map, then send `"SignShielded"` to the assigned
+    /// finalizers). For S3.2 this only proves the arm routes the inner action,
+    /// that the body is a wire-serializable `ShieldedTransaction`, and that the
+    /// path fails closed (it does not run validation — that is S5.1/S4.1).
+    fn handle_shielded_transfer(&self, message: Message) -> Result<(), SentinelError> {
+        let _tx: ShieldedTransaction =
+            deserialize_rmp_to(&message.body).map_err(|e| SentinelError::Encoding(e))?;
+        Err(SentinelError::Routing(
+            "shielded transfer pipeline not wired yet (S5.1)".to_string(),
+        ))
     }
 
     /// Handle a "Process" request — a new transaction entering the pipeline.
@@ -720,7 +746,9 @@ mod tests {
     use pneumatic_core::messages::Message;
     use pneumatic_core::registry::PendingTransactionRegistry;
     use pneumatic_core::tokens::{Token, TokenFactory};
-    use pneumatic_core::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult};
+    use pneumatic_core::transactions::{
+        PendingTransaction, ShieldedTransaction, Transaction, TransactionState, TransactionValidationResult,
+    };
     use pneumatic_core::errors::TransactionRiskFactor;
     use pneumatic_core::validation::{SelfSignedBlockValidatorSpec, TransactionValidationSpec};
 
@@ -2542,5 +2570,49 @@ mod tests {
             *sentinel.current_epoch.lock(), 2,
             "stale block must not rewind the epoch"
         );
+    }
+
+    /// The `"ShieldedTransfer"` inner-action arm of `on_data_received` (Phase S3.2)
+    /// routes to `handle_shielded_transfer`: feeding an inner `Message` with that
+    /// action returns the arm's fail-closed `Routing` error (not
+    /// `UnknownAction`, which would mean the arm is missing / fell through). The
+    /// body is a wire-serializable `ShieldedTransaction`, so the arm reaches its
+    /// return rather than failing on deserialization.
+    ///
+    /// Discriminator: remove the arm ⇒ the same input surfaces
+    /// `UnknownAction("ShieldedTransfer")`.
+    #[test]
+    fn on_data_received_shieldedtransfer_arm_reaches_handler() {
+        let (sentinel, _registry) = make_sentinel_fixture();
+
+        let shielded_tx = ShieldedTransaction {
+            id: "tx-shielded-arm".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: vec![9, 10],
+            nullifiers: vec![[1u8; 32]],
+            commitments: vec![[2u8; 32]],
+            merkle_root: [3u8; 32],
+            proof: vec![4, 5, 6],
+            note_ciphertexts: vec![vec![7u8; 128]],
+            fee: 0,
+        };
+        let body = serialize_to_bytes_rmp(&shielded_tx).expect("body serializes");
+        let message = Message {
+            chain_id: "env".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            body,
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        let raw = serialize_to_bytes_rmp(&message).expect("inner message serializes");
+
+        match sentinel.on_data_received(raw) {
+            Err(SentinelError::Routing(msg)) => assert!(
+                msg.contains("shielded transfer pipeline not wired yet"),
+                "expected the S3.2 stub gate, got {msg:?}"
+            ),
+            other => panic!("expected the shielded arm's Routing error, got {other:?}"),
+        }
     }
 }

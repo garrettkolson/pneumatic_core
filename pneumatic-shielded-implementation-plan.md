@@ -338,7 +338,7 @@ NOT separate spend/output circuits (roadmap S2 recommendation).
   `Transaction` canonical safe); discriminator 2: flipping one nullifier
   byte changes the block hash.
 
-### S3.2 — Message wiring
+### S3.2 — Message wiring (DONE)
 - **Files**: `src/messages.rs` (action constants, if any), `sentinel/src/
   sentinel.rs` (`on_data_received` match, :110-124), `finalizer/src/
   finalizer.rs` + `finalizer/src/message_dispatcher.rs` (outbound
