@@ -120,6 +120,37 @@ workspace (roadmap Part 5 — proving is benchmark-only).*
   commitment). **Wire-neutral:** no `Message`, `Transaction`, action string, or
   serialization touched.
 
+- [x] **S2.2 Network-side Halo2 proof verification (`verify.rs`)** — *done 2026-09-11*
+  Files: `src/shielded/verify.rs` (new — `ShieldedVerifier` + tests), `src/errors.rs`
+  (`PneumaticError::Shielded` variant + `Display` arm), `src/shielded/mod.rs`
+  (`mod verify;` + `pub use verify::ShieldedVerifier;`).
+  Action: S1.1 kept halo2 *proving* behind `#[cfg(test)]`; this installs the *verifying* half in
+  non-test code so the network can check a shielded proof a client submits using only the circuit's
+  public inputs + the proof bytes (never the note opening / spend key / Merkle path / output note).
+  `ShieldedVerifier::new(circuit, k)` runs `keygen_vk` **once** and caches the `(Params, VerifyingKey)`
+  keyed by a fingerprint of the circuit *configuration* (tag + width `k`), so repeated verifications
+  never re-synthesize the constraint system — a second verifier for the same config reuses the key.
+  `verify(proof, public_inputs)` builds the per-instance-column slice (exactly the circuit's
+  `Instance` order: nullifier, commit_x, commit_y, merkle_root, output_commit_x, output_commit_y, fee)
+  and runs `halo2_proofs::plonk::verify_proof` over a `Blake2bRead` transcript; a rejection surfaces as
+  `Err(PneumaticError::Shielded(..))` — never a silent accept. The proof width `k` must match the
+  proving width (10); a mismatch makes `verify` reject the proof.
+  Verify: `cargo check --workspace` and the full default suite pass; four default tests cover the
+  layout, construction, and fail-closed behavior.
+  **Discriminator (fails without the fix):** `verify_fails_closed_on_garbage_proof` /
+  `verify_fails_closed_on_tampered_public_input` — removing `verify.rs` or making `verify` return
+  `Ok(())` unconditionally makes these fail. `verify_vk_cache_reused_across_verifiers` (`#[ignore]`,
+  audit-6.10 style) proves the VK cache is load-bearing: two `new` calls for one config invoke
+  `keygen_vk` exactly once (via a `KEYGEN_CALLS` counter), not twice. `instances_for` column order is
+  pinned by a default test, so any wire-shape change to the `Instance` columns is caught.
+  **Wire-compat (ground rule 4):** `Message`, `Transaction`, and every wire path are untouched; only
+  two `pub` items are added to the `shielded` module (`ShieldedVerifier`, `keygen_calls` in tests) and
+  one new `PneumaticError` variant. `halo2_proofs` was already a production dependency (promoted for
+  S2.1) and `once_cell` already a dependency, so **no new packages enter Cargo.lock**.
+  **Test-count progression:** core lib passed `476 → 480` (this item +4, all green; 4 ignored incl.
+  the two live-prove tests remain `#[ignore]`d per the roadmap's "proving is benchmark-only" rule);
+  workspace passed `710 → 714`, `0 failed`.
+
 ### Open decisions (resolved at implementation time)
 - **Version chosen:** `halo2_proofs = "=0.3.5"` pinned on crates.io — builds clean on the Rust
   1.87.0 toolchain, so the git-`main` fallback (`halo2 = { git = …, branch = "main" }` pinned to a

@@ -40,6 +40,11 @@ pub enum PneumaticError {
         block_a: Vec<u8>,
         block_b: Vec<u8>,
     },
+    /// Halo2 (SNARK) proof verification failure — a shielded proof rejected by
+    /// `ShieldedVerifier`. Distinct from `CryptoError`: it surfaces a failed
+    /// `halo2_proofs::plonk::verify_proof` on its own greppable variant rather
+    /// than being swallowed into a generic crypto error.
+    Shielded(String),
 }
 
 impl std::fmt::Display for PneumaticError {
@@ -61,6 +66,7 @@ impl std::fmt::Display for PneumaticError {
             PneumaticError::BlockConflict { height, block_a, block_b } => {
                 write!(f, "BlockConflict {{ height: {}, block_a: {:?}, block_b: {:?} }}", height, block_a, block_b)
             }
+            PneumaticError::Shielded(msg) => write!(f, "Shielded({})", msg),
         }
     }
 }

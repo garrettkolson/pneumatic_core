@@ -55,6 +55,17 @@ pub use tree::{
 mod circuit;
 pub use circuit::{ActionCircuit, PublicInputs};
 
+// Phase S2.2 — Halo2 proof verification for the Action circuit.
+//
+// `circuit.rs` provides the proving side (the `ActionCircuit`) and the two
+// `#[ignore]`d live-proving smoke tests; `verify.rs` provides the network-side
+// verifying half so the network can check a shielded proof a client submits
+// using only the circuit's public inputs + the proof bytes — never the note
+// opening, spend key, Merkle path, or output note. See `ShieldedVerifier`.
+
+mod verify;
+pub use verify::ShieldedVerifier;
+
 #[cfg(test)]
 mod circuit_test;
 

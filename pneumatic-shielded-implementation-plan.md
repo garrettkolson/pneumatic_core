@@ -274,7 +274,7 @@ NOT separate spend/output circuits (roadmap S2 recommendation).
   review time* rather than compress. If circuit debugging exceeds ~1.5× the
   phase estimate, stop and report back rather than silently extending.
 
-### S2.2 — Verification API (network side)
+### S2.2 — Verification API (network side) (DONE)
 - **Files**: `src/shielded/verify.rs`.
 - **Action**: `verify_shielded_proof(proof_bytes, public_inputs) ->
   Result<bool, PneumaticError>` — the ONLY function the node crates call.
