@@ -83,7 +83,7 @@ static G_RHO: Lazy<Ep> = Lazy::new(|| {
 /// The 32-byte key is placed in the low 32 bytes of a 64-byte
 /// little-endian buffer (high 32 bytes zero), then reduced mod q
 /// via `from_uniform_bytes`.
-fn owner_pk_to_scalar(pk: &[u8; 32]) -> Fq {
+pub fn owner_pk_to_scalar(pk: &[u8; 32]) -> Fq {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(pk);
     Fq::from_uniform_bytes(&buf)

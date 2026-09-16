@@ -241,7 +241,7 @@ dependency conflicts or a slow first prove can blow the 4h estimate).
 One combined **Action circuit** (spend + outputs together, Orchard pattern),
 NOT separate spend/output circuits (roadmap S2 recommendation).
 
-### S2.1 — Action circuit
+### S2.1 — Action circuit (DONE)
 - **Files**: `src/shielded/circuit.rs`, `src/shielded/circuit_test.rs`
   (test harness per roadmap Part 5: known-good witnesses/proofs, stub
   verifier for unit tests).

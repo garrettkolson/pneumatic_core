@@ -52,6 +52,12 @@ pub use tree::{
     bytes_to_root, root_to_bytes, IncrementalMerkleTree, MembershipProof, TreeState, DEFAULT_DEPTH,
 };
 
+mod circuit;
+pub use circuit::{ActionCircuit, PublicInputs};
+
+#[cfg(test)]
+mod circuit_test;
+
 #[cfg(test)]
 mod tests {
     use halo2_proofs::{
