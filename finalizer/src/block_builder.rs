@@ -110,6 +110,7 @@ impl BlockBuilder {
         };
 
         SignedTransaction {
+            shielded: None,
             transaction_id: transaction.id.clone(),
             transaction: transaction.clone(),
             total_stake,
@@ -244,6 +245,7 @@ impl BlockBuilder {
         };
 
         SignedTransaction {
+            shielded: None,
             transaction_id: transaction.id.clone(),
             transaction: transaction.clone(),
             total_stake: sig.current_stake,
@@ -479,6 +481,7 @@ mod tests {
     #[test]
     fn all_block_constructors_agree_on_proposer_key() {
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: "c2_test".into(),
             transaction: Transaction {
                 id: "c2_test".into(),

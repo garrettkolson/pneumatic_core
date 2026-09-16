@@ -203,6 +203,7 @@ mod tests {
     /// Build a bare block (empty tx, no signatures) solely to exercise buffer mechanics.
     fn stub_block(previous_hash: &[u8]) -> Block {
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: "stub".to_string(),
             transaction: Transaction {
                 id: "stub".to_string(),

@@ -284,6 +284,19 @@ pub struct SignedTransaction {
     /// Public key of the proposer who created this transaction/block.
     /// Used for conflict-resolution stake lookup.
     pub proposer_key: Vec<u8>,
+    /// Shielded (Zcash-tier privacy) value transfer carried in this block.
+    ///
+    /// `None` for every ordinary block — this field is **additive**, so the
+    /// MsgPack form of a non-shielded `SignedTransaction` and every canonical
+    /// byte sequence derived from it stay byte-identical to today (pneumatic
+    /// shield plan, Ground Rule 4). When `Some`, the shielded pool update is
+    /// consensus-bound inside the block: [`canonical_signed_trans_bytes`] appends
+    /// the canonical shielded bytes (see that function) and the finalizer signs
+    /// over this exact payload. `#[serde(default)]` lets a pre-upgrade node ignore
+    /// the new map key on a shielded block — such a block is still rejected upstream
+    /// by the unknown-action gate, so this is never a silent accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded: Option<ShieldedTransaction>,
 }
 
 impl SignedTransaction {
@@ -318,6 +331,106 @@ impl SignedTransaction {
             },
             executor_sigs: HashMap::new(),
             proposer_key: vec![],
+            // Ordinary test block — no shielded payload.
+            shielded: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ShieldedTransaction — a shielded (Zcash-tier privacy) value transfer
+// ---------------------------------------------------------------------------
+
+/// A shielded (Zcash-tier privacy) value transfer.
+///
+/// The network confirms validity (correct spend authority, no double-spend,
+/// value balance) via the Halo2 proof + nullifiers + commitments, without any
+/// node ever observing sender, receiver, or amount. Every field is a *wire
+/// primitive* (`String`, `Vec<u8>`, `[u8; 32]`, `u64`), so this type is
+/// self-contained and carries **no** note openings, spend keys, or the internal
+/// `crate::shielded` module on the wire — it deliberately does not `use` that
+/// module.
+///
+/// Field encodings (consumed from the already-implemented S1.x primitives):
+/// * `nullifiers` ← [`crate::shielded::nullifier`](crate::shielded) → `[u8; 32]`
+/// * `commitments` ← `commit(&note).to_bytes()` — a 32-byte **compressed affine
+///   point** (`EpAffine`); the committer re-derives the tree leaf as
+///   `poseidon_hash([x, y])` at append time (S5.3)
+/// * `merkle_root` ← `root_to_bytes(&root)` — 32-byte little-endian
+/// See `pneumatic-shielded-implementation-plan.md` (Phase S3.1).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ShieldedTransaction {
+    /// Unique tx id (uuid, mirroring `Transaction`).
+    pub id: String,
+    /// Always `"ShieldedTransfer"` — the inner action string defined in S3.2.
+    pub action: String,
+    /// The self-signed token being transferred. The global pool is
+    /// token-agnostic, but the tx is still filed against one shielded-opt-in token.
+    pub token_id: Vec<u8>,
+    /// Nullifiers of the spent notes (`S1.4`). Pairwise distinct within the tx;
+    /// their uniqueness is the double-spend defense (`S4.2`).
+    pub nullifiers: Vec<[u8; 32]>,
+    /// New notes — one per output. Each is a 32-byte **compressed affine point**
+    /// (`S1.3`). The committer appends these commitments to the pool tree at
+    /// block-commit time (`S5.3`).
+    pub commitments: Vec<[u8; 32]>,
+    /// Referenced pool root — the Merkle root the proof was proved against.
+    /// 32-byte little-endian (`root_to_bytes`, `S1.6`).
+    pub merkle_root: [u8; 32],
+    /// Halo2 proof bytes (`ActionCircuit` proof, `S2.1`).
+    pub proof: Vec<u8>,
+    /// Encrypted note ciphertexts, one per output. Each ~2.3 KB PQC-hybrid
+    /// payload encrypted to a recipient + viewing key (`S1.5`).
+    pub note_ciphertexts: Vec<Vec<u8>>,
+    /// Public fee; `0` for v1.
+    pub fee: u64,
+}
+
+impl ShieldedTransaction {
+    /// Deterministic serialization: the binding surface the finalizer signs and
+    /// the committer hash-matches.
+    ///
+    /// `ShieldedTransaction` has **no `HashMap`** (only fixed-order `Vec`s and
+    /// primitives), so its serde form is already canonical — stable across a
+    /// serde round-trip and independent of any insertion order. This is exactly
+    /// the property `Transaction::hash` relies on, so no separate canonical view
+    /// struct is required (contrast with `CanonicalSignedTransaction`, whose
+    /// `executor_sigs` `HashMap` forces one).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, PneumaticError> {
+        crate::encoding::serialize_to_bytes_rmp(self)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))
+    }
+
+    /// SHA-256 over the entire payload. Mirrors `Transaction::hash`: finalizers
+    /// sign this digest (`S5.2`) and the committer hash-matches the wire form
+    /// against its validated registry entry (`S5.3`, H12 extension). Covers every
+    /// field — a swap of any field is caught.
+    pub fn hash(&self) -> Result<Vec<u8>, PneumaticError> {
+        let bytes = self.canonical_bytes()?;
+        Ok(BasicHashProvider::new().hash(&bytes))
+    }
+
+    /// The deterministic placeholder `Transaction` a shielded block carries in
+    /// `SignedTransaction.transaction`.
+    ///
+    /// The real `Transaction` fields (sender, amount, nonce, …) do not exist for
+    /// shielded transfers — the sender identity is hidden and the pool update is
+    /// consensus-bound via the `shielded` field instead. Deterministic, so the
+    /// block hash is a pure function of the shielded tx and never of placeholder
+    /// garbage.
+    pub fn placeholder_transaction(&self) -> Transaction {
+        Transaction {
+            id: self.id.clone(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: self.token_id.clone(),
+            bid: None,
+            sequence_number: 0,
+            sender: vec![],
+            receiver: vec![],
+            amount: None,
+            timestamp: 0,
+            result_hash: vec![],
+            sender_signature: vec![],
         }
     }
 }
@@ -368,7 +481,20 @@ pub(crate) fn canonical_signed_trans_bytes(
         executor_sigs: tx.executor_sigs.iter().collect(),
         proposer_key: &tx.proposer_key,
     };
-    crate::encoding::serialize_to_bytes_rmp(&cst)
+    let mut bytes = crate::encoding::serialize_to_bytes_rmp(&cst)?;
+
+    // Consensus-binding (S3.1): append the canonical shielded bytes when present
+    // so the block hash uniquely binds (nullifiers, commitments, referenced root,
+    // proof, ciphertexts). Absent for non-shielded blocks → the output above is
+    // byte-for-byte identical to the pre-S3.1 form (the `CanonicalSignedTransaction`
+    // core is unchanged and the append only runs on `Some`).
+    if let Some(shielded) = &tx.shielded {
+        let shielded_bytes = shielded
+            .canonical_bytes()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("shielded canonical: {e}")))?;
+        bytes.extend_from_slice(&shielded_bytes);
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -878,5 +1004,148 @@ mod tests {
         let mut keys: Vec<Vec<u8>> = pool.token_ids().cloned().collect();
         keys.sort();
         assert_eq!(keys, vec![vec![1], vec![2]]);
+    }
+
+    // --- Phase S3.1: ShieldedTransaction + the additive `shielded` field ---
+
+    /// A representative, fully-populated `ShieldedTransaction` (dummy field
+    /// contents — the bytes are what matter, not the values).
+    fn make_shielded_tx() -> ShieldedTransaction {
+        ShieldedTransaction {
+            id: "shielded_tx_1".into(),
+            action: "ShieldedTransfer".into(),
+            token_id: vec![1, 2, 3],
+            nullifiers: vec![[1u8; 32], [2u8; 32]],
+            commitments: vec![[3u8; 32], [4u8; 32]],
+            merkle_root: [5u8; 32],
+            proof: vec![9, 8, 7, 6],
+            note_ciphertexts: vec![vec![10u8; 128], vec![11u8; 128]],
+            fee: 0,
+        }
+    }
+
+    /// The exact MsgPack / canonical bytes produced by `SignedTransaction::test_transaction()`
+    /// (a non-shielded tx, `shielded: None`) in the UNMODIFIED codebase. Captured
+    /// before the additive change; a regression that resurfaces a `shielded` entry
+    /// (or otherwise reshapes the non-shielded form) fails these two tests. The
+    /// MsgPack form and the canonical block-hash form are byte-identical here.
+    const NON_SHIELDED_BASELINE: [u8; 68] = [
+        0x9b, 0xb0, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+        0x9b, 0xb0, 0x74, 0x65, 0x73, 0x74, 0x5f, 0x74, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e,
+        0xa8, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x66, 0x65, 0x72,
+        0x90, 0xc0, 0x00, 0x90, 0x90, 0xc0, 0x00, 0x90, 0x90,
+        0x2a, 0x03, 0x90, 0x18, 0x90, 0x90, 0x95, 0x90, 0x90, 0x90, 0x90, 0x00, 0x80, 0x90,
+    ];
+
+    #[test]
+    fn shielded_serde_roundtrip_byte_identical() {
+        let tx = make_shielded_tx();
+        let a = crate::encoding::serialize_to_bytes_rmp(&tx).expect("serialize");
+        let decoded: ShieldedTransaction =
+            crate::encoding::deserialize_rmp_to(&a).expect("deserialize");
+        let b = crate::encoding::serialize_to_bytes_rmp(&decoded).expect("re-serialize");
+        assert_eq!(a, b, "canonical form must be byte-identical across a serde round-trip");
+    }
+
+    #[test]
+    fn shielded_hash_stable_across_roundtrip() {
+        let tx = make_shielded_tx();
+        let a = tx.hash().expect("hash");
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&tx).expect("serialize");
+        let decoded: ShieldedTransaction =
+            crate::encoding::deserialize_rmp_to(&bytes).expect("deserialize");
+        let b = decoded.hash().expect("hash");
+        assert_eq!(a, b, "hash() must be stable across a wire round-trip");
+    }
+
+    #[test]
+    fn shielded_hash_sensitivity_flip_nullifier() {
+        let tx = make_shielded_tx();
+        let h0 = tx.hash().expect("hash");
+        let c0 = tx.canonical_bytes().expect("canonical_bytes");
+        let mut tampered = tx.clone();
+        tampered.nullifiers[0][0] ^= 0xFF;
+        let h1 = tampered.hash().expect("hash");
+        let c1 = tampered.canonical_bytes().expect("canonical_bytes");
+        assert_ne!(h0, h1, "flipping a nullifier byte must change the hash");
+        assert_ne!(c0, c1, "flipping a nullifier byte must change canonical bytes");
+    }
+
+    #[test]
+    fn shielded_hash_sensitivity_flip_merkle_root() {
+        let tx = make_shielded_tx();
+        let h0 = tx.hash().expect("hash");
+        let mut tampered = tx.clone();
+        tampered.merkle_root[0] ^= 0xFF;
+        let h1 = tampered.hash().expect("hash");
+        assert_ne!(h0, h1, "flipping the referenced root must change the hash");
+    }
+
+    #[test]
+    fn non_shielded_canonical_bytes_match_baseline() {
+        // Ground Rule 4: a non-shielded block's canonical (block-hash) bytes are
+        // byte-for-byte unchanged by the additive `shielded` field. This test pins
+        // that with the hardcoded pre-change baseline.
+        let stx = SignedTransaction::test_transaction();
+        assert_eq!(stx.shielded, None);
+        let bytes = canonical_signed_trans_bytes(&stx).expect("canonical bytes");
+        assert_eq!(
+            bytes.as_slice(),
+            &NON_SHIELDED_BASELINE,
+            "non-shielded canonical bytes must be unchanged"
+        );
+    }
+
+    #[test]
+    fn non_shielded_msgpack_field_is_absent() {
+        // A non-shielded SignedTransaction serialization must carry NO `shielded`
+        // key — even a `null` would change the bytes. Pinning the pre-change MsgPack
+        // baseline proves the field is dropped (skip_serializing_if) rather than emitted.
+        let stx = SignedTransaction::test_transaction();
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&stx).expect("msgpack");
+        assert_eq!(bytes.as_slice(), &NON_SHIELDED_BASELINE, "non-shielded MsgPack must be unchanged");
+        // And it must round-trip to the same None field (idempotent).
+        let decoded: SignedTransaction =
+            crate::encoding::deserialize_rmp_to(&bytes).expect("deserialize");
+        assert_eq!(decoded.shielded, None);
+    }
+
+    #[test]
+    fn shielded_block_hash_binds_shielded_field() {
+        // The block hash (via canonical_signed_trans_bytes) must carry the shielded
+        // payload: flipping any shielded field changes the canonical bytes.
+        let tx = make_shielded_tx();
+        let mut stx = SignedTransaction::test_transaction();
+        stx.shielded = Some(tx.clone());
+        let before = canonical_signed_trans_bytes(&stx).expect("canonical");
+        let mut tampered = tx.clone();
+        tampered.commitments[1][0] ^= 0xFF;
+        stx.shielded = Some(tampered);
+        let after = canonical_signed_trans_bytes(&stx).expect("canonical");
+        assert_ne!(before, after, "flipping a commitment must change the block hash");
+        // And a shielded block must differ from the identical non-shielded block.
+        let plain = canonical_signed_trans_bytes(&SignedTransaction::test_transaction()).expect("canonical");
+        assert_ne!(before, plain, "a shielded block must not hash like a plain block");
+    }
+
+    #[test]
+    fn placeholder_transaction_is_deterministic() {
+        let tx = make_shielded_tx();
+        let p1 = tx.placeholder_transaction();
+        let p2 = make_shielded_tx().placeholder_transaction();
+        // `Transaction` does not derive `PartialEq`; compare the fields that make
+        // the placeholder deterministic (id/action/token_id copied, rest zeroed).
+        assert_eq!(p1.id, p2.id);
+        assert_eq!(p1.action, p2.action);
+        assert_eq!(p1.token_id, p2.token_id);
+        assert_eq!(p1.id, tx.id);
+        assert_eq!(p1.action, "ShieldedTransfer");
+        assert_eq!(p1.token_id, tx.token_id);
+        // All the real-Transaction fields that do not exist for shielded transfers
+        // are zeroed — identity, amount, nonce, keys are all empty.
+        assert_eq!(p1.amount, None);
+        assert_eq!(p1.sequence_number, 0);
+        assert_eq!(p1.sender, Vec::<u8>::new());
+        assert_eq!(p1.sender_signature, Vec::<u8>::new());
     }
 }

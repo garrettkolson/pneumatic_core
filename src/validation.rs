@@ -746,6 +746,7 @@ mod tests {
         finalizer_sig: TransactionSignature,
     ) -> SignedTransaction {
         SignedTransaction {
+            shielded: None,
             transaction_id: String::from("test_signed_tx"),
             transaction: Transaction {
                 id: String::from("test_tx"),
@@ -778,6 +779,7 @@ mod tests {
         // non-empty-chain path
         if blockchain.get_count() == 0 {
             let genesis = SignedTransaction {
+                shielded: None,
                 transaction_id: String::from("genesis"),
                 transaction: Transaction {
                     id: String::from("genesis"),

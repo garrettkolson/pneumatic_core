@@ -659,6 +659,7 @@ pub mod tests {
     /// A populated `SignedTransaction` with a non-empty `executor_sigs` map.
     fn signed_tx_with(executor_sigs: HashMap<Vec<u8>, TransactionSignature>) -> SignedTransaction {
         SignedTransaction {
+            shielded: None,
             transaction_id: "block_tx".into(),
             transaction: Transaction {
                 id: "block_tx".into(),

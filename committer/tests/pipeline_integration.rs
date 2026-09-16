@@ -307,6 +307,7 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
     let tip = token.blockchain.get_current_chain_state();
 
     let signed = SignedTransaction {
+        shielded: None,
         transaction_id: "genesis_tx".to_string(),
         transaction: Transaction {
             id: "genesis_tx".to_string(),
@@ -713,6 +714,7 @@ async fn test_pipeline_no_conflict() {
 
     let block = Block {
         signed_trans: SignedTransaction {
+            shielded: None,
             transaction_id: "test_tx".to_string(),
             transaction: Transaction {
                 id: "test_tx".to_string(),
@@ -810,6 +812,7 @@ async fn commit_from_empty_registry_materializes_and_commits() {
         .last_hash_in;
     let block = Block {
         signed_trans: SignedTransaction {
+            shielded: None,
             transaction_id: "commit_sink_tx".to_string(),
             transaction: Transaction {
                 id: "commit_sink_tx".to_string(),
@@ -918,6 +921,7 @@ async fn test_pipeline_conflict_and_slashing() {
 
     let block1 = Block {
         signed_trans: SignedTransaction {
+            shielded: None,
             transaction_id: "conflict_tx_1".to_string(),
             transaction: Transaction {
                 id: "conflict_tx_1".to_string(),
@@ -962,6 +966,7 @@ async fn test_pipeline_conflict_and_slashing() {
 
     let block2 = Block {
         signed_trans: SignedTransaction {
+            shielded: None,
             transaction_id: "conflict_tx_2".to_string(),
             transaction: Transaction {
                 id: "conflict_tx_2".to_string(),

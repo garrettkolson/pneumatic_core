@@ -295,7 +295,7 @@ NOT separate spend/output circuits (roadmap S2 recommendation).
 
 ## Phase S3: Wire format & transaction types
 
-### S3.1 — `ShieldedTransaction` type
+### S3.1 — `ShieldedTransaction` type (DONE)
 - **Files**: `src/transactions.rs` (additive — `Transaction` struct
   unchanged, ground rule 4 respected).
 - **Action**:

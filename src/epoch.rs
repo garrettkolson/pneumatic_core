@@ -601,6 +601,7 @@ impl IBlockProposer for BlockProposer {
         for tx_id in tx_ids {
             let tx = registry.get_transaction(&tx_id)?;
             let signed = crate::transactions::SignedTransaction {
+                shielded: None,
                 transaction_id: tx.id.clone(),
                 transaction: tx.clone(),
                 total_stake: 0, // caller fills in after stake resolution

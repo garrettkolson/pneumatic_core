@@ -1679,6 +1679,7 @@ mod tests {
         };
 
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: trans_id.to_string(),
             transaction: make_test_transaction(trans_id, sender),
             total_voters: 3,
@@ -2839,6 +2840,7 @@ mod tests {
         // transaction payload. Build via the shared helper so the committed block hashes equal the
         // registry entry (AUDIT Phase 3.5 / H12).
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: trans_id.to_string(),
             transaction: make_test_transaction(trans_id, b"alice".to_vec()),
             total_voters: 3,
@@ -3598,6 +3600,7 @@ mod tests {
         let signature = finalizer.sign_data(&transaction_hash).expect("finalizer signature");
 
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: trans_id.to_string(),
             transaction: Transaction {
                 id: trans_id.to_string(),
@@ -4075,6 +4078,7 @@ mod tests {
         let unknown_tx_hash = b"unknown-transaction-hash".to_vec();
         let unknown_sig = unknown_finalizer.sign_data(&unknown_tx_hash).expect("finalizer signature");
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: "unknown".to_string(),
             transaction: Transaction {
                 id: "unknown".to_string(),
@@ -4156,6 +4160,7 @@ mod tests {
         };
 
         let signed = SignedTransaction {
+            shielded: None,
             transaction_id: "test".to_string(),
             transaction: Transaction {
                 id: "test".to_string(),

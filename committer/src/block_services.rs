@@ -270,6 +270,7 @@ mod tests {
     fn make_block() -> Block {
         Block {
             signed_trans: SignedTransaction {
+                shielded: None,
                 transaction_id: "dist_tx".to_string(),
                 transaction: Transaction {
                     id: "dist_tx".to_string(),
