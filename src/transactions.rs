@@ -367,6 +367,16 @@ pub struct ShieldedTransaction {
     /// The self-signed token being transferred. The global pool is
     /// token-agnostic, but the tx is still filed against one shielded-opt-in token.
     pub token_id: Vec<u8>,
+    /// Commitments of the spent notes (`S1.3`), one per nullifier. Carried so the
+    /// network can reconstruct the circuit's `commit_x/commit_y` public inputs
+    /// and verify the proof (`S4.1.2`). A *new* additive field (Phase S4.1): the
+    /// spent note's commitment is not derivable from the nullifier (`nullifier`
+    /// is `poseidon(spend_key, rho)`, one-way), so it must be supplied on the
+    /// wire. It is authenticated by the proof + Merkle membership, never trusted
+    /// on faith (shielded plan, Decision 3). `#[serde(default)]` keeps wire
+    /// backward-compat — old data omits the key and decodes to `vec![]`.
+    #[serde(default)]
+    pub spent_commitments: Vec<[u8; 32]>,
     /// Nullifiers of the spent notes (`S1.4`). Pairwise distinct within the tx;
     /// their uniqueness is the double-spend defense (`S4.2`).
     pub nullifiers: Vec<[u8; 32]>,
@@ -1015,6 +1025,7 @@ mod tests {
             id: "shielded_tx_1".into(),
             action: "ShieldedTransfer".into(),
             token_id: vec![1, 2, 3],
+            spent_commitments: vec![[6u8; 32], [7u8; 32]],
             nullifiers: vec![[1u8; 32], [2u8; 32]],
             commitments: vec![[3u8; 32], [4u8; 32]],
             merkle_root: [5u8; 32],

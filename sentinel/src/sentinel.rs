@@ -2589,6 +2589,7 @@ mod tests {
             id: "tx-shielded-arm".to_string(),
             action: "ShieldedTransfer".to_string(),
             token_id: vec![9, 10],
+            spent_commitments: vec![[1u8; 32]],
             nullifiers: vec![[1u8; 32]],
             commitments: vec![[2u8; 32]],
             merkle_root: [3u8; 32],

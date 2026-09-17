@@ -64,7 +64,9 @@ pub use circuit::{ActionCircuit, PublicInputs};
 // opening, spend key, Merkle path, or output note. See `ShieldedVerifier`.
 
 mod verify;
-pub use verify::ShieldedVerifier;
+pub use verify::{
+    action_circuit_for_verifying_key, public_inputs_from_shielded_tx, ShieldedVerifier,
+};
 
 #[cfg(test)]
 mod circuit_test;

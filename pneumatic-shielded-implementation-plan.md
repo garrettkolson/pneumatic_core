@@ -370,7 +370,7 @@ NOT separate spend/output circuits (roadmap S2 recommendation).
   discriminator: remove the role-map entry → the message is rejected
   (proves the gate is load-bearing, not cosmetic).
 
-### S3.3 — `pneumatic_prover` crate
+### S3.3 — `pneumatic_prover` crate (DONE)
 
 > Expanded client-side, **non-networked** crate below. It *produces* a
 > `ShieldedTransaction` (the wire type core defines at

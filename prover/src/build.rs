@@ -94,6 +94,7 @@ fn dummy_circuit() -> ActionCircuit {
 /// hash, and canonical-bytes properties without a live prove.
 pub fn assemble_tx(
     token_id: &[u8],
+    spent_commitments: Vec<[u8; 32]>,
     nullifiers: Vec<[u8; 32]>,
     commitments: Vec<[u8; 32]>,
     merkle_root: [u8; 32],
@@ -105,6 +106,7 @@ pub fn assemble_tx(
         id: random_id(),
         action: "ShieldedTransfer".to_string(),
         token_id: token_id.to_vec(),
+        spent_commitments,
         nullifiers,
         commitments,
         merkle_root,
@@ -199,6 +201,15 @@ pub fn build_shielded_tx(
         .try_into()
         .map_err(|_| PneumaticError::Shielded("output commitment did not encode to 32 bytes".into()))?;
 
+    // Spent note commitment as a 32-byte compressed affine point (the wire form) —
+    // carried so the network can reconstruct the circuit's commit_x/commit_y public
+    // inputs (S4.1.2). Not derivable from the nullifier, so it is produced here.
+    let spent_commit_repr = commit(note).to_bytes();
+    let spent_commit_bytes: [u8; 32] = spent_commit_repr
+        .as_ref()
+        .try_into()
+        .map_err(|_| PneumaticError::Shielded("spent commitment did not encode to 32 bytes".into()))?;
+
     // Prove over the circuit's public inputs (instance-column order mirrors
     // `ShieldedVerifier::instances_for` so a proof here verifies on the network).
     let instances: &[&[&[Fp]]] = &[&[
@@ -219,6 +230,7 @@ pub fn build_shielded_tx(
     Ok((
         assemble_tx(
             token_id,
+            vec![spent_commit_bytes],
             vec![nullifier_bytes],
             vec![commit_bytes],
             root,
@@ -254,6 +266,7 @@ mod tests {
         // the fields with the right counts and structure.
         let tx = assemble_tx(
             b"token_abc",
+            vec![[6u8; 32], [7u8; 32]],
             vec![[1u8; 32], [2u8; 32]],
             vec![[3u8; 32], [4u8; 32]],
             [5u8; 32],
@@ -262,6 +275,7 @@ mod tests {
             0,
         );
 
+        assert_eq!(tx.spent_commitments.len(), 2, "spent_commitments wires per input");
         assert_eq!(tx.nullifiers.len(), 2);
         assert_eq!(tx.commitments.len(), 2);
         assert_eq!(tx.note_ciphertexts.len(), 2);

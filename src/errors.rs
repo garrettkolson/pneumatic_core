@@ -99,7 +99,7 @@ impl From<crate::conns::ConnError> for PneumaticError {
 // Validation failure reasons (mirrors C# ValidationFailureReason minus dead ones)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationFailureReason {
     /// Transaction sender public key is missing
     SenderMissing,
@@ -145,6 +145,35 @@ pub enum ValidationFailureReason {
     StaleEpochBlock,
     /// Block conflicts with another proposal at the same height
     BlockConflict,
+    // ── Shielded value transfer (Phase S4.1) ──────────────────────────────────
+    // Additive: serde-tagged, so new→new decoding is backward-safe, and new→old
+    // decoders are covered by the fail-closed unknown-action gate. The four
+    // advisory triggers below map 1:1 to the ShieldedValidationSpec checks
+    // (S4.1.3–S4.1.5); `UnknownNullifier` / `ValueBalanceMismatch` are reserved
+    // for the Committer's authoritative path (S5.3) and are not fired by the
+    // Sentinel's advisory spec.
+    /// Structural failure for a shielded tx (S4.1 check 1): nullifier/commitment
+    /// counts out of bounds, an undecodable root or commitment point, or
+    /// nullifiers that are not pairwise distinct within the tx.
+    InvalidCommitment,
+    /// A shielded tx spends a nullifier already recorded as spent — the
+    /// double-spend check (S4.1 check 2, backed by the S4.2 nullifier set).
+    StaleNullifier,
+    /// A shielded tx references a pool root older than the accepted recency
+    /// window (S4.1 check 3, backed by the S4.3 root history).
+    StaleMerkleRoot,
+    /// `verify_shielded_proof` rejected the proof over the tx's public inputs
+    /// (S4.1 check 4). Surfaces a failed Halo2 `verify_proof` distinctly from a
+    /// generic crypto error.
+    InvalidShieldedProof,
+    /// Reserved (S5.3): a nullifier whose note has no corresponding tree leaf.
+    /// The proof already binds nullifier↔note-membership, so the advisory spec
+    /// does not fire this.
+    UnknownNullifier,
+    /// Reserved (S5.3): value imbalance. Values are hidden inside the commitments
+    /// and enforced in-circuit by the value-balance gate, so the network cannot
+    /// independently sum them; the advisory spec does not fire this.
+    ValueBalanceMismatch,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +422,46 @@ mod tests {
             }
             _ => panic!("expected Validation variant"),
         }
+    }
+
+    // --- Phase S4.1: the shielded validation reasons ---
+
+    #[test]
+    fn shielded_validation_reasons_are_distinct_and_greppable() {
+        // S4.1.1 discriminator: the new variants must be real, distinct enum arms.
+        // Reverting the additions makes this fail to compile (the arms won't
+        // resolve) — proving the arms exist — and every reason must be greppable.
+        let reasons = vec![
+            ValidationFailureReason::InvalidCommitment,
+            ValidationFailureReason::StaleNullifier,
+            ValidationFailureReason::StaleMerkleRoot,
+            ValidationFailureReason::InvalidShieldedProof,
+            ValidationFailureReason::UnknownNullifier,
+            ValidationFailureReason::ValueBalanceMismatch,
+        ];
+        let err = PneumaticError::Validation(reasons.clone());
+        let s = format!("{err:?}");
+        for needle in [
+            "InvalidCommitment",
+            "StaleNullifier",
+            "StaleMerkleRoot",
+            "InvalidShieldedProof",
+            "UnknownNullifier",
+            "ValueBalanceMismatch",
+        ] {
+            assert!(s.contains(needle), "reason must be greppable as {needle}");
+        }
+        // Distinctness: a `StaleNullifier` arm matches only `StaleNullifier`, not
+        // a neighbouring arm — the arms did not collapse into each other.
+        assert!(matches!(
+            ValidationFailureReason::StaleNullifier,
+            ValidationFailureReason::StaleNullifier
+        ));
+        assert!(!matches!(
+            ValidationFailureReason::StaleNullifier,
+            ValidationFailureReason::StaleMerkleRoot
+        ));
+        assert_eq!(reasons.len(), 6, "four advisory triggers plus two reserved");
     }
 
     #[test]

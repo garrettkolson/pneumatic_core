@@ -173,6 +173,7 @@ mod tests {
             id: "tx-shielded-rt".to_string(),
             action: "ShieldedTransfer".to_string(),
             token_id: vec![5, 6, 7],
+            spent_commitments: vec![[1u8; 32], [2u8; 32]],
             nullifiers: vec![[1u8; 32], [2u8; 32]],
             commitments: vec![[3u8; 32]],
             merkle_root: [4u8; 32],

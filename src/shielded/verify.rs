@@ -42,8 +42,15 @@ use halo2_proofs::{
 };
 use once_cell::sync::Lazy;
 
-use crate::errors::PneumaticError;
+use crate::errors::{PneumaticError, ValidationFailureReason};
 use crate::shielded::circuit::{ActionCircuit, PublicInputs};
+use crate::shielded::tree::bytes_to_root;
+use crate::shielded::{DEFAULT_DEPTH, MembershipProof, ShieldedNote};
+use crate::transactions::ShieldedTransaction;
+use pasta_curves::pallas::{Affine as EpAffine, Scalar as Fq};
+use ff::FromUniformBytes;
+use group::GroupEncoding;
+use pasta_curves::arithmetic::CurveAffine;
 
 /// The circuit definition tag. `ActionCircuit` has a fixed structure (the same
 /// columns/gates/selectors for every instance), so the verifying key is
@@ -153,6 +160,14 @@ impl ShieldedVerifier {
         ]]
     }
 
+    /// Test-only accessor: the Halo2 instantiation width (`k`) this verifier was
+    /// built at. Pins S4.1's verifying key to the prover's width (`S3.3` proves
+    /// at `k = 10`); a mismatched width makes every proof fail to verify.
+    #[cfg(test)]
+    pub(crate) fn width(&self) -> u32 {
+        self.params.k()
+    }
+
     /// Verify a proof over `public_inputs`.
     ///
     /// Returns `Ok(())` iff the proof verifies against the circuit's verifying
@@ -190,16 +205,192 @@ pub fn keygen_calls() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Phase S4.1.2 — reconstruct the circuit public inputs from the wire tx
+// ---------------------------------------------------------------------------
+
+/// Error when a `ShieldedTransaction` cannot be decoded into the circuit's
+/// `PublicInputs`. Always `InvalidCommitment` (the structural reason check 1
+/// owns) — an ambiguous root or commitment fails closed, never panics.
+fn decode_failure() -> PneumaticError {
+    PneumaticError::Validation(vec![ValidationFailureReason::InvalidCommitment])
+}
+
+/// Convert a 32-byte value to an `Fp` field element via uniform-byte reduction,
+/// mirroring `circuit.rs`/`note.rs`. The nullifier is defined this way, so the
+/// reconstructed value matches the proof's public nullifier exactly.
+fn bytes32_to_fp(bytes: &[u8; 32]) -> Fp {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(bytes);
+    Fp::from_uniform_bytes(&buf)
+}
+
+/// Decode a 32-byte compressed affine point to its `(x, y)` coordinates, failing
+/// closed on a non-member or the point at infinity (which would otherwise surface
+/// as public-input garbage). Mirrors `tree.rs`'s `from_repr`→`into_option` fail
+/// closed idiom.
+fn point_coords(bytes: &[u8; 32]) -> Result<(Fp, Fp), PneumaticError> {
+    let pt = EpAffine::from_bytes(bytes).into_option().ok_or_else(decode_failure)?;
+    let coords = pt.coordinates().into_option().ok_or_else(decode_failure)?;
+    let x = *coords.x();
+    let y = *coords.y();
+    Ok((x, y))
+}
+
+/// Reconstruct the Action circuit's [`PublicInputs`] from a wire
+/// `ShieldedTransaction`, mapping each of the circuit's seven public columns (v1
+/// 1-in/1-out) to the wire field that carries it:
+///
+/// ```text
+/// nullifier ← nullifiers[0]          commit_x/commit_y ← spent_commitments[0]
+/// merkle_root ← merkle_root          output_commit_x/output_commit_y ← commitments[0]
+/// fee ← fee
+/// ```
+///
+/// The *spent* commitment is carried (not derivable from the nullifier — the
+/// nullifier is `poseidon(spend_key, rho)`, one-way) so the verifier receives the
+/// exact instances the proof was generated over. Every missing or undecodable
+/// element fails closed as `InvalidCommitment`; the helper never panics.
+pub fn public_inputs_from_shielded_tx(tx: &ShieldedTransaction) -> Result<PublicInputs, PneumaticError> {
+    let nullifier = bytes32_to_fp(tx.nullifiers.first().ok_or_else(decode_failure)?);
+    let (commit_x, commit_y) = point_coords(tx.spent_commitments.first().ok_or_else(decode_failure)?)?;
+    let merkle_root = bytes_to_root(&tx.merkle_root).ok_or_else(decode_failure)?;
+    let (out_x, out_y) = point_coords(tx.commitments.first().ok_or_else(decode_failure)?)?;
+    Ok(PublicInputs {
+        nullifier,
+        commit_x,
+        commit_y,
+        merkle_root,
+        output_commit_x: out_x,
+        output_commit_y: out_y,
+        fee: Fp::from(tx.fee),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase S4.1.4 — verify key template
+// ---------------------------------------------------------------------------
+
+/// A structurally-valid `ActionCircuit` template used only to build the verifying
+/// key via `keygen_vk`. `keygen_vk` derives the key from the circuit's *structure*
+/// (`configure` + a zeroed `synthesize`) and is independent of witness *values*, so
+/// the template never verifies a real proof on its own. The note values are a fixed,
+/// non-degenerate choice (so the circuit's `synthesize` — which embeds the note
+/// commitment as a public input and asserts it is not the point at infinity — runs);
+/// the specific values do not affect the key. The Merkle proof carries
+/// `DEFAULT_DEPTH` siblings (the layout allocates one advice column per level and
+/// `synthesize` rejects a sibling count other than `DEFAULT_DEPTH`); their values are
+/// unused by keygen. This lets `ShieldedValidationSpec` build its verifying key once
+/// (see the `SHIELDED_VALIDATOR_VERIFIER` static) without the spec needing to name
+/// `ShieldedNote`/`Fq`/`MembershipProof`.
+pub fn action_circuit_for_verifying_key() -> ActionCircuit {
+    let note = ShieldedNote { value: 100, owner_pk: [1u8; 32], rho: Fq::from(1), rcm: Fq::from(2) };
+    let output_note = ShieldedNote { value: 90, owner_pk: [2u8; 32], rho: Fq::from(3), rcm: Fq::from(4) };
+    ActionCircuit {
+        note,
+        spend_key: [0u8; 32],
+        merkle_proof: MembershipProof { index: 0, siblings: vec![Fp::zero(); DEFAULT_DEPTH as usize] },
+        merkle_root: Fp::zero(),
+        output_note,
+        fee: 0,
+        tree_depth: DEFAULT_DEPTH,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::{PneumaticError, ValidationFailureReason};
     use crate::shielded::circuit::{ActionCircuit, PublicInputs};
-    use crate::shielded::note::{commit, ShieldedNote};
-    use crate::shielded::tree::{IncrementalMerkleTree, DEFAULT_DEPTH};
+    use crate::shielded::note::{commit, nullifier, ShieldedNote};
+    use crate::shielded::tree::{IncrementalMerkleTree, DEFAULT_DEPTH, root_to_bytes};
+    use crate::transactions::ShieldedTransaction;
     use pasta_curves::pallas::Scalar as Fq;
+
+    /// A well-formed, fully-decodable wire `ShieldedTransaction` (1-in/1-out) for
+    /// the S4.1.2 bridge tests. Real commitment bytes (from `commit`) and a real
+    /// nullifier so `point_coords`/`bytes32_to_fp` decode cleanly.
+    fn make_wire_tx() -> ShieldedTransaction {
+        let note = ShieldedNote { value: 100, owner_pk: [1u8; 32], rho: Fq::from(1), rcm: Fq::from(2) };
+        let spend_key = [0xABu8; 32];
+        let output_note = ShieldedNote { value: 90, owner_pk: [2u8; 32], rho: Fq::from(3), rcm: Fq::from(4) };
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        let (root, _proof) = tree.append(&commit(&note));
+        let spent_bytes: [u8; 32] = commit(&note).to_bytes().as_ref().try_into().unwrap();
+        let output_bytes: [u8; 32] = commit(&output_note).to_bytes().as_ref().try_into().unwrap();
+        ShieldedTransaction {
+            id: "wire_tx".into(),
+            action: "ShieldedTransfer".into(),
+            token_id: vec![1],
+            spent_commitments: vec![spent_bytes],
+            nullifiers: vec![nullifier(&note, &spend_key)],
+            commitments: vec![output_bytes],
+            merkle_root: root_to_bytes(&root),
+            proof: vec![0u8; 64],
+            note_ciphertexts: vec![vec![0u8; 64]],
+            fee: 10,
+        }
+    }
+
+    // --- Phase S4.1.2 — public_inputs_from_shielded_tx ---
+
+    #[test]
+    fn public_inputs_from_tx_maps_allseven_columns() {
+        // A well-formed tx decodes to the circuit's exact public inputs: the
+        // nullifier and fee reproduce the wire→field mapping, and the spent +
+        // output commitments map to their affine (x, y) coordinates.
+        let tx = make_wire_tx();
+        let pi = public_inputs_from_shielded_tx(&tx).expect("well-formed tx decodes");
+
+        assert_eq!(pi.nullifier, bytes32_to_fp(&tx.nullifiers[0]), "nullifier maps");
+        assert_eq!(pi.fee, Fp::from(10), "fee maps");
+
+        let note = ShieldedNote { value: 100, owner_pk: [1u8; 32], rho: Fq::from(1), rcm: Fq::from(2) };
+        let spent = commit(&note).coordinates().expect("not infinity");
+        let (sx, sy) = (*spent.x(), *spent.y());
+        assert_eq!(pi.commit_x, sx, "spent commitment -> commit_x");
+        assert_eq!(pi.commit_y, sy, "spent commitment -> commit_y");
+
+        let output_note = ShieldedNote { value: 90, owner_pk: [2u8; 32], rho: Fq::from(3), rcm: Fq::from(4) };
+        let outc = commit(&output_note).coordinates().expect("not infinity");
+        let (ox, oy) = (*outc.x(), *outc.y());
+        assert_eq!(pi.output_commit_x, ox, "output commitment -> output_commit_x");
+        assert_eq!(pi.output_commit_y, oy, "output commitment -> output_commit_y");
+    }
+
+    #[test]
+    fn public_inputs_rejects_bad_root_encoding() {
+        // Discriminator: a root that is not a valid Fp (0xFF… ≥ p) fails closed as
+        // InvalidCommitment rather than panicking or silently accepting.
+        let mut tx = make_wire_tx();
+        tx.merkle_root = [0xFFu8; 32];
+        assert!(matches!(
+            public_inputs_from_shielded_tx(&tx),
+            Err(PneumaticError::Validation(ref rs)) if rs.iter().any(|r| matches!(r, ValidationFailureReason::InvalidCommitment))
+        ), "an undecodable root must fail closed as InvalidCommitment");
+    }
+
+    #[test]
+    fn public_inputs_rejects_empty_nullifier_or_spent_commitment() {
+        // Discriminator: a missing nullifier or spent commitment (empty vec) fails
+        // closed as InvalidCommitment — the check-1 bounds live in the bridge.
+        let mut tx = make_wire_tx();
+        tx.nullifiers = vec![];
+        assert!(matches!(
+            public_inputs_from_shielded_tx(&tx),
+            Err(PneumaticError::Validation(ref rs)) if rs.iter().any(|r| matches!(r, ValidationFailureReason::InvalidCommitment))
+        ));
+
+        let mut tx2 = make_wire_tx();
+        tx2.spent_commitments = vec![];
+        assert!(matches!(
+            public_inputs_from_shielded_tx(&tx2),
+            Err(PneumaticError::Validation(ref rs)) if rs.iter().any(|r| matches!(r, ValidationFailureReason::InvalidCommitment))
+        ));
+    }
 
     /// The Halo2 instantiation width the Action circuit is built at (see
     /// `circuit_test.rs`, where `const K: u32 = 10`). The verifier's `Params`

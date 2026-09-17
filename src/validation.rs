@@ -1,11 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use once_cell::sync::Lazy;
+use ff::PrimeField;
+use halo2_proofs::pasta::Fp;
 use serde::Serialize;
 use crate::data::DataProvider;
 use crate::environment::EnvironmentMetadata;
 use crate::errors::{ValidationFailureReason, TransactionRiskFactor, PneumaticError, ReconciledSignatures};
+use crate::shielded::{
+    action_circuit_for_verifying_key, PublicInputs, ShieldedVerifier, public_inputs_from_shielded_tx,
+};
 use crate::tokens::Token;
-use crate::transactions::{Transaction, TransactionValidationResult};
+use crate::transactions::{ShieldedTransaction, Transaction, TransactionValidationResult};
 
 // ---------------------------------------------------------------------------
 // TransactionValidationSpec — action-based validation trait
@@ -28,6 +35,20 @@ pub trait TransactionValidationSpec: Send + Sync {
 
     /// Return the spec name for registration lookup.
     fn name(&self) -> &str;
+
+    /// Optional shielded-transaction validation. The default impl **fails closed**
+    /// (`UnsupportedAction`): a spec that does not override this cannot validate a
+    /// shielded tx, so a `"ShieldedTransfer"` reaching an unprepared spec is
+    /// rejected (mirrors Phase 3.2's reject-unknown-validator). Only
+    /// `ShieldedValidationSpec` overrides it. See Phase S4.1.
+    fn validate_shielded(
+        &self,
+        _tx: &ShieldedTransaction,
+        _env_data: &EnvironmentMetadata,
+        _deps: &ShieldedValidationDeps,
+    ) -> Result<TransactionValidationResult, PneumaticError> {
+        Err(PneumaticError::Validation(vec![ValidationFailureReason::UnsupportedAction]))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +334,16 @@ impl ValidationSpecRegistry {
         self.register(Box::new(SelfSignedBlockValidatorSpec::new()));
         self.register(Box::new(ExecutedBlockValidatorSpec::new(0)));
     }
+
+    /// Register the shielded validation spec (`"Shielded"`).
+    ///
+    /// Distinct from `register_defaults`: opt-in only, so a non-shielded
+    /// deployment does not construct the Halo2 verifying key. Registered under
+    /// the name `ShieldedValidationSpec::NAME`; fail-closed for a `"Shielded"`
+    /// tx that reaches an unprepared spec (see the trait default impl).
+    pub fn register_shielded(&mut self) {
+        self.register(Box::new(ShieldedValidationSpec::new()));
+    }
 }
 
 // Blanket impl: Box<dyn TransactionValidationSpec> delegates to the inner trait object.
@@ -333,6 +364,227 @@ impl TransactionValidationSpec for Box<dyn TransactionValidationSpec> {
 
     fn name(&self) -> &str {
         (**self).name()
+    }
+
+    /// Delegate shielded validation so a `ShieldedValidationSpec` held behind a
+    /// `Box<dyn TransactionValidationSpec>` still validates shielded txs (the
+    /// trait default impl below would otherwise fail it closed).
+    fn validate_shielded(
+        &self,
+        tx: &ShieldedTransaction,
+        env_data: &EnvironmentMetadata,
+        deps: &ShieldedValidationDeps,
+    ) -> Result<TransactionValidationResult, PneumaticError> {
+        (**self).validate_shielded(tx, env_data, deps)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase S4.1 — ShieldedValidationSpec
+// ---------------------------------------------------------------------------
+
+/// v1 Action circuit capacity: the circuit exposes exactly one nullifier and one
+/// output commitment as public inputs (S2.1 / S3.3 Open item #1). The structural
+/// check enforces that a tx does not exceed this; a wider circuit moves the cap in
+/// this one place (S4.1.3).
+const CIRCUIT_MAX_INPUTS: usize = 1;
+
+/// Halo2 instantiation width the Action circuit is built at. `ShieldedVerifier`
+/// in `verify.rs` uses the same width, so a proof produced by the prover verifies.
+const SHIELDED_VK_K: u32 = 10;
+
+/// A committed pool root plus the height at which it was produced. The merkle-root
+/// freshness check (check 3) walks the history oldest→newest.
+#[derive(Copy, Clone, Debug)]
+pub struct RootSnapshot {
+    pub root: [u8; 32],
+    pub height: u64,
+}
+
+/// Check 2 dependency: the nullifier set's read-side. Implemented by the S4.2
+/// `NullifierRegistry`; the spec depends on this trait, never the concrete type,
+/// so the check is buildable and testable before the registry exists.
+pub trait NullifierMembership {
+    fn contains_nullifier(&self, nullifier: [u8; 32]) -> bool;
+}
+
+/// Check 3 dependency: the append-only history of committed roots. Implemented by
+/// the S4.3 root state.
+pub trait MerkleRootHistory {
+    /// Roots ordered oldest→newest (the last element is the current tip).
+    fn root_history(&self) -> &[RootSnapshot];
+}
+
+/// The read-only pool view the spec is handed at call time. The spec itself is
+/// stateless: the composite node shares one `Arc<ShieldedPool>` (S5.3) that
+/// implements both traits; split deployments replay block history (S3.1 / S5.1)
+/// and expose it through the same traits.
+pub struct ShieldedValidationDeps<'a> {
+    /// The spent-nullifier set (check 2).
+    pub spent: &'a dyn NullifierMembership,
+    /// The committed-root history (check 3).
+    pub roots: &'a dyn MerkleRootHistory,
+    /// The accepted recency window: a root is fresh if it is at most this many
+    /// commits behind the newest.
+    pub recency_window: usize,
+}
+
+/// The Halo2 verifying key for the Action circuit, built once (lazily) at
+/// `SHIELDED_VK_K`. The template circuit supplies only the *structure* `keygen_vk`
+/// needs (keygen never uses witness data), so repeated verification reuses one
+/// cached `(Params, VerifyingKey)` via `ShieldedVerifier`'s module-level cache.
+static SHIELDED_VALIDATOR_VERIFIER: Lazy<ShieldedVerifier> = Lazy::new(|| {
+    ShieldedVerifier::new(action_circuit_for_verifying_key(), SHIELDED_VK_K)
+        .expect("shielded verifying key (ActionCircuit at K=10)")
+});
+
+/// The shielded validation spec (`"Shielded"`). Implements the four fail-closed
+/// checks (S4.1: structural, nullifier set, merkle-root freshness, proof) plus a
+/// fixed neutral risk. Stateless w.r.t. the pool — it reads pool state through the
+/// deps it is handed.
+#[derive(Debug, Clone)]
+pub struct ShieldedValidationSpec {
+    name: String,
+}
+
+impl ShieldedValidationSpec {
+    pub fn new() -> Self {
+        ShieldedValidationSpec {
+            name: String::from(Self::NAME),
+        }
+    }
+
+    /// Spec name — registered under `"Shielded"`.
+    pub const NAME: &str = "Shielded";
+}
+
+impl Default for ShieldedValidationSpec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fail-closed for a shielded tx whose wire fields cannot be decoded into the
+/// circuit's public inputs (check 1's `InvalidCommitment`).
+fn shielded_structure_err() -> PneumaticError {
+    PneumaticError::Validation(vec![ValidationFailureReason::InvalidCommitment])
+}
+
+/// The fixed, neutral risk a shielded tx reports: the amount and parties are
+/// unknown by design, so use a constant 2-party / 0-amount factor. The
+/// environment's `max_risk` gate still applies to it.
+fn shielded_neutral_risk() -> TransactionRiskFactor {
+    TransactionRiskFactor {
+        affected_parties: 2,
+        amount: 0,
+        is_contract: false,
+        is_multi_party: false,
+    }
+}
+
+/// Check 1 (structural): counts in bounds, all three commitment vectors non-empty,
+/// and nullifiers pairwise distinct within the tx. Fails closed as
+/// `InvalidCommitment`.
+fn check_structural(tx: &ShieldedTransaction) -> Result<(), PneumaticError> {
+    let err = shielded_structure_err;
+    if tx.nullifiers.is_empty() || tx.nullifiers.len() > CIRCUIT_MAX_INPUTS {
+        return Err(err());
+    }
+    if tx.spent_commitments.is_empty() || tx.spent_commitments.len() > CIRCUIT_MAX_INPUTS {
+        return Err(err());
+    }
+    if tx.commitments.is_empty() || tx.commitments.len() > CIRCUIT_MAX_INPUTS {
+        return Err(err());
+    }
+    // nullifiers pairwise distinct within the tx (the double-spend guard starts
+    // here, before the global nullifier set is consulted).
+    for i in 0..tx.nullifiers.len() {
+        for j in (i + 1)..tx.nullifiers.len() {
+            if tx.nullifiers[i] == tx.nullifiers[j] {
+                return Err(err());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check 3 (merkle-root freshness): the referenced root must equal the newest
+/// root or lie within `recency_window` commits of it. Unknown or stale roots fail
+/// closed (return false → the caller rejects with `StaleMerkleRoot`).
+fn is_root_fresh(merkle_root: &Fp, deps: &ShieldedValidationDeps) -> bool {
+    let history = deps.roots.root_history();
+    if history.is_empty() {
+        // No committed root state at all: a root cannot be proven fresh.
+        return false;
+    }
+    let newest = *history.last().unwrap();
+    match history.iter().find(|s| s.root == merkle_root.to_repr()) {
+        Some(idx) => (newest.height.saturating_sub(idx.height)) <= deps.recency_window as u64,
+        None => false,
+    }
+}
+
+impl TransactionValidationSpec for ShieldedValidationSpec {
+    fn validate(
+        &self,
+        _tx: &Transaction,
+        _token: &Token,
+        _env_data: &EnvironmentMetadata,
+    ) -> Result<TransactionValidationResult, PneumaticError> {
+        // The shielded spec validates a `ShieldedTransaction`, never a plain
+        // `Transaction`. A plain-tx reaching here is a wiring bug — fail closed.
+        Err(PneumaticError::Validation(vec![ValidationFailureReason::UnsupportedAction]))
+    }
+
+    fn calculate_risk(&self, _tx: &Transaction) -> TransactionRiskFactor {
+        shielded_neutral_risk()
+    }
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn validate_shielded(
+        &self,
+        tx: &ShieldedTransaction,
+        env_data: &EnvironmentMetadata,
+        deps: &ShieldedValidationDeps,
+    ) -> Result<TransactionValidationResult, PneumaticError> {
+        // Checks run in order 1→2→3→4; the first failure wins (short-circuit).
+        // Check 1 — structural bounds.
+        check_structural(tx)?;
+
+        // Reconstruct the circuit public inputs (undecodable element → InvalidCommitment).
+        let public_inputs = public_inputs_from_shielded_tx(tx)?;
+
+        // Check 2 — each nullifier must be unspent (the double-spend guard).
+        for nullifier in &tx.nullifiers {
+            if deps.spent.contains_nullifier(*nullifier) {
+                return Err(PneumaticError::Validation(vec![ValidationFailureReason::StaleNullifier]));
+            }
+        }
+
+        // Check 3 — referenced root must be within the recency window.
+        if !is_root_fresh(&public_inputs.merkle_root, deps) {
+            return Err(PneumaticError::Validation(vec![ValidationFailureReason::StaleMerkleRoot]));
+        }
+
+        // Policy gate — the environment's max_risk is enforced before the expensive
+        // Halo2 proof check: a tx the policy rejects is dropped early (fail fast),
+        // never paying to verify its proof. The neutral risk (score 0.30) is still
+        // gated, so a too-low max_risk rejects here.
+        let risk = shielded_neutral_risk();
+        if risk.score() > env_data.max_risk {
+            return Err(PneumaticError::Validation(vec![ValidationFailureReason::RiskExceedsThreshold]));
+        }
+
+        // Check 4 — the Halo2 proof over the reconstructed public inputs.
+        if SHIELDED_VALIDATOR_VERIFIER.verify(&tx.proof, &public_inputs).is_err() {
+            return Err(PneumaticError::Validation(vec![ValidationFailureReason::InvalidShieldedProof]));
+        }
+
+        // Success: fixed neutral risk, gated on the environment's max_risk.
+        Ok(TransactionValidationResult::valid(vec![], risk))
     }
 }
 
@@ -397,6 +649,13 @@ mod tests {
     use crate::registry::PendingTransactionRegistry;
     use crate::rns::identity::NodeIdentity;
     use crate::crypto::AsymCryptoProvider;
+    // Phase S4.1 shielded-validation tests: the note/tree primitives for building
+    // well-formed `ShieldedTransaction` fixtures, and the scalar field for them.
+    use crate::shielded::{
+        ActionCircuit, commit, nullifier, root_to_bytes, ShieldedNote, IncrementalMerkleTree, DEFAULT_DEPTH,
+    };
+    use group::GroupEncoding;
+    use pasta_curves::pallas::Scalar as Fq;
 
     // --- helpers ---
 
@@ -1091,5 +1350,370 @@ mod tests {
             TransactionValidationSpec::validate(&spec, &tx, &token, &env),
             Ok(_)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase S4.1 — ShieldedValidationSpec (four fail-closed checks)
+    // -----------------------------------------------------------------------
+
+    /// Nullifier-set fake implementing the `NullifierMembership` interface so
+    /// check 2 can run against in-memory state (S4.1.5) without the S4.2 type.
+    #[derive(Default)]
+    struct FakeNullifier {
+        spent: Vec<[u8; 32]>,
+    }
+    impl NullifierMembership for FakeNullifier {
+        fn contains_nullifier(&self, nullifier: [u8; 32]) -> bool {
+            self.spent.iter().any(|n| *n == nullifier)
+        }
+    }
+
+    /// Root-history fake implementing the `MerkleRootHistory` interface so check 3
+    /// can walk a known history (S4.1.5) without the S4.3 type.
+    #[derive(Default)]
+    struct FakeRootHistory {
+        roots: Vec<RootSnapshot>,
+    }
+    impl MerkleRootHistory for FakeRootHistory {
+        fn root_history(&self) -> &[RootSnapshot] {
+            &self.roots
+        }
+    }
+
+    /// Build a well-formed, fully-decodable 1-in/1-out `ShieldedTransaction`. The
+    /// commitment, nullifier and root bytes are real (so `point_coords` /
+    /// `bytes_to_root` decode cleanly); only the `proof` is a placeholder buffer.
+    /// Checks 1→3 short-circuit before the proof (check 4), so the placeholder is
+    /// never exercised by the rejection discriminators; the test that must reach
+    /// check 4 deliberately feeds it and expects `InvalidShieldedProof`.
+    fn make_shielded_tx() -> ShieldedTransaction {
+        make_shielded_tx_with(vec![0u8; 64], 0)
+    }
+
+    /// Same fixture with an explicit proof buffer and fee. The fee must match the
+    /// value the verifier's proof is built over (check 4's `public_inputs.fee`).
+    fn make_shielded_tx_with(proof: Vec<u8>, fee: u64) -> ShieldedTransaction {
+        let note = ShieldedNote { value: 100, owner_pk: [1u8; 32], rho: Fq::from(1), rcm: Fq::from(2) };
+        let spend_key = [0xABu8; 32];
+        let output_note = ShieldedNote { value: 90, owner_pk: [2u8; 32], rho: Fq::from(3), rcm: Fq::from(4) };
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        let (root, _proof) = tree.append(&commit(&note));
+        let spent_commit: [u8; 32] = commit(&note).to_bytes().as_ref().try_into().unwrap();
+        let output_commit: [u8; 32] = commit(&output_note).to_bytes().as_ref().try_into().unwrap();
+        let nullifier_bytes = nullifier(&note, &spend_key);
+        ShieldedTransaction {
+            id: "shielded_test".into(),
+            action: "ShieldedTransfer".into(),
+            token_id: vec![1],
+            spent_commitments: vec![spent_commit],
+            nullifiers: vec![nullifier_bytes],
+            commitments: vec![output_commit],
+            merkle_root: root_to_bytes(&root),
+            proof,
+            note_ciphertexts: vec![vec![0u8; 64]],
+            fee,
+        }
+    }
+
+    /// Run a tx through `validate_shielded` with the shared test environment
+    /// (max_risk = 1.0). The fakes are owned by the caller so the borrowed deps
+    /// stay in scope for the duration of the check.
+    fn run_shielded(
+        tx: &ShieldedTransaction,
+        spent: &FakeNullifier,
+        roots: &FakeRootHistory,
+        window: usize,
+    ) -> Result<TransactionValidationResult, PneumaticError> {
+        let deps = ShieldedValidationDeps { spent, roots, recency_window: window };
+        ShieldedValidationSpec::new().validate_shielded(tx, &make_env_with_defaults(), &deps)
+    }
+
+    fn reason_matches(result: &Result<TransactionValidationResult, PneumaticError>, r: ValidationFailureReason) -> bool {
+        matches!(
+            result,
+            Err(PneumaticError::Validation(ref rs)) if rs.iter().any(|reason| *reason == r)
+        )
+    }
+
+    #[test]
+    fn register_shielded_adds_spec_without_touching_defaults() {
+        // S4.1.3 discriminator: register_defaults() alone leaves no "Shielded" spec
+        // (a shielded tx would then fall to the fail-closed default); register_shielded()
+        // adds it and does not alter the existing defaults.
+        let mut reg = ValidationSpecRegistry::new();
+        reg.register_defaults();
+        assert!(reg.get("Shielded").is_none(), "defaults must not register Shielded");
+
+        reg.register_shielded();
+        let spec = reg.get("Shielded").expect("register_shielded adds a Shielded spec");
+        assert_eq!(spec.name(), "Shielded");
+
+        // Defaults byte-identical.
+        assert!(reg.get("SelfSigned").is_some());
+        assert!(reg.get("Executed").is_some());
+    }
+
+    #[test]
+    fn unregistered_shielded_action_fails_closed() {
+        // S4.1.6 discriminator: the trait default impl rejects shielded txs for any
+        // non-shielded spec. Exercise it directly on a plain spec — a shielded tx
+        // routed to the wrong spec must fail closed (UnsupportedAction), never accept.
+        let spec = ExecutedBlockValidatorSpec::new(0);
+        let tx = make_shielded_tx();
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let env = make_env_with_defaults();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &roots, recency_window: 10 };
+        let result = TransactionValidationSpec::validate_shielded(&spec, &tx, &env, &deps);
+        assert!(reason_matches(&result, ValidationFailureReason::UnsupportedAction),
+            "a non-shielded spec must fail closed on validate_shielded");
+    }
+
+    #[test]
+    fn proof_check_rejects_garbage_proof() {
+        // S4.1.4 discriminator: a valid-shape tx (checks 1-3 pass) with a garbage
+        // proof must reach and fail check 4 as InvalidShieldedProof — proving check 4
+        // is real. A structural failure on the same input, by contrast, fails check 1.
+        let tx = make_shielded_tx();
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "a valid-shape tx with a garbage proof must reach and fail check 4");
+    }
+
+    #[test]
+    fn structural_ok_shape_passes_checks_1_through_3() {
+        // Same input as above, but with a *valid* proof would pass checks 1-3; here
+        // the garbage proof only matters once checks 1-3 pass, so the failure at
+        // InvalidShieldedProof itself proves checks 1-3 all passed (revert any one and
+        // this input returns InvalidCommitment / StaleNullifier / StaleMerkleRoot).
+        let tx = make_shielded_tx();
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "structural + nullifier + root must all pass before the proof check");
+        // Sanity: the same tx with a stale nullifier must fail check 2, not check 4.
+        let spent2 = FakeNullifier { spent: tx.nullifiers.clone() };
+        let result2 = run_shielded(&tx, &spent2, &roots, 10);
+        assert!(reason_matches(&result2, ValidationFailureReason::StaleNullifier),
+            "an already-spent nullifier must be caught at check 2, before the proof check");
+    }
+
+    #[test]
+    fn structural_rejects_empty_nullifier_vec() {
+        // S4.1.3 discriminator: an empty nullifier vector fails check 1 (InvalidCommitment).
+        let mut tx = make_shielded_tx();
+        tx.nullifiers = vec![];
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "an empty nullifier vector must fail the structural check");
+    }
+
+    #[test]
+    fn structural_rejects_empty_spent_commitments() {
+        // S4.1.2/1.3 discriminator: the new spent_commitments field is load-bearing —
+        // an empty vec fails check 1 (InvalidCommitment), which would otherwise be a
+        // check-4 failure.
+        let mut tx = make_shielded_tx();
+        tx.spent_commitments = vec![];
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "an empty spent_commitments vector must fail the structural check");
+    }
+
+    #[test]
+    fn structural_rejects_empty_commitments() {
+        // S4.1.3 discriminator: an empty output commitment vector fails check 1.
+        let mut tx = make_shielded_tx();
+        tx.commitments = vec![];
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "an empty commitments vector must fail the structural check");
+    }
+
+    #[test]
+    fn structural_rejects_nullifier_count_over_circuit_cap() {
+        // S4.1.3 discriminator: a tx with more nullifiers than the v1 circuit cap
+        // (1-in) fails check 1 (InvalidCommitment). This is the S4.1.3 cap-enforcement.
+        let mut tx = make_shielded_tx();
+        tx.nullifiers.push(tx.nullifiers[0]); // two identical entries → over the cap
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "nullifiers over the v1 circuit cap must fail the structural check");
+    }
+
+    #[test]
+    fn structural_rejects_duplicate_nullifiers() {
+        // S4.1.3 discriminator: duplicate nullifiers within a tx fail check 1.
+        let mut tx = make_shielded_tx();
+        tx.nullifiers.push(tx.nullifiers[0]);
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "duplicate nullifiers must fail the structural check");
+    }
+
+    #[test]
+    fn nullifier_check_rejects_already_spent() {
+        // S4.1.5 discriminator: an already-spent nullifier fails check 2
+        // (StaleNullifier) — before the proof check. Same tx, fresh nullifier set,
+        // passes check 2 and reaches (and fails) check 4.
+        let tx = make_shielded_tx();
+        let nullifier = tx.nullifiers[0];
+        let spent = FakeNullifier { spent: vec![nullifier] };
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::StaleNullifier),
+            "an already-spent nullifier must be rejected at check 2");
+        // Contrast: same tx against an empty set reaches the (garbage) proof check.
+        let spent_fresh = FakeNullifier::default();
+        let result2 = run_shielded(&tx, &spent_fresh, &roots, 10);
+        assert!(reason_matches(&result2, ValidationFailureReason::InvalidShieldedProof),
+            "with a fresh nullifier the tx reaches the proof check");
+    }
+
+    #[test]
+    fn root_freshness_accepts_within_window_and_rejects_beyond() {
+        // S4.1.5 discriminator: the referenced root within the recency window passes
+        // check 3 (reaching the proof check); the same root beyond the window is
+        // rejected as StaleMerkleRoot — proving the window, not mere equality, is
+        // the freshness gate.
+        let tx = make_shielded_tx();
+        let spent = FakeNullifier::default();
+
+        // History with the tx root (R0) at height 0 and a newer tip (T) at height 1.
+        let tip = RootSnapshot { root: [7u8; 32], height: 1 };
+        let r0 = RootSnapshot { root: tx.merkle_root, height: 0 };
+        let history = FakeRootHistory { roots: vec![r0, tip] };
+
+        // window 1: R0 is 1 commit behind the tip → within window → passes check 3.
+        let within = run_shielded(&tx, &spent, &history, 1);
+        assert!(reason_matches(&within, ValidationFailureReason::InvalidShieldedProof),
+            "a root within the window must pass the freshness check");
+
+        // window 0: the SAME root, SAME history, only the window shrinks → 1 commit
+        // behind > window 0 → StaleMerkleRoot.
+        let beyond = run_shielded(&tx, &spent, &history, 0);
+        assert!(reason_matches(&beyond, ValidationFailureReason::StaleMerkleRoot),
+            "a root beyond the window must be rejected as stale");
+    }
+
+    #[test]
+    fn validator_verifier_is_built_at_k10() {
+        // S4.1.4 discriminator: the verifying key must be built at K=10 to match the
+        // prover (S3.3 proves at K=10). A different width rejects every proof.
+        assert_eq!(SHIELDED_VALIDATOR_VERIFIER.width(), 10);
+    }
+
+    #[test]
+    fn checks_run_in_structural_then_nullifier_order() {
+        // S4.1.6 discriminator: a tx that is BOTH structurally invalid (empty
+        // nullifier vec) AND would fail the nullifier check must fail at check 1
+        // (InvalidCommitment), not check 2 — proving checks run in order 1→2→3→4.
+        let mut tx = make_shielded_tx();
+        tx.nullifiers = vec![]; // check 1 structural failure
+        let spent = FakeNullifier { spent: vec![[0u8; 32]] }; // would also fail check 2
+        let roots = FakeRootHistory::default();
+        let result = run_shielded(&tx, &spent, &roots, 10);
+        assert!(reason_matches(&result, ValidationFailureReason::InvalidCommitment),
+            "the structural failure must win over the nullifier check (order 1 before 2)");
+    }
+
+    #[test]
+    fn risk_gate_rejects_shielded_above_max_risk() {
+        // The shielded spec's neutral risk (0.30) is still gated by max_risk. With a
+        // max_risk of 0.20 the neutral risk is rejected — same code path as the plain
+        // spec tests above — proving the neutral risk flows through the gate.
+        let tx = make_shielded_tx();
+        let spent = FakeNullifier::default();
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let mut env = make_env_with_defaults();
+        env.max_risk = 0.20;
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &roots, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &env, &deps);
+        assert!(reason_matches(&result, ValidationFailureReason::RiskExceedsThreshold),
+            "the neutral risk must still be rejected by the max_risk gate below its score");
+    }
+
+    // --- S4.1.6 end-to-end live prove (benchmark-only, #[ignore]d) ---
+
+    /// The ONE end-to-end live proof through `validate_shielded`. `#[ignore]`d per
+    /// the roadmap's "proving is benchmark-only" rule; run on demand with:
+    ///
+    /// ```text
+    /// cargo test --workspace -p pneumatic_core -- --ignored validate_shielded_end_to_end_live_prove
+    /// ```
+    ///
+    /// Produces a real Halo2 proof over a satisfiable Action circuit, assembles a
+    /// `ShieldedTransaction` whose reconstructed public inputs equal the circuit's,
+    /// then asserts `validate_shielded` returns `Ok` through all four checks, and
+    /// that flipping the proof yields `InvalidShieldedProof`. This proves checks 1-4
+    /// all pass together on a real proof and that check 4 is genuine (not vacuous).
+    #[test]
+    #[ignore]
+    fn validate_shielded_end_to_end_live_prove() {
+        use halo2_proofs::pasta::EqAffine;
+        use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk};
+        use halo2_proofs::poly::commitment::Params;
+        use halo2_proofs::transcript::{Blake2bWrite, Challenge255};
+        use rand::rngs::OsRng;
+
+        // A satisfiable 1-in/1-out circuit with a matching tx fixture (fee 100 = 90 + 10).
+        let note = ShieldedNote { value: 100, owner_pk: [1u8; 32], rho: Fq::from(1), rcm: Fq::from(2) };
+        let spend_key = [0xABu8; 32];
+        let output_note = ShieldedNote { value: 90, owner_pk: [2u8; 32], rho: Fq::from(3), rcm: Fq::from(4) };
+        let fee: u64 = 10;
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        let (merkle_root, merkle_proof) = tree.append(&commit(&note));
+        let circuit = ActionCircuit::new(note.clone(), spend_key, merkle_proof, merkle_root, output_note.clone(), fee, DEFAULT_DEPTH);
+        let public_inputs = circuit.public_inputs();
+
+        // Prove it at K = 10 (must match the verifying key's width).
+        let params: Params<EqAffine> = Params::new(10);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk");
+        let pk = keygen_pk(&params, vk, &circuit).expect("keygen_pk");
+        let instances_owned = ShieldedVerifier::instances_for(&public_inputs);
+        let columns_per_proof: Vec<Vec<&[Fp]>> = instances_owned.iter().map(|cols| cols.iter().map(|c| c.as_slice()).collect::<Vec<&[Fp]>>()).collect();
+        let proofs: Vec<&[&[Fp]]> = columns_per_proof.iter().map(|cols| cols.as_slice()).collect();
+        let instances: &[&[&[Fp]]] = &proofs;
+        let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<EqAffine>>::init(Vec::new());
+        create_proof(&params, &pk, &[circuit.clone()], instances, &mut OsRng, &mut transcript).expect("create_proof on a satisfiable circuit");
+        let proof = transcript.finalize();
+
+        // Assemble the wire tx with the real proof and matching fee.
+        let tx = make_shielded_tx_with(proof, fee);
+
+        let spent = FakeNullifier { spent: vec![] };
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let env = make_env_with_defaults();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &roots, recency_window: 10 };
+
+        // (a) A real proof over a fresh nullifier and current root validates through
+        //     all four checks.
+        assert!(
+            matches!(ShieldedValidationSpec::new().validate_shielded(&tx, &env, &deps), Ok(_)),
+            "a real proof must validate through all four checks"
+        );
+
+        // (b) Flipping one proof byte makes check 4 reject — proving check 4 is
+        //     genuine, not vacuous.
+        let mut bad = tx.clone();
+        if let Some(last) = bad.proof.last_mut() {
+            *last ^= 0xff;
+        }
+        let bad_result = ShieldedValidationSpec::new().validate_shielded(&bad, &env, &deps);
+        assert!(reason_matches(&bad_result, ValidationFailureReason::InvalidShieldedProof),
+            "a tampered proof must be rejected as InvalidShieldedProof");
     }
 }
