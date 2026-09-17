@@ -1236,6 +1236,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pneumatic_prover"
+version = "0.1.0"
+dependencies = [
+ "ff",
+ "group",
+ "halo2_proofs",
+ "once_cell",
+ "pasta_curves",
+ "pneumatic_core",
+ "rand",
+ "sha2",
+]
+
+[[package]]
 name = "pneumatic_sentinel"
 version = "0.1.0"
 dependencies = [

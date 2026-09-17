@@ -371,27 +371,227 @@ NOT separate spend/output circuits (roadmap S2 recommendation).
   (proves the gate is load-bearing, not cosmetic).
 
 ### S3.3 — `pneumatic_prover` crate
-- **Files**: new workspace member `prover/` (`pneumatic_prover`); root
-  `Cargo.toml` `members`.
-- **Action**: Client-side crate (NOT a node crate — no network code):
-  - **Key model**: `SpendKey` (32 B, seed) → derives (a) spend auth keypair
-    (32 B pk/sk — the note's `owner_pk`; Ed25519 keys are fine here, this is
-    *value* authorization not node identity), (b) viewing key (32 B, can
-    decrypt, can't spend), (c) a *note-scoped* randomization scheme is NOT
-    needed beyond per-note `rho`.
-  - `create_note(value, recipient_spend_or_viewing_pk) -> (ShieldedNote,
-    ciphertexts)`, `build_shielded_tx(inputs: &[ShieldedNote], outputs:
-    &[NoteOutput], spend_keys, merkle_proofs, root) -> ShieldedTransaction`
-    (calls S2 proving; the roadmap's public API shape), `scan_for_notes(
-    ciphertexts, viewing_key) -> Vec<ShieldedNote>` (viewing-key
-    compliance/audit path, roadmap 2.6).
-  - Reuses `pneumatic_core` for S1 primitives — depends on `pneumatic_core`
-    the way the node crates do.
-- **Verify**: key derivation determinism (same seed → same keys);
-  build_shielded_tx on a two-in/two-out produces a tx whose S2.2
-  verification passes; viewing-key scan finds the note, spend-key scan
-  (wrong key) does not; discriminator: spending a note with the *wrong*
-  spend key → proof construction fails (Err, not a garbage tx).
+
+> Expanded client-side, **non-networked** crate below. It *produces* a
+> `ShieldedTransaction` (the wire type core defines at
+> `transactions.rs:362`) — it never sends anything and never changes the wire.
+> See "Wire-compat" — it is ground rule 4, unchanged.
+
+**Grounding — APIs S3.3 reuses (verified in-tree).**
+
+| Surface | Signature (verified) | Used for |
+|---|---|---|
+| `ShieldedNote` | `struct { value: u64, owner_pk: [u8;32], rho: Fq, rcm: Fq }` (`note.rs:44`) | the in-note model; `Fq` = Pallas scalar |
+| `commit` | `fn commit(note: &ShieldedNote) -> EpAffine` (`note.rs:99`) | input & output commitments |
+| `nullifier` | `fn nullifier(note: &ShieldedNote, spend_key: &[u8;32]) -> [u8;32]` (`note.rs:143`) | per-input nullifiers (pairwise distinct) |
+| `NotePlaintext` | `struct { value, memo, sender_pk_hint }` (`note.rs:158`) | decrypted viewing payload |
+| `encrypt_note_to_two` | `note.rs:214` | per-output ciphertexts (spend + viewing) |
+| `decrypt_note` | `note.rs:200` | viewing-key scan |
+| `ActionCircuit` | `new(note, spend_key:[u8;32], merkle_proof, merkle_root:Fp, output_note, fee:u64, tree_depth)` (`circuit.rs:308`); `public_inputs` (`:352`); `verify_merkle_path_off_circuit` (`:329`) | building/pre-validating the circuit instance |
+| `PublicInputs` | `struct { nullifier, commit_x, commit_y, merkle_root, output_commit_x, output_commit_y, fee: Fp }` (`circuit.rs:380`) | the circuit public-input vector |
+| `IncrementalMerkleTree` | `new`/`append`/`verify_proof` (`tree.rs`) | Merkle membership |
+| `bytes_to_root`/`root_to_bytes` | `bytes_to_root(&[u8;32]) -> Option<Fp>` (fallible) (`tree.rs:324`) | referenced root wire ↔ circuit type |
+| `MembershipProof` | `struct { index, siblings }` (`tree.rs:86`) | spend path (`circuit.rs:339`) |
+| `ShieldedTransaction` | `transactions.rs:362`; `canonical_bytes` `:399`; `hash` `:408`; `placeholder_transaction` `:421` | the value this crate returns |
+| `ShieldedVerifier` | `new` (`verify.rs:111`); `verify(proof, &PublicInputs)` (`:163`) | the crate's own correctness check (test only) |
+| Live-prove recipe | `Params::new(K)`; `keygen_pk`; `create_proof(...)` at `circuit_test.rs:327-371`; `K = 10` | how `build_shielded_tx` produces `proof: Vec<u8>` |
+
+**What S3.3 is / is not.** *In scope:* the spend/viewing key model, `create_note`,
+`build_shielded_tx`, `scan_for_notes`. *Out of scope:* no network code
+(roadmap 2.1 — the network only verifies, the client proves); no circuit design
+(`ActionCircuit` is built via core's `shielded::circuit`); no node-side
+verification (`ShieldedVerifier` lives in core and is called here only inside the
+`#[ignore]`d live-prove test); no wire change.
+
+**Dependencies + workspace mechanics.** Register `prover` as a new workspace
+member (root `Cargo.toml` `members`). `halo2_proofs`, `pasta_curves`, `ff`,
+`group`, `subtle` are **already production deps of `pneumatic_core`**
+(pinned: `halo2_proofs = "=0.3.5"`, `pasta_curves = "=0.5.2"`); `Cargo.lock`
+resolves each once. Pinning the prover's direct copies to the **same `=`-versions**
+and reusing `rand = "0.8"` (already in the tree) introduces **zero new
+lockfile packages** — same zero-delta philosophy the root `Cargo.toml` S1.2–S2.1
+comments use. Halo2 items are **not re-exported** by core, so the prover needs
+`halo2_proofs` + `pasta_curves` as **direct** deps to name `create_proof`,
+`Params`, `Blake2bWrite`, `Fq`/`Fp`.
+
+**Wire-compat note for S3.3 (ground rule 4).** S3.3 produces **no wire change.**
+`ShieldedTransaction` is core's (S3.1); the crate only constructs one. No new
+action strings, no `Transaction`/`SignedTransaction` field change
+(`SignedTransaction.shielded` additive field already exists, populated by the
+finalizer, S5.2, from the payload the client submits). The ~1–2 KB proof and
+~2.3 KB/note ciphertext (S1/S2 sizing) are already within the 16 MiB frame cap.
+Old nodes still fail closed on `"ShieldedTransfer"` (S3.2); the prover has no
+bearing on that path.
+
+**Key-model decision (the one real design point).**
+
+- **4a — value-auth key vs. node-identity key.** `owner_pk` (`note.rs:49`) is a
+  32-byte **value-authorization** key mixed into the Pedersen commitment; it is
+  *not* a node identity key and *not* the `Ed25519Provider` used for encryption
+  (`encrypt_note_to_two`, `note.rs:214`, encrypts to a provider's own hybrid
+  keys). `SpendKey::from_seed(seed: [u8;32])` derives deterministically:
+  `spend_secret` (the `spend_key` passed to `nullifier` + the circuit witness),
+  `owner_pk = sha256("pneumatic-shielded/v1/owner-pk" || spend_secret)[..32]`,
+  `viewing_key = sha256("pneumatic-shielded/v1/viewing-key" || seed)`. "Ed25519
+  keys are fine here" is honored by *allowing* the pair to be an Ed25519
+  `(SigningKey, VerifyingKey)`; the default derivation is kept because an
+  in-circuit Ed25519 verify is too expensive and the commitment only needs 32
+  bytes. The circuit's `owner_pk == H(spend_secret)` binding is **S2.1's**
+  in-circuit responsibility (flagged §Open items).
+- **4b — encryption recipient vs. `owner_pk`.** v1 bundles each recipient's
+  `owner_pk` with its `Ed25519Provider` into a `ShieldedIdentity`; `build_shielded_tx`
+  sets `output.note.owner_pk` from the identity and encrypts to its provider.
+  Who may hold viewing keys is **policy only** (parent plan Open Q #2); the
+  technical path supports both.
+- **4c — randomization is per-note only.** `rho`/`rcm` randomized per output at
+  `create_note`; no separate note-scoped scheme. Enforced/tested in S3.3.2.
+
+**Corrected vs. the compact bullet (load-bearing).**
+
+1. `scan_for_notes` returns `Vec<NotePlaintext>` **not** `Vec<ShieldedNote>`
+   (viewing keys only decrypt the plaintext — `rho`/`rcm` never reach them;
+   reconstructing a note would fabricate hidden randomness). Fail-closed:
+   a mismatched ciphertext `Err`s.
+2. The "one live prove" is gated `#[ignore]`, matching S1/S2/S5/S6 (roadmap Part
+   5 — proving is benchmark-only). Default suite tests every cheap property +
+   wire assembly from a canonical proof; the single `#[ignore]`d test runs the
+   real prove + `ShieldedVerifier::verify`.
+
+**Build items.** The recorded 663 baseline predates **+64 tests merged into the
+workspace** since it was written — live-measured now (all crates except the new
+`prover`): core 489, sentinel 57, node-server 30, committer 71, finalizer 55,
+executor 10, `pipeline_integration` 9, `transport_integration` 6 = **727**. So
+this phase tracks from the live `cargo test --workspace` baseline of **727**
+(the 663 figure is preserved in the plan's Context as the original snapshot;
+S3.3's own progression below is measured, not copied). Every `#[test]` below is
+counted, so the progression is **727 → 730 → 734 → 739(+1 ignored) → 741 →
+742(+1 ignored)**.
+
+#### S3.3.1 — Crate scaffolding + workspace member + `SpendKey` model
+
+- **Files**: root `Cargo.toml` (`members += "prover"`); `prover/Cargo.toml`;
+  `prover/src/lib.rs`; `prover/src/key.rs`.
+- **Action**: (1) register `prover` as a workspace member. (2)
+  `prover/Cargo.toml`: `package = "pneumatic_prover"`, `edition = "2021"`, deps
+  `pneumatic_core = { path = ".." }`, `halo2_proofs = "=0.3.5"`,
+  `pasta_curves = "=0.5.2"` (direct — name `Fq`/`Fp`), `rand = "0.8"`,
+  `once_cell = "1.21.3"`, `sha2 = "0.10"`, `serde`/`serde_json` (optional) — all
+  pinned to versions already resolved → zero new lockfile packages. (3) `key.rs`:
+  `SpendKey { seed }` with `from_seed`, `spend_secret()`, `owner_pk()`,
+  `viewing_key()`, and `ShieldedIdentity { spend: SpendKey, identity:
+  Ed25519Provider }` bundling the value-auth key with the encryption provider
+  (§4b). Derivation pinned in code comments.
+- **Verify**: `cargo check --workspace` clean (prover compiles against core).
+- **Done (discriminator + progression)**: `key_derivation_is_deterministic`
+  (same seed → same `spend_secret`/`owner_pk`/`viewing_key`); `changing_seed_changes_all_derived_values`
+  (discriminator: change the seed → all three change, proves seed-bound not
+  constant); `owner_pk_is_derivable_from_spend_secret` (recomputes
+  `owner_pk == H(spend_secret)` — the off-circuit contract the prover satisfies;
+  the in-circuit version is S2.1's). **+3 default: 727 → 730.**
+
+#### S3.3.2 — Note creation + ciphertexts (`create_note`)
+
+- **Files**: `prover/src/note_builder.rs`.
+- **Action**: `create_note(recipient: &ShieldedIdentity, value: u64) ->
+  (ShieldedNote, Vec<u8>)`: randomize `rho`/`rcm` with `rand` (never reused
+  within the tx), build `ShieldedNote`, `commit(&note)`, `encrypt_note_to_two`
+  the `NotePlaintext` to the spend + viewing providers; return the spend-side
+  ciphertext. Input notes are supplied wholesale by the spender; only re-
+  randomization applies when re-issuing.
+- **Verify**: commitment matches core's `commit`; ciphertext roundtrips.
+- **Done (discriminator + progression)**: `create_note_commitment_matches_core`
+  (output commitment == `pneumatic_core::shielded::commit(&note)` — proves core's
+  tree accepts it at S5.3 append); `create_note_randomizes_rho_and_rcm` (same
+  `value`+`owner_pk` → different `rho`/`rcm` → different commitments = unlinkable);
+  `note_ciphertext_roundtrip_spender_and_viewing`; `note_ciphertext_wrong_key_fails_closed`
+  (foreign provider → `Err`, never garbage — S1.5 discriminator). **+4 default:
+  730 → 734.**
+
+#### S3.3.3 — `build_shielded_tx` (wire assembly + prove)
+
+- **Files**: `prover/src/build.rs` (`ProvingKey` holder + `build_shielded_tx`,
+  `assemble_tx`), `prover/src/lib.rs`.
+- **Action**: `ProvingKey` — `once_cell` `Lazy` building `Params::new(10)` +
+  `keygen_pk` **once** (S2.1 recipe; keygen cost stays off the default test path).
+  `build_shielded_tx(inputs, spend_keys, merkle_proofs, root, outputs, recipients)
+  -> Result<ShieldedTransaction, PneumaticError>`, all fail-closed: pre-validate
+  every spend with `verify_merkle_path_off_circuit`; `root` via `bytes_to_root`
+  (`None` → `Err`); assemble `ActionCircuit` per input/output; derive nullifiers
+  via `nullifier`, assert pairwise distinct; derive output commitments via
+  `commit`; encrypt outputs (S3.3.2); `create_proof` → `proof`; populate
+  `ShieldedTransaction`. `assemble_tx` wires fields from a canonical proof buffer
+  (no live prove) so the assembly/hash/canonical-bytes properties run in the
+  default suite.
+- **Verify**: well-formed tx, hash-stable; single live-prove test proves+verifies.
+- **Done (discriminator + progression)**: `build_shielded_tx_wire_type_is_well_formed`
+  (2/2 → 2 nullifiers/commitments/ciphertexts, `action=="ShieldedTransfer"`,
+  `merkle_root` is LE(root), `hash()` stable across serde round-trip);
+  `build_shielded_tx_value_balance_off_circuit` (`sum(inputs) == sum(outputs)+fee`);
+  `build_shielded_tx_nullifier_is_spend_secret_bound` (`nullifier(note, wrong) !=
+  nullifier(note, spend)` — structural "wrong spend key" discriminator);
+  `merkle_path_off_circuit_accepts_and_rejects`. **[ignore]d live prove**
+  `build_shielded_tx_live_prove_verifies`: real `build_shielded_tx` → proof →
+  `ShieldedVerifier::verify` `Ok(())`; flip a nullifier → `Err` (fails closed).
+  **+5 default (+1 ignored): 734 → 739 (+1 ignored).**
+
+#### S3.3.4 — Viewing-key scan (`scan_for_notes`)
+
+- **Files**: `prover/src/scan.rs`.
+- **Action**: `scan_for_notes(ciphertexts, viewing_provider) ->
+  Result<Vec<NotePlaintext>, PneumaticError>` — decrypt each supplied ciphertext
+  with the viewing key; a non-matching ciphertext `Err`s (fail-closed). Returns
+  `NotePlaintext`s (§Correction #1).
+- **Verify**: a matching ciphertext decrypts to the right value; wrong viewer →
+  `Err`.
+- **Done (discriminator + progression)**: `scan_for_notes_returns_plaintext_not_note`
+  (asserts result is `NotePlaintext` and no `rho`/`rcm` are recoverable — primary
+  discriminator for the audit path); `scan_for_notes_wrong_viewing_key_rejected`.
+  **+2 default: 739 → 741.**
+
+#### S3.3.5 — Reuse verify API in the crate's test + integration seam
+
+- **Files**: `prover/src/build.rs` test module (`ShieldedVerifier` from core),
+  `prover/src/lib.rs` (re-exports).
+- **Action**: confirm the prover's proof shape is exactly what
+  `ShieldedVerifier` consumes — same `K=10`, same instance-column order
+  (`ShieldedVerifier::instances_for`: nullifier, commit_x, commit_y, merkle_root,
+  output_commit_x, output_commit_y, fee — `verify.rs:144`). Restate
+  `verify_instances_match_circuit_columns` as a prover-side invariant so a future
+  circuit change breaks the prover, not the network.
+- **Verify**: `ShieldedVerifier::instances_for(&prover_public_inputs)` equals
+  `ActionCircuit::public_inputs()` column order.
+- **Done (discriminator + progression)**: `prover_public_inputs_match_verifier_columns`.
+  **+1 default: 741 → 742 (+1 ignored).**
+
+**S3.3 verification (this phase).** `cargo check --workspace` clean (no
+lockfile growth); `cargo test --workspace` = **742 passed, +1 ignored** (live
+prove), up from the live-measured 727 baseline (the recorded 663 predates +64
+tests merged into the workspace since it was written); each increment names its
+discriminator. The
+single `#[ignore]`d live prove runs on demand:
+`cargo test -p pneumatic_prover -- --ignored`.
+
+**Risks.** (1) Live-prove cost — `build_shielded_tx` keys off a `Lazy` proving
+key; `keygen_pk` is expensive and must stay off the default test path (§S3.3.3
+item 3 / Correction #2); slow proving at `K=10` is the S6.4 finding to escalate,
+not silently compress here. (2) Halo2 hygiene — exact `=`-pins keep halo2 out of
+new lockfile entries; a `cargo update` bumping any of the 5 resolved Halo2/Pasta
+crates is an API-migration event (mirror `rns-*` `=`-pin in the root
+`Cargo.toml`).
+
+**Open items / flag to roadmap owner.** (1) **Per-output circuit vs. aggregate:**
+the S2.1 `ActionCircuit` (`circuit.rs`) is 1-in/1-out; a 2-in/2-out transfer
+needs either a wider circuit (an S2.1 circuit-design change, **not** S3.3) or a
+documented v1 cap (batch at the wallet layer). Recommend locking the v1
+nullifier/commitment cap here and tracking the general multi-output circuit as an
+S2.1 follow-up, as S4.1 field bounds / S2.1 circuit capacity imply. (2)
+**`owner_pk == H(spend_secret)` binding** is off-circuit here; the soundness of
+that binding is the Action circuit's (S2.1) — catch in the S2.1 circuit audit
+(parent plan Open Q #1), not closeable in S3.3. (3) **Viewing-key policy /
+recipient wiring (§4b):** v1 bundles each recipient's `owner_pk` with its
+`Ed25519Provider`; holding policy is tracked in Open Q #2. (4) **Proving benchmark
+(S6.4 gating):** the `#[ignore]`d live prove is the S6.4 probe — surface numbers
+at S6.4, do not ship S3.3 as the measured proving path.
 
 **S3 sub-total: ~32h.**
 
@@ -829,8 +1029,10 @@ decided here)
 ## Verification (whole-plan)
 
 - After **every item**: `cargo check --workspace` + `cargo test --workspace`
-  green, test count monotonically increasing from the 663 baseline, each
-  increment named with its discriminator in the AUDIT_CHECKLIST-format
+  green, test count monotonically increasing from the current live baseline
+  (727 — the recorded 663 in Context is the plan-writing snapshot; the workspace
+  has since gained +64 tests), each increment named with its discriminator in the
+  AUDIT_CHECKLIST-format
   "Done" note.
 - Phase gates: S1 done = primitives unit-tested, no live prove in default
   suite. S2 done = circuit + test vectors + stub-verifier unit tests green.

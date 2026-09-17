@@ -1,0 +1,30 @@
+[package]
+name = "pneumatic_prover"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Phase S3.3 — the client-side (non-networked) prover crate.
+#
+# pneumatic_core supplies the S1/S2 shielded primitives (note commitment,
+# nullifier, ActionCircuit, etc.); sha2 drives the deterministic SpendKey
+# derivation in src/key.rs. Additional deps (halo2_proofs, pasta_curves,
+# once_cell, rand) are added incrementally in later S3.3 sub-items. All versions
+# are pinned to those already resolved by pneumatic_core, so this crate adds
+# zero new packages to Cargo.lock.
+pneumatic_core = { path = ".." }
+sha2 = "0.10"
+# S3.3.2 — `rand` randomizes each output note's rho/rcm (unlinkable notes).
+# S3.3.3 — `halo2_proofs`/`pasta_curves`/`once_cell` drive the Halo2 proving key
+# and name the Fq/Fp field types on ShieldedNote / PublicInputs. All pinned to
+# versions pneumatic_core already resolves (zero new lockfile packages).
+rand = "0.8"
+pasta_curves = "=0.5.2"
+halo2_proofs = "=0.3.5"
+once_cell = "1.21.3"
+# S3.3.3 — `group` provides the `Affine` trait (`.to_bytes()` for the 32-byte
+# wire commitment); `ff` provides `Field` (`zero`/`one` on the Fq/Fp field types
+# on ShieldedNote / PublicInputs). All pinned to versions pneumatic_core already
+# resolves (zero new lockfile packages).
+group = "=0.13.0"
+ff = "=0.13.1"
