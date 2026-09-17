@@ -599,7 +599,7 @@ at S6.4, do not ship S3.3 as the measured proving path.
 
 ## Phase S4: Validation layer
 
-### S4.1 — `ShieldedValidationSpec`
+### S4.1 — `ShieldedValidationSpec` (DONE)
 - **Files**: `src/validation.rs` (additive), `src/errors.rs` (error
   variants — see Context).
 - **Action**: Implement `TransactionValidationSpec` (name `"Shielded"`):

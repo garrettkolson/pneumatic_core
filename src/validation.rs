@@ -1583,6 +1583,42 @@ mod tests {
             "with a fresh nullifier the tx reaches the proof check");
     }
 
+    /// S4.2.4 seam: S4.1's check-2 discriminator re-run against the *concrete*
+    /// `NullifierRegistry` (S4.1 ran it against `FakeNullifier`; this proves the
+    /// `NullifierMembership` impl lines up on the real type).
+    #[test]
+    fn check2_against_concrete_nullifier_registry_rejects_spent() {
+        use crate::registry::NullifierRegistry;
+        let tx = make_shielded_tx();
+        let registry = NullifierRegistry::new();
+        registry.try_mark_spent(tx.nullifiers[0]).unwrap();
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let deps = ShieldedValidationDeps { spent: &registry, roots: &roots, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::StaleNullifier),
+            "check 2 must fire StaleNullifier against the concrete registry"
+        );
+    }
+
+    /// S4.2.4 seam: with the concrete registry holding the nullifier as *fresh*,
+    /// the same tx must clear checks 1-3 and reach (and fail) the check-4 proof
+    /// check — the real registry neither rejects a fresh spend nor leaks the
+    /// placeholder proof earlier than S4.1's fake did.
+    #[test]
+    fn check2_against_concrete_registry_fresh_reaches_proof_check() {
+        use crate::registry::NullifierRegistry;
+        let tx = make_shielded_tx();
+        let registry = NullifierRegistry::new(); // fresh: nothing spent
+        let roots = FakeRootHistory { roots: vec![RootSnapshot { root: tx.merkle_root, height: 0 }] };
+        let deps = ShieldedValidationDeps { spent: &registry, roots: &roots, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "a fresh concrete registry must let the tx past check 2 to the proof check"
+        );
+    }
+
     #[test]
     fn root_freshness_accepts_within_window_and_rejects_beyond() {
         // S4.1.5 discriminator: the referenced root within the recency window passes

@@ -162,6 +162,83 @@ workspace (roadmap Part 5 — proving is benchmark-only).*
   0.6.4` / `getrandom 0.2` graph without any downgrade; the smallest possible delta (the +halo2-tree
   packages, all new) was applied.
 
+## Phase S4.2 — Spent-nullifier registry
+
+*Closes Phase-S4.2 of the Pneumatic Shielded Value Transfer (Tier 1) plan
+(`pneumatic-shielded-implementation-plan.md`), per `plans/S4.2-implementation-plan.md`:
+the consensus-critical, append-only spent-nullifier set (roadmap 2.5 — consensus-critical,
+append-only, durable, globally agreed) that S4.1's check-2 `NullifierMembership` interface was
+built to plug into. Ground rules carried into this phase: `cargo check --workspace` and full
+`cargo test --workspace` pass after **every** item; each item ships ≥1 discriminator test that
+fails without the fix; no wire-shape change without a wire-compat note; fail closed, never
+silent-accept.*
+
+- [x] **S4.2.1 `NullifierRegistry` + atomic `try_mark_spent`** — *done 2026-09-17*
+  Files: `src/registry.rs` (new `NullifierRegistry` — `DashMap<[u8; 32], ()>` — placed between
+  `PendingTransactionRegistry` and `TransactionSignatureRegistry`; `#[derive(Default)]` + `new()`;
+  `try_mark_spent` / `contains` / `len` / `is_empty`), `src/lib.rs` (re-export on the existing
+  `registry` line).
+  Action: the nullifier key is `[u8; 32]` — the output of `nullifier()`
+  (`src/shielded/note.rs:143`), the same wire type as `ShieldedTransaction.nullifiers`.
+  `try_mark_spent` uses the atomic `insert`-returns-old idiom (no prior `contains_key` check —
+  the same no-TOCTOU pattern as `add_transaction` and `used_nonces`); a double-mark returns
+  `Err(PneumaticError::Validation([StaleNullifier]))` — the exact reason shape S4.1 check 2
+  surfaces, **not** `Registry(String)`. The type doc carries the never-evicted contract: no
+  removal API of any kind, unbounded v1 growth (32 B/spend), persistence is S5.3's `ShieldedPool`.
+  Tests (+4): `try_mark_spent_first_mark_succeeds`; `try_mark_spent_double_mark_rejected_as_stale_nullifier`
+  (discriminator: asserts the *exact* `Validation([StaleNullifier])` variant — a `Registry(..)`
+  or multi-reason error fails it); `contains_reflects_state`; `len_and_is_empty_track_inserts`.
+  **Done:** workspace `760 → 764`, `0 failed` (core lib `507 → 511`); ignored unchanged (7).
+- [x] **S4.2.2 `mark_many_atomic` — all-or-nothing batch** — *done 2026-09-17*
+  Files: `src/registry.rs` (one new method on `NullifierRegistry`).
+  Action: two-phase because DashMap has no multi-key transaction — (1) check-all before touching
+  state, (2) insert-all tracking this call's own inserts; if a concurrent spender lands in the
+  gap, the colliding insert triggers a conditional rollback that removes **only** the keys this
+  call inserted in phase 2 and returns `StaleNullifier`. The doc carries the soundness argument:
+  exactness rests on the no-removal-API invariant — a key whose insert returned `None` was absent
+  pre-call, and the only code that can remove such a key is the failed call that inserted it, so
+  no other call's spend is ever undone. A duplicate within the batch self-collides in phase 2
+  (a nullifier cannot be spent twice, not even by one tx); empty batch is a no-op.
+  Tests (+5): `mark_many_atomic_all_fresh_marks_all`;
+  `mark_many_atomic_second_already_spent_marks_none` (the all-or-nothing discriminator: pre-mark
+  N2, batch `[N1, N2]` → `Err` and N1 **not** marked, `len == 1`);
+  `mark_many_atomic_first_already_spent_rejects_before_any_insert` (check-all runs before
+  insert-all); `mark_many_atomic_duplicate_within_batch_rejected` (phase-2 self-collision →
+  nothing marked, `len == 0`); `mark_many_atomic_empty_batch_is_noop`.
+  **Done:** workspace `764 → 769`, `0 failed` (core lib `511 → 516`).
+- [x] **S4.2.3 concurrency proofs** — *done 2026-09-17*
+  Files: `src/registry.rs` (test module only).
+  Tests (+3): `concurrent_try_mark_spent_same_nullifier_exactly_one_succeeds` (8 threads, one
+  nullifier → exactly 1 `Ok`, `len == 1`); `concurrent_mark_many_atomic_same_batch_one_succeeds_no_partial`
+  (8 threads, identical two-nullifier batch → exactly 1 `Ok`, whole batch applied, no partial
+  state); `concurrent_mark_many_atomic_mixed_unique_and_duplicates` (16 threads: 8 unique
+  single-nullifier batches + 8 duplicates over the same 8 → exactly 8 `Ok` / 8 `Err`,
+  `len == 8`).
+  **Done:** workspace `769 → 772`, `0 failed` (core lib `516 → 519`).
+- [x] **S4.2.4 S4.1 seam — `NullifierMembership` impl + concrete-registry checks** — *done 2026-09-17*
+  Files: `src/registry.rs` (`impl NullifierMembership for NullifierRegistry` delegating to
+  `contains`; top-level `use crate::validation::NullifierMembership` — no cycle, `validation`
+  references `registry` only inside its test module), `src/validation.rs` (test module only —
+  the S4.1 fixtures are private there).
+  Action: the spec's check 2 now has its intended real backer; `ShieldedValidationDeps::spent`
+  (`&'a dyn NullifierMembership`) is satisfied by the concrete registry via the same coercion the
+  S4.1 fakes used.
+  Tests (+2): `check2_against_concrete_nullifier_registry_rejects_spent` (the S4.1 check-2
+  discriminator re-run against the concrete registry — already-spent → `StaleNullifier`);
+  `check2_against_concrete_registry_fresh_reaches_proof_check` (fresh registry → clears checks
+  1-3 and reaches check 4 → `InvalidShieldedProof` on the placeholder proof, reusing S4.1's
+  shared `Lazy<ShieldedVerifier>` — no new cost class, not `#[ignore]`d).
+  **Done:** workspace `772 → 774`, `0 failed` (core lib `519 → 521`); ignored unchanged (7:
+  core 5, prover 1, sentinel doc-test 1).
+  **Wire-compat (ground rule 4):** *no wire-message shape changed.* `SignedTransaction.shielded`
+  and every `ShieldedTransaction` field are untouched; this item adds an in-memory registry type
+  (plus one re-export) that no wire path serializes. Zero new dependencies — `DashMap` and
+  `serde` are existing production deps.
+  **Scope note:** in-memory only by design — persistence, the single-writer guard, and rollback
+  semantics are S5.3's `ShieldedPool`; the roadmap 2.5 "never evicted" contract is enforced by
+  the absence of any removal API on this type. S6.3 scales the S4.2.3 races up to 50 threads;
+  S6.2 asserts the exact named errors.
+
 ## Phase 1 — Wire integrity: sign, verify, dedup correctly
 *Closes: C1, C4, C7, L1. This is the highest-leverage phase — it makes the wire path actually
 work and removes forgeable identity from the consensus path.*

@@ -16,7 +16,7 @@ pub mod blocks;
 pub mod transactions;
 pub mod validation;
 pub mod registry;
-pub use registry::{PendingAdminCredit, PendingTransactionRegistry};
+pub use registry::{NullifierRegistry, PendingAdminCredit, PendingTransactionRegistry};
 pub mod epoch;
 pub use epoch::deterministic_select;
 pub use epoch::deterministic_select_shard;
