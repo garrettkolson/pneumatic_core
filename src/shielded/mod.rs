@@ -52,6 +52,12 @@ pub use tree::{
     bytes_to_root, root_to_bytes, IncrementalMerkleTree, MembershipProof, TreeState, DEFAULT_DEPTH,
 };
 
+// Phase S4.3 — bounded committed-root history: the concrete `MerkleRootHistory`
+// (validation.rs:413) that check 3's `is_root_fresh` reads. The trait impl
+// lands in S4.3.3 alongside the concrete-type discriminator re-run.
+mod roots;
+pub use roots::MerkleRootState;
+
 mod circuit;
 pub use circuit::{ActionCircuit, PublicInputs};
 

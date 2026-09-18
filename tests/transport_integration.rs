@@ -130,6 +130,7 @@ fn make_test_config() -> Config {
         serialization_provider: "rmp-serde".to_string(),
         shard_count: 1,
         shard_quorum_percentage: 67.0,
+        shielded_root_recency: 10,
     };
     let mut env_map = dashmap::DashMap::new();
     env_map.insert("test".to_string(), env_metadata);
@@ -193,6 +194,7 @@ fn make_config_with_env() -> Config {
         serialization_provider: "rmp-serde".to_string(),
         shard_count: 1,
         shard_quorum_percentage: 67.0,
+        shielded_root_recency: 10,
     };
     let mut env_map = dashmap::DashMap::new();
     env_map.insert("test".to_string(), env_metadata);

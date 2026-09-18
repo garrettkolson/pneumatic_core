@@ -158,6 +158,10 @@ pub struct EnvironmentMetadata {
     /// Quorum percentage within a shard (e.g. 67.0 = 2/3).
     /// Used by the signature collector when accumulating stake.
     pub shard_quorum_percentage: f32,
+    /// Number of shielded pool state snapshots (Merkle roots) retained for
+    /// the root-freshness check: a note's `merkle_root` must be one of the
+    /// most recent `K` committed pool states, older roots are stale.
+    pub shielded_root_recency: usize,
 }
 
 impl EnvironmentMetadata {
@@ -266,6 +270,7 @@ impl EnvironmentMetadata {
             logger,
             shard_count: spec.shard_count,
             shard_quorum_percentage: spec.shard_quorum_percentage,
+            shielded_root_recency: spec.shielded_root_recency,
         })
     }
 }
@@ -293,10 +298,15 @@ pub struct EnvironmentMetadataSpec {
     /// Quorum percentage within a shard. Default 67.0 (2/3).
     #[serde(default = "default_shard_quorum_percentage")]
     pub shard_quorum_percentage: f32,
+    /// Number of shielded pool state snapshots (Merkle roots) retained for
+    /// the root-freshness check. Default 10.
+    #[serde(default = "default_shielded_root_recency")]
+    pub shielded_root_recency: usize,
 }
 
 fn default_shard_count() -> u32 { 1 }
 fn default_shard_quorum_percentage() -> f32 { 67.0 }
+fn default_shielded_root_recency() -> usize { 10 }
 
 impl EnvironmentMetadataSpec {
     /// Validate the protocol-relevant numeric fields of an environment spec
@@ -448,6 +458,24 @@ mod tests {
     fn spec_validate_accepts_valid_defaults() {
         let value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
         assert!(parse(value).validate().is_ok());
+    }
+
+    // --- Phase S4.3: shielded_root_recency consensus parameter ---
+
+    #[test]
+    fn env_spec_shielded_root_recency_defaults_to_ten() {
+        // A spec that omits the key picks up the documented default (10)
+        // rather than failing to deserialize.
+        let value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        assert_eq!(parse(value).shielded_root_recency, 10);
+    }
+
+    #[test]
+    fn env_spec_shielded_root_recency_roundtrips() {
+        // An explicit non-default value must survive parsing.
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["shielded_root_recency"] = json!(25);
+        assert_eq!(parse(value).shielded_root_recency, 25);
     }
 
     #[test]

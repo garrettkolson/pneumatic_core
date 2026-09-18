@@ -633,7 +633,7 @@ at S6.4, do not ship S3.3 as the measured proving path.
   discriminator per check: e.g., pre-insert the nullifier into the set →
   `StaleNullifier` (proves check 2 runs, not just check 4).
 
-### S4.2 — Nullifier-set registry
+### S4.2 — Nullifier-set registry (DONE)
 - **Files**: `src/registry.rs` (new struct alongside `PendingTransactionRegistry`).
 - **Action**: `NullifierRegistry` — DashMap-based, mirroring the
   `PendingTransactionRegistry` conventions (every method `Result`, atomic
@@ -654,7 +654,7 @@ at S6.4, do not ship S3.3 as the measured proving path.
   exactly 1 success — mirrors `concurrent_add_signature_same_executor_one_
   succeeds`).
 
-### S4.3 — Merkle-root freshness
+### S4.3 — Merkle-root freshness (DONE)
 - **Files**: `src/shielded/` (root state), `src/validation.rs` (the check).
 - **Action**: The pool root only advances as commitments land in committed
   blocks (S5.3). A shielded tx references the root it was proved against.
@@ -666,7 +666,8 @@ at S6.4, do not ship S3.3 as the measured proving path.
   K+1 back rejected; discriminator: set K=0 in a test → the K-1 case now
   rejects (proves the window logic, not just equality).
 
-**S4 sub-total: ~28h.**
+**S4 sub-total: ~30h live-measured** (S4.1 ~20h + S4.2 ~6h + S4.3 ~4h; original
+estimate ~28h, re-baselined at S4.3 close per `plans/S4.3-implementation-plan.md`).
 
 ---
 

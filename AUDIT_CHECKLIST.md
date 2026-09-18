@@ -239,6 +239,105 @@ silent-accept.*
   the absence of any removal API on this type. S6.3 scales the S4.2.3 races up to 50 threads;
   S6.2 asserts the exact named errors.
 
+## Phase S4.3 — Merkle-root history (concrete check 3)
+
+*Closes Phase-S4.3 of the Pneumatic Shielded Value Transfer (Tier 1) plan
+(`pneumatic-shielded-implementation-plan.md`), per `plans/S4.3-implementation-plan.md`:
+the concrete `MerkleRootHistory` (S4.1, `validation.rs:413`) for check 3's `is_root_fresh` —
+a bounded, append-only committed-root history with a genesis seed, a `shielded_root_recency`
+consensus parameter, and the S4.1 check-3 discriminators re-run on the real type. Ground rules
+carried into this phase: `cargo check --workspace` and full `cargo test --workspace` pass after
+**every** item; each item ships ≥1 discriminator test that fails without the fix; no wire-shape
+change without a wire-compat note; fail closed, never silent-accept.*
+
+- [x] **S4.3.1 `MerkleRootState` — the bounded committed-root history** — *done 2026-09-17*
+  Files: `src/shielded/roots.rs` (new), `src/shielded/mod.rs` (`mod roots;` + re-export).
+  Action: `MerkleRootState { window, next_height, roots: Vec<RootSnapshot> }` — `new(k)` seeds
+  the genesis pool state (`root_to_bytes(&Fp::zero())` at height 0; Decision 2); `push(root)`
+  appends the tip at a monotonic sequence height and prunes to the newest `window + 1` entries
+  (Decision 1 — bounded retention, the Phase 3.4 orphan-buffer pattern); heights come from the
+  `next_height` counter, **not** `roots.len()` (once the first prune lands the retained length
+  is constant while the sequence keeps advancing — a live bug caught and fixed by this item's
+  prune test); `current_root()` / `recency_window()` / `len()` / `is_empty()`. No rewind / trim
+  API of any kind (S5.3 boundary, Decision 5 — the in-memory read-side view only).
+  Tests (+5): `merkle_root_state_new_seeds_genesis_pool_state`;
+  `merkle_root_state_push_advances_height_and_current_root`;
+  `merkle_root_state_prunes_to_window_plus_one` (window 2, 5 pushes → exactly heights 3,4,5
+  retained — the discriminator that exposed the `len()`-derived-height bug);
+  `merkle_root_state_history_oldest_to_newest` (strictly ascending heights, last = tip — the
+  trait's order contract); `merkle_root_state_is_send_sync` (S5.3's Arc-sharing contract).
+  **Done:** workspace `774 → 779`, `0 failed` (core lib `521 → 526`); ignored unchanged (8).
+- [x] **S4.3.2 `shielded_root_recency` consensus parameter** — *done 2026-09-17*
+  Files: `src/environment.rs` (field on `EnvironmentMetadataSpec` with
+  `#[serde(default = "default_shielded_root_recency")]` → 10; field on `EnvironmentMetadata`;
+  copy in `load_from_spec`; default fn), `sentinel/src/transaction_notifier.rs` and
+  `tests/transport_integration.rs` (×2) — the three test-only `EnvironmentMetadata`
+  struct-literal sites; the other five test fixtures (sentinel ×2, committer, tokens,
+  action_router) are JSON-based `EnvironmentMetadataSpec`s and pick up the serde default
+  without edits.
+  Action: K is a consensus parameter (Decision 3 — every node runs the same K, which is what
+  makes the bounded retention safe); `validate()` deliberately untouched (any window ≥ 0 is
+  well-typed; the range policy stays S5.3's).
+  Tests (+2): `env_spec_shielded_root_recency_defaults_to_ten` (key absent → 10, no
+  deserialization failure); `env_spec_shielded_root_recency_roundtrips` (key = 25 → 25).
+  **Done:** workspace `779 → 781`, `0 failed` (core lib `526 → 528`); ignored unchanged (8).
+- [x] **S4.3.3 `impl MerkleRootHistory for MerkleRootState` + check-3 discriminators re-run** —
+  *done 2026-09-17*
+  Files: `src/shielded/roots.rs` (the one-method impl — `root_history` returns `&self.roots`,
+  oldest→newest, last = tip; closes the S4.1 seam), `src/validation.rs` (**test module only** —
+  no production change to the spec, Decision 4; the S4.1 fakes stay in place pinning the window
+  arithmetic on a full-history view).
+  Action: the seam is provably load-bearing (S4.2.4 style): all eight tests below fail to
+  compile without the impl. Each re-runs the parent item's verify list on the concrete state
+  with the S4.2.4 pattern — a fresh real `NullifierRegistry` as `deps.spent` (check 2 passes),
+  inline `ShieldedValidationDeps` (the `run_shielded` helper is typed to the fakes), and dummy
+  post-roots as canonical `Fp::from(tag)` bytes (check 3 compares raw bytes; the dummies must
+  merely decode). Accept side reaches check 4 — `InvalidShieldedProof` on the placeholder
+  proof is the "passed check 3" signal; reject side is the exact `StaleMerkleRoot` variant.
+  Tests (+8): `check3_concrete_root_state_current_root_accepted` (tip distance 0 → check 4);
+  `check3_concrete_root_state_k_minus_1_back_accepted` (distance 9 = K−1 → accepted);
+  `check3_concrete_root_state_at_window_boundary_accepted` (distance **exactly K**, the root
+  still retained at capacity 11 — the `<=` boundary discriminator: an `<` implementation
+  (validation.rs:522) fails exactly this test);
+  `check3_concrete_root_state_k_plus_1_back_rejected` (distance K+1 → the 12th entry prunes
+  the referenced root → `StaleMerkleRoot`; per Decision 1, on a bounded state "beyond window"
+  and "not found" are the same event — the assertion is the parent's, the mechanism is the
+  prune); `check3_concrete_root_state_window_zero_rejects_one_back` (**the parent item's
+  headline discriminator**: K=0 → a root one commit back that **is in the committed history**
+  is rejected purely because the window shrank — window logic, not equality);
+  `check3_concrete_root_state_window_zero_accepts_exact_tip` (K=0 accepts the exact tip —
+  pins "K=0 = exact tip only" from both sides); `check3_concrete_root_state_unknown_root_rejected`
+  (valid field element, never committed → `StaleMerkleRoot` — fail-closed on *unknown*,
+  distinct from *stale*; a "accept if it looks like a valid field element" implementation
+  fails here); `check3_concrete_root_state_pruned_root_rejected` (window 2: push the tx root
+  then 3 dummies → pruned → `StaleMerkleRoot` **and** `state.len() == 3` in the same test —
+  retention bound and rejection consequence asserted together at the validation boundary).
+  **Done:** workspace `781 → 789`, `0 failed` (core lib `528 → 536`); ignored unchanged (8).
+  The accept-side tests reach check 4 and reuse S4.1's module-level `Lazy<ShieldedVerifier>`
+  (keygen ~60–100 s, once per test binary, already paid by S4.1's tests — no new cost class,
+  no `#[ignore]` gate).
+- [x] **S4.3.4 Genesis bootstrap — the first transfer on a fresh network** — *done 2026-09-17*
+  Files: `src/validation.rs` (test module only).
+  Test (+1): `genesis_pool_state_accepts_first_transfer` (a tx with
+  `merkle_root = [0u8; 32]` — the empty pool's root, what a wallet proves against before any
+  commitment has landed — run against a **fresh** `MerkleRootState::new(10)` with zero pushes
+  and a fresh `NullifierRegistry` → passes check 3, reaches check 4 → `InvalidShieldedProof`;
+  no bootstrap deadlock).
+  **Discriminator:** constructing the state without the genesis seed (the one-line revert of
+  Decision 2) is empty, so `is_root_fresh` takes the empty-history arm and this test becomes
+  `StaleMerkleRoot` — the seed is proven necessary, not cosmetic.
+  **Done:** workspace `789 → 790`, `0 failed` (core lib `536 → 537`); ignored unchanged (8).
+  **Wire-compat (ground rule 4):** *no wire-message shape changed of any kind.* No new action
+  string, payload schema, or message; no field added to `Transaction` / `SignedTransaction` /
+  `ShieldedTransaction` — the referenced root already rides the wire as
+  `ShieldedTransaction.merkle_root` (S3.1); the root history is not gossiped (replicated by
+  block-history replay — a derived, bounded view). The only additive surface is the
+  serde-defaulted `shielded_root_recency` key (default 10) in the node-local environment spec
+  JSON. Zero new dependencies.
+  **Scope note:** in-memory read-side structure only — persistence, the single-writer guard,
+  the rebuild-at-boot from the applied-update map, and the tip-rollback interaction are S5.3's
+  `ShieldedPool` (Decision 5), which fails closed on `current_root() != tree.root()`.
+
 ## Phase 1 — Wire integrity: sign, verify, dedup correctly
 *Closes: C1, C4, C7, L1. This is the highest-leverage phase — it makes the wire path actually
 work and removes forgeable identity from the consensus path.*

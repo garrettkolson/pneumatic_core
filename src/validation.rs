@@ -1645,6 +1645,226 @@ mod tests {
             "a root beyond the window must be rejected as stale");
     }
 
+    // -----------------------------------------------------------------------
+    // Phase S4.3 — S4.1's check-3 discriminators re-run against the concrete
+    // `MerkleRootState` (S4.3.3). The real `NullifierRegistry` backs
+    // `deps.spent` (fresh, so check 2 passes) and deps are built inline:
+    // the `run_shielded` helper above is typed to the S4.1 fakes, which stay
+    // in place to pin the window arithmetic on a full-history view.
+    // -----------------------------------------------------------------------
+
+    use crate::shielded::MerkleRootState;
+    use pasta_curves::pallas::Base as Fp;
+
+    /// Distinct, decodable dummy pool roots: `Fp::from(tag)` in canonical
+    /// form, so `public_inputs_from_shielded_tx` decodes them. Check 3
+    /// compares raw bytes, so the dummies never need to correspond to a
+    /// real tree (they must, however, be valid field elements).
+    fn dummy_root(tag: u64) -> [u8; 32] {
+        Fp::from(tag).to_repr()
+    }
+
+    /// S4.3.3 seam: S4.1's "current root accepted" on the concrete type.
+    /// State = genesis + one push of the tx's own root (tip, distance 0) →
+    /// passes check 3, reaches check 4. The whole set fails to compile
+    /// without the `impl MerkleRootHistory` — the seam is provably
+    /// load-bearing (S4.2.4 style).
+    #[test]
+    fn check3_concrete_root_state_current_root_accepted() {
+        use crate::registry::NullifierRegistry;
+        let tx = make_shielded_tx();
+        let mut state = MerkleRootState::new(10);
+        state.push(tx.merkle_root); // tip = the root the tx references
+        let spent = NullifierRegistry::new(); // fresh: check 2 passes
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "the current tip root must pass check 3 and reach the proof check"
+        );
+    }
+
+    /// S4.3.3 seam: the parent's "root from K-1 states back accepted", exact.
+    /// The tx references the genesis root (height 0); 9 dummy pushes put the
+    /// tip at height 9 → distance 9 = K-1 ≤ 10 → accepted, reaches check 4.
+    #[test]
+    fn check3_concrete_root_state_k_minus_1_back_accepted() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32]; // the genesis zero root = the height-0 snapshot
+        let mut state = MerkleRootState::new(10);
+        for i in 1..=9u64 {
+            state.push(dummy_root(i)); // tip at height 9
+        }
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "a root K-1 commits behind the tip must pass check 3"
+        );
+    }
+
+    /// S4.3.3 seam: the boundary discriminator. 10 dummy pushes → tip at
+    /// height 10, distance EXACTLY K. The root is still retained (capacity
+    /// window+1 = 11, nothing pruned), so the acceptance is decided purely
+    /// by the `<=` in `is_root_fresh` (validation.rs:522): an
+    /// implementation with `<` fails exactly this test. Together with
+    /// S4.1.5's fake test above (which pins the reject side of the same
+    /// comparison on a full history), the window math is pinned on both
+    /// sides.
+    #[test]
+    fn check3_concrete_root_state_at_window_boundary_accepted() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32];
+        let mut state = MerkleRootState::new(10);
+        for i in 1..=10u64 {
+            state.push(dummy_root(i)); // tip at height 10
+        }
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "a root exactly K commits behind the tip must pass check 3 (<=, not <)"
+        );
+    }
+
+    /// S4.3.3 seam: the parent's "K+1 back rejected". 11 dummy pushes →
+    /// the 12th entry prunes the height-0 genesis root out → the referenced
+    /// root is absent. Per Decision 1, on the bounded state "beyond the
+    /// window" and "not found" are the same event; the assertion is the
+    /// parent's, the mechanism is the prune.
+    #[test]
+    fn check3_concrete_root_state_k_plus_1_back_rejected() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32];
+        let mut state = MerkleRootState::new(10);
+        for i in 1..=11u64 {
+            state.push(dummy_root(i)); // tip at height 11, genesis root pruned
+        }
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::StaleMerkleRoot),
+            "a root K+1 commits behind the tip (pruned from the bounded state) must be rejected stale"
+        );
+    }
+
+    /// S4.3.3 seam: the parent item's headline discriminator, verbatim
+    /// intent — "set K=0 in a test → the K-1 case now rejects (proves the
+    /// window logic, not just equality)". The tx root (the genesis seed)
+    /// WAS committed and IS in the history; it is rejected purely because
+    /// the window shrank to 0. Containment/`==` logic alone cannot explain
+    /// the outcome.
+    #[test]
+    fn check3_concrete_root_state_window_zero_rejects_one_back() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32];
+        let mut state = MerkleRootState::new(0);
+        state.push(dummy_root(1)); // tip at height 1 → the genesis root is 1 back
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 0 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::StaleMerkleRoot),
+            "K=0 must reject a root even when it is in the committed history (window logic, not equality)"
+        );
+    }
+
+    /// S4.3.3 seam: the accept half of K=0. No pushes — the genesis zero
+    /// root IS the tip (distance 0 ≤ 0) → passes check 3, reaches check 4.
+    /// Together with the previous test, pins "K=0 means exact tip only"
+    /// from both sides.
+    #[test]
+    fn check3_concrete_root_state_window_zero_accepts_exact_tip() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32];
+        let state = MerkleRootState::new(0); // genesis seed is the tip
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 0 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "K=0 must accept the exact tip"
+        );
+    }
+
+    /// S4.3.3 seam: fail-closed on *unknown*, distinct from *stale*. The
+    /// tx references a root that is a perfectly valid field element but was
+    /// never committed — check 3 must reject it (a "accept if it looks
+    /// like a valid field element" implementation fails here).
+    #[test]
+    fn check3_concrete_root_state_unknown_root_rejected() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = dummy_root(999); // decodable, never committed
+        let mut state = MerkleRootState::new(10);
+        state.push(dummy_root(1));
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::StaleMerkleRoot),
+            "a never-committed (unknown) root must be rejected, not silently accepted"
+        );
+    }
+
+    /// S4.3.3 seam: the boundedness assertion seen through the spec.
+    /// Window 2: push the tx root, then 3 dummies → the retained 3 entries
+    /// drop the tx root → `StaleMerkleRoot`, AND `state.len() == 3` in the
+    /// same test — the retention bound and its rejection consequence are
+    /// asserted together, so the orphan-buffer analogy is proven at the
+    /// validation boundary, not just at the type.
+    #[test]
+    fn check3_concrete_root_state_pruned_root_rejected() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = dummy_root(1); // the tx root, committed at height 1
+        let mut state = MerkleRootState::new(2);
+        state.push(tx.merkle_root);
+        state.push(dummy_root(2));
+        state.push(dummy_root(3));
+        state.push(dummy_root(4)); // retained: heights 2,3,4 — tx root gone
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 2 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::StaleMerkleRoot),
+            "a root pruned from the bounded history must be rejected stale"
+        );
+        assert_eq!(state.len(), 3, "retention stays bounded to window + 1");
+    }
+
+    /// S4.3.4 — Decision 2's property end-to-end: the first transfer on a
+    /// fresh network. The tx references the empty pool's root (`[0u8; 32]`,
+    /// the genesis seed) and the state is `new(10)` with zero pushes — the
+    /// genesis snapshot alone must satisfy check 3.
+    ///
+    /// **Discriminator:** a state constructed *without* the genesis seed
+    /// (the one-line revert of Decision 2) is empty, so `is_root_fresh`
+    /// takes the empty-history arm and this becomes `StaleMerkleRoot` —
+    /// the seed is proven necessary, not cosmetic. No bootstrap deadlock.
+    #[test]
+    fn genesis_pool_state_accepts_first_transfer() {
+        use crate::registry::NullifierRegistry;
+        let mut tx = make_shielded_tx();
+        tx.merkle_root = [0u8; 32]; // the empty pool root a wallet proves against pre-commits
+        let state = MerkleRootState::new(10); // fresh network: genesis seed only, no pushes
+        let spent = NullifierRegistry::new();
+        let deps = ShieldedValidationDeps { spent: &spent, roots: &state, recency_window: 10 };
+        let result = ShieldedValidationSpec::new().validate_shielded(&tx, &make_env_with_defaults(), &deps);
+        assert!(
+            reason_matches(&result, ValidationFailureReason::InvalidShieldedProof),
+            "the first transfer (referencing the genesis pool root) must pass check 3 and reach the proof check"
+        );
+    }
+
     #[test]
     fn validator_verifier_is_built_at_k10() {
         // S4.1.4 discriminator: the verifying key must be built at K=10 to match the

@@ -362,6 +362,7 @@ mod tests {
             serialization_provider: "rmp-serde".to_string(),
             shard_count: 1,
             shard_quorum_percentage: 67.0,
+            shielded_root_recency: 10,
         }
     }
 
