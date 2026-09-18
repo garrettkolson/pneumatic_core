@@ -166,6 +166,11 @@ pub enum ValidationFailureReason {
     /// (S4.1 check 4). Surfaces a failed Halo2 `verify_proof` distinctly from a
     /// generic crypto error.
     InvalidShieldedProof,
+    /// A shielded transfer was submitted for a token that has not opted in to
+    /// shielded transfers (Sentinel admission step 3, Phase S5.1): the token's
+    /// metadata lacks `shielded_opt_in = "true"`. Fired by the Sentinel, not the
+    /// advisory spec.
+    NotShieldedOptIn,
     /// Reserved (S5.3): a nullifier whose note has no corresponding tree leaf.
     /// The proof already binds nullifier↔note-membership, so the advisory spec
     /// does not fire this.
@@ -321,6 +326,33 @@ mod tests {
         let err = PneumaticError::Resource("no established link".to_string());
         assert!(err.to_string().contains("Resource"));
         assert!(err.to_string().contains("no established link"));
+    }
+
+    // --- Shielded failure reasons — additive serde-tagged variants (Phase S5.1.3) ---
+
+    /// `NotShieldedOptIn` round-trips through the serde wire form: encoding the
+    /// new variant and decoding it back yields exactly that variant. This is
+    /// the additive property S4.1's wire note established for the shielded
+    /// block (new→new decoders are safe; new→old decoders fail closed at the
+    /// unknown-variant gate) — and it pins the variant's existence in the
+    /// enum.
+    #[test]
+    fn validation_failure_reason_not_shielded_opt_in_roundtrips() {
+        let reason = ValidationFailureReason::NotShieldedOptIn;
+
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&reason)
+            .expect("NotShieldedOptIn must serialize");
+        let decoded: ValidationFailureReason =
+            crate::encoding::deserialize_rmp_to(&bytes).expect("must decode back");
+        assert_eq!(decoded, ValidationFailureReason::NotShieldedOptIn);
+
+        // JSON form round-trips identically (both wire encodings are
+        // serde-tagged by variant name).
+        let json = crate::encoding::serialize_to_bytes_json(&reason)
+            .expect("NotShieldedOptIn must serialize (json)");
+        let decoded_json: ValidationFailureReason =
+            crate::encoding::deserialize_json_to(&json).expect("must decode back (json)");
+        assert_eq!(decoded_json, ValidationFailureReason::NotShieldedOptIn);
     }
 
     #[test]

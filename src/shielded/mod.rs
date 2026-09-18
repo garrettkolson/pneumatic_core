@@ -58,6 +58,12 @@ pub use tree::{
 mod roots;
 pub use roots::MerkleRootState;
 
+// Phase S5.1 — the read-only shielded-pool seam the shielded roles validate
+// against (S4.1's promise at validation.rs:418-421). S5.4 swaps the one
+// construction site for the real `Arc<ShieldedPool>`; the roles never change.
+mod pool_view;
+pub use pool_view::{ShieldedPoolView, SimpleShieldedPoolView};
+
 mod circuit;
 pub use circuit::{ActionCircuit, PublicInputs};
 

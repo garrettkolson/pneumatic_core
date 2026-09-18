@@ -9,7 +9,7 @@ use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::node::registry::NodeRegistry;
-use pneumatic_core::transactions::Transaction;
+use pneumatic_core::transactions::{ShieldedTransaction, Transaction};
 
 /// Handles all outbound message sending from the Sentinel to other node types.
 /// Packages transactions and commands into the proper `Message` wire format.
@@ -96,6 +96,38 @@ impl TransactionNotifier {
         let msg = Message::signed(
             env.token_partition_id.clone(),
             "Preload",
+            body,
+            None,
+            &self.config.identity,
+        )?;
+
+        let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
+        self.send_to_nodes(NodeRegistryType::Finalizer, payload)
+    }
+
+    /// Notify the assigned Finalizers of an admitted shielded transfer so one
+    /// can sign it (Phase S5.1; the finalizer's own path is S5.2).
+    ///
+    /// Mirrors `send_to_finalizer_for_preload` — same envelope, same
+    /// sender-identity signing discipline, same fail-closed `NoTarget`. The
+    /// two differences: the body is the shielded tx's **canonical bytes**
+    /// (the S3.1 binding surface — the finalizer in S5.2 signs
+    /// `stx.hash()` over exactly these bytes, so its signature binds to what
+    /// the sentinel validated and registered) and the action is
+    /// `"SignShielded"` (already in `FINALIZER_ACTIONS` — no dispatcher
+    /// change).
+    pub fn send_sign_shielded(
+        &self,
+        stx: &ShieldedTransaction,
+        finalizer_key: &[u8],
+        env: &EnvironmentMetadata,
+    ) -> Result<(), NotifyError> {
+        let body = stx.canonical_bytes()?;
+        // Sign with our own identity — the receiver verifies against the
+        // sender's registered key, never the destination's.
+        let msg = Message::signed(
+            env.token_partition_id.clone(),
+            "SignShielded",
             body,
             None,
             &self.config.identity,
@@ -406,6 +438,62 @@ mod tests {
             deserialize_rmp_to(&raw).expect("captured payload should be a Message");
         assert_eq!(message.action, "Clear");
         assert_signed_by(&message, &identity);
+    }
+
+    fn make_test_shielded_tx() -> ShieldedTransaction {
+        ShieldedTransaction {
+            id: "shd_001".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: vec![1, 2, 3],
+            spent_commitments: vec![[6u8; 32]],
+            nullifiers: vec![[1u8; 32]],
+            commitments: vec![[3u8; 32]],
+            merkle_root: [5u8; 32],
+            proof: vec![9, 8, 7, 6],
+            note_ciphertexts: vec![vec![10u8; 64]],
+            fee: 0,
+        }
+    }
+
+    #[test]
+    fn sign_shielded_signed_with_sender_not_destination() {
+        let (notifier, identity, registry) = make_notifier();
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        // The finalizer peer's registered key — the pre-1.1 bug put this
+        // destination key into the signature field instead of a signature.
+        let finalizer_key = vec![0xAB; 32];
+        assert!(registry.register_peer(
+            finalizer_key.clone(),
+            [8u8; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConnection { recorder: recorder.clone() }),
+        ));
+
+        notifier
+            .send_sign_shielded(&make_test_shielded_tx(), &finalizer_key, &make_test_env())
+            .expect("send should succeed");
+
+        assert!(
+            poll_recorder(&recorder, 1),
+            "SignShielded message should reach the finalizer peer"
+        );
+        let raw = recorder.lock().unwrap()[0].clone();
+        let message: Message =
+            deserialize_rmp_to(&raw).expect("captured payload should be a Message");
+        assert_eq!(message.action, "SignShielded");
+
+        // Must verify under the sender (sentinel) identity...
+        assert_signed_by(&message, &identity);
+
+        // ...and never under the destination's key.
+        let verifier = Ed25519Provider::generate();
+        let under_destination = verifier
+            .check_signature(&message.signature, &finalizer_key, &message.body)
+            .unwrap_or(false);
+        assert!(
+            !under_destination,
+            "signature must not verify under the destination's key"
+        );
     }
 
     #[test]

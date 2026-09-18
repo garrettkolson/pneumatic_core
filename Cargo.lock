@@ -1255,9 +1255,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dashmap",
+ "ff",
+ "group",
  "log",
  "parking_lot",
+ "pasta_curves",
  "pneumatic_core",
+ "pneumatic_prover",
  "serde",
  "serde_json",
  "tokio",

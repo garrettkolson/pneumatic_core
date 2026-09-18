@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::errors::PneumaticError;
-use crate::transactions::{PendingTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature, TransactionPool};
+use crate::transactions::{PendingTransaction, ShieldedTransaction, Transaction, TransactionState, TransactionValidationResult, TransactionSignature, TransactionPool};
 use crate::errors::{ValidationFailureReason, TransactionRiskFactor};
 use crate::validation::NullifierMembership;
 
@@ -41,6 +41,12 @@ pub struct PendingTransactionRegistry {
     /// for its sender even after the tx is dequeued or committed, so a replay can never be
     /// re-admitted once accepted. Keyed by all three because each token has its own account.
     used_nonces: DashMap<(Vec<u8>, Vec<u8>, usize), ()>,
+    /// Shielded transfers admitted by the sentinel (Phase S5.1). Parallel to
+    /// `transactions`, never evicted: a shielded tx has no `TransactionState`
+    /// lifecycle and no remove path, so its registry entry is permanent. The
+    /// committer hash-matches block-carried shielded txs against these entries
+    /// (S5.3); the finalizer reads them at signing time (S5.2).
+    shielded_transactions: DashMap<String, ShieldedTransaction>,
 }
 
 impl PendingTransactionRegistry {
@@ -51,6 +57,7 @@ impl PendingTransactionRegistry {
             admin_credits: DashMap::new(),
             gas_tracker: Mutex::new(HashMap::new()),
             used_nonces: DashMap::new(),
+            shielded_transactions: DashMap::new(),
         }
     }
 
@@ -87,6 +94,54 @@ impl PendingTransactionRegistry {
             )));
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Shielded transfers (Phase S5.1) — a parallel, never-evicted map.
+    //
+    // Shielded txs have no `TransactionState` lifecycle: they are admitted
+    // once, signalled to the finalizer, and stay in the registry permanently
+    // (the committer's S5.3 hash-match reads them at block-commit time,
+    // which happens after the tx is long out of any pending pipeline).
+    // There is deliberately **no remove path** here — eviction is a
+    // double-spend/consensus bug (roadmap 2.5), the same reason
+    // `used_nonces` never evicts.
+    // ------------------------------------------------------------------
+
+    /// Admit a validated shielded transfer into the registry.
+    ///
+    /// Atomic like `add_transaction`: `insert` returns the old value, so a
+    /// duplicate id is detected without a TOCTOU window. A duplicate id is a
+    /// protocol violation (the same id was already admitted) and is rejected,
+    /// never silently overwritten — overwriting would let a second,
+    /// differently-proven tx squat an id the first one was already signed.
+    pub fn register_shielded(&self, tx: &ShieldedTransaction) -> Result<(), PneumaticError> {
+        // Atomic like `add_transaction`: `insert` returns the old value, so
+        // the duplicate check has no TOCTOU window. But unlike a pending tx,
+        // an admitted shielded tx may never be *replaced*: the finalizer has
+        // already signed it and the committer will hash-match against it at
+        // block-commit time, so a duplicate submission must not be able to
+        // transiently swap a signed id for a new payload. If the key was
+        // present, restore the original value before rejecting.
+        let prev = self.shielded_transactions.insert(tx.id.clone(), tx.clone());
+        if let Some(old) = prev {
+            self.shielded_transactions.insert(tx.id.clone(), old);
+            return Err(PneumaticError::Registry(format!(
+                "ShieldedTransaction {} already exists in registry", tx.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Is a shielded transfer admitted in the registry?
+    pub fn contains_shielded(&self, id: &str) -> bool {
+        self.shielded_transactions.contains_key(id)
+    }
+
+    /// Fetch a registered shielded transfer (cloned — the registry owns the
+    /// canonical copy; callers may not mutate it).
+    pub fn get_shielded(&self, id: &str) -> Option<ShieldedTransaction> {
+        self.shielded_transactions.get(id).map(|e| e.value().clone())
     }
 
     /// Acquire a lock on a transaction for a new pipeline stage.
@@ -958,6 +1013,76 @@ mod tests {
         }
         registry.set_requested_finalizer("tx1", vec![99]).unwrap();
         assert!(!registry.is_requested_finalizer("tx1", &[1, 2, 3]));
+    }
+
+    // --- Shielded transfers (Phase S5.1.2) ---
+
+    /// A minimal shielded tx for registry tests (dummy field contents).
+    fn shielded_fixture(id: &str) -> ShieldedTransaction {
+        ShieldedTransaction {
+            id: id.into(),
+            action: "ShieldedTransfer".into(),
+            token_id: vec![1, 2, 3],
+            spent_commitments: vec![[6u8; 32]],
+            nullifiers: vec![[1u8; 32]],
+            commitments: vec![[3u8; 32]],
+            merkle_root: [5u8; 32],
+            proof: vec![9, 8, 7, 6],
+            note_ciphertexts: vec![vec![10u8; 64]],
+            fee: 0,
+        }
+    }
+
+    /// Admit → contains → get round-trips the exact tx (the clone is the
+    /// canonical copy; no field is lost in flight).
+    #[test]
+    fn register_shielded_roundtrips_through_map() {
+        let registry = PendingTransactionRegistry::new();
+        let tx = shielded_fixture("shd_1");
+
+        assert!(!registry.contains_shielded("shd_1"), "fresh registry: absent");
+        assert!(
+            registry.get_shielded("shd_1").is_none(),
+            "fresh registry: no entry to fetch"
+        );
+
+        registry.register_shielded(&tx).unwrap();
+
+        assert!(registry.contains_shielded("shd_1"), "admitted: present");
+        assert_eq!(
+            registry.get_shielded("shd_1"),
+            Some(tx.clone()),
+            "fetched entry equals the admitted tx exactly"
+        );
+    }
+
+    /// A duplicate id is rejected atomically — `insert`'s returned old value
+    /// is the race-free duplicate check — and the rejection leaves the
+    /// original entry untouched (a silent overwrite would let a second,
+    /// differently-proven tx squat a signed id).
+    #[test]
+    fn register_shielded_duplicate_id_rejected_atomically() {
+        let registry = PendingTransactionRegistry::new();
+        let first = shielded_fixture("shd_dup");
+
+        registry.register_shielded(&first).unwrap();
+
+        // Same id, *different* proof: the duplicate is a protocol violation.
+        let mut impostor = first.clone();
+        impostor.proof = vec![0xDE, 0xAD];
+        let err = registry.register_shielded(&impostor).unwrap_err();
+        assert!(
+            matches!(err, PneumaticError::Registry(_)),
+            "duplicate id is a Registry error, got: {:?}",
+            err
+        );
+
+        // The original is intact — nothing was overwritten.
+        assert_eq!(
+            registry.get_shielded("shd_dup"),
+            Some(first),
+            "the first-admitted entry survives a duplicate rejection"
+        );
     }
 
     // --- TransactionSignatureRegistry ---

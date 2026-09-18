@@ -309,6 +309,15 @@ pub fn build_runtime(
     let tokens: Arc<DashMap<Vec<u8>, pneumatic_core::tokens::Token>> = Arc::new(DashMap::new());
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
 
+    // S5.1 Decision 1: the shielded roles' validation reads pool state
+    // through the `ShieldedPoolView` seam, built here as a placeholder over
+    // fresh shared state (fail-closed against anything non-genesis). S5.4
+    // swaps exactly this construction line for S5.3's `Arc<ShieldedPool>`,
+    // which implements the same trait — nothing downstream changes.
+    let shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView> = Arc::new(
+        pneumatic_core::shielded::SimpleShieldedPoolView::new(env_data.shielded_root_recency),
+    );
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -363,6 +372,7 @@ pub fn build_runtime(
                 epoch_boundary_detector.clone(),
                 block_proposer.clone(),
                 block_services.clone(),
+                shielded_pool_view.clone(),
             )
         })
         .collect();
@@ -436,6 +446,7 @@ fn build_role_plugin(
     epoch_boundary_detector: Arc<EpochBoundaryDetector>,
     block_proposer: Arc<BlockProposer>,
     block_services: Arc<BlockServices>,
+    shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView>,
 ) -> Option<Box<dyn RoleHost>> {
     use pneumatic_core::node::NodeRegistryType;
     match role {
@@ -496,6 +507,7 @@ fn build_role_plugin(
                 pending_registry,
                 gossiper,
                 data_provider,
+                shielded_pool_view,
             );
             Some(Box::new(sentinel))
         }
@@ -776,9 +788,22 @@ mod tests {
     use pneumatic_core::node::{NodeTypeConfig, NodeRegistryType};
     use pneumatic_core::transactions::ShieldedTransaction;
 
+    use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
+    use pneumatic_core::data::{DataProvider, DefaultDataProvider};
+    use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
+    use pneumatic_core::logging::Logger;
+    use pneumatic_core::node::registry::NodeRegistry;
+    use pneumatic_core::node::stake_index::StakeIndex;
+    use pneumatic_core::registry::PendingTransactionRegistry;
+    use pneumatic_core::shielded::{SimpleShieldedPoolView, ShieldedPoolView};
+    use pneumatic_committer::block_services::BlockServices;
+    use pneumatic_committer::epoch_manager::{
+        EpochReconciler, LeaderSelector, StakeStore, StakingManager,
+    };
+
     use crate::role_dispatcher::RoleError;
     use crate::role_selector::StakeProvider;
-    use super::{build_runtime, route_data_plane};
+    use super::{build_runtime, build_role_plugin, route_data_plane};
 
     /// A complete, valid `EnvironmentMetadataSpec` — the canonical fixture used
     /// by the committer/sentinel integration tests, with `environment_id` set to
@@ -899,6 +924,113 @@ mod tests {
             public_key: vec![],
             stake_set: None,
         }
+    }
+
+    /// S5.1.5 discriminator: the node-server DI bundle plumbs a
+    /// `ShieldedPoolView` into `build_role_plugin`, and the sentinel arm
+    /// consumes it (the 7th `Sentinel::new` argument). A wiring that forgets
+    /// the parameter fails to compile in both places, so the runtime half of
+    /// this test asserts the arm builds a genuine plugin (not `None`) that
+    /// reports the sentinel role.
+    #[test]
+    fn build_role_plugin_sentinel_arm_builds_with_pool_view() {
+        let config = runtime_config(
+            vec![bad_peer()],
+            type_config_select(NodeRegistryType::Sentinel),
+        );
+        // Same environment lookup as `build_runtime`: the main environment
+        // the config references.
+        let env_data = config
+            .environment_metadata
+            .get(&config.main_environment_id)
+            .map(|e| Arc::new(e.value().clone()))
+            .expect("test config carries its main environment");
+
+        let data_provider: Arc<dyn DataProvider> = Arc::new(DefaultDataProvider::new());
+        let hash_provider: Arc<dyn HashProvider> = Arc::new(BasicHashProvider::new());
+        let shared_logger: Arc<dyn Logger> = env_data.logger.clone();
+
+        let stake_index = Arc::new(StakeIndex::new(
+            data_provider.clone(),
+            env_data.token_partition_id.clone(),
+            1,
+            None,
+        ));
+        let stake_check = stake_index.make_check(config.clone());
+        let node_registry = Arc::new(NodeRegistry::init(config.clone(), None, stake_check));
+
+        let stake_store = Arc::new(StakeStore::new());
+        let staking_manager = Arc::new(StakingManager::new(
+            stake_store.clone(),
+            shared_logger.clone(),
+        ));
+        let epoch_reconciler = Arc::new(EpochReconciler::new(
+            stake_store.clone(),
+            Arc::new(CandidateRegistry::new()),
+            data_provider.clone(),
+            env_data.environment_id.clone(),
+            vec![],
+            env_data.cost_model.slash_fraction,
+        ));
+        let leader_selector = Arc::new(LeaderSelector::new(hash_provider.clone()));
+
+        let tokens: Arc<DashMap<Vec<u8>, pneumatic_core::tokens::Token>> =
+            Arc::new(DashMap::new());
+        let pending_registry = Arc::new(PendingTransactionRegistry::new());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let initial_epoch = Epoch::new_with_leader(
+            1,
+            now,
+            now + 300,
+            leader_selector.as_ref(),
+            &stake_store.to_stake_set(),
+            &[],
+        );
+        let epoch_boundary_detector = Arc::new(EpochBoundaryDetector::new(initial_epoch));
+        let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
+        let block_services = Arc::new(BlockServices::new(
+            tokens.clone(),
+            data_provider.clone(),
+            node_registry.clone(),
+            env_data.clone(),
+            shared_logger.clone(),
+            config.identity.clone(),
+        ));
+
+        // S5.1 Decision 1's wiring: the pristine placeholder view, exactly
+        // as `build_runtime` now constructs it.
+        let shielded_pool_view: Arc<dyn ShieldedPoolView> =
+            Arc::new(SimpleShieldedPoolView::new(env_data.shielded_root_recency));
+
+        let host = build_role_plugin(
+            NodeRegistryType::Sentinel,
+            config,
+            env_data,
+            data_provider,
+            node_registry,
+            hash_provider,
+            stake_store,
+            staking_manager,
+            epoch_reconciler,
+            leader_selector,
+            tokens,
+            pending_registry,
+            epoch_boundary_detector,
+            block_proposer,
+            block_services,
+            shielded_pool_view,
+        )
+        .expect("the sentinel arm builds a plugin");
+
+        assert_eq!(
+            host.role(),
+            NodeRegistryType::Sentinel,
+            "the constructed host reports the sentinel role"
+        );
     }
 
     /// The host boots even when the RNS transport cannot start — a missing

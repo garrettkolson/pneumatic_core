@@ -14,3 +14,12 @@ log = "0.4"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+# Phase S5.1 — the `#[ignore]`d live end-to-end test builds a real proof via
+# the client-side prover crate (S3.3); `pasta_curves` (Fq/Fp field elements)
+# and `group` (`.to_bytes()` on the commitment points) drive the default-suite
+# test fixtures. All pinned to versions the workspace already resolves (zero
+# new lockfile packages).
+pneumatic_prover = { path = "../prover" }
+pasta_curves = "=0.5.2"
+ff = "=0.13.1"
+group = "=0.13.0"

@@ -99,6 +99,21 @@ impl Token {
         self.metadata.insert(key, value);
     }
 
+    /// Whether this token has opted in to shielded value transfer (Phase S5.1).
+    ///
+    /// Opt-in is a metadata flag set at token mint (`shielded_opt_in = "true"`).
+    /// The sentinel's shielded admission checks it before touching pool state:
+    /// a shielded transfer for a non-opt-in token is rejected
+    /// (`ValidationFailureReason::NotShieldedOptIn`) — fail closed. A missing
+    /// key, any other value, or the empty string all count as *not* opted in;
+    /// only the exact string `"true"` counts.
+    pub fn is_shielded_opt_in(&self) -> bool {
+        self.metadata
+            .get("shielded_opt_in")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
     /// Test helper: create a minimal Token for use in tests.
     #[cfg(test)]
     pub fn test_token() -> Self {
@@ -1012,6 +1027,46 @@ mod block_validation_error_tests {
     fn block_validation_error_display() {
         let err = BlockValidationError::TokenNotFound;
         assert_eq!(err.to_string(), "TokenNotFound");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Phase S5.1.3: the shielded opt-in flag
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod shielded_opt_in_tests {
+    use super::*;
+
+    /// Every pre-existing token lacks the metadata key, so every pre-existing
+    /// deployment's behavior is unchanged: the default is OFF (fail closed by
+    /// absence — a transfer to such a token gets `NotShieldedOptIn`).
+    #[test]
+    fn token_shielded_opt_in_absent_is_off() {
+        assert!(!Token::new().is_shielded_opt_in());
+    }
+
+    /// The exact opt-in spelling: metadata `{"shielded_opt_in": "true"}`.
+    #[test]
+    fn token_shielded_opt_in_true_is_on() {
+        let mut token = Token::new();
+        token.set_metadata("shielded_opt_in".into(), "true".into());
+        assert!(token.is_shielded_opt_in());
+    }
+
+    /// **Discriminator** — pins the exact-string comparison: only `"true"`
+    /// counts. Any other value is OFF; a `parse::<bool>`-style looseness
+    /// ("1" → true, "TRUE" → true) fails this test.
+    #[test]
+    fn token_shielded_opt_in_non_true_is_off() {
+        for value in ["false", "1", "TRUE", ""] {
+            let mut token = Token::new();
+            token.set_metadata("shielded_opt_in".into(), value.into());
+            assert!(
+                !token.is_shielded_opt_in(),
+                "metadata value {value:?} must not count as opted in"
+            );
+        }
     }
 }
 
