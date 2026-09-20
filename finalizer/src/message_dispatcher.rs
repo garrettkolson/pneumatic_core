@@ -8,7 +8,7 @@ use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::rns::identity::NodeIdentity;
-use pneumatic_core::transactions::TransactionCommit;
+use pneumatic_core::transactions::{TransactionCommit, TransactionSignature};
 
 // ---------------------------------------------------------------------------
 // MessageDispatcher — sends blocks to committers and clears to sentinels
@@ -69,6 +69,41 @@ impl MessageDispatcher {
 
         // Broadcast to all committers via registered connections
         self.node_registry.send_to_all(payload, &NodeRegistryType::Committer).await;
+
+        Ok(())
+    }
+
+    /// Broadcast a shielded-transfer vote to all Finalizer peers (Phase S5.2).
+    ///
+    /// The voting finalizer signs `ShieldedTransaction::hash()` over the
+    /// canonical bytes (S5.1 contract) and fans the vote out to the finalizer
+    /// set; the collector accumulates it in its `SignatureCollector` and
+    /// finalizes at stake-weighted quorum. The body is a `TransactionSignature`
+    /// — an existing wire type, so no new wire shape (Ground Rule 4).
+    pub async fn send_shielded_vote_to_finalizers(
+        &self,
+        vote: TransactionSignature,
+    ) -> Result<(), PneumaticError> {
+        // Build the message body with the vote
+        let msg_body = serialize_to_bytes_rmp(&vote)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Package as a wire message, signed with this node's identity
+        let message = Message::signed(
+            self.env_id.clone(),
+            "ShieldedVote",
+            msg_body,
+            None,
+            &self.identity,
+        )?;
+
+        let payload = serialize_to_bytes_rmp(&message)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
+
+        // Broadcast to all finalizer peers via registered connections
+        self.node_registry
+            .send_to_all(payload, &NodeRegistryType::Finalizer)
+            .await;
 
         Ok(())
     }

@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use pneumatic_core::blocks::{Block, BlockFactory, FinalityStatus};
-use pneumatic_core::crypto::HashProvider;
-use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
-use pneumatic_core::transactions::{SignedTransaction, Transaction, TransactionSignature};
+use pneumatic_core::transactions::{
+    ShieldedTransaction, SignedTransaction, Transaction, TransactionSignature,
+};
 
 // ---------------------------------------------------------------------------
 // BlockBuilder — forms SignedTransaction and Block from reconciled signatures
@@ -113,6 +113,69 @@ impl BlockBuilder {
             shielded: None,
             transaction_id: transaction.id.clone(),
             transaction: transaction.clone(),
+            total_stake,
+            total_voters,
+            leader_address: self.leader_address.clone(),
+            leader_stake: self.leader_stake,
+            leader_hash: self.leader_hash.clone(),
+            finalizer_addr: self.finalizer_addr.clone(),
+            finalizer_sig: placeholder_sig,
+            executor_sigs,
+            proposer_key: self.leader_address.clone(),
+        }
+    }
+
+    /// Build a SignedTransaction for a shielded transfer (Phase S5.2).
+    ///
+    /// The S3.1 placeholder `Transaction` rides in `transaction` (the real
+    /// sender/amount fields do not exist for shielded value — the pool update
+    /// is consensus-bound via the `shielded` field instead), the votes land
+    /// in `executor_sigs` **keyed by the voting finalizer public keys**
+    /// (the map is the canonical voter-sig carrier in shielded blocks — the
+    /// field name is historical; a dedicated `finalizer_votes` field was
+    /// considered and rejected to keep the canonical schema change to exactly
+    /// one additive field), and `finalizer_sig` is the same placeholder
+    /// `sign_finalizer_block` fills in. Entry shape mirrors
+    /// `build_signed_transaction` exactly.
+    pub fn build_signed_transaction_shielded(
+        &self,
+        reconciled: &ReconciledSignatures,
+        stx: &ShieldedTransaction,
+        total_stake: u64,
+        total_voters: u32,
+    ) -> SignedTransaction {
+        // Voting-finalizer signatures keyed by voter public key (reconciled
+        // stake order preserved in the map).
+        let executor_sigs: HashMap<Vec<u8>, TransactionSignature> = reconciled
+            .executor_signatures
+            .iter()
+            .map(|es| {
+                (
+                    es.executor_public_key.clone(),
+                    TransactionSignature {
+                        transaction_id: stx.id.as_bytes().to_vec(),
+                        env_id: stx.token_id.clone(),
+                        transaction_hash: es.signature.clone(),
+                        signature: es.signature.clone(),
+                        current_stake: es.stake,
+                    },
+                )
+            })
+            .collect();
+
+        // Placeholder finalizer signature — filled by sign_finalizer_block.
+        let placeholder_sig = TransactionSignature {
+            transaction_id: stx.id.as_bytes().to_vec(),
+            env_id: stx.token_id.clone(),
+            transaction_hash: vec![], // filled by sign_finalizer_block
+            signature: vec![],
+            current_stake: 0,
+        };
+
+        SignedTransaction {
+            shielded: Some(stx.clone()),
+            transaction_id: stx.id.clone(),
+            transaction: stx.placeholder_transaction(),
             total_stake,
             total_voters,
             leader_address: self.leader_address.clone(),
@@ -543,5 +606,86 @@ mod tests {
             17,
         );
         assert_eq!(core_block.proposer_key, vec![3, 1, 4]);
+    }
+
+    // S5.2: the shielded carrier — the stx rides in `shielded: Some(..)`,
+    // voting-finalizer signatures are keyed by voter pubkey in
+    // `executor_sigs`, and the finalizer sig is a placeholder that
+    // `sign_finalizer_block` fills later.
+    #[test]
+    fn test_build_signed_transaction_shielded() {
+        let stx = ShieldedTransaction {
+            id: "sh_tx_001".to_string(),
+            action: "ShieldedTransfer".to_string(),
+            token_id: vec![9, 9],
+            spent_commitments: vec![[1u8; 32]],
+            nullifiers: vec![[2u8; 32]],
+            commitments: vec![[3u8; 32]],
+            merkle_root: [0xAB; 32],
+            proof: vec![9u8; 64],
+            note_ciphertexts: vec![vec![7u8; 64]],
+            fee: 0,
+        };
+        let reconciled = ReconciledSignatures {
+            executor_signatures: vec![
+                pneumatic_core::errors::ExecutorSignature {
+                    executor_public_key: b"voter_a".to_vec(),
+                    signature: vec![1, 1, 1],
+                    stake: 60,
+                },
+                pneumatic_core::errors::ExecutorSignature {
+                    executor_public_key: b"voter_b".to_vec(),
+                    signature: vec![2, 2, 2],
+                    stake: 40,
+                },
+            ],
+            winning_finalizer: vec![],
+            conflict_resolved: false,
+        };
+
+        let hp = Arc::new(pneumatic_core::crypto::BasicHashProvider::new());
+        let (signing_key, verifying_key) = make_test_keypair();
+        let builder = BlockBuilder::new(
+            signing_key,
+            verifying_key,
+            hp,
+            vec![1, 2, 3],
+            100,
+            vec![4, 5, 6],
+            vec![7, 8, 9],
+        );
+
+        let signed = builder
+            .build_signed_transaction_shielded(&reconciled, &stx, 100, 2);
+
+        // The stx is the canonical carrier, not the placeholder.
+        assert_eq!(signed.shielded.as_ref(), Some(&stx));
+        assert_eq!(signed.transaction_id, "sh_tx_001");
+        // Placeholder transaction carries the shielded action name.
+        assert_eq!(signed.transaction.action, "ShieldedTransfer");
+        assert_eq!(signed.total_stake, 100);
+        assert_eq!(signed.total_voters, 2);
+
+        // One vote per voter, keyed by voter public key, bound to the stx.
+        assert_eq!(signed.executor_sigs.len(), 2);
+        let sig_a = signed
+            .executor_sigs
+            .get(b"voter_a".as_slice())
+            .expect("voter_a vote present");
+        assert_eq!(sig_a.transaction_id, "sh_tx_001".as_bytes().to_vec());
+        assert_eq!(sig_a.env_id, vec![9, 9]);
+        assert_eq!(sig_a.transaction_hash, vec![1, 1, 1]);
+        assert_eq!(sig_a.signature, vec![1, 1, 1]);
+        assert_eq!(sig_a.current_stake, 60);
+        let sig_b = signed
+            .executor_sigs
+            .get(b"voter_b".as_slice())
+            .expect("voter_b vote present");
+        assert_eq!(sig_b.transaction_hash, vec![2, 2, 2]);
+        assert_eq!(sig_b.current_stake, 40);
+
+        // Finalizer sig is a placeholder until sign_finalizer_block runs.
+        assert!(signed.finalizer_sig.signature.is_empty());
+        assert!(signed.finalizer_sig.transaction_hash.is_empty());
     }
 }

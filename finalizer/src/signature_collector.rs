@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures, TransactionRiskFactor};
 use pneumatic_core::registry::TransactionSignatureRegistry;
-use pneumatic_core::transactions::{TransactionSignature, TransactionValidationResult};
+use pneumatic_core::transactions::TransactionSignature;
 
 // ---------------------------------------------------------------------------
 // SignatureCollector — collects and verifies executor signatures per tx
@@ -91,6 +91,40 @@ impl SignatureCollector {
         let quorum_pct = self.quorum_percentage.round() as u128;
         let reached = (sig_count as u128) * 100 >= (self.total_voters as u128) * quorum_pct;
         Ok(reached)
+    }
+
+    /// Stake-weighted quorum for shielded finalizer votes (Phase S5.2): the
+    /// sum of the admitted votes' `current_stake` (stamped from the epoch
+    /// snapshot at admission — never self-reported) must satisfy
+    /// `admitted * 100 >= total_stake * quorum` in `u128` — the Phase 6.9
+    /// exact-integer pattern (`reconcile_signatures` line 136-143).
+    ///
+    /// Unlike `check_quorum` there is deliberately **no count-based fast
+    /// path and no optimistic branch**: a shielded transfer commits only at
+    /// stake-weighted quorum (roadmap 2.1 — client-side proving, quorum-gated
+    /// by design). `total_stake` is the current epoch snapshot's total,
+    /// passed in by the caller (the collector stays snapshot-agnostic).
+    pub fn check_stake_quorum(&self, tx_id: &str, total_stake: u64) -> Result<bool, PneumaticError> {
+        let sig_map = self
+            .signature_registry
+            .get_transaction_registry(tx_id)
+            .ok_or_else(|| PneumaticError::Registry(format!(
+                "Transaction {} not in signature registry for quorum check", tx_id
+            )))?;
+
+        let admitted: u128 = sig_map
+            .iter()
+            .map(|(_, sig)| sig.current_stake as u128)
+            .sum();
+
+        if total_stake == 0 {
+            return Ok(false);
+        }
+
+        // admitted / total_stake >= quorum/100  <=>  admitted * 100 >=
+        // total_stake * quorum in u128 (stake sums fit comfortably).
+        let quorum_pct = self.quorum_percentage.round() as u128;
+        Ok(admitted * 100 >= (total_stake as u128) * quorum_pct)
     }
 
     /// Reconcile collected signatures via stake-weighted supermajority.
@@ -306,6 +340,62 @@ mod tests {
         // threshold, so A must not be declared the winning finalizer.
         assert_ne!(reconciled.winning_finalizer, b"A".to_vec(),
             "integer quorum must not reach at A's 2^52 stake; f64 rounding bug would make A the winner");
+    }
+
+    // --- Phase S5.2: stake-weighted quorum (check_stake_quorum) ---
+
+    /// Below the threshold: 60 of 100 stake admitted < 67% → no quorum.
+    #[test]
+    fn check_stake_quorum_below_threshold() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        collector
+            .add_signature("tx_s", b"v1".to_vec(), make_sample_signature("tx_s", b"v1", 60))
+            .unwrap();
+        assert!(!collector.check_stake_quorum("tx_s", 100).unwrap());
+    }
+
+    /// At the threshold: 67 of 100 admitted — the exact-integer boundary
+    /// `67 * 100 >= 100 * 67` must count as quorum met.
+    #[test]
+    fn check_stake_quorum_at_threshold() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        collector
+            .add_signature("tx_s", b"v1".to_vec(), make_sample_signature("tx_s", b"v1", 67))
+            .unwrap();
+        assert!(collector.check_stake_quorum("tx_s", 100).unwrap());
+    }
+
+    /// One vote carrying the full snapshot stake (100/100 = 100% ≥ 67%)
+    /// reaches quorum — the single-voter shape of the S5.2 fixture.
+    #[test]
+    fn check_stake_quorum_single_full_stake_vote() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        collector
+            .add_signature("tx_s", b"v1".to_vec(), make_sample_signature("tx_s", b"v1", 100))
+            .unwrap();
+        assert!(collector.check_stake_quorum("tx_s", 100).unwrap());
+    }
+
+    /// Zero total stake → fail closed (no quorum), even with admitted stake.
+    #[test]
+    fn check_stake_quorum_zero_total_stake_fails_closed() {
+        let registry = make_registry();
+        let collector = make_collector(registry.clone());
+        collector
+            .add_signature("tx_s", b"v1".to_vec(), make_sample_signature("tx_s", b"v1", 100))
+            .unwrap();
+        assert!(!collector.check_stake_quorum("tx_s", 0).unwrap());
+    }
+
+    /// Unknown tx → `Registry` error (no implicit quorum for a tx with no
+    /// collected votes).
+    #[test]
+    fn check_stake_quorum_unknown_tx_errors() {
+        let collector = make_collector(make_registry());
+        assert!(collector.check_stake_quorum("nope", 100).is_err());
     }
 
     #[test]
