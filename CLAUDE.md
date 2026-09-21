@@ -68,3 +68,14 @@ Data frames consist of a 4-byte big-endian length header followed by the MsgPack
 - `data.rs` uses Unix domain sockets on Unix platforms, falling back to TCP loopback (port 55555) on non-Unix
 - `NodeRegistry::send_to_all` (node/registry.rs:167) sends over registered connections; one TODO remains at node/registry.rs:74 (placeholder public node address)
 - Staking persistence is still stubbed — `StubStakingManager` (epoch.rs:363) logs `StakingOp`s without persisting them
+
+> **Note (2026-09-20):** sections above predate the shielded ZK stack, RNS transport, hybrid PQ crypto, prover crate, and composite node-server — the repo has 7 crates and 27 root modules, not the counts stated here. The current state of the project is tracked in the Infinite Brain vault at `infinite-brain/`. Verify anything in this file against the vault or the code.
+
+## Infinite Brain (project memory) — standing protocol
+
+This repo's knowledge-graph vault is at `infinite-brain/` (Obsidian-compatible; node/edge/frontmatter schemas in `infinite-brain/_system/`). Two standing duties apply to every agent session:
+
+1. **Orient via the vault.** Before doing architecture, protocol, roadmap, crypto, networking, or "what state is X in" work, read `infinite-brain/_system/INDEX.md`, then follow typed edges to the relevant nodes (skill: `infinite-brain-query-vault`). This is cheaper than re-deriving from source. If a vault claim and the code disagree, the code wins — fix the node.
+2. **Update the vault after significant changes.** When a change lands that affects architecture, protocol decisions, roadmap/phase status, dependencies, or measured baselines (e.g. test counts): update the affected nodes (body, `verified_at`, `confidence`), add nodes for genuinely new concepts/decisions/tasks/events, keep `_system/INDEX.md` in sync with files on disk, and append one log node to `infinite-brain/logs/` (8-field log schema in `infinite-brain/_system/FRONTMATTER-SCHEMA.md`; skills: `infinite-brain-convert-note`, `infinite-brain-organize-vault`). Trivial edits (typo fixes, test-only tweaks) do not require vault updates.
+
+Full operating rules, quality standards, and prohibited actions: `infinite-brain/_system/AGENTS.md`. Run `infinite-brain-vault-health` (auto mode, read-only) periodically to decay stale confidence and surface needs-review nodes.
