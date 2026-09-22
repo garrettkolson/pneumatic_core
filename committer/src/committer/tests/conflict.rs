@@ -224,7 +224,8 @@ async fn commit_conflict_same_proposer_partial_slash_respects_fraction() {
     // a proposer staked at 100 should drop to 50, proving the amount is
     // configured rather than always full.
     let dp = Arc::new(TestDataProvider::new());
-    let (committer, registry, _logger) = make_test_committer_with_slash(dp, 0.5);
+    let (committer, registry, _logger) =
+        make_test_committer_with_slash(dp, 0.5, Arc::new(ShieldedPool::new(10)));
 
     // Bootstrap token and chain
     let mut token = Token::new();

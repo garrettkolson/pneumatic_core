@@ -7,6 +7,8 @@ pub mod committer;
 pub mod committer_error;
 pub mod epoch_manager;
 pub mod orphan_buffer;
+pub mod shielded_pool;
 
 pub use committer::Committer;
+pub use shielded_pool::{PoolApplyOutcome, ShieldedPool};
 

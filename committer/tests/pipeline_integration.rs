@@ -249,6 +249,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
     let epoch_detector = pneumatic_core::epoch::EpochBoundaryDetector::new(initial_epoch);
     let block_proposer = Arc::new(pneumatic_core::epoch::BlockProposer::new(vec![], 0, vec![]));
 
+    let shielded_pool = Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10));
     let block_services = Arc::new(BlockServices::new(
         tokens.clone(),
         data_provider_core.clone(),
@@ -256,6 +257,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
         env_data.clone(),
         env_data.logger.clone(),
         identity.clone(),
+        shielded_pool.clone(),
     ));
 
     let committer = Committer::new(
@@ -280,6 +282,7 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
         epoch_duration,
         5000,
         candidate_registry,
+        shielded_pool,
     );
 
     (committer, pending_registry, tokens, node_registry, gossiper)

@@ -15,6 +15,7 @@ use pneumatic_core::tokens::{Token, TokenCommitResult};
 use pneumatic_core::transactions::TransactionCommit;
 
 use super::committer_error::CommitterError;
+use super::shielded_pool::ShieldedPool;
 
 /// Convert bytes to lowercase hex string.
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -36,6 +37,10 @@ pub struct BlockServices {
     logger: Arc<dyn Logger>,
     /// Node identity — signs all outgoing distribution messages
     identity: Arc<NodeIdentity>,
+    /// The global shielded pool (S5.3) — the shared `Arc` handle the
+    /// commit-time pool steps (apply / persist / rollback, orchestrated by
+    /// the Committer's commit path) operate on.
+    shielded_pool: Arc<ShieldedPool>,
 }
 
 impl BlockServices {
@@ -46,6 +51,7 @@ impl BlockServices {
         env_data: Arc<EnvironmentMetadata>,
         logger: Arc<dyn Logger>,
         identity: Arc<NodeIdentity>,
+        shielded_pool: Arc<ShieldedPool>,
     ) -> Self {
         BlockServices {
             tokens,
@@ -54,6 +60,7 @@ impl BlockServices {
             env_data,
             logger,
             identity,
+            shielded_pool,
         }
     }
 
@@ -329,6 +336,7 @@ mod tests {
             make_test_env_data(),
             Arc::new(FileLogger::new("/tmp/test_block_services.log".to_string())),
             identity.clone(),
+            Arc::new(ShieldedPool::new(10)),
         );
 
         services.distribute_to_archivers(&make_block()).await.expect("distribution should succeed");
@@ -363,6 +371,7 @@ mod tests {
             make_test_env_data(),
             Arc::new(FileLogger::new("/tmp/test_block_services.log".to_string())),
             identity.clone(),
+            Arc::new(ShieldedPool::new(10)),
         );
 
         services.distribute_token(&[1]).await.expect("distribution should succeed");

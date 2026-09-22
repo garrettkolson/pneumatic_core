@@ -101,6 +101,30 @@ impl Committer {
 
         // Propagate every block we committed this call (the original plus the promoted ones).
         for committed_block in &committed {
+            // S5.3: every block that reaches the chain advances the pool —
+            // idempotent for blocks already committed on the Commit path
+            // (their deltas are recorded; a replay is a no-op), and a
+            // defeated/rolled-back block never enters `committed` (the
+            // linkage gate is the coherence guard), so chain and pool stay
+            // in lockstep. Applied deltas are persisted (roadmap 2.5). A
+            // fault here is fail-closed: a block the chain appended that the
+            // pool cannot apply is a consensus-state divergence this node
+            // must surface, not swallow.
+            let applied = self
+                .shielded_pool
+                .apply_update(committed_block, &self.env_data)
+                .map_err(|e| {
+                    self.env_data.logger.log(format!(
+                        "BlockFinalized: shielded pool apply FAILED for block {}: {e:?}",
+                        bytes_to_hex(&committed_block.current_hash)
+                    ));
+                    e
+                })?;
+            if matches!(applied, PoolApplyOutcome::Applied) {
+                self.shielded_pool
+                    .save(&*self.data_provider, &self.env_data.token_partition_id)?;
+            }
+
             // Distribute to archivars (propagate gossip)
             let _ = self.block_services.distribute_to_archivers(committed_block).await;
 

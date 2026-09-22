@@ -15,7 +15,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
-use pneumatic_core::data::{DataProvider, DefaultDataProvider};
+use pneumatic_core::data::DataProvider;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
@@ -211,6 +211,7 @@ impl NodeServer {
 pub fn build_runtime(
     config: Arc<Config>,
     stake_provider: Arc<dyn super::role_selector::StakeProvider>,
+    data_provider: Arc<dyn DataProvider>,
 ) -> Result<NodeServer, PneumaticError> {
     // --- env metadata for the node's main environment (hard requirement) ----
     let env_data = match config
@@ -250,8 +251,10 @@ pub fn build_runtime(
         }
     };
 
-    // --- data provider -------------------------------------------------------
-    let data_provider: Arc<dyn DataProvider> = Arc::new(DefaultDataProvider::new());
+    // --- data provider (injected: production passes DefaultDataProvider) ----
+    // S5.3: the pool's boot load (below) is fail-closed — a store that cannot
+    // be reached is a boot error, so tests must inject a reachable in-memory
+    // provider; production keeps `DefaultDataProvider` and the strict contract.
 
     // --- registration stake gate (off the RNS worker pool, zero I/O) --------
     let stake_index = Arc::new(StakeIndex::new(
@@ -302,13 +305,28 @@ pub fn build_runtime(
     let tokens: Arc<DashMap<Vec<u8>, pneumatic_core::tokens::Token>> = Arc::new(DashMap::new());
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
 
-    // S5.1 Decision 1: the shielded roles' validation reads pool state
-    // through the `ShieldedPoolView` seam, built here as a placeholder over
-    // fresh shared state (fail-closed against anything non-genesis). S5.4
-    // swaps exactly this construction line for S5.3's `Arc<ShieldedPool>`,
-    // which implements the same trait — nothing downstream changes.
+    // S5.3: the composite node loads ONE global shielded pool (fail-closed:
+    // a corrupted stored state refuses to boot; a true absence seeds a
+    // pristine genesis and persists it) and shares it by `Arc` with the
+    // BlockServices and the committer's commit path.
+    let shielded_pool = pneumatic_committer::shielded_pool::ShieldedPool::load(
+        data_provider.as_ref(),
+        &env_data.token_partition_id,
+        env_data.shielded_root_recency,
+    )
+    .map_err(|e| {
+        PneumaticError::Network(format!("load shielded pool at boot: {e:?}"))
+    })?;
+
+    // S5.1 Decision 1 (S5.3): the shielded roles' validation reads pool
+    // state through the `ShieldedPoolView` seam, now built over the REAL
+    // pool's live state at boot (`view_parts`: the shared nullifier
+    // registry + the current published root snapshot) — strictly better
+    // than the S5.1 pristine placeholder. S5.4 swaps this construction for
+    // the pool's own live view; nothing downstream changes.
+    let (pool_nullifiers, pool_roots) = shielded_pool.view_parts();
     let shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView> = Arc::new(
-        pneumatic_core::shielded::SimpleShieldedPoolView::new(env_data.shielded_root_recency),
+        pneumatic_core::shielded::SimpleShieldedPoolView::with(pool_nullifiers, pool_roots),
     );
 
     let now = std::time::SystemTime::now()
@@ -333,6 +351,7 @@ pub fn build_runtime(
         env_data.clone(),
         shared_logger.clone(),
         config.identity.clone(),
+        shielded_pool.clone(),
     ));
 
     // --- role selection + plugin construction -------------------------------
@@ -366,6 +385,7 @@ pub fn build_runtime(
                 block_proposer.clone(),
                 block_services.clone(),
                 shielded_pool_view.clone(),
+                shielded_pool.clone(),
             )
         })
         .collect();
@@ -440,6 +460,8 @@ fn build_role_plugin(
     block_proposer: Arc<BlockProposer>,
     block_services: Arc<BlockServices>,
     shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView>,
+    // S5.3: the global shielded pool (the committer arm's commit path).
+    shielded_pool: Arc<pneumatic_committer::shielded_pool::ShieldedPool>,
 ) -> Option<Box<dyn RoleHost>> {
     use pneumatic_core::node::NodeRegistryType;
     match role {
@@ -470,6 +492,7 @@ fn build_role_plugin(
                 300,
                 5000,
                 Arc::new(CandidateRegistry::new()),
+                shielded_pool,
             );
             Some(Box::new(committer))
         }
@@ -804,6 +827,50 @@ mod tests {
     use crate::role_selector::StakeProvider;
     use super::{build_runtime, build_role_plugin, route_data_plane};
 
+    /// In-memory `DataProvider` for runtime tests (S5.3): models a REACHABLE
+    /// data service with no records — `get_shielded_pool` returns `Ok(None)`
+    /// (the pool's boot load then seeds a pristine genesis) and every save is a
+    /// no-op. All other reads answer "not found" in-process, so these tests
+    /// never open a socket: production keeps `DefaultDataProvider` and its
+    /// strict fail-closed boot contract.
+    #[derive(Default)]
+    struct MemoryDataProvider;
+
+    impl DataProvider for MemoryDataProvider {
+        fn get_token(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<pneumatic_core::tokens::Token, pneumatic_core::data::DataError> {
+            Err(pneumatic_core::data::DataError::DataNotFound)
+        }
+        fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, pneumatic_core::data::DataError> {
+            Err(pneumatic_core::data::DataError::DataNotFound)
+        }
+        fn get_user(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<pneumatic_core::user::User, pneumatic_core::data::DataError> {
+            Err(pneumatic_core::data::DataError::DataNotFound)
+        }
+        fn get_stake_snapshot(&self, _epoch: u64, _partition_id: &str) -> Result<pneumatic_core::epoch::StakeSet, pneumatic_core::data::DataError> {
+            Err(pneumatic_core::data::DataError::StoreNotFound)
+        }
+        fn save_stake_snapshot(&self, _epoch: u64, _snapshot: pneumatic_core::epoch::StakeSet, _partition_id: &str) -> Result<(), pneumatic_core::data::DataError> {
+            Ok(())
+        }
+        fn get_executor_set(&self, _epoch: u64, _partition_id: &str) -> Result<pneumatic_core::epoch::ExecutorSet, pneumatic_core::data::DataError> {
+            Err(pneumatic_core::data::DataError::StoreNotFound)
+        }
+        fn save_executor_set(&self, _epoch: u64, _set: pneumatic_core::epoch::ExecutorSet, _partition_id: &str) -> Result<(), pneumatic_core::data::DataError> {
+            Ok(())
+        }
+        fn get_shielded_pool(&self, _partition_id: &str) -> Result<Option<pneumatic_core::data::ShieldedPoolState>, pneumatic_core::data::DataError> {
+            Ok(None)
+        }
+        fn save_shielded_pool(&self, _state: &pneumatic_core::data::ShieldedPoolState, _partition_id: &str) -> Result<(), pneumatic_core::data::DataError> {
+            Ok(())
+        }
+    }
+
+    /// The data provider every `build_runtime` test injects.
+    fn test_data_provider() -> Arc<dyn DataProvider> {
+        Arc::new(MemoryDataProvider)
+    }
+
     /// A complete, valid `EnvironmentMetadataSpec` — the canonical fixture used
     /// by the committer/sentinel integration tests, with `environment_id` set to
     /// `test_env` (matching `main_environment_id`). Every field the struct
@@ -998,6 +1065,7 @@ mod tests {
             env_data.clone(),
             shared_logger.clone(),
             config.identity.clone(),
+            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10)),
         ));
 
         // S5.1 Decision 1's wiring: the pristine placeholder view, exactly
@@ -1022,6 +1090,7 @@ mod tests {
             block_proposer,
             block_services,
             shielded_pool_view,
+            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10)),
         )
         .expect("the sentinel arm builds a plugin");
 
@@ -1042,7 +1111,7 @@ mod tests {
         let provider = Arc::new(MapStakeProvider::with_default(2000));
 
         // No panic, no hard error — the host is constructible without transport.
-        let server = build_runtime(cfg, provider).expect("host boots without transport");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host boots without transport");
         // The selected roles still install over the in-process path (registration
         // order: Committer, Sentinel, Executor, Finalizer). Archiver is selected
         // but has no plugin, so it is never installed.
@@ -1078,6 +1147,7 @@ mod tests {
         let q = build_runtime(
             qualifying,
             Arc::new(MapStakeProvider::with_default(2000)),
+            test_data_provider(),
         )
         .expect("host builds");
         assert_eq!(
@@ -1108,6 +1178,7 @@ mod tests {
         let c = build_runtime(
             cold,
             Arc::new(MapStakeProvider::with_default(0)),
+            test_data_provider(),
         )
         .expect("host builds");
         assert!(
@@ -1127,7 +1198,7 @@ mod tests {
     async fn build_runtime_initializes_epoch() {
         let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         assert_eq!(server.installed_roles(), vec![NodeRegistryType::Committer]);
         let msg = msg("Commit");
@@ -1151,7 +1222,7 @@ mod tests {
         // above any stake): exactly one role installs.
         let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         assert_eq!(
             server.installed_roles(),
@@ -1177,7 +1248,7 @@ mod tests {
         let cfg =
             runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         let payload = serialize_to_bytes_rmp(&msg("Commit")).expect("payload serializes");
 
@@ -1203,7 +1274,7 @@ mod tests {
         let cfg =
             runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         let payload = serialize_to_bytes_rmp(&msg("Confirm")).expect("payload serializes");
 
@@ -1222,7 +1293,7 @@ mod tests {
     async fn finalizer_inbound_handler_not_stub() {
         let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Finalizer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         assert_eq!(server.installed_roles(), vec![NodeRegistryType::Finalizer]);
 
@@ -1248,7 +1319,7 @@ mod tests {
     async fn executor_preload_routed_through_dispatcher() {
         let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Executor));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         assert_eq!(server.installed_roles(), vec![NodeRegistryType::Executor]);
 
@@ -1271,7 +1342,7 @@ mod tests {
         // has no plugin).
         let cfg = runtime_config(vec![bad_peer()], type_config_floor(0));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         let advanced = server.roll_forward(2).await;
         // Every installed role was visited (registration order) …
@@ -1289,7 +1360,7 @@ mod tests {
     async fn epoch_advance_poll_triggers_advance() {
         let cfg = runtime_config(vec![bad_peer()], type_config_floor(0));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         // `now = 0` is long before the epoch's expiry (~build time + 300s) ⇒
         // the epoch is live, so poll must not advance.
@@ -1316,7 +1387,7 @@ mod tests {
         // Qualifying stake selects every wired role + Archiver at boot.
         let cfg = runtime_config(vec![bad_peer()], type_config_floor(0));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         let recomputed = server.recompute_role_set();
         assert_eq!(
@@ -1329,7 +1400,8 @@ mod tests {
         // stake-driven, not a fixed capture. Fails if recompute ignores stake.
         let cold_cfg = runtime_config(vec![bad_peer()], type_config_floor(0));
         let cold_server =
-            build_runtime(cold_cfg, Arc::new(MapStakeProvider::with_default(0))).expect("host builds");
+            build_runtime(cold_cfg, Arc::new(MapStakeProvider::with_default(0)), test_data_provider())
+                .expect("host builds");
         assert!(
             cold_server.recompute_role_set().is_empty(),
             "recompute over zero stake must admit no roles"
@@ -1347,7 +1419,7 @@ mod tests {
         // Qualifying stake installs all four wired roles.
         let cfg = runtime_config(vec![bad_peer()], type_config_floor(0));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         let installed = server.installed_roles();
         // The fan-out runs (no panic) and does not mutate the install set —
@@ -1375,7 +1447,7 @@ mod tests {
     async fn signshielded_request_reaches_finalizer_plugin_auth_gate() {
         let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Finalizer));
         let provider = Arc::new(MapStakeProvider::with_default(2000));
-        let server = build_runtime(cfg, provider).expect("host builds");
+        let server = build_runtime(cfg, provider, test_data_provider()).expect("host builds");
 
         assert_eq!(server.installed_roles(), vec![NodeRegistryType::Finalizer]);
 

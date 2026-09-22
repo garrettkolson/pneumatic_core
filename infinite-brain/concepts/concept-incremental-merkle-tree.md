@@ -8,7 +8,7 @@ summary: "Append-only Merkle tree (DEFAULT_DEPTH=32) over shielded note commitme
 auto_inject: false
 applicable_when: "Working on tree.rs, MerkleRootState, membership proofs, or pool roots"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/22/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If DEFAULT_DEPTH changes, the leaf hashing changes, or the tree is replaced"
 tags: [shielded, merkle, tree, membership]
@@ -38,3 +38,5 @@ source_url: "Empty"
 `src/shielded/tree.rs` implements an **incremental Merkle tree**: append-only, fixed depth `DEFAULT_DEPTH = 32` (line 35; `Tree::default()` uses it). Each new note commitment is inserted at the next leaf slot; the root updates in O(depth) without re-hashing prior leaves.
 
 Two consumers: (1) the **network** — `MerkleRootState` (`src/shielded/roots.rs:70`) records root history so the validation spec can check that a transaction's claimed root is fresh and within the recency window; (2) the **prover** — membership paths from this tree are inputs to the `ActionCircuit`, which verifies them in-circuit.
+
+**S5.3 (2026-09-22):** `commitment_to_leaf` is `pub` (the canonical commitment→leaf mapping that pool deltas record) and `membership_proof(index)` re-derives an EXISTING leaf's proof against the tree's current root — an `append`'s returned proof is stale once later leaves land above it (the sibling path changes), so pool tooling/tests re-derive on demand.

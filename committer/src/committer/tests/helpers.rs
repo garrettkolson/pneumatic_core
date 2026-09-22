@@ -19,9 +19,10 @@ pub use pneumatic_core::messages::Message;
 pub use pneumatic_core::node::registry::NodeRegistry;
 pub use pneumatic_core::node::NodeRegistryType;
 pub use pneumatic_core::registry::PendingTransactionRegistry;
-pub use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature, TransactionState, TransactionValidationResult};
+pub use pneumatic_core::transactions::{PendingTransaction, SignedTransaction, Transaction, TransactionCommit, TransactionSignature, TransactionState, TransactionValidationResult, ShieldedTransaction};
 pub use pneumatic_core::user::User;
 pub use std::collections::HashMap;
+pub use crate::shielded_pool::{PoolApplyOutcome, ShieldedPool};
 
 use super::super::*;
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,12 @@ pub struct TestDataProvider {
     /// When true, `save_stake_snapshot`/`save_executor_set` return an error
     /// (simulates a snapshot-persistence failure).
     pub fail_snapshot_save: bool,
+    /// When true, `save_shielded_pool` returns an error (simulates the S5.3
+    /// durability seam: the pool delta cannot be persisted).
+    pub fail_shielded_save: bool,
+    /// In-memory shielded-pool store (S5.3): `get_shielded_pool`/
+    /// `save_shielded_pool` read/write this, mirroring the real data service.
+    pub shielded_pool_state: Mutex<Option<pneumatic_core::data::ShieldedPoolState>>,
 }
 
 
@@ -48,6 +55,8 @@ impl TestDataProvider {
             fail_get: false,
             fail_save: false,
             fail_snapshot_save: false,
+            fail_shielded_save: false,
+            shielded_pool_state: Mutex::new(None),
         }
     }
 
@@ -58,6 +67,8 @@ impl TestDataProvider {
             fail_get,
             fail_save,
             fail_snapshot_save: false,
+            fail_shielded_save: false,
+            shielded_pool_state: Mutex::new(None),
         }
     }
 
@@ -66,6 +77,15 @@ impl TestDataProvider {
     /// persistence error rather than swallowing it (AUDIT Phase 5.4 / M8).
     pub fn with_snapshot_save_failure(mut self, fail: bool) -> Self {
         self.fail_snapshot_save = fail;
+        self
+    }
+
+    /// Arm the S5.3 shielded-pool persistence failure, so `save_shielded_pool`
+    /// returns `Err`. Used to prove the commit path fails closed (no chain
+    /// append, delta reverted) when the durable nullifier record cannot be
+    /// written.
+    pub fn with_shielded_save_failure(mut self, fail: bool) -> Self {
+        self.fail_shielded_save = fail;
         self
     }
     pub fn insert_user(&self, key: Vec<u8>, partition_id: String, user: User) {
@@ -147,6 +167,25 @@ impl DataProvider for TestDataProvider {
         }
         Ok(())
     }
+
+    fn get_shielded_pool(
+        &self,
+        _partition_id: &str,
+    ) -> Result<Option<pneumatic_core::data::ShieldedPoolState>, DataError> {
+        Ok(self.shielded_pool_state.lock().unwrap().clone())
+    }
+
+    fn save_shielded_pool(
+        &self,
+        state: &pneumatic_core::data::ShieldedPoolState,
+        _partition_id: &str,
+    ) -> Result<(), DataError> {
+        if self.fail_shielded_save {
+            return Err(DataError::StoreNotFound);
+        }
+        *self.shielded_pool_state.lock().unwrap() = Some(state.clone());
+        Ok(())
+    }
 }
 
 
@@ -194,6 +233,23 @@ pub fn make_test_block_for_token(
     sender: Vec<u8>,
 ) -> Block {
     make_block_for_token_id(committer, trans_id, sender, &vec![1])
+}
+
+
+/// S5.3: a block whose `SignedTransaction` carries a shielded payload, chained
+/// off the token's current chain state. The hash is recomputed AFTER the
+/// shielded field is set, because the block hash covers `signed_trans`.
+pub fn make_shielded_block_for_token(
+    committer: &Committer,
+    trans_id: &str,
+    sender: Vec<u8>,
+    stx: pneumatic_core::transactions::ShieldedTransaction,
+) -> Block {
+    let mut block = make_block_for_token_id(committer, trans_id, sender, &vec![1]);
+    block.signed_trans.shielded = Some(stx);
+    block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+        .expect("well-formed test block hashes");
+    block
 }
 
 
@@ -288,19 +344,33 @@ pub fn bootstrap_token_chain(committer: &Committer) {
 }
 
 
-/// Builds a Committer with the default full-stake slash fraction (1.0).
+/// Builds a Committer with the default full-stake slash fraction (1.0) and a
+/// pristine shielded pool (S5.3).
 pub fn make_test_committer(
     data_provider: Arc<TestDataProvider>,
 ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
-    make_test_committer_with_slash(data_provider, 1.0)
+    make_test_committer_with_slash(data_provider, 1.0, Arc::new(ShieldedPool::new(10)))
 }
 
 
-/// Builds a Committer with an overridable `CostModel.slash_fraction`. The default
-/// `make_test_committer` delegates here with the full-stake default (1.0).
+/// S5.3: builds a Committer with an explicit shielded pool — the commit/
+/// finality pipeline tests drive the commit path through a real
+/// `Arc<ShieldedPool>` to assert pool/chain lockstep.
+pub fn make_test_committer_with_pool(
+    data_provider: Arc<TestDataProvider>,
+    pool: Arc<ShieldedPool>,
+) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
+    make_test_committer_with_slash(data_provider, 1.0, pool)
+}
+
+
+/// Builds a Committer with an overridable `CostModel.slash_fraction` and
+/// shielded pool. The default `make_test_committer` delegates here with the
+/// full-stake default (1.0) and a pristine pool.
 pub fn make_test_committer_with_slash(
     data_provider: Arc<TestDataProvider>,
     slash_fraction: f64,
+    shielded_pool: Arc<ShieldedPool>,
 ) -> (Committer, Arc<PendingTransactionRegistry>, Arc<CollectingLogger>) {
     let mut env_data = Arc::new(make_test_env_data());
     // Install an in-memory collecting logger so a test can assert a failure path emitted an
@@ -415,6 +485,7 @@ pub fn make_test_committer_with_slash(
         env_data.clone(),
         env_data.logger.clone(),
         identity.clone(),
+        shielded_pool.clone(),
     ));
 
     let committer = Committer::new(
@@ -437,6 +508,7 @@ pub fn make_test_committer_with_slash(
         epoch_duration,
         5000,
         candidate_registry,
+        shielded_pool,
     );
 
     (committer, pending_registry, Arc::new(logger))
@@ -642,6 +714,7 @@ pub fn build_committer_for_leader_test(
         env_data.clone(),
         env_data.logger.clone(),
         identity.clone(),
+        Arc::new(ShieldedPool::new(10)),
     ));
 
     let test_dp = dp;
@@ -665,6 +738,7 @@ pub fn build_committer_for_leader_test(
         epoch_duration,
         5000,
         candidate_registry,
+        Arc::new(ShieldedPool::new(10)),
     );
 
     (committer, pending_registry, test_dp)

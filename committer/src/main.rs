@@ -20,6 +20,7 @@ use pneumatic_core::rns::wrapper::{AnnouncedIdentity, RnsNetwork};
 
 use pneumatic_committer::block_services::BlockServices;
 use pneumatic_committer::committer::Committer;
+use pneumatic_committer::shielded_pool::ShieldedPool;
 use pneumatic_committer::epoch_manager::{
     EpochReconciler, LeaderSelector, StakeStore, StakingManager,
 };
@@ -219,6 +220,17 @@ async fn main() {
         stake_store.add_staker(key, stake);
     }
 
+    // S5.3: load the global shielded pool (fail-closed at boot, like the
+    // stake snapshot: a corrupted state refuses to start; a true absence
+    // seeds a pristine genesis and persists it). Shared by Arc with the
+    // BlockServices and the Committer's commit path.
+    let shielded_pool = ShieldedPool::load(
+        data_provider.as_ref(),
+        &env_data.token_partition_id,
+        env_data.shielded_root_recency,
+    )
+    .expect("load shielded pool at boot");
+
     // 7. Create EpochReconciler and LeaderSelector.
     // The CandidateRegistry is shared (cloned) between the reconciler and the
     // Committer so the reconciler's same-chain fork detection and the
@@ -267,6 +279,7 @@ async fn main() {
         env_data.clone(),
         shared_logger.clone(),
         config.identity.clone(),
+        shielded_pool.clone(),
     ));
 
     // 11. Create Committer
@@ -290,6 +303,7 @@ async fn main() {
         epoch_duration,
         5000, // proposal_interval_ms: check every 5 seconds
         candidate_registry,
+        shielded_pool,
     ));
 
     // 12. Wire up gossiper message handler

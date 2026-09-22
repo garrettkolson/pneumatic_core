@@ -241,7 +241,10 @@ impl IncrementalMerkleTree {
     ///
     /// Panics if the commitment is the point at infinity (which a Pedersen
     /// commitment from S1.3 will never be in practice).
-    fn commitment_to_leaf(commitment: &EpAffine) -> Fp {
+    ///
+    /// Public (S5.3): the canonical commitment→leaf mapping that pool deltas
+    /// record — tests and off-pool tooling use it to mirror tree state.
+    pub fn commitment_to_leaf(commitment: &EpAffine) -> Fp {
         let coords = commitment
             .coordinates()
             .expect("commitment must not be the point at infinity");
@@ -299,6 +302,35 @@ impl IncrementalMerkleTree {
         self.leaf_count += 1;
         let root = current;
         (root, MembershipProof { index, siblings })
+    }
+
+    /// Derive the membership proof for an EXISTING leaf (S5.3): the sibling
+    /// path for `index` in the tree's current state. The result verifies
+    /// against [`Self::root`] of the tree as it stands now.
+    ///
+    /// A proof returned by an earlier `append` call is STALE once further
+    /// leaves are appended (the sibling path above the new leaves changes),
+    /// so pool tooling and tests re-derive proofs on demand with this.
+    pub fn membership_proof(&self, index: usize) -> MembershipProof {
+        debug_assert!(
+            (index as u64) < self.leaf_count,
+            "membership_proof: index beyond the leaf count"
+        );
+        let mut siblings = Vec::with_capacity(self.depth as usize);
+        for l in 0..self.depth {
+            let pos = (index as u64) >> l;
+            let sib_pos = pos ^ 1;
+            let sib = self
+                .levels[l as usize]
+                .get(sib_pos as usize)
+                .copied()
+                .unwrap_or(Fp::zero());
+            siblings.push(sib);
+        }
+        MembershipProof {
+            index: index as u64,
+            siblings,
+        }
     }
 
     /// Verify a membership proof against a root.

@@ -106,6 +106,22 @@ impl Committer {
         if transaction.hash()? != commit.proposed_block.signed_trans.transaction.hash()? {
             return Err(CommitterError::TransactionPayloadMismatch(tx_id.clone()));
         }
+        // S5.3: the shielded extension of H12. The wire block's shielded
+        // payload must be the one the (never-evicted, S5.1) parallel map
+        // holds for this tx — hash-compare the full canonical payloads, so a
+        // swap of ANY shielded field (proof, nullifiers, commitments, fee)
+        // is caught. A shielded block whose tx is absent from the parallel
+        // map is equally a mismatch (the payload it commits is not the one
+        // that was validated and pooled).
+        if let Some(wire_shielded) = &commit.proposed_block.signed_trans.shielded {
+            let registry_shielded = self
+                .pending_registry
+                .get_shielded(&tx_id)
+                .ok_or_else(|| CommitterError::TransactionPayloadMismatch(tx_id.clone()))?;
+            if wire_shielded.hash()? != registry_shielded.hash()? {
+                return Err(CommitterError::TransactionPayloadMismatch(tx_id.clone()));
+            }
+        }
 
         // Step 3: Check for conflicts and resolve before committing. The resolved
         // conflict tells us whether the incoming block wins outright (`Commit`) or
@@ -113,10 +129,56 @@ impl Committer {
         // — or was rejected (`LoserDiscarded`, surfaced below).
         match self.handle_conflict_at_commit(commit, &finalizer_key) {
             Ok(CommitConflictOutcome::Commit) => {
-                self.block_services.commit_block(commit, None)?;
+                // S5.3 durability ordering (roadmap 2.5): the pool delta is
+                // applied AND persisted BEFORE the chain append — the durable
+                // nullifier record precedes the block's committed report, so a
+                // crash can never produce "block committed, spend not
+                // recorded". (An idempotent replay applies nothing and persists
+                // nothing.) If the append fails, undo the just-applied delta
+                // — the exact inverse — so the pool tracks the chain.
+                let applied = self.shielded_commit_apply(commit)?;
+                if let Err(e) = self.block_services.commit_block(commit, None) {
+                    self.shielded_commit_undo(commit, applied)?;
+                    return Err(e);
+                }
             }
             Ok(CommitConflictOutcome::CommitWinnerAfterRollback(loser_hash)) => {
-                self.block_services.commit_block(commit, Some(loser_hash))?;
+                // S5.3 lockstep rollback. The plan's original order (revert
+                // loser → apply winner → commit) LOST the loser's delta if the
+                // commit failed; this inverted order keeps the pool consistent
+                // with the chain in BOTH branches:
+                //   1. apply the WINNER's delta and persist;
+                //   2. commit — `commit_block` rolls the defeated tip back on
+                //      the chain and appends the winner;
+                //   3. on success, the defeated delta leaves the pool when it
+                //      has one (a buffered loser never applied → `PoolRollback`
+                //      is the expected no-op);
+                //   4. on failure, `commit_block` auto-restores the defeated
+                //      tip on the chain (Token::commit_block re-appends the
+                //      removed block on validation failure) — so the
+                //      WINNER's delta leaves the pool instead.
+                let applied = self.shielded_commit_apply(commit)?;
+                match self.block_services.commit_block(commit, Some(loser_hash.clone())) {
+                    Ok(_) => {
+                        // The defeated delta leaves the pool — but ONLY when
+                        // the loser actually has one. The rollback target is
+                        // normally a buffered candidate that never reached
+                        // the chain (and never advanced the pool): for those
+                        // `PoolRollback` is the expected "no delta recorded"
+                        // outcome, not a fault. Only a committed tip (a
+                        // loser that WAS applied) carries a delta to revert.
+                        match self.shielded_pool.revert_update(&loser_hash) {
+                            Ok(()) | Err(CommitterError::PoolRollback { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        self.shielded_pool
+                            .save(&*self.data_provider, &self.env_data.token_partition_id)?;
+                    }
+                    Err(e) => {
+                        self.shielded_commit_undo(commit, applied)?;
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => return Err(e),
         }
@@ -173,6 +235,63 @@ impl Committer {
         // Step 6: Distribute the committed block to archivers
         let _ = self.block_services.distribute_to_archivers(&commit.proposed_block).await;
 
+        Ok(())
+    }
+
+    /// S5.3: apply (and persist) the incoming block's shielded pool delta
+    /// BEFORE its chain append — the roadmap 2.5 durability ordering. Plain
+    /// blocks and idempotent replays are no-ops (nothing to persist).
+    fn shielded_commit_apply(
+        &self,
+        commit: &TransactionCommit,
+    ) -> Result<PoolApplyOutcome, CommitterError> {
+        let outcome = self
+            .shielded_pool
+            .apply_update(&commit.proposed_block, &self.env_data)?;
+        if matches!(outcome, PoolApplyOutcome::Applied) {
+            if let Err(e) = self
+                .shielded_pool
+                .save(&*self.data_provider, &self.env_data.token_partition_id)
+            {
+                // The durable record could not be written: the block will NOT
+                // be committed, so the just-applied delta must leave the
+                // in-memory pool too — the chain never moved, and a divergent
+                // pool (delta in memory, not in the store) would be worse
+                // than the surfaced failure. The store still holds the
+                // pre-apply state, so no re-save is needed after the revert.
+                if let Err(revert_err) = self
+                    .shielded_pool
+                    .revert_update(&commit.proposed_block.current_hash)
+                {
+                    // A revert failure on top of a save failure means the
+                    // guarded state may be inconsistent: surface both.
+                    return Err(CommitterError::PoolPersist {
+                        cause: format!(
+                            "pool save failed ({e:?}); delta revert failed ({revert_err:?})"
+                        ),
+                    });
+                }
+                return Err(e);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// S5.3: undo a just-applied delta after a failed chain append (the exact
+    /// inverse of `shielded_commit_apply`) and persist the restored state.
+    /// Only a freshly `Applied` delta is undone — an idempotent replay (`
+    /// AlreadyApplied`) or a plain block has nothing to undo.
+    fn shielded_commit_undo(
+        &self,
+        commit: &TransactionCommit,
+        applied: PoolApplyOutcome,
+    ) -> Result<(), CommitterError> {
+        if matches!(applied, PoolApplyOutcome::Applied) {
+            self.shielded_pool
+                .revert_update(&commit.proposed_block.current_hash)?;
+            self.shielded_pool
+                .save(&*self.data_provider, &self.env_data.token_partition_id)?;
+        }
         Ok(())
     }
 

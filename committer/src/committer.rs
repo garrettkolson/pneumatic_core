@@ -27,6 +27,7 @@ use super::block_services::BlockServices;
 use super::committer_error::CommitterError;
 use super::epoch_manager::{EpochReconciler, LeaderSelector, StakeStore, StakingManager};
 use super::orphan_buffer::{BufferDecision, OrphanBuffer};
+use super::shielded_pool::{PoolApplyOutcome, ShieldedPool};
 
 /// Convert a byte slice to a hex string (lowercase, no prefix).
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -130,6 +131,10 @@ pub struct Committer {
     block_proposer: Arc<dyn IBlockProposer>,
     /// Candidate registry for conflict detection at commit time
     candidate_registry: Arc<CandidateRegistry>,
+    /// The global shielded pool (S5.3) — the sole owner of committed
+    /// shielded state, shared by `Arc` with the block services and (in the
+    /// composite node) the shielded roles' validation views.
+    shielded_pool: Arc<ShieldedPool>,
     /// Duration of each epoch in seconds
     epoch_duration: i64,
     /// Interval between proposal polls in milliseconds
@@ -192,6 +197,7 @@ impl Committer {
         epoch_duration: i64,
         proposal_interval_ms: u64,
         candidate_registry: Arc<CandidateRegistry>,
+        shielded_pool: Arc<ShieldedPool>,
     ) -> Self {
         Committer {
             env_data,
@@ -214,6 +220,7 @@ impl Committer {
             epoch_duration,
             proposal_interval_ms,
             candidate_registry,
+            shielded_pool,
             confirmation_votes: Mutex::new(HashMap::new()),
             stake_set_cache: Mutex::new(HashMap::new()),
             orphan_blocks: Mutex::new(OrphanBuffer::new(1024, 256, Duration::from_secs(30))),
@@ -480,4 +487,5 @@ mod tests {
     mod epoch;
     mod quorum;
     mod distribution;
+    mod pool;
 }
