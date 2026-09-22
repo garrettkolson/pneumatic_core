@@ -44,6 +44,7 @@ use once_cell::sync::Lazy;
 
 use crate::errors::{PneumaticError, ValidationFailureReason};
 use crate::shielded::circuit::{ActionCircuit, PublicInputs};
+use crate::shielded::poseidon::poseidon_hash;
 use crate::shielded::tree::bytes_to_root;
 use crate::shielded::{DEFAULT_DEPTH, MembershipProof, ShieldedNote};
 use crate::transactions::ShieldedTransaction;
@@ -264,6 +265,20 @@ pub fn public_inputs_from_shielded_tx(tx: &ShieldedTransaction) -> Result<Public
         output_commit_y: out_y,
         fee: Fp::from(tx.fee),
     })
+}
+
+/// S5.3: the tree leaf a 32-byte wire commitment becomes when appended to the
+/// shielded pool tree — `poseidon_hash([x, y])` over the decoded affine
+/// coordinates, the same value `IncrementalMerkleTree::append` computes from
+/// the decoded point (tree.rs `commitment_to_leaf`).
+///
+/// The committer's `ShieldedPool` re-derives each validated tx's output
+/// commitment leaves this way at apply time (step 4), so the pool's tree
+/// reconstructs identically on every node. Fails closed (undecodable /
+/// non-member / point at infinity) exactly as `point_coords` does.
+pub fn commitment_leaf(bytes: &[u8; 32]) -> Result<Fp, PneumaticError> {
+    let (x, y) = point_coords(bytes)?;
+    Ok(poseidon_hash(&[x, y]))
 }
 
 // ---------------------------------------------------------------------------

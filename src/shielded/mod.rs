@@ -77,7 +77,7 @@ pub use circuit::{ActionCircuit, PublicInputs};
 
 mod verify;
 pub use verify::{
-    action_circuit_for_verifying_key, public_inputs_from_shielded_tx, ShieldedVerifier,
+    action_circuit_for_verifying_key, commitment_leaf, public_inputs_from_shielded_tx, ShieldedVerifier,
 };
 
 #[cfg(test)]

@@ -313,6 +313,12 @@ mod tests {
         fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition: &str) -> Result<(), DataError> {
             self.inner.save_executor_set(epoch, set, partition)
         }
+        fn get_shielded_pool(&self, partition: &str) -> Result<Option<crate::data::ShieldedPoolState>, DataError> {
+            self.inner.get_shielded_pool(partition)
+        }
+        fn save_shielded_pool(&self, state: &crate::data::ShieldedPoolState, partition: &str) -> Result<(), DataError> {
+            self.inner.save_shielded_pool(state, partition)
+        }
     }
 
     /// A test `DataProvider` delegating to a `StubDataProvider` so a snapshot
@@ -345,6 +351,12 @@ mod tests {
         }
         fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition: &str) -> Result<(), DataError> {
             self.inner.lock().unwrap().save_executor_set(epoch, set, partition)
+        }
+        fn get_shielded_pool(&self, partition: &str) -> Result<Option<crate::data::ShieldedPoolState>, DataError> {
+            self.inner.lock().unwrap().get_shielded_pool(partition)
+        }
+        fn save_shielded_pool(&self, state: &crate::data::ShieldedPoolState, partition: &str) -> Result<(), DataError> {
+            self.inner.lock().unwrap().save_shielded_pool(state, partition)
         }
     }
 

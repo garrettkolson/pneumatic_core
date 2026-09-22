@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category::Data;
 use crate::conns::{ConnError, ConnTarget, LocalTarget};
+use crate::crypto::sha256;
 use crate::conns::factories::{ConnFactory, IsConnFactory};
 use crate::conns::uds::data_socket_path;
 use crate::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
@@ -64,6 +65,33 @@ pub trait DataProvider : Send + Sync {
     /// no change; providers that can resolve a tip override this.
     fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
         Ok(None)
+    }
+
+    /// Retrieve the committed shielded-pool state for a partition (S5.3).
+    ///
+    /// `Ok(None)` means a *true absence* (the key was never written — the
+    /// committer seeds pristine genesis and persists it). Any `Err`
+    /// (corruption, `SnapshotCorrupt`, a hung/unauthenticated service) is a
+    /// fail-closed boot condition for a shielded-enabled committer: a pool
+    /// the store cannot return verbatim must never be silently re-seeded,
+    /// because re-seeding forgets prior spends (a double-spend window).
+    ///
+    /// The default `Ok(None)` keeps role-specific stubs compiling; production
+    /// (`DefaultDataProvider`) and in-memory test stubs override it.
+    fn get_shielded_pool(&self, partition_id: &str) -> Result<Option<ShieldedPoolState>, DataError> {
+        Ok(None)
+    }
+
+    /// Persist the committed shielded-pool state for a partition (S5.3).
+    ///
+    /// This is the durable record that closes the crash-and-restart
+    /// un-spend window (roadmap 2.5): the committer persists a delta here
+    /// *before* reporting its block committed. The default `Ok(())` keeps
+    /// role-specific stubs compiling; a provider that does not actually
+    /// persist silently voids that guarantee — shielded-enabled deployments
+    /// must use a provider that overrides this.
+    fn save_shielded_pool(&self, state: &ShieldedPoolState, partition_id: &str) -> Result<(), DataError> {
+        Ok(())
     }
 }
 
@@ -285,6 +313,33 @@ impl DataProvider for DefaultDataProvider {
         let token = self.get_token(&token_id, partition_id)?;
         Ok(Some(token.blockchain.get_current_chain_state().last_hash_in))
     }
+
+    fn get_shielded_pool(&self, partition_id: &str) -> Result<Option<ShieldedPoolState>, DataError> {
+        // S5.3: read the SHA-256 envelope, verify the fingerprint, then return
+        // the plain pool state. NOTE the fail-closed asymmetry with the
+        // in-memory stubs: this provider never fabricates `Ok(None)` — a
+        // missing key at the service level surfaces as a data error
+        // (deserialization failure / service reply), and the committer treats
+        // any `Err` as corrupt at boot. The conservative direction: we would
+        // rather refuse to start than silently re-seed a pool whose prior
+        // spends we cannot prove are gone.
+        let env: ShieldedPoolStateEnvelope = self.get_data_internal(
+            &b"shielded_pool".to_vec(),
+            DataOp::Get(GetOp::ShieldedPool),
+            partition_id,
+        )?;
+        env.verify()?;
+        Ok(Some(env.payload))
+    }
+
+    fn save_shielded_pool(&self, state: &ShieldedPoolState, partition_id: &str) -> Result<(), DataError> {
+        let env = ShieldedPoolStateEnvelope::new(state.clone());
+        self.save_data_internal::<ShieldedPoolStateEnvelope>(
+            &b"shielded_pool".to_vec(),
+            DataOp::Save(SaveOp::ShieldedPool(env)),
+            partition_id,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -309,6 +364,9 @@ pub enum GetOp {
     User,
     StakeSnapshot(u64),
     ExecutorSet(u64),
+    /// S5.3: the committed shielded-pool state for a partition (additive —
+    /// ground rule 4: an old data service seeing the unknown tag fails closed).
+    ShieldedPool,
 }
 
 impl std::fmt::Display for GetOp {
@@ -319,6 +377,7 @@ impl std::fmt::Display for GetOp {
             GetOp::User => write!(f, "User"),
             GetOp::StakeSnapshot(epoch) => write!(f, "StakeSnapshot({})", epoch),
             GetOp::ExecutorSet(epoch) => write!(f, "ExecutorSet({})", epoch),
+            GetOp::ShieldedPool => write!(f, "ShieldedPool"),
         }
     }
 }
@@ -334,6 +393,9 @@ pub enum SaveOp {
     // instead of trusting arbitrary deserialized bytes.
     StakeSnapshot(StakeSnapshotEnvelope),
     ExecutorSet(ExecutorSetEnvelope),
+    // S5.3: the shielded pool state, same envelope discipline (additive —
+    // ground rule 4).
+    ShieldedPool(ShieldedPoolStateEnvelope),
 }
 
 /// SHA-256 envelope around a persisted stake snapshot.
@@ -404,6 +466,98 @@ impl ExecutorSetEnvelope {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shielded pool state persistence (Phase S5.3)
+// ---------------------------------------------------------------------------
+
+/// One applied block's shielded-pool delta (S5.3): the leaves it appended,
+/// the nullifiers it spent, and the pool root that resulted.
+///
+/// Persisted in commit order; this ordered sequence is the pool's complete
+/// history — the tree is rebuilt by re-appending the concatenated leaves,
+/// the root history by pushing each `post_root`, and rollback is the exact
+/// removal of one entry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AppliedPoolDelta {
+    /// The block hash (`current_hash`) of the block that produced the delta.
+    pub block_hash: Vec<u8>,
+    /// Pool leaves appended by the block (canonical 32-byte Fp encoding).
+    pub leaves: Vec<[u8; 32]>,
+    /// Nullifiers spent by the block.
+    pub nullifiers: Vec<[u8; 32]>,
+    /// Pool root after applying this delta (canonical 32-byte Fp encoding).
+    pub post_root: [u8; 32],
+}
+
+/// Full shielded-pool state for S5.3 persistence.
+///
+/// All fields are fixed-order (`Vec`/primitives) — no `HashMap` — so the
+/// serde MsgPack form is already canonical; `canonical_bytes` serializes
+/// directly.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ShieldedPoolState {
+    /// Current pool root (canonical 32-byte Fp encoding).
+    pub root: [u8; 32],
+    /// Number of leaves in the tree (== `leaves.len()`, asserted on load).
+    pub leaf_count: u64,
+    /// The full ordered leaf sequence (canonical 32-byte Fp encoding each).
+    pub leaves: Vec<[u8; 32]>,
+    /// The spent-nullifier set (the union of the applied deltas' nullifiers).
+    pub nullifiers: Vec<[u8; 32]>,
+    /// The applied deltas in commit order.
+    pub applied: Vec<AppliedPoolDelta>,
+}
+
+impl ShieldedPoolState {
+    /// Canonical bytes (see the type doc: the serde form is already
+    /// canonical — no `HashMap` fields).
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, DataError> {
+        serialize_to_bytes_rmp(self).map_err(DataError::SerializationError)
+    }
+
+    /// SHA-256 fingerprint of `canonical_bytes()` — the value stored in the
+    /// envelope and re-verified on load (Phase 5.4 pattern).
+    pub fn fingerprint(&self) -> [u8; 32] {
+        sha256(&self.canonical_bytes().unwrap_or_default())
+            .try_into()
+            .unwrap_or([0u8; 32])
+    }
+}
+
+/// SHA-256 envelope around a persisted shielded-pool state (S5.3). Mirrors
+/// `StakeSnapshotEnvelope` (Phase 5.4 / H9/M8): the payload travels with its
+/// digest, and a load that sees a mismatch surfaces `SnapshotCorrupt`
+/// instead of trusting deserialized bytes. No epoch field — the pool is a
+/// single per-partition value, not per-epoch.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShieldedPoolStateEnvelope {
+    /// The pool state.
+    pub payload: ShieldedPoolState,
+    /// `payload.fingerprint()` — the SHA-256 of `payload.canonical_bytes()`.
+    pub hash: [u8; 32],
+}
+
+impl ShieldedPoolStateEnvelope {
+    /// Wrap a pool state, computing its SHA-256 fingerprint.
+    pub fn new(payload: ShieldedPoolState) -> Self {
+        ShieldedPoolStateEnvelope {
+            hash: payload.fingerprint(),
+            payload,
+        }
+    }
+
+    /// Verify the stored fingerprint matches the payload; `SnapshotCorrupt`
+    /// otherwise (S5.3, Phase 5.4 pattern).
+    pub fn verify(&self) -> Result<(), DataError> {
+        if self.hash != self.payload.fingerprint() {
+            return Err(DataError::SnapshotCorrupt(
+                "shielded pool state: stored hash != payload.fingerprint()".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for SaveOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -412,6 +566,7 @@ impl std::fmt::Display for SaveOp {
             SaveOp::User(_) => write!(f, "User"),
             SaveOp::StakeSnapshot(_) => write!(f, "StakeSnapshot"),
             SaveOp::ExecutorSet(_) => write!(f, "ExecutorSet"),
+            SaveOp::ShieldedPool(_) => write!(f, "ShieldedPool"),
         }
     }
 }
@@ -571,6 +726,7 @@ pub struct StubDataProvider {
     users: std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::collections::HashMap<String, User>>>,
     stake_snapshots: std::sync::Mutex<std::collections::HashMap<u64, StakeSnapshotEnvelope>>,
     executor_sets: std::sync::Mutex<std::collections::HashMap<u64, ExecutorSetEnvelope>>,
+    pool_state: std::sync::Mutex<Option<ShieldedPoolStateEnvelope>>,
 }
 
 impl StubDataProvider {
@@ -580,6 +736,7 @@ impl StubDataProvider {
             users: std::sync::Mutex::new(std::collections::HashMap::new()),
             stake_snapshots: std::sync::Mutex::new(std::collections::HashMap::new()),
             executor_sets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pool_state: std::sync::Mutex::new(None),
         }
     }
 
@@ -613,6 +770,24 @@ impl StubDataProvider {
         let mut env = StakeSnapshotEnvelope::new(snapshot, epoch);
         env.hash = [0u8; 32]; // never matches payload.fingerprint()
         self.stake_snapshots.lock().unwrap().insert(epoch, env);
+        self
+    }
+
+    /// Store a shielded-pool state (wrapped in its SHA-256 envelope) so a
+    /// subsequent `get_shielded_pool` verifies integrity — matching
+    /// `DefaultDataProvider` (S5.3).
+    pub fn with_shielded_pool(mut self, state: ShieldedPoolState) -> Self {
+        let env = ShieldedPoolStateEnvelope::new(state);
+        *self.pool_state.lock().unwrap() = Some(env);
+        self
+    }
+
+    /// Store a shielded-pool state with a deliberately wrong fingerprint, to
+    /// prove a corrupted pool state is detected on load (S5.3, Phase 5.4 pattern).
+    pub fn with_corrupted_shielded_pool(mut self, state: ShieldedPoolState) -> Self {
+        let mut env = ShieldedPoolStateEnvelope::new(state);
+        env.hash = [0u8; 32]; // never matches payload.fingerprint()
+        *self.pool_state.lock().unwrap() = Some(env);
         self
     }
 
@@ -717,6 +892,18 @@ impl DataProvider for StubDataProvider {
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, _partition_id: &str) -> Result<(), DataError> {
         let env = ExecutorSetEnvelope::new(set, epoch);
         self.executor_sets.lock().unwrap().insert(epoch, env);
+        Ok(())
+    }
+
+    fn get_shielded_pool(&self, _partition_id: &str) -> Result<Option<ShieldedPoolState>, DataError> {
+        let env = self.pool_state.lock().unwrap().clone().ok_or(DataError::DataNotFound)?;
+        env.verify()?;
+        Ok(Some(env.payload))
+    }
+
+    fn save_shielded_pool(&self, state: &ShieldedPoolState, _partition_id: &str) -> Result<(), DataError> {
+        let env = ShieldedPoolStateEnvelope::new(state.clone());
+        *self.pool_state.lock().unwrap() = Some(env);
         Ok(())
     }
 }

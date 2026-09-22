@@ -201,6 +201,23 @@ impl IncrementalMerkleTree {
         Self::new(DEFAULT_DEPTH)
     }
 
+    /// Restore constructor (S5.3): rebuild a tree over an existing leaf
+    /// sequence by re-appending each leaf in order.
+    ///
+    /// Used by the committer's shielded pool on rollback and boot reload,
+    /// where the full ordered leaf list is persisted. The re-append is
+    /// O(n·depth) — acceptable at v1 scale (32 B/leaf is already the
+    /// audited persistence cost). The result is bit-identical to a tree
+    /// built by the same append sequence, so any membership proof that
+    /// verified before still verifies against the restored root.
+    pub fn from_leaves(depth: u32, leaves: &[Fp]) -> Self {
+        let mut tree = Self::new(depth);
+        for leaf in leaves {
+            tree.append_leaf(leaf);
+        }
+        tree
+    }
+
     /// The tree's fixed depth.
     pub fn depth(&self) -> u32 {
         self.depth
@@ -238,13 +255,21 @@ impl IncrementalMerkleTree {
     /// along with a membership proof for the newly-appended leaf.
     pub fn append(&mut self, commitment: &EpAffine) -> (Fp, MembershipProof) {
         let leaf = Self::commitment_to_leaf(commitment);
+        self.append_leaf(&leaf)
+    }
+
+    /// Append a raw `Fp` leaf, updating the affected path to the root in
+    /// O(log n). Returns the new root and the membership proof for the
+    /// newly-appended leaf. `append` is the commitment convenience wrapper
+    /// over this; `from_leaves` reuses it for restore.
+    pub fn append_leaf(&mut self, leaf: &Fp) -> (Fp, MembershipProof) {
         let index = self.leaf_count;
 
         // Push leaf at level 0.
-        self.levels[0].push(leaf);
+        self.levels[0].push(*leaf);
 
         let mut siblings = Vec::with_capacity(self.depth as usize);
-        let mut current = leaf;
+        let mut current = *leaf;
 
         for l in 0..self.depth {
             let pos = index >> l;
@@ -364,6 +389,34 @@ mod tests {
         let (root1, _) = tree.append(&commit(&make_note(0)));
         let (root2, _) = tree.append(&commit(&make_note(1)));
         assert_ne!(root1, root2, "root must change after second append");
+    }
+
+    /// S5.3 restore constructor: `from_leaves` over the exact appended leaf
+    /// sequence reproduces the appended tree bit-for-bit (root, leaf count),
+    /// and membership proofs still verify against the restored root.
+    #[test]
+    fn from_leaves_reproduces_append_tree() {
+        let mut tree = IncrementalMerkleTree::new(4);
+        let mut appends = Vec::new();
+        for i in 0..5u64 {
+            appends.push(tree.append(&commit(&make_note(i))));
+        }
+        let leaves: Vec<Fp> = (0..5).map(|i| note_leaf(&make_note(i))).collect();
+        let restored = IncrementalMerkleTree::from_leaves(4, &leaves);
+        assert_eq!(restored.root(), tree.root(), "restored root must match");
+        assert_eq!(restored.leaf_count(), tree.leaf_count(), "restored leaf count must match");
+        let (_, proof) = &appends[4];
+        assert!(
+            IncrementalMerkleTree::verify_proof(&note_leaf(&make_note(4)), proof, &restored.root(), 4),
+            "proof must verify against the restored root"
+        );
+    }
+
+    #[test]
+    fn from_leaves_empty() {
+        let tree = IncrementalMerkleTree::from_leaves(4, &[]);
+        assert_eq!(tree.root(), Fp::zero(), "empty restore is the zero root");
+        assert_eq!(tree.leaf_count(), 0);
     }
 
     #[test]

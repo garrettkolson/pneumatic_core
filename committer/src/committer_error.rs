@@ -76,6 +76,42 @@ pub enum CommitterError {
     /// metadata of a token that already exists. The rejected distribution is
     /// discarded and the cached token is left intact. `token_id` is the hex id.
     TokenConflict(String),
+    /// S5.3: the committer's authoritative shielded re-check (step 0 of
+    /// `ShieldedPool::apply_update`, `ShieldedValidationSpec::validate_shielded`
+    /// against the pool's OWN state) rejected the proof. Soundness does not
+    /// depend on the sentinel/finalizer verdicts — a tx with a full finalizer
+    /// quorum still fails here if its proof does not verify (S5.3
+    /// discriminator 5). `cause` is the validation reason summary.
+    ShieldedProofInvalid {
+        tx_id: String,
+        cause: String,
+    },
+    /// S5.3: a shielded-pool state fault. `kind` distinguishes:
+    /// `"corrupt"` (envelope fingerprint mismatch — `SnapshotCorrupt`),
+    /// `"integrity"` (rebuilt state contradicts itself, e.g.
+    /// `current_root() != tree.root()`, a bad Fp encoding, a leaf-count
+    /// mismatch, or a recorded `post_root` history inconsistent with the leaf
+    /// sequence), `"invalid_root"` (a persisted 32-byte root is not a valid
+    /// `Fp`). `corrupt`/`integrity` are fail-closed boot/apply errors — the
+    /// committer refuses to run on a pool it cannot reconstruct exactly
+    /// (never silently re-seed: that forgets prior spends).
+    PoolState {
+        kind: &'static str,
+        cause: String,
+    },
+    /// S5.3: persisting the pool state failed (roadmap 2.5 durability) —
+    /// `save_shielded_pool` returned a `DataError`. The commit is rolled
+    /// back / the finalization surfaced; a block is never reported committed
+    /// without its durable nullifier record.
+    PoolPersist {
+        cause: String,
+    },
+    /// S5.3: a rollback was requested for a block with no recorded pool delta
+    /// (no shielded payload, or the delta was already reverted) — never a
+    /// silent skip. `block` is the hex block hash.
+    PoolRollback {
+        block: String,
+    },
 }
 
 impl From<io::Error> for CommitterError {

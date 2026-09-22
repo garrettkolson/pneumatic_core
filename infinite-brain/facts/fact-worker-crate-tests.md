@@ -1,6 +1,6 @@
 ---
 id: fact-worker-crate-tests
-title: "Per-worker-crate test counts verified 09/20/2026 (cargo test -p)"
+title: "Per-worker-crate test counts verified 09/21/2026 (cargo test -p)"
 type: fact
 namespace: pneumatic
 visibility: namespace
@@ -8,7 +8,7 @@ summary: "Verified per-crate: executor 10 passed, finalizer 66, committer 71 lib
 auto_inject: false
 applicable_when: "Quoting per-crate test counts for the worker crates, checking test health after a change in executor/finalizer/committer/sentinel/node-server"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/21/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Stale whenever any worker crate's test modules change — re-run cargo test -p <crate> per crate"
 tags: [tests, worker-crates, baseline, per-crate]
@@ -25,9 +25,9 @@ related: []
 source_url: "Empty"
 ---
 
-# Per-worker-crate test counts verified 09/20/2026
+# Per-worker-crate test counts verified 09/21/2026
 
-`cargo test -p <crate>` run per worker crate on 09/20/2026 (all `0 failed`):
+`cargo test -p <crate>` run per worker crate on 09/21/2026 (all `0 failed`); the committer crate's 80 (71 lib + 9 integration) is unchanged by the Phase 2 `impl Committer` split into `committer/src/committer/`.
 
 | Crate | Result |
 |-------|--------|

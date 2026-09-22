@@ -5,6 +5,13 @@ edition = "2021"
 
 [dependencies]
 pneumatic_core = { path = ".." }
+# S5.3: the shielded pool works in the Pallas base field `Fp` (the tree's leaf
+# type). `pasta_curves`/`ff`/`subtle` are pinned to the exact versions
+# pneumatic_core resolves (S1.2/S1.6), so this adds zero new packages to
+# Cargo.lock and the `Fp` here is the identical type the core crate uses.
+pasta_curves = "=0.5.2"
+ff = "=0.13.1"
+subtle = "=2.6.1"
 async-trait = "0.1.88"
 tokio = { version = "1.44.2", features = ["full"] }
 ed25519-dalek = { version = "2.0", features = ["std"] }
@@ -17,3 +24,7 @@ dashmap = "7.0.0-rc0"
 [dev-dependencies]
 tempfile = "3.20.0"
 hex = "0.4"
+# S5.3: the live (benchmark-only, `#[ignore]`) pool tests build real Halo2
+# proofs via the prover client crate — proving never runs in the default
+# test suite ("proving is benchmark-only").
+pneumatic_prover = { path = "../prover" }

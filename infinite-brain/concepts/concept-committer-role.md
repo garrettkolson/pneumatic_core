@@ -8,9 +8,9 @@ summary: "The terminal node: role-gated auth for 7 wire actions, commit with con
 auto_inject: false
 applicable_when: "Working on committer/, commit-time validation, conflict resolution, gas, epoch transitions, or block distribution"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/21/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when committer/src/committer.rs changes its action router, handle_commit pipeline, or conflict outcome enum"
+staleness_signal: "Stale when the committer's action router, handle_commit pipeline, or conflict outcome enum changes, or when impl Committer methods move between the src/committer/ child modules"
 tags: [committer, worker-crate, commit, conflict-resolution, epochs]
 edges:
   - target: concept-candidate-registry-conflict
@@ -39,7 +39,15 @@ source_url: "Empty"
 
 # Committer role — terminal commit pipeline and epoch management
 
-The Committer is the terminal node in the pneumatic pipeline (`committer/src/committer.rs:85-96`): it receives `TransactionCommit` messages from Finalizers, validates and commits blocks to token blockchains, distributes blocks to archivers, handles token distribution, and manages epoch transitions (staking, reconciliation, leader selection).
+The Committer is the terminal node in the pneumatic pipeline (`committer/src/committer.rs`): it receives `TransactionCommit` messages from Finalizers, validates and commits blocks to token blockchains, distributes blocks to archivers, handles token distribution, and manages epoch transitions (staking, reconciliation, leader selection).
+
+**Code layout (post-split).** The original ~3000-line `committer/src/committer.rs` was modularized: the struct, `new`, action router, and accessors stay in the root module, while the `impl Committer` methods were split into five descendant modules (each re-declares `impl Committer`, pulls in the root's private items via `use super::*;`, and marks cross-module methods `pub(crate)` to keep them callable from the router and tests without widening public API). See `committer/src/committer/`:
+
+- `committing.rs` (327) — `handle_commit`, `check_and_commit_transaction_results`, `handle_conflict_at_commit`, `validate_transaction_message` (the commit pipeline + conflict resolution + per-sender gas).
+- `distributing.rs` (50) — `handle_token_distribution`, `handle_block_distribution`.
+- `finalizing.rs` (204) — `verify_block_finalizer_sig`, `handle_block_finalized`, `buffer_orphan`, `replay_orphan_blocks` (out-of-order block handling).
+- `quoruming.rs` (170) — `handle_block_confirmed_vote`, `handle_block_quorum_reached`, `broadcast_quorum_reached`, `broadcast_vote`.
+- `epoching.rs` (276) — `handle_epoch_reconcile`, `advance_epoch`, `advance_epoch_to`, `propose_blocks`, `run_epoch_loop`.
 
 Commit pipeline (code-verified):
 

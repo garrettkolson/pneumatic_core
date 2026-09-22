@@ -362,16 +362,25 @@ impl PendingTransactionRegistry {
 // NullifierRegistry — consensus-critical spent-nullifier set (Phase S4.2)
 // ---------------------------------------------------------------------------
 
-/// Append-only set of every spent shielded-note nullifier (roadmap 2.5:
-/// consensus-critical, append-only, durable, globally agreed).
+/// Set of every spent shielded-note nullifier (roadmap 2.5: consensus-
+/// critical, append-only, durable, globally agreed).
 ///
-/// **Nullifiers are never removed.** This type deliberately exposes no
-/// removal API: a rollback that un-spent a nullifier would be a double-spend
-/// (two divergent per-token chain branches could spend the same note, and a
-/// set that shrinks on reorg would let both stand). The only `remove` calls
-/// in this type are the internal phase-2 rollback in `mark_many_atomic`,
-/// which restores the pre-call state of a *failed* batch — it never
-/// un-spends a nullifier any successful call marked.
+/// **Nullifiers are never removed — with exactly one scoped exception
+/// (S5.3).** This type deliberately exposes no general removal API: a
+/// rollback that un-spent a nullifier would be a double-spend (two divergent
+/// per-token chain branches could spend the same note, and a set that shrinks
+/// on reorg would let both stand).
+///
+/// The one removal API, [`NullifierRegistry::unmark_many`], is a scoped,
+/// documented exception: only the committer's `ShieldedPool` rollback path
+/// may call it, only under the pool's single-writer guard, and only with the
+/// exact keys recorded in the losing block's applied delta. That pairing is
+/// what makes it safe: the pool runs *every* `mark_many_atomic` under the
+/// same guard, so an `unmark_many` can never interleave with the two phases
+/// of `mark_many_atomic` — the phase-2 rollback argument below is unchanged —
+/// and a rolled-back loser's spend is precisely the one a tip rollback must
+/// undo (UTXO semantics: the winning branch may re-spend the un-spent note,
+/// so the set shrinks only together with the branch state that created it).
 ///
 /// **Growth:** unbounded in v1 (32 B per spend — 10M spends ≈ 320 MB).
 /// Compaction is a future item; not built here.
@@ -432,11 +441,13 @@ impl NullifierRegistry {
     /// the gap between the phases, an insert hits an existing key: this call
     /// then removes exactly the keys it itself inserted in phase 2 and
     /// returns `StaleNullifier`. That rollback is exact because this type has
-    /// **no removal API** (never-evicted, roadmap 2.5): a key whose insert
-    /// returned `None` was absent just before this call, and the only code
-    /// that can remove such a key is the failed call that inserted it — so a
-    /// rolled-back key is restored to its pre-call state and no other call's
-    /// spend is ever undone.
+    /// **no general removal API** (roadmap 2.5; the sole scoped exception,
+    /// `unmark_many`, is callable only from the pool's single-writer rollback
+    /// path, which shares this call's guard and so cannot interleave with
+    /// these two phases): a key whose insert returned `None` was absent just
+    /// before this call, and the only code that can remove such a key is the
+    /// failed call that inserted it — so a rolled-back key is restored to its
+    /// pre-call state and no other call's spend is ever undone.
     ///
     /// A batch containing the same nullifier twice self-collides in phase 2
     /// and is rejected the same way (a nullifier cannot be spent twice, not
@@ -469,6 +480,23 @@ impl NullifierRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Remove a batch of nullifiers from the spent set — the exact inverse of
+    /// `mark_many_atomic`, **scoped to S5.3 rollback**.
+    ///
+    /// This is the type's sole removal API and a scoped, documented exception
+    /// to the never-removed rule (see the type doc). The only sanctioned
+    /// caller is the committer's `ShieldedPool` rollback path, and it may
+    /// call this (a) under the pool's single-writer guard and (b) with
+    /// exactly the keys recorded in the losing block's applied delta. Any
+    /// other use — a non-pool caller, keys not taken from a recorded delta,
+    /// a call racing `mark_many_atomic`'s two phases — breaks the
+    /// single-writer discipline the phase-2 rollback argument relies on.
+    pub fn unmark_many(&self, nullifiers: &[[u8; 32]]) {
+        for nullifier in nullifiers {
+            self.nullifiers.remove(nullifier);
+        }
     }
 }
 
