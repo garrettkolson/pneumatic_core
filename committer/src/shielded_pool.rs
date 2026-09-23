@@ -993,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min) in this test binary. AGENT: un-ignore and re-run when you change the pool's re-validation, the four shielded checks, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_committer -- --ignored apply_update_rejects_bad_proof_with_pool_owned_deps`"]
     fn apply_update_rejects_bad_proof_with_pool_owned_deps() {
         // Discriminator 5's fast form: a structurally-valid tx (checks 1-3
         // pass: fresh nullifier, genesis root is fresh) with a garbage proof

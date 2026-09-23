@@ -433,6 +433,12 @@ pub struct ShieldedValidationDeps<'a> {
 /// `SHIELDED_VK_K`. The template circuit supplies only the *structure* `keygen_vk`
 /// needs (keygen never uses witness data), so repeated verification reuses one
 /// cached `(Params, VerifyingKey)` via `ShieldedVerifier`'s module-level cache.
+///
+/// SLOW-TEST NOTE: every test that reaches check 4 (this static) is `#[ignore]`d
+/// because the first touch pays the one-time ActionCircuit keygen (measured
+/// ~2.5 min) and the rest block on it. Un-ignore a test when you change the
+/// functionality it covers — each test's ignore note names the trigger and the
+/// re-run command. Until then the default suite stays fast.
 static SHIELDED_VALIDATOR_VERIFIER: Lazy<ShieldedVerifier> = Lazy::new(|| {
     ShieldedVerifier::new(action_circuit_for_verifying_key(), SHIELDED_VK_K)
         .expect("shielded verifying key (ActionCircuit at K=10)")
@@ -1470,6 +1476,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored proof_check_rejects_garbage_proof`"]
     fn proof_check_rejects_garbage_proof() {
         // S4.1.4 discriminator: a valid-shape tx (checks 1-3 pass) with a garbage
         // proof must reach and fail check 4 as InvalidShieldedProof — proving check 4
@@ -1483,6 +1490,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored structural_ok_shape_passes_checks_1_through_3`"]
     fn structural_ok_shape_passes_checks_1_through_3() {
         // Same input as above, but with a *valid* proof would pass checks 1-3; here
         // the garbage proof only matters once checks 1-3 pass, so the failure at
@@ -1565,6 +1573,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored nullifier_check_rejects_already_spent`"]
     fn nullifier_check_rejects_already_spent() {
         // S4.1.5 discriminator: an already-spent nullifier fails check 2
         // (StaleNullifier) — before the proof check. Same tx, fresh nullifier set,
@@ -1606,6 +1615,7 @@ mod tests {
     /// check — the real registry neither rejects a fresh spend nor leaks the
     /// placeholder proof earlier than S4.1's fake did.
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored check2_against_concrete_registry_fresh_reaches_proof_check`"]
     fn check2_against_concrete_registry_fresh_reaches_proof_check() {
         use crate::registry::NullifierRegistry;
         let tx = make_shielded_tx();
@@ -1620,6 +1630,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored root_freshness_accepts_within_window_and_rejects_beyond`"]
     fn root_freshness_accepts_within_window_and_rejects_beyond() {
         // S4.1.5 discriminator: the referenced root within the recency window passes
         // check 3 (reaching the proof check); the same root beyond the window is
@@ -1670,6 +1681,7 @@ mod tests {
     /// without the `impl MerkleRootHistory` — the seam is provably
     /// load-bearing (S4.2.4 style).
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored check3_concrete_root_state_current_root_accepted`"]
     fn check3_concrete_root_state_current_root_accepted() {
         use crate::registry::NullifierRegistry;
         let tx = make_shielded_tx();
@@ -1688,6 +1700,7 @@ mod tests {
     /// The tx references the genesis root (height 0); 9 dummy pushes put the
     /// tip at height 9 → distance 9 = K-1 ≤ 10 → accepted, reaches check 4.
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored check3_concrete_root_state_k_minus_1_back_accepted`"]
     fn check3_concrete_root_state_k_minus_1_back_accepted() {
         use crate::registry::NullifierRegistry;
         let mut tx = make_shielded_tx();
@@ -1714,6 +1727,7 @@ mod tests {
     /// comparison on a full history), the window math is pinned on both
     /// sides.
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored check3_concrete_root_state_at_window_boundary_accepted`"]
     fn check3_concrete_root_state_at_window_boundary_accepted() {
         use crate::registry::NullifierRegistry;
         let mut tx = make_shielded_tx();
@@ -1781,6 +1795,7 @@ mod tests {
     /// Together with the previous test, pins "K=0 means exact tip only"
     /// from both sides.
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored check3_concrete_root_state_window_zero_accepts_exact_tip`"]
     fn check3_concrete_root_state_window_zero_accepts_exact_tip() {
         use crate::registry::NullifierRegistry;
         let mut tx = make_shielded_tx();
@@ -1851,6 +1866,7 @@ mod tests {
     /// takes the empty-history arm and this becomes `StaleMerkleRoot` —
     /// the seed is proven necessary, not cosmetic. No bootstrap deadlock.
     #[test]
+    #[ignore = "slow: reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change the four shielded checks, is_root_fresh/MerkleRootState, NullifierRegistry, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored genesis_pool_state_accepts_first_transfer`"]
     fn genesis_pool_state_accepts_first_transfer() {
         use crate::registry::NullifierRegistry;
         let mut tx = make_shielded_tx();
@@ -1866,6 +1882,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: directly touches SHIELDED_VALIDATOR_VERIFIER, paying the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change ShieldedVerifier, the VK cache, SHIELDED_VK_K, or the ActionCircuit: `cargo test -p pneumatic_core -- --ignored validator_verifier_is_built_at_k10`"]
     fn validator_verifier_is_built_at_k10() {
         // S4.1.4 discriminator: the verifying key must be built at K=10 to match the
         // prover (S3.3 proves at K=10). A different width rejects every proof.

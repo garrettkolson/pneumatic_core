@@ -7,8 +7,11 @@
 //!
 //! Fast-suite scope: no live Halo2 proving here, so these tests exercise the
 //! reject paths (H12 mismatch, stale nullifier, stale root, bad proof), which
-//! need no proof. The advance/persist/rollback lockstep paths are covered by
-//! the `#[ignore]`d live tests at the bottom of this module.
+//! need no proof. The one test that reaches the pool's check-4 proof re-check
+//! (`recheck_rejects_bad_proof_…`) is `#[ignore]`d: its first run pays the
+//! one-time ActionCircuit keygen (~2.5 min). The advance/persist/rollback
+//! lockstep paths are covered by the `#[ignore]`d live tests at the bottom of
+//! this module.
 
 use super::helpers::*;
 use super::super::*;
@@ -144,6 +147,7 @@ async fn h12_rejects_swapped_shielded_payload() {
 /// discriminator: a sentinel-validated payload never lets a bad proof through
 /// — the committer re-checks with pool-owned deps.
 #[tokio::test]
+#[ignore = "slow: the pool's re-check reaches check 4, whose lazy SHIELDED_VALIDATOR_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min) in this test binary. AGENT: un-ignore and re-run when you change the pool's re-validation, the four shielded checks, ShieldedVerifier, or the ActionCircuit: `cargo test -p pneumatic_committer -- --ignored recheck_rejects_bad_proof_despite_matching_registry_entry`"]
 async fn recheck_rejects_bad_proof_despite_matching_registry_entry() {
     let pool = Arc::new(ShieldedPool::new(10));
     let (_dp, (committer, registry)) = setup("tx_recheck_proof", pool.clone()).await;

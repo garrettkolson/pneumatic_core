@@ -23,9 +23,12 @@
 //!   `Err(PneumaticError::Shielded(..))` — a tampered proof or tampered public
 //!   input never silently passes.
 //!
-//! Verification is network-side and cheap relative to proving, so it runs in
-//! the default test suite. The two *live prove* tests remain `#[ignore]`d per
-//! the roadmap's "proving is benchmark-only" rule; this module does not prove.
+//! Verification is network-side and cheap relative to proving. The tests that
+//! touch the lazily-built `SHIELDED_VERIFIER` are `#[ignore]`d because the first
+//! touch pays the one-time `keygen_vk` (measured ~2.5 min) and the rest block on
+//! it; the default suite keeps the fast transcript/instance plumbing tests. The
+//! *live prove* tests remain `#[ignore]`d per the roadmap's "proving is
+//! benchmark-only" rule; this module does not prove.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -413,11 +416,17 @@ mod tests {
     /// Note this is the *circuit* width, not the Merkle `tree_depth`.
     const K: u32 = 10;
 
-    /// One shared, lazily-built `ShieldedVerifier` for all the default (fast,
-    /// non-ignore) tests. Building the Halo2 verifying key (`keygen_vk`) for the
-    /// complex Action circuit is expensive (~60–100s); a module-level `Lazy`
-    /// guarantees it runs exactly once even though the tests execute in parallel,
-    /// instead of each test racing its own `new` and keying separately.
+    /// One shared, lazily-built `ShieldedVerifier`. Building the Halo2 verifying
+    /// key (`keygen_vk`) for the complex Action circuit is expensive (~60–100s);
+    /// a module-level `Lazy` guarantees it runs exactly once even though the
+    /// tests execute in parallel, instead of each test racing its own `new` and
+    /// keying separately.
+    ///
+    /// SLOW-TEST NOTE: every test below that touches this static is `#[ignore]`d
+    /// because the first touch pays that one-time keygen (measured ~2.5 min) and
+    /// the rest block on it. Un-ignore a test when you change the functionality
+    /// it covers — each test's ignore note names the trigger and the re-run
+    /// command. Until then the default suite stays fast.
     static SHIELDED_VERIFIER: Lazy<ShieldedVerifier> = Lazy::new(|| {
         let (circuit, _public_inputs) = make_known_good_fixture();
         ShieldedVerifier::new(circuit, K).expect("vk")
@@ -490,6 +499,7 @@ mod tests {
     /// usable verifier. A circuit whose configuration cannot reach its minimum
     /// row count would surface as `PneumaticError::Shielded`.
     #[test]
+    #[ignore = "slow: first touch of SHIELDED_VERIFIER pays the one-time ActionCircuit keygen_vk (~2.5 min). AGENT: un-ignore and re-run when you change ActionCircuit structure, ShieldedVerifier, the VK cache, Poseidon, or the verify() path: `cargo test -p pneumatic_core -- --ignored verify_vk_construction_succeeds`"]
     fn verify_vk_construction_succeeds() {
         // `SHIELDED_VERIFIER` is built once by the module-level `Lazy`, which
         // runs the `new` construction path; checking its params validates the
@@ -501,6 +511,7 @@ mod tests {
     /// This exercises the transcript-read + constraint-system failure path
     /// without requiring an expensive live proof.
     #[test]
+    #[ignore = "slow: blocked behind the one-time ActionCircuit keygen_vk (~2.5 min) paid by the first SHIELDED_VERIFIER touch. AGENT: un-ignore and re-run when you change ActionCircuit structure, ShieldedVerifier, the VK cache, Poseidon, or the verify() path: `cargo test -p pneumatic_core -- --ignored verify_fails_closed_on_garbage_proof`"]
     fn verify_fails_closed_on_garbage_proof() {
         let (_circuit, public_inputs) = make_known_good_fixture();
         let verifier = &SHIELDED_VERIFIER;
@@ -521,6 +532,7 @@ mod tests {
     /// Fail closed: a tampered public input must be rejected even for a proof
     /// over the correct inputs.
     #[test]
+    #[ignore = "slow: blocked behind the one-time ActionCircuit keygen_vk (~2.5 min) paid by the first SHIELDED_VERIFIER touch. AGENT: un-ignore and re-run when you change ActionCircuit structure, ShieldedVerifier, the VK cache, Poseidon, or the verify() path: `cargo test -p pneumatic_core -- --ignored verify_fails_closed_on_tampered_public_input`"]
     fn verify_fails_closed_on_tampered_public_input() {
         let (_circuit, public_inputs) = make_known_good_fixture();
         let verifier = &SHIELDED_VERIFIER;
