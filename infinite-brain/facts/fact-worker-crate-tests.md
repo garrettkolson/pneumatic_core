@@ -37,7 +37,7 @@ source_url: "Empty"
 | pneumatic_sentinel | 57 passed + 1 ignored (lib) + 1 ignored (doc-tests) |
 | pneumatic_node_server | 32 passed + 2 ignored (lib) |
 
-Notes on the ignored sentinel tests: the ignored doc-test is the one live end-to-end proof through the full sentinel path — `#[ignore = "live halo2 prove (~1 min); see the test's doc comment"]` at `sentinel/src/sentinel.rs:3280` (the S5.1 live e2e fixture that `pneumatic_sentinel`'s dev-dependencies on `pneumatic_prover`/`pasta_curves`/`ff`/`group` exist for, per `sentinel/Cargo.toml` dev-deps comment).
+Notes on the ignored sentinel tests: the ignored doc-test is the one live end-to-end proof through the full sentinel path — `#[ignore = "live halo2 prove (~1 min); see the test's doc comment"]` at `sentinel/src/sentinel/tests/shielded.rs:613` (post-09/23 modularization; the S5.1 live e2e fixture that `pneumatic_sentinel`'s dev-dependencies on `pneumatic_prover`/`pasta_curves`/`ff`/`group` exist for, per `sentinel/Cargo.toml` dev-deps comment).
 
 The committer's 9 integration tests live in `committer/tests/pipeline_integration.rs` — end-to-end pipeline scenarios over real RNS wire transports: no-conflict commit, conflict → resolution → slashing, commit-from-empty-registry materialization, and unregistered-sender rejection.
 

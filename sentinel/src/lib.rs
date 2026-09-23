@@ -7,6 +7,7 @@
 //! - Manages transaction state in the `PendingTransactionRegistry`
 
 pub mod sentinel;
+pub mod sentinel_error;
 pub mod transaction_validator;
 pub mod transaction_notifier;
 

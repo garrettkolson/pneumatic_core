@@ -8,9 +8,9 @@ summary: "The gatekeeper: fail-closed sender auth, gas + spec validation; self-v
 auto_inject: false
 applicable_when: "Working on sentinel/, transaction admission, routing, finalizer assignment, or shielded transfer intake"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when sentinel/src/sentinel.rs changes its action routing, C3 sender-auth steps, or the self-verified routing split"
+staleness_signal: "Stale when sentinel/src/sentinel.rs changes its action routing, or sentinel/src/sentinel/processing.rs changes the C3 sender-auth steps / self-verified routing split"
 tags: [sentinel, worker-crate, gatekeeper, routing, admission]
 edges:
   - target: pattern-fail-closed
@@ -20,7 +20,7 @@ edges:
   - target: concept-executor-sharding
     type: related_to
     weight: 0.8
-    note: "The sentinel's ExecutorSetCache + deterministic selection is the shard-aware routing half of sharding"
+    note: "The sentinel's EpochSnapshotCache<ExecutorSet> + deterministic selection is the shard-aware routing half of sharding"
   - target: concept-shielded-pool-view
     type: related_to
     weight: 0.9
@@ -39,7 +39,7 @@ source_url: "Empty"
 
 # Sentinel role — gatekeeper: auth, validation, and routing
 
-The Sentinel is the first node in the pipeline and the gatekeeper role (`sentinel/src/sentinel.rs:22-32`): receive raw transactions, validate against the appropriate spec, route them, manage the `PendingTransactionRegistry`, and handle risk-based routing. Its `on_data_received` dispatches `Process`, `Confirm`, `Reject`, `Register`, `Clear`/`Delete`, `BlockFinalized`, and `ShieldedTransfer` (`sentinel.rs:122-142`).
+The Sentinel is the first node in the pipeline and the gatekeeper role (`sentinel/src/sentinel.rs:32-58`): receive raw transactions, validate against the appropriate spec, route them, manage the `PendingTransactionRegistry`, and handle risk-based routing. Its `on_data_received` dispatches `Process`, `Confirm`, `Reject`, `Register`, `Clear`/`Delete`, `BlockFinalized`, and `ShieldedTransfer` (`sentinel.rs:130-147`). After the 09/23 modularization (task-monolith-modularization step 2), per-action handlers live in `sentinel/src/sentinel/{processing,finalizing,registering,epoching,shielded}.rs` (impl-split, `use super::*;`) and tests under `sentinel/src/sentinel/tests/`.
 
 `handle_process_request` (code-verified):
 
@@ -48,6 +48,6 @@ The Sentinel is the first node in the pipeline and the gatekeeper role (`sentine
 3. **Routing split**: load the token; if `token.is_self_verified`, route directly toward commitment (`handle_self_signed`) — Executor + Finalizer skipped. Contract tokens default `block_validation_spec_name` to `SelfSigned` but keep `is_self_verified = false`, so the flag (not the spec name) is the discriminator (AUDIT 5.9).
 4. Standard path: transition to `Validated` with risk (rejecting replayed nonces, Phase 5.6/H14) and send to Executors for preloading.
 
-**Deterministic finalizer assignment**: `assign_finalizer_deterministic` loads the epoch stake snapshot, then delegates to `pneumatic_core::deterministic_select` over `FINALIZER_DOMAIN` with the latest block hash as salt; a zero-stake winner is a routing error (`sentinel.rs:685-720`); a rejected finalizer triggers a `_retry` suffix reselection (`sentinel.rs:721-736`).
+**Deterministic finalizer assignment**: `assign_finalizer_deterministic` loads the epoch stake snapshot, then delegates to `pneumatic_core::deterministic_select` over `FINALIZER_DOMAIN` with the latest block hash as salt; a zero-stake winner is a routing error; a rejected finalizer triggers a `_retry` suffix reselection (`sentinel/src/sentinel/finalizing.rs:150-200`).
 
-**Shielded transfers** (`sentinel.rs:144-221`): five fail-closed steps — canonical deserialize, advisory `validate_shielded` against the shared `ShieldedValidationDeps` (pool-view nullifiers + root history + recency window), token gates (resolvable, self-verified, shielded opt-in), atomic registration in the never-evicted shielded map, then deterministic finalizer assignment + `SignShielded` fan-out. Shielded txs **bypass the Executor entirely** — value moves in-circuit, nothing to execute.
+**Shielded transfers** (`sentinel/src/sentinel/shielded.rs`): five fail-closed steps — canonical deserialize, advisory `validate_shielded` against the shared `ShieldedValidationDeps` (pool-view nullifiers + root history + recency window), token gates (resolvable, self-verified, shielded opt-in), atomic registration in the never-evicted shielded map, then deterministic finalizer assignment + `SignShielded` fan-out. Shielded txs **bypass the Executor entirely** — value moves in-circuit, nothing to execute.

@@ -7662,3 +7662,31 @@
 2026-09-23 16:55:36.250172 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
 2026-09-23 16:55:36.251934 UTC: Committed block to token [01] (chain length: 2, seq: 1)
 2026-09-23 16:55:36.253836 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:40:07.458935 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:40:07.461468 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:40:07.464321 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:40:07.466402 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:40:31.117362 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:40:31.119486 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:40:31.120155 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:40:31.121958 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:41:02.147286 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:41:02.149925 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:41:02.152513 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:41:02.154186 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:41:20.578735 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:41:20.581230 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:41:20.584493 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:41:20.586104 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:41:38.481624 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:41:38.485736 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:41:38.486922 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:41:38.490797 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 17:42:07.491858 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 17:42:07.492652 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 17:42:07.493563 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 17:42:07.495744 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-23 18:10:44.603468 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-23 18:10:44.605135 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-23 18:10:44.606099 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-23 18:10:44.607712 UTC: Attempted to distribute block to archivers (hash: )

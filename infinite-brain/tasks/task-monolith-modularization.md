@@ -10,7 +10,7 @@ applicable_when: "Planning or executing codebase refactors after the committer m
 confidence: 0.9
 verified_at: "09/23/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale once the individual splits land — each split should close its own slice of this list (step 1 DONE 09/23)"
+staleness_signal: "Stale once the individual splits land — each split should close its own slice of this list (steps 1–2 DONE 09/23)"
 tags: [task, refactor, modularization, code-health]
 edges:
   - target: event-node-server-composite
@@ -46,7 +46,7 @@ side services + dedicated error type extracted.
 
 | Crate | File | Lines | Tests | Verdict |
 |---|---|---|---|---|
-| sentinel | sentinel.rs | 3333 (largest in repo) | 55 / ~2500 ln | Split: sentinel/{processing, finalizing, registering, epoching, shielded} + sentinel_error.rs + tests/ (9 files). Optional routing.rs service (finalizer assignment + shard select; dup prev-hash salt L403≈L697). Medium. |
+| sentinel | sentinel.rs | 3333 (largest in repo) | 55 / ~2500 ln | ~~Split~~ **DONE 09/23/2026**: sentinel/{processing, finalizing, registering, epoching, shielded} + sentinel_error.rs + tests/ (7 files, not 9 — helpers/error merged into the domain set). Main file now 179 ln; suite green at 57/1ig (see log). |
 | finalizer | finalizer.rs | 2373 | 25 / ~1414 ln | Split: finalizer/{signing, shielded, finalizing} + tests/{helpers, signing, shielded, epoch_stake}. Keep 4 existing siblings TOP-LEVEL. Optional: shielded_tx_store + unified voter_auth services; ~35 ln dup between try_finalize/_optimistic. Medium-low. |
 | node-server | node_server.rs | 2393 | 17 / ~1548 ln | Split: node_server/{build, plugins, epoch_coord, transport} + tests/. New deps.rs (RoleDeps struct collapses 17-arg build_role_plugin) + role_adapters.rs. Keep build_role_plugin WHOLE (one construction site = S5.4 pool invariant). Medium. |
 | executor | executor.rs | 1081 | ~500 ln | Cohesive — tests-only move at most. Low priority. |
@@ -76,7 +76,7 @@ side services + dedicated error type extracted.
 ## Suggested order
 
 1. ~~core EpochSnapshotCache<T> + delete 3 worker copies~~ — **DONE 09/23/2026**: `pneumatic_core::epoch::EpochSnapshotCache<T>` (fetch-hook closure + std Mutex; 7 `epoch::tests::snapshot_cache_*` tests); sentinel/finalizer wire it in their constructors; 3 worker files deleted; suite green at 823/32 (see fact-test-suite delta arithmetic).
-2. sentinel split
+2. ~~sentinel split~~ — **DONE 09/23/2026**: 5 concern modules + sentinel_error.rs + 7 test files under `sentinel::tests`; main file 179 ln (struct + new + initialize + on_data_received + mod decls). Moved private methods promoted to `pub(crate)` (committer convention — cross-module calls from dispatch + tests); `pub` API unchanged. Deviation: 7 test files, not 9 (rough estimate in the original analysis; every test has a home: processing 27, finalizing 8, registering 5, epoching 4, shielded 23, error 2, helpers 11 fixtures). Workspace green 823/32, sentinel 57/1ig, no new warnings.
 3. finalizer split
 4. node-server split
 5. root-lib splits (registry → validation → epoch → node/registry)
