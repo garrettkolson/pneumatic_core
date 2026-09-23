@@ -31,3 +31,14 @@ serde_json = "1.0.140"
 # Needed only to build a `Config` in unit tests: `Config::new_for_testing`
 # takes a `DashMap` for its per-type config and environment registries.
 dashmap = "7.0.0-rc0"
+# S5.4 live tests: the client-side shielded-transaction builder (the same
+# prover call a wire client makes) for the two `#[ignore]`d live composite
+# tests. Pinned to the version the prover crate resolves (zero new lockfile
+# packages).
+pneumatic_prover = { path = "../prover" }
+# S5.4 live tests: the Pallas scalar type for building `ShieldedNote`s in the
+# test fixtures (same pin the prover crate uses).
+pasta_curves = "=0.5.2"
+# S5.4 tests: the `Connection` trait is `#[async_trait]`; the recording
+# connection in the e2e test impls it.
+async-trait = "0.1.88"

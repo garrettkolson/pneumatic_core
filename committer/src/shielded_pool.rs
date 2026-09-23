@@ -34,12 +34,15 @@
 //! In safe Rust a `&'self dyn`-returning trait method cannot point at a
 //! changing snapshot: the guard's live `Arc<MerkleRootState>` is an
 //! interior-mutable value, and no lock-free public swap exists for it
-//! (crossbeam-epoch is deliberately not added in S5.3 — no lock-free reader
-//! need exists until S5.4's role-view design). The live snapshot is reachable
-//! *owned* via [`ShieldedPool::view_parts`], which is exactly what the
-//! composite build uses to compose the sentinel's/finalizer's
-//! `SimpleShieldedPoolView`. Making a role's view track the pool's *live*
-//! root state is S5.4's design work (see the S5.4 plan's swap-site note).
+//! (crossbeam-epoch is deliberately not added in S5.3). S5.4 resolved the
+//! role-view design with option (a): the composite passes the pool ITSELF
+//! (`Arc<ShieldedPool> as Arc<dyn ShieldedPoolView>`) as each shielded role's
+//! view — no separate `SimpleShieldedPoolView` composition. The
+//! boot-snapshot semantics of `root_history` are intentional and
+//! consensus-safe: the advisory sentinel/finalizer gates only need "some
+//! recent valid root" to re-verify against, while the COMMIT decision is
+//! re-checked by the committer against the pool's own LIVE roots (read under
+//! the guard), so a stale view can never admit a commit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -433,9 +436,11 @@ impl ShieldedPool {
 
     /// The view's two read sides, at the guard's CURRENT published state:
     /// the shared nullifier registry (live) and the root state as of now
-    /// (a snapshot `Arc` — the live value, clowned). The composite build
-    /// composes the sentinel's/finalizer's `SimpleShieldedPoolView` from this
-    /// at boot (the S5.4 swap site).
+    /// (a snapshot `Arc` — the live value, cloned). Used by tests and by
+    /// split-deployment replay views that compose a
+    /// `SimpleShieldedPoolView` from an explicit snapshot; the composite
+    /// passes the pool itself as the role view (S5.4, decision 2a), so its
+    /// boot path no longer calls this.
     pub fn view_parts(&self) -> (Arc<NullifierRegistry>, Arc<MerkleRootState>) {
         let state = self.guard.lock().unwrap_or_else(|p| p.into_inner());
         (Arc::clone(&self.nullifiers), Arc::clone(&state.roots))

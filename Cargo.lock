@@ -1226,12 +1226,15 @@ dependencies = [
 name = "pneumatic_node_server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dashmap",
  "ed25519-dalek",
+ "pasta_curves",
  "pneumatic_committer",
  "pneumatic_core",
  "pneumatic_executor",
  "pneumatic_finalizer",
+ "pneumatic_prover",
  "pneumatic_sentinel",
  "serde_json",
  "strum",

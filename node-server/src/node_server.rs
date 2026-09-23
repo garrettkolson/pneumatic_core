@@ -91,6 +91,13 @@ pub struct NodeServer {
     installed_roles: Vec<pneumatic_core::node::NodeRegistryType>,
     // Lifecycle seed carried for Phase 5 (epoch coordinator).
     epoch_boundary_detector: Arc<EpochBoundaryDetector>,
+    // S5.4: the composite's shared shielded state — the SAME `Arc`s the
+    // role-plugins hold (committer commit path, block services, role views).
+    // Retained here for the e2e tests' pool/chain lockstep assertions and
+    // for the Phase 6 deferred re-registration path.
+    tokens: Arc<DashMap<Vec<u8>, pneumatic_core::tokens::Token>>,
+    pending_registry: Arc<PendingTransactionRegistry>,
+    shielded_pool: Arc<pneumatic_committer::shielded_pool::ShieldedPool>,
 }
 
 impl NodeServer {
@@ -114,6 +121,37 @@ impl NodeServer {
     /// `select()`, in `NodeRegistryType` order.
     pub fn selected_roles(&self) -> Vec<pneumatic_core::node::NodeRegistryType> {
         self.role_selector.lock().unwrap().selected_roles().to_vec()
+    }
+
+    /// The composite's global shielded pool (S5.4) — the same `Arc` the
+    /// committer's commit path, the block services, and the sentinel/finalizer
+    /// validation views hold. Exposed for the e2e tests' pool/chain lockstep
+    /// assertions (never a second pool).
+    pub fn shielded_pool(&self) -> Arc<pneumatic_committer::shielded_pool::ShieldedPool> {
+        Arc::clone(&self.shielded_pool)
+    }
+
+    /// The composite's shared token cache — the chain state the committer
+    /// commits into. Exposed for the e2e tests' chain-side lockstep
+    /// assertions.
+    pub fn tokens(&self) -> Arc<DashMap<Vec<u8>, pneumatic_core::tokens::Token>> {
+        Arc::clone(&self.tokens)
+    }
+
+    /// The composite's shared pending-transaction registry (the parallel
+    /// never-evicted shielded map included). Exposed for the e2e tests that
+    /// seed the H12 validated-entry / shielded-payload pairs before driving
+    /// a `Commit` through the dispatcher.
+    pub fn pending_registry(&self) -> Arc<PendingTransactionRegistry> {
+        Arc::clone(&self.pending_registry)
+    }
+
+    /// The composite's node registry (peer registrations, role lookups).
+    /// Exposed for the e2e tests that register the node's own identity as a
+    /// `Finalizer`/`Committer` peer with recording connections, exactly the
+    /// way a split deployment registers its voting finalizer.
+    pub fn node_registry(&self) -> Arc<NodeRegistry> {
+        Arc::clone(&self.node_registry)
     }
 
     // --- Phase 5: epoch coordinator ----------------------------------------
@@ -318,16 +356,20 @@ pub fn build_runtime(
         PneumaticError::Network(format!("load shielded pool at boot: {e:?}"))
     })?;
 
-    // S5.1 Decision 1 (S5.3): the shielded roles' validation reads pool
-    // state through the `ShieldedPoolView` seam, now built over the REAL
-    // pool's live state at boot (`view_parts`: the shared nullifier
-    // registry + the current published root snapshot) — strictly better
-    // than the S5.1 pristine placeholder. S5.4 swaps this construction for
-    // the pool's own live view; nothing downstream changes.
-    let (pool_nullifiers, pool_roots) = shielded_pool.view_parts();
-    let shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView> = Arc::new(
-        pneumatic_core::shielded::SimpleShieldedPoolView::with(pool_nullifiers, pool_roots),
-    );
+    // S5.4 (Decision 2, option a) — the real-pool swap: the shielded
+    // roles' validation view IS the live pool (this `shielded_pool`), no
+    // separate view object is composed in `build_runtime` anymore. The view
+    // itself is derived per arm inside `build_role_plugin` (one `Arc`
+    // clone, erased to `Arc<dyn ShieldedPoolView>`), so the view and the
+    // commit path are the same object by construction. Semantics:
+    // `nullifier_set()` is the pool's single shared registry (live);
+    // `root_history()` is the pool's `view_roots` — a construction-time
+    // snapshot (safe-Rust single-writer design: no lock-free swap of the
+    // guard's published root state, see shielded_pool.rs module docs). A
+    // long-running node's role views therefore see the root history as of
+    // boot; that is safe for consensus because the committer's
+    // authoritative re-check at commit time reads the pool's OWN live root
+    // history (under the guard) and never the role views.
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -384,7 +426,6 @@ pub fn build_runtime(
                 epoch_boundary_detector.clone(),
                 block_proposer.clone(),
                 block_services.clone(),
-                shielded_pool_view.clone(),
                 shielded_pool.clone(),
             )
         })
@@ -435,6 +476,9 @@ pub fn build_runtime(
         role_dispatcher,
         installed_roles,
         epoch_boundary_detector,
+        tokens,
+        pending_registry,
+        shielded_pool,
     })
 }
 
@@ -459,11 +503,16 @@ fn build_role_plugin(
     epoch_boundary_detector: Arc<EpochBoundaryDetector>,
     block_proposer: Arc<BlockProposer>,
     block_services: Arc<BlockServices>,
-    shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView>,
     // S5.3: the global shielded pool (the committer arm's commit path).
     shielded_pool: Arc<pneumatic_committer::shielded_pool::ShieldedPool>,
 ) -> Option<Box<dyn RoleHost>> {
     use pneumatic_core::node::NodeRegistryType;
+    // S5.4 (Decision 2, option a): the sentinel/finalizer arms consume the
+    // SAME pool as their `ShieldedPoolView` — the role views read the
+    // shared registry live; no separate view object is composed here (the
+    // one that used to be built in `build_runtime` is gone).
+    let shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView> =
+        shielded_pool.clone() as Arc<dyn pneumatic_core::shielded::ShieldedPoolView>;
     match role {
         NodeRegistryType::Committer => {
             let gossiper = Arc::new(Gossiper::new(
@@ -802,13 +851,26 @@ mod tests {
     use dashmap::DashMap;
     use strum::IntoEnumIterator;
 
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+
+    use pneumatic_core::blocks::{BlockFactory, FinalityStatus};
     use pneumatic_core::config::{BootstrapPeer, Config};
-    use pneumatic_core::encoding::serialize_to_bytes_rmp;
+    use pneumatic_core::conns::Connection;
+    use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
     use pneumatic_core::errors::PneumaticError;
     use pneumatic_core::environment::{EnvironmentMetadata, EnvironmentMetadataSpec};
     use pneumatic_core::messages::Message;
     use pneumatic_core::node::{NodeTypeConfig, NodeRegistryType};
-    use pneumatic_core::transactions::ShieldedTransaction;
+    use pneumatic_core::rns::identity::NodeIdentity;
+    use pneumatic_core::registry::TransactionSignatureRegistry;
+    use pneumatic_core::tokens::Token;
+    use pneumatic_core::transactions::{ShieldedTransaction, SignedTransaction, TransactionCommit};
+    use pneumatic_core::user::User;
+    use pneumatic_core::validation::ValidationSpecRegistry;
+
+    // S5.4 fixtures (shared by the live composite tests).
+    use pneumatic_core::data::{DataError, ShieldedPoolState};
+    use pneumatic_core::epoch::StakeSet;
 
     use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
     use pneumatic_core::data::{DataProvider, DefaultDataProvider};
@@ -817,7 +879,6 @@ mod tests {
     use pneumatic_core::node::registry::NodeRegistry;
     use pneumatic_core::node::stake_index::StakeIndex;
     use pneumatic_core::registry::PendingTransactionRegistry;
-    use pneumatic_core::shielded::{SimpleShieldedPoolView, ShieldedPoolView};
     use pneumatic_committer::block_services::BlockServices;
     use pneumatic_committer::epoch_manager::{
         EpochReconciler, LeaderSelector, StakeStore, StakingManager,
@@ -825,7 +886,10 @@ mod tests {
 
     use crate::role_dispatcher::RoleError;
     use crate::role_selector::StakeProvider;
-    use super::{build_runtime, build_role_plugin, route_data_plane};
+    use super::{
+        build_runtime, build_role_plugin, route_data_plane, RoleDispatcher, RoleHandler,
+        RoleHost,
+    };
 
     /// In-memory `DataProvider` for runtime tests (S5.3): models a REACHABLE
     /// data service with no records — `get_shielded_pool` returns `Ok(None)`
@@ -992,12 +1056,12 @@ mod tests {
         }
     }
 
-    /// S5.1.5 discriminator: the node-server DI bundle plumbs a
-    /// `ShieldedPoolView` into `build_role_plugin`, and the sentinel arm
-    /// consumes it (the 7th `Sentinel::new` argument). A wiring that forgets
-    /// the parameter fails to compile in both places, so the runtime half of
-    /// this test asserts the arm builds a genuine plugin (not `None`) that
-    /// reports the sentinel role.
+    /// S5.4: the node-server DI bundle no longer plumbs a separate
+    /// `ShieldedPoolView` — the sentinel arm derives it from the SAME
+    /// `Arc<ShieldedPool>` that `block_services` and the committer arm hold
+    /// (the view and the commit path are one object by construction). This
+    /// test builds exactly that shared pool and asserts the arm builds a
+    /// genuine plugin (not `None`) that reports the sentinel role.
     #[test]
     fn build_role_plugin_sentinel_arm_builds_with_pool_view() {
         let config = runtime_config(
@@ -1058,6 +1122,11 @@ mod tests {
         );
         let epoch_boundary_detector = Arc::new(EpochBoundaryDetector::new(initial_epoch));
         let block_proposer = Arc::new(BlockProposer::new(vec![], 0, vec![]));
+        // S5.4: ONE pool, shared — `block_services` and the sentinel arm's
+        // derived view are the same object, exactly as `build_runtime` wires
+        // it now (the arm no longer takes a separate view parameter).
+        let shielded_pool =
+            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10));
         let block_services = Arc::new(BlockServices::new(
             tokens.clone(),
             data_provider.clone(),
@@ -1065,13 +1134,8 @@ mod tests {
             env_data.clone(),
             shared_logger.clone(),
             config.identity.clone(),
-            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10)),
+            shielded_pool.clone(),
         ));
-
-        // S5.1 Decision 1's wiring: the pristine placeholder view, exactly
-        // as `build_runtime` now constructs it.
-        let shielded_pool_view: Arc<dyn ShieldedPoolView> =
-            Arc::new(SimpleShieldedPoolView::new(env_data.shielded_root_recency));
 
         let host = build_role_plugin(
             NodeRegistryType::Sentinel,
@@ -1089,8 +1153,7 @@ mod tests {
             epoch_boundary_detector,
             block_proposer,
             block_services,
-            shielded_pool_view,
-            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10)),
+            shielded_pool,
         )
         .expect("the sentinel arm builds a plugin");
 
@@ -1494,5 +1557,837 @@ mod tests {
             }
             other => panic!("expected the fail-closed Downstream auth error, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // S5.4 tests
+    // -----------------------------------------------------------------------
+
+    /// A `Connection` that records each sent payload verbatim (S5.4 e2e
+    /// relay: the test re-dispatches what each role recorded on its peers).
+    struct RecordingConnection {
+        recorder: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for RecordingConnection {
+        async fn send(&self, data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            self.recorder.lock().unwrap().push(data.clone());
+            Ok(())
+        }
+    }
+
+    /// In-memory `DataProvider` for the S5.4 live composite tests: the seeded
+    /// pool state (the pool's boot load; saves update the copy), the opt-in
+    /// self-verified token (the sentinel's token gates + the finalizer's
+    /// `resolve_previous_hash`), the submitter user, and the epoch-1 stake
+    /// snapshot (the finalizer's quorum math + the committer's conflict
+    /// stakes all read from it — the same lazy snapshot path production uses).
+    struct E2eDataProvider {
+        pool_state: std::sync::Mutex<ShieldedPoolState>,
+        token: Token,
+        user_pk: Vec<u8>,
+        stakers: std::collections::HashMap<Vec<u8>, u64>,
+    }
+
+    impl DataProvider for E2eDataProvider {
+        fn get_token(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Token, DataError> {
+            Ok(self.token.clone())
+        }
+        fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, DataError> {
+            Err(DataError::DataNotFound)
+        }
+        fn get_user(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<User, DataError> {
+            Ok(User {
+                public_key: self.user_pk.clone(),
+                fuel_balance: 10_000,
+                stake: 0,
+                nonce: 0,
+            })
+        }
+        fn get_stake_snapshot(
+            &self,
+            _epoch: u64,
+            _partition_id: &str,
+        ) -> Result<StakeSet, DataError> {
+            Ok(StakeSet { stakers: self.stakers.clone() })
+        }
+        fn save_stake_snapshot(
+            &self,
+            _epoch: u64,
+            _snapshot: StakeSet,
+            _partition_id: &str,
+        ) -> Result<(), DataError> {
+            Ok(())
+        }
+        fn get_executor_set(
+            &self,
+            _epoch: u64,
+            _partition_id: &str,
+        ) -> Result<pneumatic_core::epoch::ExecutorSet, DataError> {
+            Err(DataError::StoreNotFound)
+        }
+        fn save_executor_set(
+            &self,
+            _epoch: u64,
+            _set: pneumatic_core::epoch::ExecutorSet,
+            _partition_id: &str,
+        ) -> Result<(), DataError> {
+            Ok(())
+        }
+        fn get_shielded_pool(
+            &self,
+            _partition_id: &str,
+        ) -> Result<Option<ShieldedPoolState>, DataError> {
+            Ok(Some(self.pool_state.lock().unwrap().clone()))
+        }
+        fn save_shielded_pool(
+            &self,
+            state: &ShieldedPoolState,
+            _partition_id: &str,
+        ) -> Result<(), DataError> {
+            *self.pool_state.lock().unwrap() = state.clone();
+            Ok(())
+        }
+    }
+
+    /// A `Config` whose `test_env` carries the REAL shielded spec (defaults +
+    /// `register_shielded`) in its transaction-spec registry: the composite
+    /// sentinel and finalizer advisory gates look the spec up by name, and the
+    /// minimal `SPEC` above leaves `trans_validation_specs` empty (that would
+    /// fail closed `UnsupportedAction` before any transfer work). The
+    /// committer's commit-time re-check is registry-independent (it builds
+    /// `ShieldedValidationSpec::new()` directly), so only these two arms need
+    /// the injection.
+    fn runtime_config_with_shielded_spec(
+        bootstrap: Vec<BootstrapPeer>,
+        type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>,
+    ) -> Arc<Config> {
+        let registry = env_registry();
+        {
+            let mut ref_mut = registry.get_mut("test_env").expect("test env present");
+            let env = ref_mut.value_mut();
+            let mut specs = ValidationSpecRegistry::new();
+            specs.register_defaults();
+            specs.register_shielded();
+            env.transaction_validation_specs = Arc::new(specs);
+        }
+        let mut cfg = Config::new_for_testing("test_env".into(), registry, type_configs);
+        cfg.bootstrap_peers = bootstrap;
+        Arc::new(cfg)
+    }
+
+    /// A test-build finalizer plugin: the REAL `Finalizer` (the composite
+    /// finalizer arm's construction, over the shared live pool) whose
+    /// `allowed_actions` reports `FINALIZER_ACTIONS` with `"SignShielded"`
+    /// REMOVED. The `handle` body is a loud failure — the dispatcher must
+    /// never reach it for the removed action.
+    struct ReducedFinalizerPlugin(pneumatic_finalizer::Finalizer);
+
+    impl RoleHandler for ReducedFinalizerPlugin {
+        fn role(&self) -> NodeRegistryType {
+            NodeRegistryType::Finalizer
+        }
+        fn allowed_actions(&self) -> &'static [&'static str] {
+            &["Sign", "Finalize", "ShieldedVote"]
+        }
+        fn handle<'a>(
+            &'a self,
+            message: Message,
+        ) -> std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = Result<(), RoleError>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                Err(RoleError::Downstream(PneumaticError::Network(format!(
+                    "reduced finalizer: handler called for {action:?} outside its reduced set",
+                    action = message.action
+                ))))
+            })
+        }
+    }
+
+    impl RoleHost for ReducedFinalizerPlugin {
+        fn advance_epoch(&mut self, _epoch: u64) {
+            pneumatic_finalizer::Finalizer::advance_epoch(&mut self.0);
+        }
+        fn initiate_shutdown<'a>(
+            &'a mut self,
+        ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                pneumatic_finalizer::Finalizer::initiate_shutdown(&self.0).await
+            })
+        }
+    }
+
+    /// S5.4 discriminator: the `"SignShielded"` entry in `FINALIZER_ACTIONS`
+    /// is the routing gate, not decoration. The real finalizer plugin (the
+    /// same construction the composite's finalizer arm performs, over the
+    /// shared live pool) is presented to a dispatcher under a reduced action
+    /// set — `"SignShielded"` removed — and a `SignShielded` vote request
+    /// must be rejected `UnknownAction` at the dispatcher, BEFORE any handler
+    /// work. If the gate were not load-bearing (routing by role type rather
+    /// than the reported action set), this test dispatches into the loud
+    /// failure arm instead. The positive-side twin is
+    /// `signshielded_request_reaches_finalizer_plugin_auth_gate` (entry
+    /// present ⇒ routed to the real handler).
+    #[tokio::test]
+    async fn signshielded_removed_from_action_set_is_rejected_by_dispatcher() {
+        let config = runtime_config(
+            vec![bad_peer()],
+            type_config_select(NodeRegistryType::Finalizer),
+        );
+        let env_data = config
+            .environment_metadata
+            .get(&config.main_environment_id)
+            .map(|e| Arc::new(e.value().clone()))
+            .expect("test config carries its main environment");
+
+        let data_provider: Arc<dyn DataProvider> = Arc::new(DefaultDataProvider::new());
+        let hash_provider: Arc<dyn HashProvider> = Arc::new(BasicHashProvider::new());
+        let node_registry = Arc::new(NodeRegistry::init(
+            config.clone(),
+            None,
+            StakeIndex::new(
+                data_provider.clone(),
+                env_data.token_partition_id.clone(),
+                1,
+                None,
+            )
+            .make_check(config.clone()),
+        ));
+        let pending_registry = Arc::new(PendingTransactionRegistry::new());
+
+        // The composite finalizer arm's construction (S5.4: the view is the
+        // shared live pool, erased to the seam — exactly the arm's in-fn
+        // derivation).
+        let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+        let verifying_key: VerifyingKey = signing_key.verifying_key();
+        let signature_registry = Arc::new(TransactionSignatureRegistry::new());
+        let shielded_pool =
+            Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10));
+        let shielded_pool_view: Arc<dyn pneumatic_core::shielded::ShieldedPoolView> =
+            shielded_pool.clone() as Arc<dyn pneumatic_core::shielded::ShieldedPoolView>;
+        let finalizer = pneumatic_finalizer::Finalizer::new(
+            env_data.environment_id.clone(),
+            config.public_key.clone(),
+            config.identity.clone(),
+            node_registry,
+            pending_registry,
+            signature_registry,
+            66.6,
+            4,
+            signing_key,
+            verifying_key,
+            hash_provider,
+            vec![],
+            0,
+            vec![],
+            1,
+            data_provider,
+            env_data.token_partition_id.clone(),
+            shielded_pool_view,
+            env_data.clone(),
+        );
+
+        let plugin: Box<dyn RoleHost> = Box::new(ReducedFinalizerPlugin(finalizer));
+        let dispatcher = RoleDispatcher::new(vec![plugin]);
+
+        // The vote request (the same action the composite's sentinel emits).
+        // An empty body is deliberately fine: the dispatcher inspects only
+        // the action string, so this proves the gate fired pre-body.
+        match dispatcher.dispatch(msg("SignShielded")).await {
+            Err(RoleError::UnknownAction(action)) => assert_eq!(action, "SignShielded"),
+            other => panic!(
+                "expected the dispatcher's UnknownAction for the removed entry, got {other:?}"
+            ),
+        }
+    }
+
+    /// S5.4 composite e2e (LIVE — one halo2 prove): all four roles installed
+    /// in ONE composite node, and a shielded transfer is driven through all
+    /// four dispatch hops — Sentinel `Verify` → `SignShielded` → Finalizer
+    /// `SignShielded` → `ShieldedVote` → Finalizer `ShieldedVote` → `Commit`
+    /// → Committer `Commit` — with the inter-hop messages relayed by
+    /// re-dispatching what each role recorded on its peers. The test drives
+    /// ONLY the four relays: the sentinel does its own registration +
+    /// finalizer assignment, the finalizer its own build + sign, and the
+    /// committer materializes its pending entry from the authenticated wire
+    /// block (H4). The terminal assertion is the pool/chain lockstep: the
+    /// committer's commit path applied the delta to the SAME
+    /// `Arc<ShieldedPool>` the roles' views read (S5.4's whole point — one
+    /// pool, no separate view).
+    #[tokio::test]
+    #[ignore = "live halo2 prove (~1 min); run with --ignored"]
+    async fn live_composite_shielded_e2e_all_four_hops_advance_the_pool() {
+        use pneumatic_core::blocks::BlockFactory;
+        use pneumatic_core::blocks::FinalityStatus;
+        use pneumatic_core::shielded::{
+            commit, root_to_bytes, IncrementalMerkleTree, ShieldedNote, DEFAULT_DEPTH,
+        };
+        use pneumatic_prover::{build_shielded_tx, NoteOutput, ShieldedIdentity, SpendKey};
+        use pasta_curves::pallas::Scalar as Fq;
+
+        // --- the shielded universe: one input note, proven live ------------
+        let input_note = ShieldedNote {
+            value: 100,
+            owner_pk: [1u8; 32],
+            rho: Fq::from(1),
+            rcm: Fq::from(2),
+        };
+        let spend_key = [0xABu8; 32];
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        let (root, _) = tree.append(&commit(&input_note));
+        let pre_root = root_to_bytes(&root);
+        let proof = tree.membership_proof(0);
+
+        // Seed the pool's persisted state with the input note's leaf, so the
+        // boot-loaded pool's root history contains the root this tx proves
+        // against (within recency) — the same seeding the committer's live
+        // pool tests use. `from_state` rebuilds the tree from the delta's
+        // leaves, so the seed delta must carry the leaf it produced.
+        let leaf =
+            root_to_bytes(&IncrementalMerkleTree::commitment_to_leaf(&commit(&input_note)));
+        let seed_state = ShieldedPoolState {
+            root: pre_root,
+            leaf_count: 1,
+            leaves: vec![leaf],
+            nullifiers: vec![],
+            applied: vec![e2e_seed_delta(vec![0xAA; 32], vec![leaf], pre_root)],
+        };
+
+        // --- the composite's own identity is the voting finalizer ----------
+        // (a split deployment registers its voting finalizer the same way).
+        // The key must sit in BOTH the Finalizer bucket (the finalizer's C1
+        // gate on SignShielded/ShieldedVote, and the committer's Commit role
+        // gate — `Commit` requires the signer's role set to include
+        // Finalizer) and the Committer bucket (so the finalizer's outbound
+        // Commit has a recorded destination to relay from).
+        let cfg = runtime_config_with_shielded_spec(vec![bad_peer()], type_config_floor(0));
+        let own_key = cfg.public_key.clone();
+
+        // The token must exist in BOTH the composite's shared token cache
+        // (the committer's commit path) and the data provider (the
+        // finalizer's `resolve_previous_hash` reads the PROVIDER, not the
+        // cache) — the SAME genesis-chained token in both, built BEFORE the
+        // provider, so the finalizer's prev-hash and the committer's strict
+        // linkage check agree.
+        let mut token = make_e2e_token();
+        {
+            let mut genesis = pneumatic_core::blocks::Block {
+                signed_trans: SignedTransaction::test_transaction(),
+                token_metadata: std::collections::HashMap::new(),
+                previous_hash: vec![42u8; 32],
+                timestamp: 0,
+                current_hash: vec![],
+                finality_status: FinalityStatus::Optimistic,
+                proposer_key: vec![],
+                epoch_number: 0,
+            };
+            genesis.current_hash =
+                BlockFactory::create_hash(&genesis).expect("genesis hashes");
+            token.blockchain.add_block(genesis);
+        }
+
+        // One in-memory data provider: the seeded pool state, the opt-in
+        // self-verified token, the user, and an epoch-1 stake snapshot in
+        // which this node's own key is the sole (hence 100%) staker.
+        let mut stakers = std::collections::HashMap::new();
+        stakers.insert(own_key.clone(), 100u64);
+        let dp = Arc::new(E2eDataProvider {
+            pool_state: std::sync::Mutex::new(seed_state),
+            token: token.clone(),
+            user_pk: b"alice".to_vec(),
+            stakers,
+        });
+
+        let server = build_runtime(cfg, Arc::new(MapStakeProvider::with_default(2000)), dp.clone())
+            .expect("composite boots with the seeded pool");
+        let pool = server.shielded_pool();
+        assert_eq!(pool.leaf_count(), 1, "boot load rebuilt the seeded pool");
+        assert_eq!(pool.applied_count(), 1, "the seed delta survived the boot load");
+
+        // Register the composite's own identity as Finalizer + Committer
+        // peers with recording connections, so every outbound hop is
+        // captured for the relay.
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(
+            server.node_registry().register_peer(
+                own_key.clone(), [9u8; 16], &NodeRegistryType::Finalizer,
+                Box::new(RecordingConnection { recorder: recorder.clone() }),
+            ),
+            "own finalizer peer registers"
+        );
+        assert!(
+            server.node_registry().register_peer(
+                own_key.clone(), [9u8; 16], &NodeRegistryType::Committer,
+                Box::new(RecordingConnection { recorder: recorder.clone() }),
+            ),
+            "own committer peer registers"
+        );
+
+        // Prove the live transfer against the pool's seeded root: 100 = 90 + 10.
+        let recipient = ShieldedIdentity {
+            spend: SpendKey::from_seed([2u8; 32]),
+            identity: pneumatic_core::crypto::Ed25519Provider::generate(),
+        };
+        let (stx, _) = build_shielded_tx(
+            &[1u8], &[input_note], &[&spend_key], &[proof],
+            pre_root, &[NoteOutput::new(90, recipient)], 10,
+        )
+        .expect("the real prove must succeed");
+        let nullifier = stx.nullifiers[0];
+
+        // Install the SAME genesis-chained token in the composite's shared
+        // token cache (the committer's commit path).
+        {
+            let tokens = server.tokens();
+            tokens.entry(vec![1]).or_insert(token);
+        }
+        let tokens_before = server
+            .tokens()
+            .get(&vec![1])
+            .map(|t| t.blockchain.get_count())
+            .unwrap_or(0);
+
+        // --- hop 1: the sentinel's `Verify` (inner ShieldedTransfer) -------
+        // The sentinel performs its own advisory gate, token gates, the
+        // parallel `register_shielded`, and the deterministic finalizer
+        // assignment, and records the outbound SignShielded — nothing else
+        // to pre-stage (the committer materializes its pending entry from
+        // the authenticated wire block, H4).
+        let verify_msg = Message {
+            chain_id: "env".to_string(),
+            action: "Verify".to_string(),
+            body: serialize_to_bytes_rmp(
+                &Message {
+                    chain_id: "env".to_string(),
+                    action: "ShieldedTransfer".to_string(),
+                    body: serialize_to_bytes_rmp(&stx).expect("stx serializes"),
+                    signature: vec![],
+                    public_key: vec![],
+                    stake_set: None,
+                },
+            )
+            .expect("inner message serializes"),
+            signature: vec![],
+            public_key: vec![],
+            stake_set: None,
+        };
+        server
+            .dispatch(verify_msg)
+            .await
+            .expect("hop 1: the sentinel accepts the live transfer");
+
+        // Hop 2: relay the sentinel's recorded SignShielded to the finalizer.
+        let sign = next_recorded(&recorder, "SignShielded").await;
+        server.dispatch(sign).await.expect("hop 2: the finalizer signs the vote");
+
+        // Hop 3: relay the finalizer's recorded ShieldedVote.
+        let vote = next_recorded(&recorder, "ShieldedVote").await;
+        server.dispatch(vote).await.expect("hop 3: quorum finalizes the transfer");
+
+        // Hop 4: relay the finalizer's recorded Commit to the committer.
+        let commit_msg = next_recorded(&recorder, "Commit").await;
+        server
+            .dispatch(commit_msg.clone())
+            .await
+            .expect("hop 4: the committer commits the shielded block");
+        let commit: TransactionCommit =
+            deserialize_rmp_to(&commit_msg.body).expect("commit body deserializes");
+
+        // --- the lockstep assertion: ONE pool advanced, the chain followed -
+        assert_eq!(pool.leaf_count(), 2, "the output commitment leaf was appended");
+        assert_eq!(pool.applied_count(), 2, "seed delta + this commit's delta");
+        assert!(pool.nullifiers().contains(nullifier), "the spend is recorded");
+        assert_eq!(
+            pool.current_root(),
+            pool_tree_root(&pool),
+            "the root-history tip equals the rebuilt tree root"
+        );
+        let tip = server
+            .tokens()
+            .get(&vec![1])
+            .unwrap()
+            .blockchain
+            .get_current_chain_state()
+            .last_hash_in;
+        assert_eq!(
+            tip,
+            commit.proposed_block.current_hash,
+            "the committed block is the chain tip"
+        );
+        let count = server.tokens().get(&vec![1]).unwrap().blockchain.get_count();
+        assert_eq!(count, tokens_before + 1, "chain advanced exactly one block");
+    }
+
+    /// S5.4 conflict check (LIVE — two halo2 proves): a shielded block that
+    /// LOSES its tip conflict is rolled back lockstep — the loser's pool
+    /// delta is reverted (leaves, nullifiers, root history) through the
+    /// COMPOSITE's dispatch path (dispatcher → committer plugin →
+    /// `commit_block` rollback branch → pool `revert_update`), proving the
+    /// machinery needs no epoch-logic changes: the lockstep the committer
+    /// owns works unchanged inside the composite. The winner's delta stays
+    /// applied. Finalizer-free by design: both Commits are hand-signed by
+    /// two registered finalizer identities with UNEQUAL stakes (100 vs 200 —
+    /// an equal-stake tie would fail closed) — the committer's conflict
+    /// resolution is the unit under test, not the finalizer's quorum math.
+    #[tokio::test]
+    #[ignore = "live halo2 prove x2 (~2 min); run with --ignored"]
+    async fn live_composite_conflict_rollback_lockstep() {
+        use pneumatic_core::blocks::BlockFactory;
+        use pneumatic_core::blocks::FinalityStatus;
+        use pneumatic_core::crypto::AsymCryptoProvider;
+        use pneumatic_core::shielded::{
+            commit, root_to_bytes, IncrementalMerkleTree, ShieldedNote, DEFAULT_DEPTH,
+        };
+        use pneumatic_prover::{build_shielded_tx, NoteOutput, ShieldedIdentity, SpendKey};
+        use pasta_curves::pallas::Scalar as Fq;
+
+        // TWO input notes in ONE tree: the sibling proposals A and B each
+        // prove against the FINAL root (the pool's current root — the root
+        // history both recency checks run against).
+        let note_a = ShieldedNote {
+            value: 100,
+            owner_pk: [1u8; 32],
+            rho: Fq::from(1),
+            rcm: Fq::from(2),
+        };
+        let note_b = ShieldedNote {
+            value: 200,
+            owner_pk: [2u8; 32],
+            rho: Fq::from(3),
+            rcm: Fq::from(4),
+        };
+        let spend_a = [0xA1u8; 32];
+        let spend_b = [0xB2u8; 32];
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        let (root_a, _) = tree.append(&commit(&note_a));
+        let (root_b, proof_b) = tree.append(&commit(&note_b));
+        let root_a = root_to_bytes(&root_a);
+        let root_b = root_to_bytes(&root_b);
+        let leaf_a = root_to_bytes(&IncrementalMerkleTree::commitment_to_leaf(&commit(&note_a)));
+        let leaf_b = root_to_bytes(&IncrementalMerkleTree::commitment_to_leaf(&commit(&note_b)));
+        // note_a's membership re-derived against the FINAL root.
+        let proof_a = tree.membership_proof(0);
+
+        // Seed the pool with BOTH leaves in two prior deltas (the final root
+        // as the tip — the pool's boot state).
+        let seed_state = ShieldedPoolState {
+            root: root_b,
+            leaf_count: 2,
+            leaves: vec![leaf_a, leaf_b],
+            nullifiers: vec![],
+            applied: vec![
+                e2e_seed_delta(vec![0xAA; 32], vec![leaf_a], root_a),
+                e2e_seed_delta(vec![0xAB; 32], vec![leaf_b], root_b),
+            ],
+        };
+
+        // Two distinct finalizer identities: the conflicting proposers.
+        let identity_a = NodeIdentity::generate_in_memory();
+        let identity_b = NodeIdentity::generate_in_memory();
+        let key_a = identity_a.ed25519.public_key().expect("A pubkey");
+        let key_b = identity_b.ed25519.public_key().expect("B pubkey");
+
+        // Committer-only composite: the unit under test is the committer's
+        // commit path (the S5.4 pool swap) — no sentinel/finalizer arms.
+        let cfg = runtime_config(vec![bad_peer()], type_config_select(NodeRegistryType::Committer));
+        let mut stakers = std::collections::HashMap::new();
+        stakers.insert(key_a.clone(), 100u64);
+        stakers.insert(key_b.clone(), 200u64);
+        let dp = Arc::new(E2eDataProvider {
+            pool_state: std::sync::Mutex::new(seed_state),
+            token: make_e2e_token(),
+            user_pk: b"alice".to_vec(),
+            stakers,
+        });
+        let server = build_runtime(cfg, Arc::new(MapStakeProvider::with_default(2000)), dp)
+            .expect("composite boots with the seeded pool");
+        let pool = server.shielded_pool();
+        assert_eq!(pool.leaf_count(), 2, "boot load rebuilt the seeded pool");
+        assert_eq!(pool.applied_count(), 2, "both seed deltas survived the boot load");
+
+        // Prove BOTH sibling spends live, against the shared FINAL root:
+        // A: 100 = 90 + 10; B: 200 = 190 + 10.
+        let recipient_a = ShieldedIdentity {
+            spend: SpendKey::from_seed([2u8; 32]),
+            identity: pneumatic_core::crypto::Ed25519Provider::generate(),
+        };
+        let recipient_b = ShieldedIdentity {
+            spend: SpendKey::from_seed([3u8; 32]),
+            identity: pneumatic_core::crypto::Ed25519Provider::generate(),
+        };
+        let (stx_a, _) = build_shielded_tx(
+            &[1u8], &[note_a], &[&spend_a], &[proof_a],
+            root_b, &[NoteOutput::new(90, recipient_a)], 10,
+        )
+        .expect("prove A");
+        let (stx_b, _) = build_shielded_tx(
+            &[1u8], &[note_b], &[&spend_b], &[proof_b],
+            root_b, &[NoteOutput::new(190, recipient_b)], 10,
+        )
+        .expect("prove B");
+        let null_a = stx_a.nullifiers[0];
+        let null_b = stx_b.nullifiers[0];
+
+        // Bootstrap the token (shared cache) with a genesis.
+        {
+            let tokens = server.tokens();
+            let mut t = tokens.entry(vec![1]).or_insert(make_e2e_token());
+            let mut genesis = pneumatic_core::blocks::Block {
+                signed_trans: SignedTransaction::test_transaction(),
+                token_metadata: std::collections::HashMap::new(),
+                previous_hash: vec![42u8; 32],
+                timestamp: 0,
+                current_hash: vec![],
+                finality_status: FinalityStatus::Optimistic,
+                proposer_key: vec![],
+                epoch_number: 0,
+            };
+            genesis.current_hash = BlockFactory::create_hash(&genesis).expect("genesis hashes");
+            t.blockchain.add_block(genesis);
+        }
+
+        // Register BOTH proposers as Finalizer peers (recording connections
+        // — nothing is actually sent), so the committer's Commit auth
+        // resolves their role sets and their stake from the snapshot.
+        let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (key, rhash) in
+            [(key_a.clone(), [0xA0u8; 16]), (key_b.clone(), [0xB0u8; 16])]
+        {
+            assert!(
+                server.node_registry().register_peer(
+                    key, rhash, &NodeRegistryType::Finalizer,
+                    Box::new(RecordingConnection { recorder: recorder.clone() }),
+                ),
+                "proposer peer registers"
+            );
+        }
+
+        // H12 shielded pairing for both siblings: each wire block's stx must
+        // hash-match a registered shielded entry (no plain entries — the
+        // committer materializes them from the wire block, H4).
+        let registry = server.pending_registry();
+        registry.register_shielded(&stx_a).expect("A's payload registers");
+        registry.register_shielded(&stx_b).expect("B's payload registers");
+
+        // A commits first: the block is chained off the tip captured NOW
+        // (the genesis hash) and signed by proposer A's registered
+        // finalizer identity.
+        let genesis_tip = server
+            .tokens()
+            .get(&vec![1])
+            .map(|t| {
+                let s = t.blockchain.get_current_chain_state();
+                if s.last_hash_in.is_empty() {
+                    Vec::new()
+                } else {
+                    s.last_hash_in
+                }
+            })
+            .unwrap_or_default();
+        let block_a = make_e2e_shielded_block(&stx_a, genesis_tip.clone());
+        let commit_a = e2e_commit(&stx_a, &block_a);
+        server
+            .dispatch(e2e_commit_message(&commit_a, &identity_a))
+            .await
+            .expect("A commits and becomes the tip");
+        assert!(pool.nullifiers().contains(null_a), "A's delta is applied");
+
+        // B (higher stake) commits at the SAME chain position — chained off
+        // the genesis tip captured BEFORE A committed, so the conflict is on
+        // the position, not the prev hash. B wins; A is rolled back
+        // lockstep through the composite's commit path.
+        let block_b = make_e2e_shielded_block(&stx_b, genesis_tip);
+        let commit_b = e2e_commit(&stx_b, &block_b);
+        server
+            .dispatch(e2e_commit_message(&commit_b, &identity_b))
+            .await
+            .expect("B wins the conflict and commits");
+
+        // Chain: A is gone, B is the sole block at the position.
+        let tip = server
+            .tokens()
+            .get(&vec![1])
+            .unwrap()
+            .blockchain
+            .get_current_chain_state()
+            .last_hash_in;
+        assert_eq!(tip, commit_b.proposed_block.current_hash, "B is the tip");
+        assert_eq!(
+            server.tokens().get(&vec![1]).unwrap().blockchain.get_count(),
+            2,
+            "genesis + B: A rolled back"
+        );
+
+        // Pool: LOCKSTEP — A's delta reverted, B's delta intact.
+        assert_eq!(
+            pool.leaf_count(),
+            3,
+            "two seed leaves + B's leaf (A's leaf reverted)"
+        );
+        assert!(
+            !pool.nullifiers().contains(null_a),
+            "A's nullifier is unmarked (delta reverted)"
+        );
+        assert!(
+            pool.nullifiers().contains(null_b),
+            "B's nullifier is marked"
+        );
+        assert_eq!(
+            pool.applied_count(),
+            3,
+            "two seed deltas + B's delta (A's delta reverted)"
+        );
+        assert_eq!(
+            pool.current_root(),
+            pool_tree_root(&pool),
+            "post-rollback root history is coherent"
+        );
+    }
+
+    // --- e2e test fixtures --------------------------------------------------
+
+    /// The shielded token the e2e universe targets: self-verified + opt-in.
+    fn make_e2e_token() -> Token {
+        let mut t = Token::new();
+        t.id = vec![1];
+        t.is_self_verified = true;
+        t.set_metadata("shielded_opt_in".into(), "true".into());
+        t
+    }
+
+    fn e2e_seed_delta(block_hash: Vec<u8>, leaves: Vec<[u8; 32]>, post_root: [u8; 32])
+    -> pneumatic_core::data::AppliedPoolDelta {
+        pneumatic_core::data::AppliedPoolDelta {
+            block_hash,
+            leaves,
+            nullifiers: vec![],
+            post_root,
+        }
+    }
+
+    /// The wire block for an e2e shielded commit: the canonical plain block
+    /// shape (the committer's H12 tx-hash pairing is against the EMBEDDED
+    /// plain transaction, byte-identical to what the finalizer embeds),
+    /// carrying the shielded payload, chained off `prev_hash`.
+    fn make_e2e_shielded_block(
+        stx: &pneumatic_core::transactions::ShieldedTransaction,
+        prev_hash: Vec<u8>,
+    ) -> pneumatic_core::blocks::Block {
+        let signed = SignedTransaction {
+            shielded: Some(stx.clone()),
+            transaction_id: stx.id.clone(),
+            transaction: pneumatic_core::transactions::Transaction {
+                id: stx.id.clone(),
+                action: "ShieldedTransfer".into(),
+                token_id: vec![1],
+                bid: None,
+                sequence_number: 1,
+                sender: b"alice".to_vec(),
+                receiver: vec![2],
+                amount: None,
+                timestamp: 0,
+                result_hash: vec![],
+                sender_signature: vec![],
+            },
+            total_voters: 3,
+            total_stake: 42,
+            leader_hash: prev_hash.clone(),
+            leader_address: vec![],
+            leader_stake: 0,
+            finalizer_addr: vec![],
+            finalizer_sig: pneumatic_core::transactions::TransactionSignature {
+                transaction_id: vec![],
+                env_id: vec![],
+                transaction_hash: vec![],
+                signature: vec![],
+                current_stake: 0,
+            },
+            executor_sigs: std::collections::HashMap::new(),
+            proposer_key: vec![],
+        };
+        let mut block = pneumatic_core::blocks::Block {
+            signed_trans: signed,
+            token_metadata: std::collections::HashMap::new(),
+            previous_hash: prev_hash,
+            timestamp: 0,
+            current_hash: vec![],
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        block.current_hash =
+            BlockFactory::create_hash(&block).expect("well-formed test block hashes");
+        block
+    }
+
+    fn e2e_commit(
+        stx: &pneumatic_core::transactions::ShieldedTransaction,
+        block: &pneumatic_core::blocks::Block,
+    ) -> TransactionCommit {
+        TransactionCommit {
+            trans_id: stx.id.as_bytes().to_vec(),
+            token_id: vec![1],
+            env_id: "test_env".to_string(),
+            proposed_block: block.clone(),
+        }
+    }
+
+    /// The signed wire `Commit` message (envelope: the proposer's finalizer
+    /// identity — registered as a Finalizer, which `Commit` permits).
+    fn e2e_commit_message(
+        commit: &TransactionCommit,
+        identity: &NodeIdentity,
+    ) -> Message {
+        let body = serialize_to_bytes_rmp(commit).expect("commit serializes");
+        Message::signed("env".to_string(), "Commit", body, None, identity).expect("signs")
+    }
+
+    /// Poll the recorder until a message with `action` appears (the
+    /// fire-and-forget gossiper sends on a worker thread), then return it.
+    async fn next_recorded(
+        recorder: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        action: &str,
+    ) -> Message {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (found, n) = {
+                let guard = recorder.lock().unwrap();
+                let found = guard
+                    .iter()
+                    .find(|raw| {
+                        deserialize_rmp_to::<Message>(raw)
+                            .map(|m| m.action == action)
+                            .unwrap_or(false)
+                    })
+                    .cloned();
+                (found, guard.len())
+            };
+            if let Some(raw) = found {
+                return deserialize_rmp_to::<Message>(&raw).expect("recorded payload is a Message");
+            }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for a recorded {action:?} (have {n} payloads)");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The pool's live tree root, rebuilt from the snapshot's leaf set (for
+    /// the root-history coherence assertion) — `current_root()` is the
+    /// history tip; the tree root over the same leaves must equal it.
+    fn pool_tree_root(
+        pool: &pneumatic_committer::shielded_pool::ShieldedPool,
+    ) -> [u8; 32] {
+        use pneumatic_core::shielded::{
+            bytes_to_root, IncrementalMerkleTree, DEFAULT_DEPTH,
+        };
+        let mut tree = IncrementalMerkleTree::new(DEFAULT_DEPTH);
+        for leaf in pool.state_snapshot().leaves {
+            tree.append_leaf(&bytes_to_root(&leaf).expect("snapshot leaf is a committed leaf"));
+        }
+        pneumatic_core::shielded::root_to_bytes(&tree.root())
     }
 }
