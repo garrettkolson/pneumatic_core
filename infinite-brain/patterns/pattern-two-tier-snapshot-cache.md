@@ -4,13 +4,13 @@ title: "Tiered epoch-snapshot cache — local Map → DataProvider (peer tier re
 type: pattern
 namespace: pneumatic
 visibility: namespace
-summary: "Epoch snapshots (stake/executor sets) served by a local Mutex<HashMap> tier (O(1)) with a ~1ms DataProvider fallback; sentinel variant reserves a peer tier; invalidated on epoch advance."
+summary: "SINGLE generic implementation since 09/23: core `epoch::EpochSnapshotCache<T>` (local Mutex<HashMap> tier, O(1), + fetch-hook ~1ms DataProvider fallback; peer tier reserved); sentinel/finalizer instantiate it with StakeSet/ExecutorSet; invalidated on epoch advance."
 auto_inject: false
 applicable_when: "Adding a new per-epoch data dependency to a role crate, optimizing snapshot reads, or wiring epoch-boundary invalidation"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when the snapshot cache modules (finalizer/sentinel stake_snapshot_cache.rs, sentinel/executor_set_cache.rs) change tiers or invalidation"
+staleness_signal: "Stale when core src/epoch.rs EpochSnapshotCache changes tiers, fetch-hook signature, or invalidation semantics"
 tags: [caching, snapshots, epoch, data-provider, performance]
 edges:
   - target: concept-finalizer-role
@@ -31,9 +31,16 @@ source_url: "Empty"
 
 # Tiered epoch-snapshot cache — local Map → DataProvider (peer tier reserved)
 
-A shared structural pattern across the worker crates for per-epoch data (stake sets, executor sets). The tiers, as documented in the module headers:
+**Single shared implementation** (09/23, monolith-modularization step 1): `pneumatic_core::epoch::EpochSnapshotCache<T>` in `src/epoch.rs`. One generic struct replaces the three near-identical worker-crate copies that previously existed (sentinel + finalizer `stake_snapshot_cache.rs` — byte-identical code — and sentinel `executor_set_cache.rs`; all deleted).
 
-- **Finalizer** (`finalizer/src/stake_snapshot_cache.rs:48-60`): two tiers — (1) local `Mutex<HashMap>` hit, O(1), zero network latency, the happy path; (2) DataProvider fallback via TCP/UDS to the local data service, ~1ms. The cache is invalidated on epoch transition so a new epoch's snapshot is freshly fetched; `advance_epoch` calls `invalidate_all` (`finalizer/src/finalizer.rs:954-957`).
-- **Sentinel** (`sentinel/src/stake_snapshot_cache.rs:1-8`, `sentinel/src/executor_set_cache.rs:1-8`): three tiers — local (loaded when the first block of a new epoch is seen), DataProvider, and a **reserved** third peer tier ("request from another node's DataProvider"). The executor-set cache "mirrors StakeSnapshotCache pattern" verbatim.
+Shape:
 
-Properties worth reusing: one cache per (epoch, snapshot-kind) pair keyed by epoch number; all I/O behind the `DataProvider` trait so tests inject in-memory fakes; invalidation tied to the epoch clock rather than TTL; and the sentinel's explicit tier-3 reservation so the data path can degrade from local-service to peer fetch without a shape change.
+- **Tier 1 — local** `Mutex<HashMap<u64, T>>` (std sync Mutex; core has no parking_lot dep): O(1) hit, zero network latency, the happy path.
+- **Tier 2 — fetch hook** `Box<dyn Fn(u64, &str) -> Result<T, DataError> + Send + Sync>`: called only on a local miss; the worker closures capture an `Arc<dyn DataProvider>` clone and call `get_stake_snapshot` / `get_executor_set` (~1 ms local data service). `get` re-caches a successful fetch; a fetch error logs `warn!` and returns `None` (fail-open to `None`, as before).
+- **Tier 3 — peer (reserved)**: not wired; reserved for future degradation from local-service to peer fetch without a shape change.
+
+Instantiation: sentinel `new()` builds `Arc<EpochSnapshotCache<StakeSet>>` and `Arc<EpochSnapshotCache<ExecutorSet>>` (`sentinel/src/sentinel.rs`); finalizer builds `EpochSnapshotCache<StakeSet>` (`finalizer/src/finalizer.rs`). Invalidation is tied to the epoch clock: finalizer `advance_epoch` / sentinel epoch-advance call `invalidate_all` (no TTL).
+
+Properties worth reusing (unchanged): one cache per (epoch, snapshot-kind) pair keyed by epoch number; all I/O behind the `DataProvider` trait so tests inject in-memory fakes (the 7 `epoch::tests::snapshot_cache_*` tests cover both StakeSet and ExecutorSet variants plus partition-id pass-through).
+
+History: the three-way duplication was flagged in the 09/23 refactoring-opportunity analysis (`task-monolith-modularization`) and removed as its step 1 — sentinel 67→57, finalizer 66→61 tests, core +7.

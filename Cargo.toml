@@ -39,6 +39,9 @@ tokio-stream = "0.1.17"
 async-trait = "0.1.88"
 futures = "0.3"
 hex = "0.4"
+# Warning line in `epoch::EpochSnapshotCache`'s fetch-fallback path. Already
+# resolved in the lockfile by the worker crates; no new packages.
+log = "0.4"
 aes-gcm = "0.11.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
 hkdf = "0.12"

@@ -1166,6 +1166,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "libc",
+ "log",
  "moka",
  "once_cell",
  "pasta_curves",

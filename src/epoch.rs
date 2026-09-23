@@ -870,6 +870,93 @@ impl Default for CandidateRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// EpochSnapshotCache — tiered epoch-snapshot cache (local Map → fetch hook)
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+use crate::data::DataError;
+
+/// Tiered epoch-snapshot cache shared by the worker roles.
+///
+/// Holds per-epoch values (e.g. [`StakeSet`] / [`ExecutorSet`]) in a local
+/// `Mutex<HashMap<u64, T>>` tier (O(1) hits) with a **fetch hook** used as
+/// the ~1 ms DataProvider fallback on a miss. A **peer tier** (requesting
+/// the snapshot from a neighboring node's DataProvider) is reserved for
+/// future use and not wired here.
+///
+/// This is the single implementation of what was previously three
+/// near-identical worker-crate copies (`StakeSnapshotCache` in both the
+/// sentinel and finalizer crates, and `ExecutorSetCache` in the sentinel
+/// crate).
+pub struct EpochSnapshotCache<T: Clone + Send> {
+    /// Local tier: epoch → snapshot.
+    local: Mutex<HashMap<u64, T>>,
+    /// Tier-2 fallback: fetch the snapshot for an epoch from the local
+    /// DataProvider (or other backing store). The closure captures whatever
+    /// it needs (typically an `Arc<dyn DataProvider>`) and is invoked only
+    /// on a local-tier miss.
+    fetch: Box<dyn Fn(u64, &str) -> Result<T, DataError> + Send + Sync>,
+    /// Partition id passed to the fetch hook.
+    partition_id: String,
+}
+
+impl<T: Clone + Send> EpochSnapshotCache<T> {
+    /// Create a new cache with no cached snapshots.
+    pub fn new<F>(partition_id: String, fetch: F) -> Self
+    where
+        F: Fn(u64, &str) -> Result<T, DataError> + Send + Sync + 'static,
+    {
+        EpochSnapshotCache {
+            local: Mutex::new(HashMap::new()),
+            fetch: Box::new(fetch),
+            partition_id,
+        }
+    }
+
+    /// Get a snapshot for the given epoch.
+    ///
+    /// Tries the local cache first. If not found, invokes the fetch hook
+    /// and caches the result for future lookups.
+    pub fn get(&self, epoch: u64) -> Option<T> {
+        // Tier 1: Local cache hit
+        if let Some(snapshot) = self.local.lock().unwrap().get(&epoch).cloned() {
+            return Some(snapshot);
+        }
+
+        // Tier 2: DataProvider (fetch hook) fallback
+        match (self.fetch)(epoch, &self.partition_id) {
+            Ok(snapshot) => {
+                self.local.lock().unwrap().insert(epoch, snapshot.clone());
+                Some(snapshot)
+            }
+            Err(e) => {
+                log::warn!("DataProvider returned error for epoch {}: {:?}", epoch, e);
+                None
+            }
+        }
+    }
+
+    /// Put a snapshot directly into the local cache.
+    /// Called when a block from a new epoch is observed.
+    pub fn put(&self, epoch: u64, snapshot: T) {
+        self.local.lock().unwrap().insert(epoch, snapshot);
+    }
+
+    /// Returns the number of cached epochs.
+    pub fn cached_count(&self) -> usize {
+        self.local.lock().unwrap().len()
+    }
+
+    /// Invalidate all cached snapshots.
+    ///
+    /// Called on epoch transition to force a fresh fetch of the next epoch's
+    /// snapshot.
+    pub fn invalidate_all(&self) {
+        self.local.lock().unwrap().clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -878,6 +965,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use crate::blocks::{Block, FinalityStatus};
+    use crate::data::{DataProvider, StubDataProvider};
 
     // --- LeaderSelector tests ---
 
@@ -885,6 +973,122 @@ mod tests {
         StakeSet {
             stakers: stakes.into_iter().collect(),
         }
+    }
+
+    fn make_executor_set(executors: Vec<(Vec<u8>, u64)>) -> ExecutorSet {
+        ExecutorSet {
+            executors: executors.into_iter().collect(),
+        }
+    }
+
+    // --- EpochSnapshotCache tests (shared tiered cache; was duplicated in
+    //     the sentinel/finalizer worker crates) ---
+
+    #[test]
+    fn snapshot_cache_empty_returns_none() {
+        let dp = Arc::new(StubDataProvider::new());
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_stake_snapshot(epoch, _p));
+        assert!(cache.get(1).is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_put_and_get() {
+        let dp = Arc::new(StubDataProvider::new());
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_stake_snapshot(epoch, _p));
+        cache.put(5, make_stake_set(vec![(vec![1], 100), (vec![2], 200)]));
+        let result = cache.get(5).unwrap();
+        assert_eq!(result.total_stake(), 300);
+    }
+
+    #[test]
+    fn snapshot_cache_fallback_to_data_provider() {
+        let snapshot = make_stake_set(vec![(vec![10], 500)]);
+        let dp = Arc::new(StubDataProvider::new().with_stake_snapshot(3, snapshot));
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_stake_snapshot(epoch, _p));
+
+        // First call — fetch fallback, caches locally
+        let result = cache.get(3).unwrap();
+        assert_eq!(result.total_stake(), 500);
+
+        // Second call — local cache hit
+        assert_eq!(cache.cached_count(), 1);
+        assert!(cache.get(3).is_some());
+    }
+
+    #[test]
+    fn snapshot_cache_independent_epochs() {
+        let dp = Arc::new(
+            StubDataProvider::new()
+                .with_stake_snapshot(1, make_stake_set(vec![(vec![1], 100)]))
+                .with_stake_snapshot(2, make_stake_set(vec![(vec![2], 200)])),
+        );
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_stake_snapshot(epoch, _p));
+
+        assert_eq!(cache.get(1).unwrap().total_stake(), 100);
+        assert_eq!(cache.get(2).unwrap().total_stake(), 200);
+        assert_eq!(cache.cached_count(), 2);
+    }
+
+    #[test]
+    fn snapshot_cache_invalidate_all_clears_and_refetches() {
+        let dp = Arc::new(
+            StubDataProvider::new()
+                .with_stake_snapshot(1, make_stake_set(vec![(vec![1], 100)]))
+                .with_stake_snapshot(2, make_stake_set(vec![(vec![2], 200)])),
+        );
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_stake_snapshot(epoch, _p));
+
+        cache.put(1, make_stake_set(vec![(vec![1], 100)]));
+        cache.put(2, make_stake_set(vec![(vec![2], 200)]));
+        assert_eq!(cache.cached_count(), 2);
+
+        cache.invalidate_all();
+        assert_eq!(cache.cached_count(), 0);
+
+        // After invalidation, get falls back to the fetch hook
+        assert_eq!(cache.get(1).unwrap().total_stake(), 100);
+        assert_eq!(cache.cached_count(), 1); // Re-cached from DataProvider
+    }
+
+    #[test]
+    fn snapshot_cache_executor_set_variant() {
+        let executors = make_executor_set(vec![(vec![10], 500)]);
+        let dp = Arc::new(StubDataProvider::new().with_executor_set(3, executors));
+        let cache: EpochSnapshotCache<ExecutorSet> =
+            EpochSnapshotCache::new("test".into(), move |epoch, _p| dp.get_executor_set(epoch, _p));
+
+        // Fetch fallback, then local hit
+        assert_eq!(cache.get(3).unwrap().total_stake(), 500);
+        assert_eq!(cache.cached_count(), 1);
+
+        // put + invalidate_all on the executor-set variant
+        cache.put(4, make_executor_set(vec![(vec![1], 100)]));
+        assert_eq!(cache.cached_count(), 2);
+        cache.invalidate_all();
+        assert_eq!(cache.cached_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_cache_fetch_receives_partition_id() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::data::DataError;
+
+        let saw_partition = Arc::new(AtomicBool::new(false));
+        let saw_partition_clone = Arc::clone(&saw_partition);
+        let cache: EpochSnapshotCache<StakeSet> =
+            EpochSnapshotCache::new("partition-A".into(), move |_epoch, partition| {
+                if partition == "partition-A" {
+                    saw_partition_clone.store(true, Ordering::SeqCst);
+                }
+                Err(DataError::DataNotFound)
+            });
+        assert!(cache.get(1).is_none()); // DataNotFound → None
+        assert!(saw_partition.load(Ordering::SeqCst));
     }
 
     // --- Phase 5.4 / H9+M8: snapshot integrity envelope ---

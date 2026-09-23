@@ -70,10 +70,11 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | id | title | summary | edges |
 |---|---|---|---|
 
-## task (5)
+## task (6)
 
 | id | title | summary | edges |
 |---|---|---|---|
+| `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | sentinel/finalizer/node-server monoliths + 4 root-lib multi-concern files follow the pre-d25f1ba shape; 2 verified cross-crate dups (epoch snapshot cache, C1 auth). Prioritized, test-gated. | 5 |
 | `task-data-provider-wire-tests` | Open gap: DefaultDataProvider wire-format tests (data.rs) | Open gap in TASKS.md's 'Remaining test gaps': wire-format tests for the DefaultDataProvider (data.rs); siblings: server.rs async poison, epoch stubs, registry send_to_all, config helpers. | 3 |
 | `task-e2e-pipeline-integration-test` | Open gap: e2e pipeline integration test (sentinel → executor → finalizer → committer) | Open item in TASKS.md's 'Remaining test gaps': a full-pipeline integration test, sentinel → executor → finalizer → committer; also the audit's overall Done-when scenario. | 4 |
 | `task-executor-contract-bytecode` | Open: executor contract execution is a stub (TODO at executor.rs:386) | Executor::execute_contract is a documented stub that serializes the tx itself as the 'output'; TODO at executor/src/executor.rs:386: decode and execute real contract bytecode. | 2 |
@@ -98,7 +99,7 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | `pattern-fail-closed` | Fail-closed construction | Invalid state must be impossible to construct, not merely rejectable: ActionCircuit construction, ShieldedValidationSpec checks, and pool-view seams all fail closed on bad input. | 3 |
 | `pattern-per-sender-rmw-mutex` | Per-sender read-modify-write mutex for balance deductions | DashMap of sender key to Arc<Mutex<()>> serializes read-modify-write (get, subtract, save) per sender while distinct senders stay fully concurrent; failures surfaced, never swallowed. | 2 |
 | `pattern-pinned-dependencies` | Exact-pinned external dependencies | Security-sensitive externals (rns-net/rns-crypto/rns-core) are =-pinned in the workspace Cargo.toml; a single choke-point builder keeps consensus behavior from drifting. | 2 |
-| `pattern-two-tier-snapshot-cache` | Tiered epoch-snapshot cache — local Map → DataProvider (peer tier reserved) | Epoch snapshots (stake/executor sets) served by a local Mutex<HashMap> tier (O(1)) with a ~1ms DataProvider fallback; sentinel variant reserves a peer tier; invalidated on epoch advance. | 3 |
+| `pattern-two-tier-snapshot-cache` | Tiered epoch-snapshot cache — core EpochSnapshotCache<T> | Single generic core impl since 09/23: local Mutex<HashMap> tier (O(1)) + fetch-hook DataProvider fallback (~1ms), peer tier reserved; sentinel/finalizer instantiate with StakeSet/ExecutorSet. | 3 |
 | `pattern-verify-before-dedup` | Verify before dedup: never admit unverified content to a cache | Receivers run full verification (signature/envelope/fingerprint) BEFORE inserting into any dedup/corruption cache, so rejected input can never poison a slot a legitimate message would use. | 3 |
 
 ## hypothesis (1)
@@ -117,7 +118,7 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | `fact-rns-nodeconfig` | RNS NodeConfig: ~45 fields, no Default — RnsNodeConfigBuilder is the single choke point | rns-net 0.7.0 NodeConfig has ~45 fields and no Default; the full literal lives at config_builder.rs:120-172 (UDP 4242, per-peer udp_port+i, no TCP in v1, 48h dest TTL). | 3 |
 | `fact-rns-pinning` | RNS transport: rns-net =0.7.0, rns-crypto =0.1.9, rns-core =0.1.16 (exact pins) | Reticulum (RNS) transport pinned to exact versions in workspace Cargo.toml; NodeConfig (~45 fields, no Default) built via RnsNodeConfigBuilder; e2e tests over RNS exist. | 3 |
 | `fact-shielded-stack` | Shielded ZK stack: module map (S1.1–S5.2 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState. S1.1–S5.2 complete. | 4 |
-| `fact-test-suite` | Test baseline 2026-09-20: 822 passed / 8 ignored / 0 failed | 09/20/2026 workspace test baseline: 822 passed / 8 ignored / 0 failed — core 546, committer 80, executor 10, finalizer 66, node-server 31, prover 15, sentinel 67, integration 6. | 2 |
+| `fact-test-suite` | Test baseline 2026-09-23: 823 passed / 32 ignored / 0 failed | 09/23/2026 workspace baseline after EpochSnapshotCache<T> extraction + 623c7f3 long-running ignores: 823 passed / 32 ignored / 0 failed — core 541, committer 101, executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 6. | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
 | `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/20/2026 (cargo test -p) | Verified per-crate: executor 10 passed, finalizer 66, committer 71 lib + 9 integration, sentinel 67 + 2 ignored (live halo2 e2e + doc), node-server 31 — 0 failed in every crate. | 2 |
 | `fact-workspace-layout` | Workspace layout: 7 crates, 27 root modules | Rust workspace: root pneumatic_core lib (27 modules in lib.rs incl. rns, shielded) + sentinel, executor, finalizer, committer, node-server, prover crates. | 3 |
@@ -163,4 +164,4 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 
 ## Totals
 
-78 nodes. Logs (append-only, never indexed): see logs/.
+79 nodes. Logs (append-only, never indexed): see logs/.

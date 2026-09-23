@@ -1,14 +1,14 @@
 ---
 id: fact-test-suite
-title: "Test baseline 2026-09-21: 823 passed / 9 ignored / 0 failed"
+title: "Test baseline 2026-09-23: 823 passed / 32 ignored / 0 failed"
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "09/21/2026 workspace test baseline after the committer `impl Committer` modularization: 823 passed / 9 ignored / 0 failed — committer 80 (71 lib + 9 integration, unchanged by the split), core 548 (+2 pre-existing growth vs the 09/20 546), executor 10, finalizer 66, node-server 31, prover 15, sentinel 67, integration 6."
+summary: "09/23/2026 workspace test baseline after the EpochSnapshotCache<T> extraction (15 worker cache tests removed, 7 core tests added) and 623c7f3's long-running-test ignores: 823 passed / 32 ignored / 0 failed — core 541, committer 101 (92 lib + 9 integration), executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 6."
 auto_inject: false
 applicable_when: "Checking test health, regressing after a change, or quoting baseline counts"
 confidence: 1.0
-verified_at: "09/21/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Stale whenever the workspace test counts change — re-run cargo test --workspace"
 tags: [tests, baseline, ci, quality]
@@ -25,10 +25,10 @@ related: []
 source_url: "Empty"
 ---
 
-# Test baseline 2026-09-21
+# Test baseline 2026-09-23
 
-`cargo test --workspace` at HEAD on 09/21/2026: **823 passed, 9 ignored, 0 failed**.
+`cargo test --workspace` at HEAD on 09/23/2026: **823 passed, 32 ignored, 0 failed**.
 
-Per crate: pneumatic_core 548 passed / 5 ignored; **committer 80 passed / 0 ignored** (71 lib + 9 integration) — unchanged by the Phase 2 `impl Committer` split into the five child modules under `committer/src/committer/`; executor 10; finalizer 66; node-server 31; prover 15 / 1 ignored; sentinel 67 / 1 ignored; transport_integration 6; rns_live 0 / 1 ignored; plus one crate with 0 passed / 1 ignored doc-test.
+Per crate: pneumatic_core 541 passed / 19 ignored; committer 101 passed / 7 ignored (92 lib + 9 integration); executor 10; finalizer 61; node-server 32 / 2 ignored; prover 15 / 1 ignored; sentinel 57 / 1 ignored; transport_integration 6; rns_live 0 / 1 ignored; plus one crate with 0 passed / 1 ignored doc-test.
 
-The delta vs the 09/20 figure (822 passed / 8 ignored) is pre-existing: `pneumatic_core` grew +2 unit tests (546 -> 548) and one doc-test is now counted — the committer crate (the only one Phase 2 touched) is byte-for-byte its 80/0 baseline, and the full suite is 0 failed.
+Delta vs the 09/22 figure (847 passed / 16 ignored): **−24 passed / +16 ignored**. Two independent causes: (1) commit 623c7f3 ("ignored long-running tests w/ notes", 09/23 09:16) moved 16 long-running/live tests to `#[ignore]` (+16 ignored, −16 passed); (2) the `EpochSnapshotCache<T>` extraction deleted 15 worker-crate cache tests (sentinel 10, finalizer 5) and added 7 core tests (`epoch::tests::snapshot_cache_*`) (net −8 passed). 847 − 16 − 8 = 823 ✓; 16 + 16 = 32 ✓.

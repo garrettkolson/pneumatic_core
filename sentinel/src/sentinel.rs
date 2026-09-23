@@ -6,7 +6,7 @@ use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
-use pneumatic_core::epoch::FINALIZER_DOMAIN;
+use pneumatic_core::epoch::{EpochSnapshotCache, ExecutorSet, FINALIZER_DOMAIN, StakeSet};
 use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::messages::Message;
@@ -16,8 +16,6 @@ use pneumatic_core::shielded::ShieldedPoolView;
 use pneumatic_core::transactions::{ShieldedTransaction, Transaction, TransactionState};
 use pneumatic_core::validation::{ShieldedValidationDeps, ShieldedValidationSpec};
 
-use super::executor_set_cache::ExecutorSetCache;
-use super::stake_snapshot_cache::StakeSnapshotCache;
 
 /// Sentinel — the gatekeeper node type in the pneumatic pipeline.
 ///
@@ -39,10 +37,10 @@ pub struct Sentinel {
     data_provider: Arc<dyn DataProvider>,
     /// Stake snapshot cache for deterministic per-transaction routing.
     /// Loaded from local cache → DataProvider → (reserved) peer fallback.
-    stake_snapshot_cache: Arc<StakeSnapshotCache>,
+    stake_snapshot_cache: Arc<EpochSnapshotCache<StakeSet>>,
     /// Executor set cache for deterministic shard-aware routing.
     /// Loaded from local cache → DataProvider → (reserved) peer fallback.
-    executor_set_cache: Arc<ExecutorSetCache>,
+    executor_set_cache: Arc<EpochSnapshotCache<ExecutorSet>>,
     /// The environment this sentinel operates on.
     env_data: Arc<EnvironmentMetadata>,
     /// The read-only shielded-pool view the advisory shielded validation
@@ -77,12 +75,18 @@ impl Sentinel {
         );
         let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), Arc::clone(&data_provider));
         let partition_id = env_data.environment_id.clone();
-        let stake_snapshot_cache = Arc::new(
-            StakeSnapshotCache::new(data_provider.clone(), partition_id.clone())
-        );
-        let executor_set_cache = Arc::new(
-            ExecutorSetCache::new(data_provider.clone(), partition_id)
-        );
+        // Each fetch closure captures its own clone of the provider Arc so
+        // the `data_provider` field can still be moved into the struct below.
+        let stake_dp = data_provider.clone();
+        let stake_snapshot_cache = Arc::new(EpochSnapshotCache::new(
+            partition_id.clone(),
+            move |epoch, partition| stake_dp.get_stake_snapshot(epoch, partition),
+        ));
+        let executor_dp = data_provider.clone();
+        let executor_set_cache = Arc::new(EpochSnapshotCache::new(
+            partition_id,
+            move |epoch, partition| executor_dp.get_executor_set(epoch, partition),
+        ));
 
         Sentinel {
             node_registry,
@@ -677,7 +681,7 @@ impl Sentinel {
     /// Deterministically assign a finalizer for a transaction using the current
     /// stake snapshot. Returns the assigned finalizer's public key.
     ///
-    /// Uses the sentinel's `StakeSnapshotCache` to load the snapshot for the
+    /// Uses the sentinel's `EpochSnapshotCache<StakeSet>` to load the snapshot for the
     /// given epoch, then delegates to `pneumatic_core::deterministic_select`.
     ///
     /// If the snapshot is not cached and the DataProvider call fails, returns

@@ -11,7 +11,7 @@ use pneumatic_core::data::DataProvider;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures, ValidationFailureReason};
-use pneumatic_core::epoch::StakeSet;
+use pneumatic_core::epoch::{EpochSnapshotCache, StakeSet};
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
@@ -27,7 +27,6 @@ use pneumatic_core::validation::{ShieldedValidationDeps, ShieldedValidationSpec}
 use crate::block_builder::BlockBuilder;
 use crate::message_dispatcher::MessageDispatcher;
 use crate::signature_collector::SignatureCollector;
-use crate::stake_snapshot_cache::StakeSnapshotCache;
 
 /// Convert a byte slice to a hex string (lowercase, no prefix).
 fn bytes_to_hex(bytes: &[u8]) -> String {
@@ -77,7 +76,7 @@ pub struct Finalizer {
     current_epoch: u64,
     /// Stake snapshot cache — fetches the current epoch's stake set from the
     /// DataProvider (with local caching) for quorum gossip.
-    stake_cache: StakeSnapshotCache,
+    stake_cache: EpochSnapshotCache<StakeSet>,
     /// Current stake set for quorum gossip.
     /// Manual override via `set_stake_set` — used by tests. In production this
     /// stays `None` and `get_stake_set_for_epoch` uses the cache instead.
@@ -181,7 +180,14 @@ impl Finalizer {
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             awaiting_shutdown: Arc::new(Mutex::new(false)),
             current_epoch,
-            stake_cache: StakeSnapshotCache::new(data_provider.clone(), partition_id.clone()),
+            stake_cache: {
+                // The fetch closure captures its own clone of the provider
+                // Arc so `data_provider` can still be moved into the struct.
+                let stake_dp = data_provider.clone();
+                EpochSnapshotCache::new(partition_id.clone(), move |epoch, partition| {
+                    stake_dp.get_stake_snapshot(epoch, partition)
+                })
+            },
             stake_set: None,
             data_provider,
             partition_id,
