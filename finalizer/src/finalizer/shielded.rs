@@ -3,6 +3,7 @@
 //! and shielded finalization.
 
 use super::*;
+use pneumatic_core::auth::{authenticate_envelope, EnvelopeAuthError};
 
 impl Finalizer {
 /// Authenticate an inbound shielded (vote request or vote) message.
@@ -15,41 +16,44 @@ impl Finalizer {
 /// its voting finalizer as a Finalizer). Unknown / role-less signers are
 /// rejected fail-closed before any other work.
 fn authenticate_shielded_message(&self, message: &Message) -> Result<Vec<u8>, PneumaticError> {
-    // (1) Envelope signature: verified against the claimed public key.
-    //     `check_signature` is pure and returns `Ok(false)` (never panics)
-    //     on malformed input.
-    if !self
-        .identity
-        .ed25519
-        .check_signature(&message.signature, &message.public_key, &message.body)
-        .map_err(|e| {
-            PneumaticError::CryptoError(format!(
-                "envelope signature verification failed for {}: {e}",
-                bytes_to_hex(&message.public_key)
-            ))
-        })?
-    {
-        return Err(PneumaticError::CryptoError(format!(
+    // (1) Envelope signature + registration resolution via the shared core
+    //     C1 primitive (it owns the `Ok(false)`-means-mismatch trap).
+    let roles = authenticate_envelope(
+        &self.identity.ed25519,
+        &self.node_registry,
+        &message.signature,
+        &message.public_key,
+        &message.body,
+    )
+    .map_err(|e| match e {
+        EnvelopeAuthError::Signature {
+            reason: Some(reason),
+            ..
+        } => PneumaticError::CryptoError(format!(
+            "envelope signature verification failed for {}: {reason}",
+            bytes_to_hex(&message.public_key)
+        )),
+        EnvelopeAuthError::Signature { .. } => PneumaticError::CryptoError(format!(
             "envelope signature verification failed for {}",
             bytes_to_hex(&message.public_key)
-        )));
-    }
+        )),
+        EnvelopeAuthError::Unregistered { .. } => PneumaticError::Registry(format!(
+            "sender {} is not registered as any node",
+            bytes_to_hex(&message.public_key)
+        )),
+    })?;
 
-    // (2) Role gate: the verified signer must be registered as a
-    //     `Finalizer` (among its full role set — a composite voter
+    // (2) Role gate (local policy): the verified signer must be registered as
+    //     a `Finalizer` (among its full role set — a composite voter
     //     registered as Finalizer + other roles still authenticates).
-    let roles = self.node_registry.find_node_types_by_public_key(&message.public_key);
-    match roles.is_empty() {
-        false if roles.contains(&NodeRegistryType::Finalizer) => Ok(message.public_key.clone()),
-        false => Err(PneumaticError::Registry(format!(
+    if roles.contains(&NodeRegistryType::Finalizer) {
+        Ok(message.public_key.clone())
+    } else {
+        Err(PneumaticError::Registry(format!(
             "sender {} is registered as {:?}, not a Finalizer",
             bytes_to_hex(&message.public_key),
             roles
-        ))),
-        true => Err(PneumaticError::Registry(format!(
-            "sender {} is not registered as any node",
-            bytes_to_hex(&message.public_key)
-        ))),
+        )))
     }
 }
 

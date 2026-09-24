@@ -6,6 +6,7 @@ use std::sync::Arc;
 use dashmap::{DashMap, Entry};
 use tokio::sync::Mutex;
 
+use pneumatic_core::auth::authenticate_envelope;
 use pneumatic_core::crypto::AsymCryptoProvider;
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
@@ -299,23 +300,21 @@ impl Committer {
             .read()
             .expect("crypto provider poisoned");
 
-        // (1) Envelope signature over the message body.
-        if !crypto
-            .check_signature(&message.signature, &message.public_key, &message.body)
-            .unwrap_or(false)
-        {
-            return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
-        }
-
-        // (2) Registration + role set (Phase 6): is the signer a known node? A
-        // composite identity may be registered under several roles — resolve the
-        // full set.
-        let roles = self
-            .node_registry
-            .find_node_types_by_public_key(&message.public_key);
-        if roles.is_empty() {
-            return Err(CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)));
-        }
+        // (1) Envelope signature + registration (Phase 6) via the shared core
+        // C1 primitive: the body must verify under the claimed key (the
+        // helper owns the `Ok(false)`-means-mismatch trap), and the proven key
+        // must be a registered node. A composite identity resolves its full
+        // role set. Provider errors are swallowed into the same rejection as
+        // before (fail closed, no oracle on why).
+        let roles = authenticate_envelope(
+            &*crypto,
+            &self.node_registry,
+            &message.signature,
+            &message.public_key,
+            &message.body,
+        )
+        .map_err(|_| CommitterError::UnauthenticatedSender(bytes_to_hex(&message.public_key)))?;
+        drop(crypto);
 
         // (3) Role gate: allowed-role(action) must intersect the node's role
         // set — a composite identity registered for N roles may send actions

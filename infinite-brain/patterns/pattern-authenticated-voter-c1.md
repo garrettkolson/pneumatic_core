@@ -10,7 +10,7 @@ applicable_when: "Adding a new inbound message handler in any role crate, review
 confidence: 0.95
 verified_at: "09/23/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when the C1-style checks in finalizer/signing.rs handle_signature / finalizer/shielded.rs handle_sign_shielded, committer.rs authenticate_message, or sentinel/processing.rs handle_process_request change"
+staleness_signal: "Stale when core `auth::authenticate_envelope` changes semantics, or when the role gates in finalizer/signing.rs authenticate_signature_message / finalizer/shielded.rs authenticate_shielded_message / committer.rs authenticate_message, or sentinel/processing.rs handle_process_request change"
 tags: [authentication, identity, fail-closed, message-handling, cross-role]
 edges:
   - target: pattern-fail-closed
@@ -41,11 +41,14 @@ source_url: "Empty"
 
 A reusable cross-role authentication pattern visible in all four worker crates' inbound handlers. The rule: **the public key that enters consensus-relevant state is the key *proven* by the envelope signature and *confirmed* by a registration role check — never a key self-reported inside the message body.** Any anomaly (bad signature, unregistered key, wrong role) rejects the whole message before any other work.
 
+**Shared primitive (09/23, modularization step 6):** the two shared steps — envelope verify (including the `check_signature` `Ok(false)`-means-mismatch trap) + registry role resolution — now live in core as `pneumatic_core::auth::authenticate_envelope` (`src/auth.rs`, 5 core tests); it returns the sender's full resolved role set. The per-crate *role gate* (which resolved roles may perform which action) intentionally stays local, along with each crate's error taxonomy — the exact rejection strings are load-bearing for existing tests. The original "five production sites" analysis was 2-for-5 wrong: block_services.rs:221 and transaction_notifier.rs:323 were `#[cfg(test)] assert_signed_by` test helpers, not production auth; the true production surface was three functions (all now delegating). The sentinel's C3 shape (envelope sender == `tx.sender`) is a *binding* check without a registry gate and stays outside the helper.
+
 Instances (code-verified):
 
-- **Finalizer, executor votes** (`finalizer/src/finalizer/signing.rs:113-153`): the comment marks it `(C1)`. Envelope signature verified against `message.public_key`; that key must be a registered `Executor`; then the *inner* signature is checked over the claimed `transaction_hash` with the negated result (a bare `?` would silently accept a failing verify — the code spells this out). Voter stake is stamped from the epoch snapshot, never the message's self-reported field.
-- **Finalizer, shielded arms** (`finalizer/src/finalizer/shielded.rs:14-54`): same shape, `Finalizer` role gate, including composite identities registered under several roles.
-- **Committer router** (`committer/src/committer.rs:267-335`): envelope check (defense-in-depth with the gossiper's upstream check), registration lookup resolving the full role set, then an action→allowed-roles gate with `SelfOnly`/`AnyRegistered` variants.
-- **Sentinel admission** (`sentinel/src/sentinel/processing.rs`, C3 comment in `handle_process_request`; post-09/23 modularization): non-empty sender, sender's signature over canonical tx bytes, and authenticated envelope sender == `tx.sender` — so a peer cannot debit an account it doesn't own.
+- **Shared core primitive** (`src/auth.rs`): `authenticate_envelope(crypto, registry, signature, public_key, body) -> Result<Vec<NodeRegistryType>, EnvelopeAuthError>` — `Signature { reason: Option<String> }` distinguishes provider error from clean mismatch; `Unregistered` for a verified but unknown key.
+- **Finalizer, executor votes** (`finalizer/src/finalizer/signing.rs`, `authenticate_signature_message`): delegates (1)+(2) to the helper, then gates on `Executor` in the resolved set; voter stake is stamped from the epoch snapshot, never the message's self-reported field; the *inner* signature is checked over the claimed `transaction_hash` with the negated result.
+- **Finalizer, shielded arms** (`finalizer/src/finalizer/shielded.rs`, `authenticate_shielded_message`): same shape, `Finalizer` role gate, including composite identities registered under several roles.
+- **Committer router** (`committer/src/committer.rs`, `authenticate_message`): helper call (any failure → `UnauthenticatedSender`, provider errors swallowed as before), then the local action→allowed-roles gate with `Exact`/`SelfOnly`/`AnyRegistered` variants.
+- **Sentinel admission** (`sentinel/src/sentinel/processing.rs`, C3 comment in `handle_process_request`): non-empty sender, sender's signature over canonical tx bytes, and authenticated envelope sender == `tx.sender` — so a peer cannot debit an account it doesn't own. Not migrated: no registry role gate in this shape.
 
 Why it matters: it is the precondition that makes single-signature optimistic finality and stake-weighted quorum trustworthy, and it keeps the composite node's multi-role identities from cross-contaminating role privileges.

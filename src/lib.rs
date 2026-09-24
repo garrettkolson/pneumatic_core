@@ -22,6 +22,7 @@ pub use epoch::deterministic_select;
 pub use epoch::deterministic_select_shard;
 pub use epoch::ExecutorSet;
 pub mod action_router;
+pub mod auth;
 pub mod user;
 pub mod rns;
 pub mod shielded;
