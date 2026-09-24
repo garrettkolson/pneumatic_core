@@ -8,7 +8,7 @@ summary: "Nullifier uniqueness is enforced at consensus (NullifierMembership) â€
 auto_inject: false
 applicable_when: "Touching validation, nullifier handling, or designing new spend types"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If nullifier checks move out of the validation spec, or a non-consensus nullifier mechanism is introduced"
 tags: [shielded, nullifier, consensus, validation]
@@ -35,6 +35,6 @@ source_url: "Empty"
 
 # Nullifiers are consensus-critical
 
-Every spent note produces exactly one nullifier, and the network **must** enforce nullifier uniqueness at the consensus layer. A double-spend is indistinguishable from a double-nullifier, so the check lives inside the shielded validation spec: `NullifierMembership` membership (`src/registry.rs:382`) is checked before the zk-proof is even verified.
+Every spent note produces exactly one nullifier, and the network **must** enforce nullifier uniqueness at the consensus layer. A double-spend is indistinguishable from a double-nullifier, so the check lives inside the shielded validation spec: `NullifierMembership` membership (`src/registry.rs:82`, impl at `registry/nullifiers.rs:117`) is checked before the zk-proof is even verified.
 
 This is the fundamental privacy/consensus tradeoff of the design: nullifiers are public, on-chain, consensus-checked data. Privacy is achieved by making the nullifier a one-way Poseidon hash (spend key, rho) that reveals nothing about the note â€” but the *uniqueness obligation* is fully public and consensus-critical.

@@ -8,7 +8,7 @@ summary: "nullifier = Poseidon1(spend_key, rho) — a public, consensus-deduplic
 auto_inject: false
 applicable_when: "Touching nullifier generation, NullifierRegistry, or double-spend rules"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If the nullifier hash inputs change, or nullifiers stop being consensus-checked"
 tags: [shielded, nullifier, spend, consensus]
@@ -28,7 +28,7 @@ edges:
   - target: fact-shielded-stack
     type: part_of
     weight: 0.7
-    note: "Generated in note.rs:143; tracked in registry.rs:382"
+    note: "Generated in note.rs:143; tracked in registry.rs:82 (NullifierMembership impl registry/nullifiers.rs:117)"
 related: []
 source_url: "Empty"
 ---
@@ -43,4 +43,4 @@ nullifier = Poseidon1(spend_key, rho)
 
 (`src/shielded/note.rs:143`). The spend key is derived from the note's key material (owner-held secret); rho is the note's discriminator. Because Poseidon1 is one-way, the nullifier reveals **nothing** about the note's value, owner, or position in the pool — but it is *deterministic*, so spending the same note twice yields the same nullifier, which the network detects and rejects.
 
-Network state: `NullifierRegistry` (`src/registry.rs:382`) provides `NullifierMembership` membership, checked by the validation spec **before** proof verification. Nullifier uniqueness is therefore consensus-critical — the load-bearing wall of double-spend prevention.
+Network state: `NullifierRegistry` (`src/registry.rs:82`, `NullifierMembership` impl at `registry/nullifiers.rs:117`) provides membership checking, done by the validation spec **before** proof verification. Nullifier uniqueness is therefore consensus-critical — the load-bearing wall of double-spend prevention.

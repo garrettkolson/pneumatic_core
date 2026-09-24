@@ -8,7 +8,7 @@ summary: "NodeRegistry keeps per-type DashMap directories (Committer/Sentinel/Ex
 auto_inject: false
 applicable_when: "Modifying node registration, fan-out delivery, peer eviction, multi-role (composite) nodes"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If registration message shapes, per-type collections, stake gate, or priority selection change"
 tags: [registry, nodes, registration, peer-discovery]
@@ -20,11 +20,11 @@ edges:
   - target: fact-wire-protocol
     type: related_to
     weight: 0.8
-    note: "Registration rides the MsgPack NetworkPacket control+data envelope (node.rs:36-43 area, registry.rs:443)"
+    note: "Registration rides the MsgPack NetworkPacket control+data envelope (node.rs:36-43 area, node/registry/registration.rs:214)"
   - target: event-node-server-composite
     type: related_to
     weight: 0.7
-    note: "Multi-bucket admission (registry.rs:487-522) is what lets one composite node register under several types"
+    note: "Multi-bucket admission (node/registry/registration.rs:258-293) is what lets one composite node register under several types"
   - target: concept-env-driven-config
     type: depends_on
     weight: 0.7
@@ -37,6 +37,6 @@ source_url: "Empty"
 
 `NodeType` is `Full`/`Light` (`src/node.rs:15`); `NodeRegistryType` is the five role buckets: `Committer, Sentinel, Executor, Finalizer, Archiver` (node.rs:141-147). `NodeRegistry` (`src/node/registry.rs:26`) holds one `DashMap<Vec<u8>, NodeRegistryNode>` **per type** (lines 27-31), keyed by node public key, plus liveness/eviction state (1 s poll, line 81), a 5 s per-send bound (line 75), and per-(rhash, type) delivery-failure counters (lines 88-102).
 
-Registration is a signed, two-way protocol. A `NodeRequest` (node.rs:162) carries `requester_key`, a **claimed** transport address `requester_rhash`, requested type(s), and a `binding_signature` — an Ed25519 signature over `(rhash, requested_type, requester_types)`: forging the claim needs the victim's signing key (node.rs:149-171). `handle_register` (registry.rs:470) verifies the binding first (line 476), admits the key under **every** qualifying type it declares — stake gate runs outside the lock (line 569), then capacity-check + insert run atomically under `admission_lock` (lines 576-597) — and replies with a binding-signed `RegisterAck` (lines 659-666); the acked type is the highest-priority one registered (Finalizer > Executor > Sentinel > Committer, lines 527-535). Directory responses sign the full `(entries, type, rhash)` tuple so signatures can't replay across types (node.rs:174-186).
+Registration is a signed, two-way protocol. A `NodeRequest` (node.rs:162) carries `requester_key`, a **claimed** transport address `requester_rhash`, requested type(s), and a `binding_signature` — an Ed25519 signature over `(rhash, requested_type, requester_types)`: forging the claim needs the victim's signing key (node.rs:149-171). `handle_register` (node/registry/registration.rs:241) verifies the binding first (line 247), admits the key under **every** qualifying type it declares — stake gate runs outside the lock (line 340), then capacity-check + insert run atomically under `admission_lock` (lines 347-368) — and replies with a binding-signed `RegisterAck` (lines 430-437); the acked type is the highest-priority one registered (Finalizer > Executor > Sentinel > Committer, lines 298-306). Directory responses sign the full `(entries, type, rhash)` tuple so signatures can't replay across types (node.rs:174-186).
 
-Fan-out is `send_to_all`/`send_to_all_blocking` over the registered connections (lines 864, 938); a node that arrived via a directory response (no own binding) is never listed in one (lines 392-395).
+Fan-out is `send_to_all`/`send_to_all_blocking` over the registered connections (`node/registry/fanout.rs:13`, `:87`); a node that arrived via a directory response (no own binding) is never listed in one (`node/registry/registration.rs:163-166`).

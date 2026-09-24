@@ -8,7 +8,7 @@ summary: "PendingTransactionRegistry (registry.rs:31) tracks in-flight transacti
 auto_inject: false
 applicable_when: "Modifying tx admission, leader dequeue, gas accounting, nonce/replay rules, or shielded tx bookkeeping"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If registry fields, used_nonces keying, or dequeue/eviction semantics change"
 tags: [registry, transactions, nonce, replay]
@@ -20,7 +20,7 @@ edges:
   - target: concept-leader-election
     type: related_to
     weight: 0.8
-    note: "dequeue_for_leader (registry.rs:266) is what BlockProposer.propose_batch pulls from"
+    note: "dequeue_for_leader (registry/pending.rs:221) is what BlockProposer.propose_batch pulls from"
   - target: concept-transaction-lifecycle
     type: related_to
     weight: 0.7

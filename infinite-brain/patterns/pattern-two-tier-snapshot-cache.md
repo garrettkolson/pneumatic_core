@@ -10,7 +10,7 @@ applicable_when: "Adding a new per-epoch data dependency to a role crate, optimi
 confidence: 1.0
 verified_at: "09/23/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when core src/epoch.rs EpochSnapshotCache changes tiers, fetch-hook signature, or invalidation semantics"
+staleness_signal: "Stale when core src/epoch/snapshot_cache.rs EpochSnapshotCache changes tiers, fetch-hook signature, or invalidation semantics"
 tags: [caching, snapshots, epoch, data-provider, performance]
 edges:
   - target: concept-finalizer-role
@@ -31,7 +31,7 @@ source_url: "Empty"
 
 # Tiered epoch-snapshot cache — local Map → DataProvider (peer tier reserved)
 
-**Single shared implementation** (09/23, monolith-modularization step 1): `pneumatic_core::epoch::EpochSnapshotCache<T>` in `src/epoch.rs`. One generic struct replaces the three near-identical worker-crate copies that previously existed (sentinel + finalizer `stake_snapshot_cache.rs` — byte-identical code — and sentinel `executor_set_cache.rs`; all deleted).
+**Single shared implementation** (09/23, monolith-modularization step 1): `pneumatic_core::epoch::EpochSnapshotCache<T>` in `src/epoch/snapshot_cache.rs` (moved from `src/epoch.rs` in the step-5 root-lib split). One generic struct replaces the three near-identical worker-crate copies that previously existed (sentinel + finalizer `stake_snapshot_cache.rs` — byte-identical code — and sentinel `executor_set_cache.rs`; all deleted).
 
 Shape:
 

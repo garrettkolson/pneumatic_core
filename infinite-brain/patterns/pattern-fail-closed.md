@@ -8,7 +8,7 @@ summary: "Invalid state must be impossible to construct, not merely rejectable: 
 auto_inject: false
 applicable_when: "Designing new validation, circuit, or pool code; reviewing error handling"
 confidence: 0.9
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If new consensus-facing code adopts fail-open behavior, the pattern claim weakens"
 tags: [fail-closed, safety, pattern, validation]
@@ -34,7 +34,7 @@ source_url: "Empty"
 Consensus-facing code in this repo follows a consistent discipline: **invalid state is impossible to construct or always rejected**, never silently passed. Concrete instances:
 
 - `ActionCircuit` construction rejects structurally invalid actions (bad commitment consistency) *before* proving begins — a bad input fails the build, not the proof.
-- `ShieldedValidationSpec` runs all four gates with any error/miss → rejection; a `Shielded` name in the registry without a registered spec is itself a failure (fail-closed at `validation.rs:342`).
+- `ShieldedValidationSpec` runs all four gates with any error/miss → rejection; a `Shielded` name in the registry without a registered spec is itself a failure (fail-closed in `validation/registries.rs`).
 - The pool-view seam returns errors rather than inventing state when the underlying pool lacks data.
 
 When adding consensus-path code, match this: prefer `Result` paths where the `Err` side is the only side.

@@ -8,7 +8,7 @@ summary: "ShieldedTransaction (transactions.rs:362) validation = 4 fail-closed g
 auto_inject: false
 applicable_when: "Adding validation checks, modifying the shielded tx struct, or debugging rejections"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/23/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If the 4-check structure of ShieldedValidationSpec changes"
 tags: [shielded, validation, lifecycle, transactions]
@@ -37,7 +37,7 @@ source_url: "Empty"
 
 `ShieldedTransaction` (`src/transactions.rs:362`) carries: `id`, `action`, `token_id`, `spent_commitments`, `nullifiers`, `commitments` (outputs), `merkle_root`, `proof`, `note_ciphertexts`, `fee`. Identity is canonical: `canonical_bytes()` (line 409) serializes via **rmp** (MsgPack), and the tx id is **SHA-256** of those bytes (line 419).
 
-Network-side validation is `ShieldedValidationSpec` named `"Shielded"` (`src/validation.rs:446`, registered at `:338`), running **four fail-closed gates in order**:
+Network-side validation is `ShieldedValidationSpec` named `"Shielded"` (`validation/shielded.rs:63`, registered at `validation/registries.rs:49`), running **four fail-closed gates in order**:
 
 1. **Structural** — well-formed fields
 2. **Nullifier membership** — via `NullifierMembership` (no double-spend)
