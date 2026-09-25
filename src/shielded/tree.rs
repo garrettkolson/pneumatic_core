@@ -661,4 +661,68 @@ mod tests {
             "bytes >= p must fail to deserialize as Fp"
         );
     }
+
+    #[test]
+    fn concurrent_append_and_proof_verification_stay_consistent() {
+        // S6.3: readers (membership_proof + root + verify_proof) race writers
+        // (append) on one shared tree. Every (leaf, proof, root) triple
+        // captured under the shared lock is from ONE snapshot and must verify;
+        // after the writer finishes, the final state verifies end-to-end. A
+        // regression to an unsynchronized read path that can straddle an
+        // append would make a captured proof fail against a moved root.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let depth = 8u32;
+        let tree = Arc::new(Mutex::new(IncrementalMerkleTree::new(depth)));
+        let base_leaf = Fp::from(1);
+        {
+            tree.lock().unwrap().append_leaf(&base_leaf);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        const APPENDS: u64 = 200;
+        let mut read_handles = Vec::new();
+        for _ in 0..4 {
+            let tree = Arc::clone(&tree);
+            let stop = Arc::clone(&stop);
+            read_handles.push(thread::spawn(move || {
+                let mut verified = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let t = tree.lock().unwrap();
+                    let proof = t.membership_proof(0);
+                    let root = t.root();
+                    assert!(
+                        IncrementalMerkleTree::verify_proof(&base_leaf, &proof, &root, depth),
+                        "a proof captured under the lock must verify against the same-snapshot root"
+                    );
+                    verified += 1;
+                }
+                verified
+            }));
+        }
+        let writer = {
+            let tree = Arc::clone(&tree);
+            thread::spawn(move || {
+                for i in 0..APPENDS {
+                    tree.lock().unwrap().append_leaf(&Fp::from((i + 2) as u64));
+                }
+            })
+        };
+        writer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let mut total = 0usize;
+        for h in read_handles {
+            total += h.join().unwrap();
+        }
+        assert!(total > 0, "readers must have done work during the race");
+        let t = tree.lock().unwrap();
+        assert_eq!(t.leaf_count(), 1 + APPENDS);
+        // Final-state consistency: the base leaf's proof verifies end-to-end.
+        let proof = t.membership_proof(0);
+        assert!(
+            IncrementalMerkleTree::verify_proof(&base_leaf, &proof, &t.root(), depth),
+            "after the writers finish, the tree must verify end-to-end"
+        );
+    }
 }

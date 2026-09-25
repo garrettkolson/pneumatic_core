@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 09/20/2026 (auto-generated from files on disk).
+Last rebuilt: 09/25/2026 (auto-generated from files on disk).
 
 ## pillar (2)
 
@@ -70,7 +70,7 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | id | title | summary | edges |
 |---|---|---|---|
 
-## task (6)
+## task (7)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -80,15 +80,17 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | `task-executor-contract-bytecode` | Open: executor contract execution is a stub (TODO at executor.rs:386) | Executor::execute_contract is a documented stub that serializes the tx itself as the 'output'; TODO at executor/src/executor.rs:386: decode and execute real contract bytecode. | 2 |
 | `task-s5-3-pool-append` | S5.3 — Committer: pool append, persistence, nullifier commit | Wire the committer to apply shielded pool updates at commit: authoritative proof re-check, idempotent replay, first-spent-wins StaleNullifier, K-freshness, atomic rollback, durable nullifiers. | 7 |
 | `task-s5-4-real-pool-swap` | S5.4 — Composite node-server: real Arc<ShieldedPool> wiring | DONE 2026-09-22: composite role views are the shared Arc<ShieldedPool> itself (no composed view); fast action-gate discriminator + live e2e (4 dispatch hops) + live conflict lockstep-rollback tests; 847 passed / 16 ignored. | 7 |
+| `task-s6-shielded-completion` | S6 — Shielded Tier-1 completion: attacks, concurrency, cross-crate pipeline, proving UX | CLOSED 2026-09-25: attack suite + nullifier/Merkle concurrency + cross-crate 4-hop pipeline with wire-byte privacy assertion + prove/verify timing; 834/37/0; Tier-1 feature-complete. | 5 |
 
-## event (4)
+## event (5)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `event-node-server-composite` | Composite node-server runtime (4 role plugins) | Commit e96a00a: the node-server composite runtime — one process hosting executor, finalizer, committer, and sentinel as plugins for full-node deployments. | 3 |
 | `event-pq-hybrid` | Phase 7: hybrid PQ crypto landed | Commit 503c8b6: the N = N+1 hybrid crypto — every signature (Ed25519·ML-DSA-44) and KEM (X25519·ML-KEM-768) is a classical+PQC concatenation. | 2 |
 | `event-rns-e2e` | RNS end-to-end transport tests landed | Commit 451a00d: end-to-end tests over the Reticulum (RNS) transport layer — messages sent/received through the full rns-net stack with the exact pinned versions. | 2 |
-| `event-s5-2-finalizer-wiring` | S5.2: finalizer wiring for shielded transactions | Commit 1b7e4f0 (current HEAD, 09/20/2026): 'feat: finalizer wiring for zk-shielded transactions' — the shielded validation spec is now on the finalizer's block path. | 3 |
+| `event-s5-2-finalizer-wiring` | S5.2: finalizer wiring for shielded transactions | Commit 1b7e4f0 (09/20/2026): 'feat: finalizer wiring for zk-shielded transactions' — the shielded validation spec is now on the finalizer's block path. | 3 |
+| `event-s6-shielded-completion` | S6: shielded Tier-1 feature-complete | 2026-09-25: S6 closes the shielded plan — attack suite, concurrency, cross-crate 4-hop pipeline with wire-byte privacy assertion, prove/verify timing. Workspace 834/37/0; Tier-1 feature-complete. | 4 |
 
 ## pattern (7)
 
@@ -108,7 +110,7 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | Hypothesis: README Phase 8 production-readiness work is planned, not done | README's Phase 8 (rustdoc, ADR docs, operator runbook; LOW, Post-MVP) is documented as planned; the other roadmap phases verify as done, so Phase 8 items are likely still outstanding. | 3 |
 
-## fact (10)
+## fact (11)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -117,10 +119,11 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 | `fact-port-allocations` | Port-per-registry-type allocations | Each node registry type has dedicated external and internal ports (e.g. Committer=42001 external / 50000 internal); data service on 55555. | 2 |
 | `fact-rns-nodeconfig` | RNS NodeConfig: ~45 fields, no Default — RnsNodeConfigBuilder is the single choke point | rns-net 0.7.0 NodeConfig has ~45 fields and no Default; the full literal lives at config_builder.rs:120-172 (UDP 4242, per-peer udp_port+i, no TCP in v1, 48h dest TTL). | 3 |
 | `fact-rns-pinning` | RNS transport: rns-net =0.7.0, rns-crypto =0.1.9, rns-core =0.1.16 (exact pins) | Reticulum (RNS) transport pinned to exact versions in workspace Cargo.toml; NodeConfig (~45 fields, no Default) built via RnsNodeConfigBuilder; e2e tests over RNS exist. | 3 |
-| `fact-shielded-stack` | Shielded ZK stack: module map (S1.1–S5.2 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState. S1.1–S5.2 complete. | 4 |
+| `fact-shielded-stack` | Shielded ZK stack: module map (S1–S6 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble, S6 test layer. S1–S6 complete — Tier-1 feature-complete. | 4 |
 | `fact-test-suite` | Test baseline 2026-09-23: 828 passed / 32 ignored / 0 failed | 09/23/2026 workspace baseline after the full modularization program + core C1 auth helper (+5 auth tests): 828 passed / 32 ignored / 0 failed — core 546, committer 101, executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 6. | 2 |
+| `fact-test-suite-s6` | Test baseline 2026-09-25: 834 passed / 37 ignored / 0 failed | 09/25/2026 workspace baseline after S6 (shielded Tier-1 completion): 834 passed / 37 ignored / 0 failed — core 552/23, committer 101/7, prover 15/2, rest unchanged. | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
-| `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/20/2026 (cargo test -p) | Verified per-crate: executor 10 passed, finalizer 66, committer 71 lib + 9 integration, sentinel 67 + 2 ignored (live halo2 e2e + doc), node-server 31 — 0 failed in every crate. | 2 |
+| `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/25/2026 (post-S6) | Verified per-crate after S6: executor 10, finalizer 61, committer 92 lib + 9 integration, sentinel 57 + 2 ignored, node-server 32 + 2 ignored, core 552 + 23 ignored, prover 15 + 2 ignored — 0 failed in every crate. | 2 |
 | `fact-workspace-layout` | Workspace layout: 7 crates, 27 root modules | Rust workspace: root pneumatic_core lib (27 modules in lib.rs incl. rns, shielded) + sentinel, executor, finalizer, committer, node-server, prover crates. | 3 |
 
 ## source (7)
@@ -164,4 +167,4 @@ Last rebuilt: 09/20/2026 (auto-generated from files on disk).
 
 ## Totals
 
-79 nodes. Logs (append-only, never indexed): see logs/.
+82 nodes. Logs (append-only, never indexed): see logs/.

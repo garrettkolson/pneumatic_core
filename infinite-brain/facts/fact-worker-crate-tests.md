@@ -4,11 +4,11 @@ title: "Per-worker-crate test counts verified 09/23/2026 (cargo test -p)"
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "Verified per-crate after the EpochSnapshotCache<T> extraction: executor 10 passed, finalizer 61, committer 92 lib + 9 integration, sentinel 57 + 2 ignored (live halo2 e2e + doc), node-server 32 + 2 ignored — 0 failed in every crate."
+summary: "Verified per-crate after S6: executor 10 passed, finalizer 61, committer 92 lib + 9 integration, sentinel 57 + 2 ignored, node-server 32 + 2 ignored, core 552 + 23 ignored, prover 15 + 2 ignored — 0 failed in every crate."
 auto_inject: false
 applicable_when: "Quoting per-crate test counts for the worker crates, checking test health after a change in executor/finalizer/committer/sentinel/node-server"
 confidence: 1.0
-verified_at: "09/23/2026"
+verified_at: "09/25/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Stale whenever any worker crate's test modules change — re-run cargo test -p <crate> per crate"
 tags: [tests, worker-crates, baseline, per-crate]
@@ -25,9 +25,9 @@ related: []
 source_url: "Empty"
 ---
 
-# Per-worker-crate test counts verified 09/23/2026
+# Per-worker-crate test counts verified 09/25/2026 (post-S6)
 
-`cargo test --workspace` on 09/23/2026 (all `0 failed`), after the `EpochSnapshotCache<T>` extraction (task-monolith-modularization step 1): sentinel −10 and finalizer −5 cache tests moved into 7 core `epoch::tests::snapshot_cache_*` tests; S5.3/S5.4 shielded work grew the committer from 80 to 101 (92 lib + 9 integration) and node-server from 31 to 32 + 2 ignored; 623c7f3 moved 16 long-running tests to `#[ignore]` workspace-wide.
+`cargo test --workspace` on 09/25/2026 (all `0 failed`), after S6 (shielded Tier-1 completion, task-s6-shielded-completion): core grew from 546/19 to 552 passed / 23 ignored (S6.1 fast ×2 + S6.2 fast ×2 + S6.3 ×2 passed; S6.1 live ×2 + S6.2 live ×2 ignored) and prover from 15/1 to 15 passed / 2 ignored (S6.4 timing test, `#[ignore]`d); every other crate unchanged from the 09/23 baseline. Historical: the 09/23 figure came after the `EpochSnapshotCache<T>` extraction (sentinel −10, finalizer −5 moved into 7 core `epoch::tests::snapshot_cache_*`); S5.3/S5.4 grew the committer 80→101 (92 lib + 9 integration) and node-server 31→32 + 2 ignored; 623c7f3 moved 16 long-running tests to `#[ignore]` workspace-wide.
 
 | Crate | Result |
 |-------|--------|

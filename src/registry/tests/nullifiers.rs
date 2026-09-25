@@ -191,3 +191,39 @@ fn concurrent_mark_many_atomic_mixed_unique_and_duplicates() {
     assert_eq!(failures, 8);
     assert_eq!(registry.len(), 8);
 }
+
+#[test]
+fn concurrent_try_mark_spent_50_threads_mixed_unique_and_duplicates() {
+    // S6.3: the wider race — 50 threads over 25 unique nullifiers, each
+    // nullifier contended by exactly two threads. Exactly 25 wins, 25 stale
+    // rejections, 25 in the set; every loser must surface the
+    // stale-nullifier verdict (not a generic failure).
+    let registry = Arc::new(NullifierRegistry::new());
+    let mut handles = vec![];
+    for i in 0..50 {
+        let reg = registry.clone();
+        let nullifier = [(i % 25) as u8; 32];
+        handles.push(thread::spawn(move || reg.try_mark_spent(nullifier)));
+    }
+    let mut successes = 0;
+    let mut failures = 0;
+    for h in handles {
+        match h.join().unwrap() {
+            Ok(()) => successes += 1,
+            Err(e) => {
+                assert!(
+                    matches!(
+                        e,
+                        PneumaticError::Validation(ref reasons)
+                            if reasons == &vec![ValidationFailureReason::StaleNullifier]
+                    ),
+                    "a losing mark must be Validation([StaleNullifier]), got: {e:?}"
+                );
+                failures += 1;
+            }
+        }
+    }
+    assert_eq!(successes, 25);
+    assert_eq!(failures, 25);
+    assert_eq!(registry.len(), 25);
+}

@@ -1,14 +1,14 @@
 ---
 id: fact-shielded-stack
-title: "Shielded ZK stack: module map (S1.1–S5.2 landed)"
+title: "Shielded ZK stack: module map (S1–S6 landed)"
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState. S1.1–S5.2 complete."
+summary: "src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble. S1–S6 complete — Tier-1 feature-complete."
 auto_inject: false
-applicable_when: "Locating shielded code, scoping S5.3+/S6 work, or wiring the pool"
+applicable_when: "Locating shielded code, or continuing the operational open items (circuit audit, viewing keys, proving UX, anonymity bootstrap)"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/25/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If a new shielded sub-module appears or a phase beyond S5.2 lands"
 tags: [shielded, module-map, zk, architecture]
@@ -47,6 +47,6 @@ Landed code (verified against the tree):
 - `pool_view.rs` — `ShieldedPoolView` trait (line 44) / `SimpleShieldedPoolView` (line 58); S5.1 read-only seam
 - `circuit_test.rs` — `const K: u32 = 10` test mirror
 
-**Elsewhere:** `ShieldedTransaction` (`src/transactions.rs:362`; canonical bytes via rmp, id = SHA-256), `ShieldedValidationSpec` named "Shielded" (`src/validation.rs:446`), `NullifierRegistry` (`src/registry.rs:382`).
+**Elsewhere:** `ShieldedTransaction` (`src/transactions.rs:362`; canonical bytes via rmp, id = SHA-256), `ShieldedValidationSpec` named "Shielded" (`src/validation.rs:446`), `NullifierRegistry` (`src/registry.rs:382`), `ShieldedPool` + apply/revert/persist (`committer/src/shielded_pool.rs`, S5.3), composite real-pool wiring (`node-server/src/node_server.rs`, S5.4), prover `build_shielded_tx`/`assemble_tx` (`prover/src/build.rs`), and the S6 test layer: `tests/shielded_pipeline.rs` (cross-crate 4-hop pipeline + wire-byte privacy), `tests/shielded_attacks.rs` (canonical attack table), concurrency tests in `src/registry/tests/nullifiers.rs` and `src/shielded/tree.rs`, timing test in `prover/src/build.rs`.
 
-Phases S1.1 → S5.2 are all landed (git: 16ec89c … 1b7e4f0).
+Phases S1.1 → S6 are all landed (git: 16ec89c … S6 closeout). Tier-1 is feature-complete; remaining work is operational (see event-s6-shielded-completion).
