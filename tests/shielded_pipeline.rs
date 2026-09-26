@@ -452,7 +452,11 @@ fn build_pipeline(real_shielded: bool, pre_spent: Option<[u8; 32]>) -> Pipeline 
         ),
         "finalizer: committer peer registers (commit capture)"
     );
-    let (signing_key, verifying_key) = test_signing_key();
+    let verifying_key = {
+        let pk = sf_pk.clone();
+        let pk_bytes: [u8; 32] = pk.try_into().expect("32-byte pk");
+        ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).expect("valid vk")
+    };
     let finalizer = Finalizer::new(
         ENV_ID.to_string(),
         sf_pk.clone(),
@@ -462,7 +466,7 @@ fn build_pipeline(real_shielded: bool, pre_spent: Option<[u8; 32]>) -> Pipeline 
         Arc::new(TransactionSignatureRegistry::new()),
         67.0, // stake quorum
         1,   // total voters (100/100 stake — one vote is quorum)
-        signing_key,
+        sf_identity.clone(),
         verifying_key,
         Arc::new(BasicHashProvider::new()),
         vec![10, 20, 30], // leader address
@@ -582,13 +586,6 @@ fn build_pipeline(real_shielded: bool, pre_spent: Option<[u8; 32]>) -> Pipeline 
         vote_recorder,
         commit_recorder,
     }
-}
-
-fn test_signing_key() -> (ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey) {
-    // Deterministic finalizer signing key (the finalizer fixture pattern).
-    let seed = [0x5Au8; 32];
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    (signing_key.clone(), signing_key.verifying_key())
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,7 +1122,11 @@ fn build_pipeline_with_pool(
         ),
         "finalizer: committer peer registers"
     );
-    let (signing_key, verifying_key) = test_signing_key();
+    let verifying_key = {
+        let pk = sf_pk.clone();
+        let pk_bytes: [u8; 32] = pk.try_into().expect("32-byte pk");
+        ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).expect("valid vk")
+    };
     let finalizer = Finalizer::new(
         ENV_ID.to_string(),
         sf_pk.clone(),
@@ -1135,7 +1136,7 @@ fn build_pipeline_with_pool(
         Arc::new(TransactionSignatureRegistry::new()),
         67.0,
         1,
-        signing_key,
+        sf_identity.clone(),
         verifying_key,
         Arc::new(BasicHashProvider::new()),
         vec![10, 20, 30],

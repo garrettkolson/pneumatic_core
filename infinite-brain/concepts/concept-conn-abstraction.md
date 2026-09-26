@@ -4,11 +4,11 @@ title: "Connection abstraction: ConnFactory + Sender/Stream/Listener trait famil
 type: concept
 namespace: pneumatic
 visibility: namespace
-summary: "One factory and four trait families (Connection/Sender/Stream/Listener) abstract TCP and Unix sockets; every local path is UDS-first with TCP fallback."
+summary: "One factory and four trait families (Connection/Sender/Stream/Listener) abstract TCP and Unix sockets; every local path is UDS-first with TCP fallback. NOTE: this is the legacy/local transport layer (data-service channels) — the production inter-node wire for role traffic is RNS (see concept-rns-transport)."
 auto_inject: false
-applicable_when: "Adding a transport, touching src/conns/**, or building a new service-to-service channel"
+applicable_when: "Adding a transport, touching src/conns/**, or building a new local service-to-service channel. For inter-node role traffic, see concept-rns-transport (RNS is the production wire)."
 confidence: 0.95
-verified_at: "09/20/2026"
+verified_at: "09/25/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If the Connection/Sender/Stream/Listener trait shapes in src/conns change, or a third transport type is added"
 tags: [networking, traits, tcp, uds, factory, framing]

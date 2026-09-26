@@ -1,12 +1,12 @@
-//! Phase 1.1 regression: both `send_to_finalizer` paths sign `Execute`
-//! with the executor's own identity — never the destination finalizer's key.
+//! Phase 1.1 regression: every `send_to_finalizer` message signs with the
+//! executor's own identity — never the destination finalizer's key.
 use super::helpers::*;
 use super::super::*;
 
-/// Both `send_to_finalizer` impls (Executor and ExecutorHandle — the one
-/// spawned execution tasks use) must emit an "Execute" message signed
-/// with the executor's identity, never the destination finalizer's key
-/// (the pre-1.1 bug placed the destination key in the signature field).
+/// `ExecutorHandle::send_to_finalizer` (the impl spawned execution tasks use)
+/// emits a "Preload" (the serialized tx) followed by a "Sign" vote, both signed
+/// with the executor's identity, never the destination finalizer's key (the
+/// pre-1.1 bug placed the destination key in the signature field).
 #[tokio::test]
 async fn send_to_finalizer_signed_with_executor_identity() {
     let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
@@ -32,25 +32,29 @@ async fn send_to_finalizer_signed_with_executor_identity() {
         10,
     );
 
-    // Executor::send_to_finalizer ...
-    executor
-        .send_to_finalizer("test_tx_001", vec![1, 2, 3], vec![4, 5, 6])
-        .await
-        .expect("send should succeed");
-    // ... and ExecutorHandle::send_to_finalizer (the impl used by run_execution).
+    // The spawned-task path: ExecutorHandle::send_to_finalizer emits a
+    // "Preload" (serialized tx) followed by a "Sign" vote over the result hash.
     executor
         .clone_handle()
-        .send_to_finalizer("test_tx_001", vec![7, 8, 9], vec![10, 11, 12])
+        .send_to_finalizer("test_tx_001", vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9])
         .await
         .expect("send should succeed");
 
     let captured = recorder.lock().unwrap();
-    assert_eq!(captured.len(), 2, "finalizer should receive two Execute messages");
+    assert_eq!(
+        captured.len(),
+        2,
+        "finalizer should receive Preload + Sign"
+    );
     for bytes in captured.iter() {
         let message: pneumatic_core::messages::Message =
             pneumatic_core::encoding::deserialize_rmp_to(bytes)
                 .expect("captured payload should be a Message");
-        assert_eq!(message.action, "Execute");
+        assert!(
+            message.action == "Preload" || message.action == "Sign",
+            "expected Preload or Sign, got {}",
+            message.action
+        );
         assert_signed_by(&message, &identity);
 
         // ...and never under the destination's key.

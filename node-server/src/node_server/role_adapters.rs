@@ -46,8 +46,12 @@ impl RoleHandler for pneumatic_executor::Executor {
         std::boxed::Box<dyn std::future::Future<Output = Result<(), RoleError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let tx_id = String::from_utf8_lossy(&message.body);
-            self.preload_for_transaction(&tx_id)
+            // The sentinel's Preload body is the rmp-serialized `Transaction`,
+            // not raw tx_id bytes (sentinel/src/transaction_notifier.rs:32).
+            // `ingest_preload` decodes it, registers the tx in this executor's
+            // own pending registry (execution reads from there), and starts
+            // the run.
+            self.ingest_preload(&message.body)
                 .await
                 .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}"))))
         })

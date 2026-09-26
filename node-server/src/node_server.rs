@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
 
 use dashmap::DashMap;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::{BasicHashProvider, HashProvider};

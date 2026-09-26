@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
-use tokio::sync::Mutex;
+use ed25519_dalek::VerifyingKey;
 
 use pneumatic_core::blocks::{Block, BlockFactory, FinalityStatus};
+use pneumatic_core::crypto::AsymCryptoProvider;
 use pneumatic_core::encoding::serialize_to_bytes_rmp;
 use pneumatic_core::errors::{PneumaticError, ReconciledSignatures};
+use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::transactions::{
     ShieldedTransaction, SignedTransaction, Transaction, TransactionSignature,
 };
@@ -24,8 +25,13 @@ use pneumatic_core::transactions::{
 ///
 /// This does NOT send messages — that is handled by MessageDispatcher.
 pub struct BlockBuilder {
-    /// Ed25519 signing key for signing blocks as the finalizer
-    signing_key: Arc<Mutex<SigningKey>>,
+    /// The finalizer's identity — its hybrid `ed25519` provider signs blocks
+    /// (producing the `[Ed25519 · ML-DSA pk · ML-DSA sig]` hybrid signature
+    /// the committer's `check_signature` verifies). Signing with a bare
+    /// `ed25519_dalek::SigningKey` produced a 64-byte signature that the
+    /// committer's hybrid verifier rejects (`split_hybrid_signature` fails →
+    /// `InvalidFinalizerSignature`).
+    signing_key: Arc<NodeIdentity>,
     /// Verifying key for this finalizer (derived from signing key)
     verifying_key: VerifyingKey,
     /// Hash provider for computing block hashes
@@ -44,12 +50,13 @@ pub struct BlockBuilder {
 }
 
 impl BlockBuilder {
-    /// Create a new BlockBuilder with the given signing key and environment data.
+    /// Create a new BlockBuilder with the given signing identity and environment data.
     ///
-    /// `signing_key` is the Ed25519 private key used to sign blocks as the finalizer.
-    /// `verifying_key` is derived from the signing key and used to produce the finalizer address.
+    /// `signing_key` is the finalizer's identity; its hybrid `ed25519` provider
+    /// signs blocks. `verifying_key` is the Ed25519 verifying key (derived from
+    /// the identity) used to produce the finalizer address.
     pub fn new(
-        signing_key: SigningKey,
+        signing_key: Arc<NodeIdentity>,
         verifying_key: VerifyingKey,
         hash_provider: Arc<dyn pneumatic_core::crypto::HashProvider>,
         leader_address: Vec<u8>,
@@ -58,7 +65,7 @@ impl BlockBuilder {
         finalizer_addr: Vec<u8>,
     ) -> Self {
         BlockBuilder {
-            signing_key: Arc::new(Mutex::new(signing_key)),
+            signing_key,
             verifying_key,
             hash_provider,
             leader_address,
@@ -218,11 +225,15 @@ impl BlockBuilder {
         combined_input.extend_from_slice(&sig_hash);
         let transaction_hash = self.hash_provider.hash(&combined_input);
 
-        // Sign the transaction hash with the finalizer's Ed25519 private key
-        let signature = {
-            let kp = self.signing_key.lock().await;
-            kp.sign(&transaction_hash).to_bytes()
-        };
+        // Sign the transaction hash with the finalizer's hybrid identity key.
+        // This produces a `[Ed25519 · ML-DSA pk · ML-DSA sig]` hybrid
+        // signature that the committer's `check_signature` verifies. (A bare
+        // Ed25519 signature would fail the committer's hybrid verifier.)
+        let signature = self
+            .signing_key
+            .ed25519
+            .sign_data(&transaction_hash)
+            .map_err(|e| PneumaticError::CryptoError(format!("finalizer block signing failed: {e}")))?;
 
         Ok(TransactionSignature {
             transaction_id: signed_tx.transaction.id.as_bytes().to_vec(),
@@ -284,6 +295,17 @@ impl BlockBuilder {
         transaction: &Transaction,
         executor_key: &[u8],
     ) -> SignedTransaction {
+        // Stamp the verified executor vote's hash into the embedded
+        // transaction: `sig.transaction_hash` is exactly the hash the
+        // executor signed (verified by the finalizer's inner check before
+        // this runs), and the `Executed` block spec rejects a block whose
+        // embedded `transaction.result_hash` is empty — the sentinel's
+        // preload never sets it, so without this stamp the committer's
+        // `validate_block` would fail every standard-pipeline block with
+        // `MissingResultHash`.
+        let mut transaction = transaction.clone();
+        transaction.result_hash = sig.transaction_hash.clone();
+
         // Single executor signature in the map
         let executor_sigs: HashMap<Vec<u8>, TransactionSignature> = [(
             executor_key.to_vec(),
@@ -345,13 +367,12 @@ mod tests {
     use super::*;
     use pneumatic_core::transactions::Transaction;
 
-    fn make_test_keypair() -> (SigningKey, VerifyingKey) {
-        use rand::RngCore;
-        let mut seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut seed);
-        let signing_key = SigningKey::from_bytes(&seed);
-        let verifying_key = signing_key.verifying_key();
-        (signing_key, verifying_key)
+    fn make_test_keypair() -> (Arc<NodeIdentity>, VerifyingKey) {
+        let identity = Arc::new(NodeIdentity::generate_in_memory());
+        let pk = identity.ed25519.public_key().expect("identity public key");
+        let pk_bytes: [u8; 32] = pk.try_into().expect("32-byte public key");
+        let verifying_key = VerifyingKey::from_bytes(&pk_bytes).expect("valid verifying key");
+        (identity, verifying_key)
     }
 
     fn make_test_transaction() -> Transaction {

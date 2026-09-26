@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use pneumatic_core::crypto::HashProvider;
+use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
@@ -14,7 +14,7 @@ use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::identity::NodeIdentity;
-use pneumatic_core::transactions::Transaction;
+use pneumatic_core::transactions::{Transaction, TransactionState};
 
 // ---------------------------------------------------------------------------
 // Executor — transaction computation node
@@ -139,51 +139,33 @@ impl Executor {
         self.preload_tasks.lock().await.remove(tx_id);
     }
 
-    /// Send execution result to the Finalizer for signature collection.
+    /// Ingest a Preload message body from the Sentinel and begin execution.
     ///
-    /// Packages the execution result as a message and broadcasts to all
-    /// Finalizer nodes in the target environment.
-    async fn send_to_finalizer(
-        &self,
-        tx_id: &str,
-        execution_result: Vec<u8>,
-        result_hash: Vec<u8>,
-    ) -> Result<(), ExecutorError> {
-        // Look up the finalizer nodes in the registry
-        let finalizer_nodes = self
-            .node_registry
-            .get_nodes(&NodeRegistryType::Finalizer)
-            .ok_or_else(|| ExecutorError::NoFinalizers("No finalizers registered".to_string()))?;
+    /// The Preload body is the rmp-serialized `Transaction` (the sentinel's
+    /// `send_to_executors_for_preload`), not raw tx_id bytes. The executor
+    /// reads the transaction from **its own** pending registry during
+    /// execution, so the ingested tx is registered here (Preloaded state)
+    /// before `preload_for_transaction` is called.
+    pub async fn ingest_preload(&self, body: &Vec<u8>) -> Result<(), ExecutorError> {
+        let tx: Transaction = deserialize_rmp_to(body).map_err(|e| ExecutorError::Encoding(e))?;
 
-        if finalizer_nodes.is_empty() {
-            return Err(ExecutorError::NoFinalizers(
-                "No finalizers registered".to_string(),
-            ));
+        // Register in this executor's own registry (execution reads from here).
+        if self.pending_registry.contains(&tx.id) {
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx.id) {
+                if matches!(entry.state, TransactionState::Pending) {
+                    entry.transition_to_preloaded(tx.clone());
+                }
+            }
+        } else {
+            self.pending_registry
+                .register_pending(tx.id.clone())
+                .map_err(|e| ExecutorError::Registry(e.to_string()))?;
+            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx.id) {
+                entry.transition_to_preloaded(tx.clone());
+            }
         }
 
-        // Package execution result as a message
-        let msg_body = serialize_to_bytes_rmp(&ExecutionResult {
-            transaction_id: tx_id.to_string(),
-            result_data: execution_result,
-            result_hash,
-        }).map_err(|e| ExecutorError::Encoding(e))?;
-
-        // Sign with our own identity — the receiver verifies against the
-        // sender's registered key, never the destination's.
-        let message = Message::signed(
-            self.env_id.clone(),
-            "Execute",
-            msg_body,
-            None,
-            &self.identity,
-        )?;
-
-        let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
-
-        // Broadcast to all finalizers via registered connections
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer).await;
-
-        Ok(())
+        self.preload_for_transaction(&tx.id).await
     }
 
     /// Validate execution results against expected constraints.
@@ -318,11 +300,14 @@ impl ExecutorHandle {
         // Step 5: Execute the contract with the transaction payload
         let execution_output = self.execute_contract(&transaction, &contract_data)?;
 
-        // Step 6: Create intermediate result
+        // Step 6: Create intermediate result. The output hash is computed
+        // BEFORE validation (step 7): `validate_execution_result` rejects an
+        // empty `result_hash`, so hashing must precede it — the old ordering
+        // validated an always-empty hash and failed every execution.
         let mut final_result = ExecutionResult {
             transaction_id: tx_id.to_string(),
             result_data: execution_output.clone(),
-            result_hash: vec![],
+            result_hash: self.hash_provider.hash(&execution_output),
         };
 
         // Step 7: Validate execution results
@@ -335,9 +320,6 @@ impl ExecutorHandle {
             return Err(ExecutorError::Validation(reasons));
         }
 
-        // Step 8: Hash the execution output
-        final_result.result_hash = self.hash_provider.hash(&execution_output);
-
         // Step 9: Get finalizer key from validation result
         let finalizer_key = self.get_finalizer_key(tx_id);
 
@@ -348,9 +330,20 @@ impl ExecutorHandle {
             }
         }
 
-        // Step 11: Send execution result to the Finalizer
+        // Step 11: Send execution result to the Finalizer. The finalizer
+        // needs the transaction registered in its own pending registry before
+        // it can process the "Sign" vote (its optimistic-finality path loads
+        // the tx from that registry), so the executor also emits a "Preload"
+        // carrying the serialized transaction. Both ride the same RNS link to
+        // each finalizer, so the "Preload" is ordered before the "Sign".
+        let tx_bytes = serialize_to_bytes_rmp(&transaction).map_err(ExecutorError::Encoding)?;
         if let Err(e) = self
-            .send_to_finalizer(tx_id, final_result.result_data.clone(), final_result.result_hash.clone())
+            .send_to_finalizer(
+                tx_id,
+                tx_bytes,
+                final_result.result_data.clone(),
+                final_result.result_hash.clone(),
+            )
             .await
         {
             // Transition to Failed state on send failure
@@ -422,24 +415,84 @@ impl ExecutorHandle {
         Ok(())
     }
 
-    /// Send execution result to the Finalizer for signature collection.
+    /// Send the execution result to the Finalizers.
+    ///
+    /// Two messages ride to each finalizer, in order (same RNS link ⇒ FIFO):
+    ///
+    /// 1. `"Preload"` carrying the serialized transaction — registers the tx
+    ///    in the finalizer's own pending registry, which its
+    ///    optimistic-finality path loads from (without it, the "Sign" vote
+    ///    below is rejected with "not found in registry").
+    /// 2. `"Sign"` — the executor's signed vote. The executor is a *voter*
+    ///    in the finalizer's signature collection (audit C1): it signs the
+    ///    execution-output hash with its own identity key and emits a
+    ///    `TransactionSignature` — the contract `Finalizer::handle_signature`
+    ///    implements (envelope auth + registered-Executor gate, then the
+    ///    inner signature check over `transaction_hash`).
+    ///
+    /// `current_stake` is sent as 0: the finalizer stamps the real stake from
+    /// the epoch snapshot (C1 — never trust a self-reported stake).
     async fn send_to_finalizer(
         &self,
         tx_id: &str,
+        tx_bytes: Vec<u8>,
         execution_result: Vec<u8>,
         result_hash: Vec<u8>,
     ) -> Result<(), ExecutorError> {
-        let msg_body = serialize_to_bytes_rmp(&ExecutionResult {
-            transaction_id: tx_id.to_string(),
-            result_data: execution_result,
-            result_hash,
-        }).map_err(|e| ExecutorError::Encoding(e))?;
+        // Look up the finalizer nodes in the registry
+        let finalizer_nodes = self
+            .node_registry
+            .get_nodes(&NodeRegistryType::Finalizer)
+            .ok_or_else(|| ExecutorError::NoFinalizers("No finalizers registered".to_string()))?;
+
+        if finalizer_nodes.is_empty() {
+            return Err(ExecutorError::NoFinalizers(
+                "No finalizers registered".to_string(),
+            ));
+        }
+
+        // (1) Preload: register the transaction in the finalizer's registry.
+        // The finalizer's `handle_preload` deserializes the body as a
+        // `Transaction` and stores it; the sender is this executor.
+        let preload_message = Message::signed(
+            self.env_id.clone(),
+            "Preload",
+            tx_bytes,
+            None,
+            &self.identity,
+        )?;
+        let preload_payload =
+            serialize_to_bytes_rmp(&preload_message).map_err(|e| ExecutorError::Encoding(e))?;
+        self.node_registry
+            .send_to_all(preload_payload, &NodeRegistryType::Finalizer)
+            .await;
+
+        // (2) Sign: the executor's signed vote. Sign the execution-output
+        // hash with this executor's identity key — the finalizer's inner
+        // check verifies it over `transaction_hash`.
+        let signature = self
+            .identity
+            .ed25519
+            .sign_data(&result_hash)
+            .map_err(|e| ExecutorError::Crypto(e))?;
+
+        let vote = pneumatic_core::transactions::TransactionSignature {
+            transaction_id: tx_id.as_bytes().to_vec(),
+            env_id: self.env_id.as_bytes().to_vec(),
+            transaction_hash: result_hash,
+            signature,
+            current_stake: 0, // stamped by the finalizer from the epoch snapshot (C1)
+        };
+
+        let msg_body =
+            serialize_to_bytes_rmp(&vote).map_err(|e| ExecutorError::Encoding(e))?;
+        let _ = execution_result; // the result bytes are covered by their hash
 
         // Sign with our own identity — the receiver verifies against the
         // sender's registered key, never the destination's.
         let message = Message::signed(
             self.env_id.clone(),
-            "Execute",
+            "Sign",
             msg_body,
             None,
             &self.identity,
@@ -489,6 +542,8 @@ pub enum ExecutorError {
     Validation(Vec<ValidationFailureReason>),
     /// No finalizer nodes registered
     NoFinalizers(String),
+    /// Signing the execution-result hash failed (vote path, audit C1)
+    Crypto(PneumaticError),
     /// Backpressure: executor is at max capacity
     AtCapacity {
         max_in_flight: usize,

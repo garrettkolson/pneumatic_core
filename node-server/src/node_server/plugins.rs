@@ -103,8 +103,16 @@ pub(crate) fn build_role_plugin(
             // (`initialize` is a stub), so the keys/quorum are the node's own
             // identity key + the bootstrap quorum. The handler forwards to that
             // stub.
-            let signing_key = SigningKey::from_bytes(&[0u8; 32]);
-            let verifying_key: VerifyingKey = signing_key.verifying_key();
+            // The finalizer signs blocks with its identity's hybrid provider;
+            // the verifying key is derived from the identity's Ed25519 public
+            // key so `finalizer_addr` matches the signing key.
+            let verifying_key: VerifyingKey = {
+                let pk = config.public_key.clone();
+                let pk_bytes: [u8; 32] = pk
+                    .try_into()
+                    .expect("finalizer public key must be 32 bytes");
+                VerifyingKey::from_bytes(&pk_bytes).expect("valid verifying key")
+            };
             let signature_registry = Arc::new(TransactionSignatureRegistry::new());
             let finalizer = pneumatic_finalizer::Finalizer::new(
                 env_data.environment_id.clone(),
@@ -115,7 +123,7 @@ pub(crate) fn build_role_plugin(
                 signature_registry,
                 66.6,
                 4,
-                signing_key,
+                config.identity.clone(),
                 verifying_key,
                 hash_provider,
                 vec![],

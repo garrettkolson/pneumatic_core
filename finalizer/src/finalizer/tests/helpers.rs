@@ -252,14 +252,6 @@ pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
     registry
 }
 
-pub fn make_test_signing_key() -> (SigningKey, VerifyingKey) {
-    let mut seed = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut seed);
-    let signing_key = SigningKey::from_bytes(&seed);
-    let verifying_key = signing_key.verifying_key();
-    (signing_key, verifying_key)
-}
-
 pub fn make_finalizer(
     pending_registry: Arc<PendingTransactionRegistry>,
 ) -> Finalizer {
@@ -344,18 +336,25 @@ pub fn make_finalizer_with_shielded_identity(
     let signature_registry = Arc::new(TransactionSignatureRegistry::new());
     let hash_provider = Arc::new(BasicHashProvider::new());
 
-    let (signing_key, verifying_key) = make_test_signing_key();
+    // The finalizer signs with its identity's hybrid provider; the verifying
+    // key is derived from the identity's Ed25519 public key so
+    // `finalizer_addr` matches.
+    let verifying_key = {
+        let pk = identity.ed25519.public_key().expect("identity pk");
+        let pk_bytes: [u8; 32] = pk.try_into().expect("32-byte pk");
+        ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).expect("valid vk")
+    };
 
     Finalizer::new(
         "test_env".to_string(),
         vec![1, 2, 3, 4],
-        identity,
+        identity.clone(),
         node_registry,
         pending_registry,
         signature_registry,
         67.0,   // quorum
         3,      // total voters
-        signing_key,
+        identity,
         verifying_key,
         hash_provider,
         vec![10, 20, 30], // leader address

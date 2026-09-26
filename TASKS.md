@@ -244,7 +244,7 @@ Original `BlockConfirmed` renamed to `BlockFinalized`. Full stake-weighted quoru
 - [x] Block gossip tests: valid append, orphan ignored, tampered rejected, unknown token error (4 new tests in committer.rs), serialization test (1 new test in dispatcher)
 - [x] Concurrency tests: near-simultaneous candidate submission (Arc-shared DashMap) — only unit-level stress tests exist in `epoch.rs`, no concurrent committer commit tests
 - [x] Quorum gossip path: `send_block_finalized` → `handle_block_finalized` → `send_block_confirmed_vote` → `handle_block_confirmed_vote` → `send_block_quorum_reached` → `handle_block_quorum_reached` unit-tested (7 tests across all three handlers)
-- [x] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — no tests verify the full pipeline (no integration test spanning sentinel → executor → finalizer → committer). Transport integration tests exist at the boundary layer only (`tests/transport_integration.rs`).
+- [x] End-to-end pipeline: submit → optimistic → no conflict → confirmed; submit → conflict → resolved → slashing — **COMPLETE (2026-07-26):** `tests/pipeline_integration.rs` — full SUB→SENT→EXEC→FIN→COMM chain over RNS (5 nodes, 9 identities, 2 per role); standard tx path with committer consensus assertions. Transport integration tests at `tests/transport_integration.rs` (boundary layer) and `tests/pipeline_integration.rs` (full pipeline).
 
 ### Implementation Order Recommendation
 
@@ -910,5 +910,7 @@ Stubbed within implemented methods:
 **Covered:** Gas deduction in check_and_commit_transaction_results (deducts, no gas tracked, saturates on overflow). Quorum gossip: block finalized (valid append, orphan ignored, tampered rejected, unknown token error), vote tracking (accumulates_stake, skips_missing_stake_set), quorum reached (Confirmed transition).
 
 #### Remaining test gaps
-**Files:** `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (send_to_all), e2e pipeline integration (sentinel → executor → finalizer → committer)
+**Files:** `data.rs` (DefaultDataProvider tests), `server.rs` (async poison test fix), `epoch.rs` (StubEpochReconciler/StubStakingManager unit tests), `node/registry.rs` (send_to_all)
 **Action:** DefaultDataProvider wire format tests, ThreadPool async poison, epoch reconciliation stubs, node registry send_to_all. Config.rs test helpers exist but unit tests for loading/parsing would be useful.
+
+**Completed (2026-07-26):** e2e pipeline integration test — `tests/pipeline_integration.rs` — full SUB→SENT→EXEC→FIN→COMM chain over RNS (5 RNS nodes, 9 identities, 2 instances per role). Standard tx path: Process → Preload → Sign → BlockFinalized → Clear, with committer consensus assertions. Root-cause findings: (1) RNS Resource path requires a **direct link** between sender and receiver RNS nodes — the topology must include a FIN↔SENT edge (the chain was SUB-SENT-EXEC-FIN-COMM; added SENT↔FIN to make it a small mesh); (2) rns-net 0.7.0 port-wiring rule: node D's interface `k` listens on `base+k` and must forward to `peer_base + j` where `j` is D's index in the peer's peer list.

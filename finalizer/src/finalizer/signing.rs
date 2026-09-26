@@ -96,6 +96,28 @@ pub async fn handle_preload(&self, message: &Message) -> Result<Vec<u8>, Pneumat
         .await
         .insert(tx.id.clone(), serialize_to_bytes_rmp(&tx)?);
 
+    // Register the transaction in this finalizer's own pending registry,
+    // because the optimistic-finality path (`try_finalize_optimistic`) loads
+    // the transaction from `self.pending_registry` and fails closed if the
+    // entry is missing. The entry must be in an executable state
+    // (Preloaded/Validated/Executing), so a fresh Pending entry is transitioned
+    // to Preloaded with the deserialized transaction. A re-preload of an
+    // already-registered tx is a no-op (the entry is past Pending).
+    if self.pending_registry.contains(&tx.id) {
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx.id) {
+            if matches!(entry.state, TransactionState::Pending) {
+                entry.transition_to_preloaded(tx.clone());
+            }
+        }
+    } else {
+        self.pending_registry
+            .register_pending(tx.id.clone())
+            .map_err(|e| PneumaticError::Registry(format!("preload register: {e}")))?;
+        if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx.id) {
+            entry.transition_to_preloaded(tx.clone());
+        }
+    }
+
     // Acknowledge receipt
     Ok(pneumatic_core::messages::acknowledge())
 }

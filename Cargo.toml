@@ -96,6 +96,7 @@ tempfile = "3.20.0"
 # S6.1/S6.2 — root-level integration suites over the worker crates
 # (pipeline + adversarial). Path deps into this workspace: zero new packages.
 pneumatic_sentinel = { path = "sentinel" }
+pneumatic_executor = { path = "executor" }
 pneumatic_finalizer = { path = "finalizer" }
 pneumatic_committer = { path = "committer" }
 pneumatic_prover = { path = "prover" }

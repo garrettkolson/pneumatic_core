@@ -167,9 +167,12 @@ impl RnsSender {
 
 impl Sender for RnsSender {
     fn get_response(&self, data: &[u8]) -> Result<Vec<u8>, ConnError> {
-        // Send payload through RNS; no response expected (async delivery)
+        // Data-plane send through RNS; no response expected (async delivery).
+        // `send_data_packet` wraps the payload in a `NetworkPacket { data }`
+        // frame and routes frames above the ~481 B direct-packet cap through
+        // the Resource transfer path (audit 7.1).
         self.network
-            .send_to(self.rhash, data)
+            .send_data_packet(self.rhash, data)
             .map_err(|e| ConnError::IO(e.to_string()))?;
         Ok(vec![])
     }

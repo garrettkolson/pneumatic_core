@@ -107,8 +107,11 @@ async fn signshielded_removed_from_action_set_is_rejected_by_dispatcher() {
     // The composite finalizer arm's construction (S5.4: the view is the
     // shared live pool, erased to the seam — exactly the arm's in-fn
     // derivation).
-    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
-    let verifying_key: VerifyingKey = signing_key.verifying_key();
+    let verifying_key: VerifyingKey = {
+        let pk = config.public_key.clone();
+        let pk_bytes: [u8; 32] = pk.try_into().expect("32-byte pk");
+        VerifyingKey::from_bytes(&pk_bytes).expect("valid vk")
+    };
     let signature_registry = Arc::new(TransactionSignatureRegistry::new());
     let shielded_pool =
         Arc::new(pneumatic_committer::shielded_pool::ShieldedPool::new(10));
@@ -123,7 +126,7 @@ async fn signshielded_removed_from_action_set_is_rejected_by_dispatcher() {
         signature_registry,
         66.6,
         4,
-        signing_key,
+        config.identity.clone(),
         verifying_key,
         hash_provider,
         vec![],

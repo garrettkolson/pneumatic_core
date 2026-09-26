@@ -1171,6 +1171,7 @@ dependencies = [
  "once_cell",
  "pasta_curves",
  "pneumatic_committer",
+ "pneumatic_executor",
  "pneumatic_finalizer",
  "pneumatic_prover",
  "pneumatic_sentinel",

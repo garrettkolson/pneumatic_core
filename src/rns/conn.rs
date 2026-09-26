@@ -27,8 +27,14 @@ impl RnsConnection {
 #[async_trait::async_trait]
 impl Connection for RnsConnection {
     async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError> {
+        // Data-plane send: wraps the payload in a `NetworkPacket { data }`
+        // frame (the wire contract the peer's `on_packet` bridge expects) and
+        // routes frames above the ~481 B direct-packet cap through the
+        // Resource transfer path — without which every real pneumatic
+        // Message (~3.8 KB with the PQC hybrid signature) fails at the RNS
+        // pack step (audit 7.1).
         self.network
-            .send_to(self.rhash, data)
+            .send_data_packet(self.rhash, data)
             .map_err(|e| ConnError::WriteError(Some(e.to_string())))
     }
 }

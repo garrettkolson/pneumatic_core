@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use tokio::sync::Mutex;
 
 use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
@@ -125,7 +125,7 @@ pub fn new(
     signature_registry: Arc<TransactionSignatureRegistry>,
     quorum_percentage: f32,
     total_voters: u32,
-    signing_key: SigningKey,
+    signing_key: Arc<NodeIdentity>,
     verifying_key: VerifyingKey,
     hash_provider: Arc<dyn HashProvider>,
     leader_address: Vec<u8>,

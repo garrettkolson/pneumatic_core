@@ -73,6 +73,10 @@ pub const ASPECTS: [&str; 2] = ["udp", "pneumatic"];
 
 const WORKER_THREADS: usize = 4;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Maximum plaintext a single RNS direct packet can carry: rns-core's MTU
+/// (500 B) minus the 19-byte HEADER_1. Frames above this ride the Resource
+/// transfer path (`send_data_packet` routes by this cap).
+pub const DIRECT_PACKET_PLAINTEXT_MAX: usize = 481;
 /// RNS envelope overhead (ChaCha20-Poly1305 + DTN framing) measured at
 /// ~115 B in the spike; 1 KiB of margin keeps the raw guard a fast
 /// pre-filter. The authoritative check is on plaintext, in the workers.
@@ -245,9 +249,7 @@ impl Callbacks for NetworkCallbacks {
     fn on_resource_failed(&mut self, _link_id: LinkId, _error: String) {}
 
     /// A Resource transfer completed (sender-side proof validated by us).
-    fn on_resource_completed(&mut self, link_id: LinkId) {
-        eprintln!("[pneumatic] rns: resource transfer completed (link {:02x?})", link_id.0);
-    }
+    fn on_resource_completed(&mut self, _link_id: LinkId) {}
 
     fn on_resource_progress(&mut self, _link_id: LinkId, _received: usize, _total: usize) {}
 }
@@ -417,6 +419,38 @@ impl RnsNetwork {
             .map_err(|e| PneumaticError::Network(format!("send to {:02x?} failed: {:?}", rhash, e)))
     }
 
+    /// Send a data-plane payload (e.g. a rmp-serialized `Message`) to `rhash`.
+    ///
+    /// This is the wire contract for role-to-role traffic: the payload is
+    /// wrapped in a `NetworkPacket { control: None, data: Some(payload) }`
+    /// frame (the same framing the composite's `on_packet` bridge and the
+    /// control-plane directory path expect — a bare `Message` on the wire
+    /// deserializes as an *empty* `NetworkPacket` and is silently dropped),
+    /// then routed by size:
+    ///
+    /// - frames within the direct-packet plaintext cap (~481 B) ride the
+    ///   direct `send_packet` path;
+    /// - larger frames (every real pneumatic `Message` is ~3.8 KB once the
+    ///   PQC hybrid signature is in the envelope) ride the native Resource
+    ///   transfer path (`send_resource_to`), which has no 500 B cap.
+    ///
+    /// Audit 7.1: without the size-based routing, `RnsConnection` (the only
+    /// production `Connection` impl) failed every real message at the RNS
+    /// pack step.
+    pub fn send_data_packet(&self, rhash: [u8; 16], payload: &[u8]) -> Result<(), PneumaticError> {
+        let frame = crate::node::NetworkPacket {
+            control: None,
+            data: Some(payload.to_vec()),
+        };
+        let frame_bytes = crate::encoding::serialize_to_bytes_rmp(&frame)
+            .map_err(|e| PneumaticError::Network(format!("data-plane frame serialize: {e}")))?;
+        if frame_bytes.len() <= DIRECT_PACKET_PLAINTEXT_MAX {
+            self.send_to(rhash, &frame_bytes)
+        } else {
+            self.send_resource_to(rhash, frame_bytes)
+        }
+    }
+
     /// Send `payload` over the native Resource transfer path to `rhash`, bypassing
     /// the ~481 B direct-packet cap. The `payload` typically is the rmp-serialized
     /// `NetworkPacket` carrying a `Message` — it rides on the resource's opaque
@@ -525,6 +559,84 @@ impl RnsNetwork {
     /// Our rhash (transport identity), for logging and config cross-checks.
     pub fn my_rhash(&self) -> [u8; 16] {
         self.my_rhash
+    }
+
+    /// `true` if `rhash` has a route upgraded by a live peer announce, as
+    /// opposed to the bootstrap-seeded synthetic route (which carries a
+    /// zero `dest_hash` and can be used for direct packets in some rns-net
+    /// versions but never for Resource link establishment). The startup
+    /// announce races peers' listeners coming up, so callers that send over
+    /// the Resource path should poll this (re-`announce()`ing in between)
+    /// before sending.
+    pub fn route_is_live(&self, rhash: [u8; 16]) -> bool {
+        self.destinations
+            .get(&rhash)
+            .map(|e| e.value().received_at > 0.0)
+            .unwrap_or(false)
+    }
+
+    /// Establish (and wait for) an Active Resource link to `rhash` without
+    /// sending a payload. The on-demand `send_resource_to` path creates links
+    /// lazily, which can stall mid-pipeline if a handshake is slow; calling
+    /// this for every edge up front (during route-gate) surfaces a stuck link
+    /// before any data depends on it and warms the link so later sends reuse it.
+    pub fn ensure_link(&self, rhash: [u8; 16]) -> Result<(), PneumaticError> {
+        let announced = self
+            .destinations
+            .get(&rhash)
+            .map(|e| e.value().clone())
+            .ok_or_else(|| PneumaticError::Resource(format!("no route to rhash {:02x?}", rhash)))?;
+        let dest_hash = announced.dest_hash;
+        let peer_sig_pub = extract_peer_sig_pub(&announced.public_key);
+        // Reuse an already-Active link.
+        if self.links.get(&dest_hash).is_some() {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        let mut attempts = 0u32;
+        loop {
+            // A link may have become active from a previous attempt's handshake.
+            if self.links.get(&dest_hash).is_some() {
+                return Ok(());
+            }
+            match self.node.create_link(dest_hash.0, peer_sig_pub) {
+                Ok(link_id) => {
+                    match self.wait_for_link_active(dest_hash, &deadline) {
+                        Ok(()) => {
+                            let _ = link_id;
+                            return Ok(());
+                        }
+                        // The link was created (a link_id assigned) but the
+                        // handshake never reached Active before the deadline.
+                        // `create_link` is optimistic — a *fresh* handshake on
+                        // the next iteration may succeed where this one lost a
+                        // packet. Retry until the deadline.
+                        Err(_) => {
+                            attempts += 1;
+                            if std::time::Instant::now() >= deadline {
+                                return Err(PneumaticError::Resource(format!(
+                                    "link to rhash {:02x?} (dest_hash {:02x?}) not established after {attempts} attempt(s)",
+                                    rhash, dest_hash.0
+                                )));
+                            }
+                            // Brief settle before the next handshake attempt so
+                            // in-flight packets drain and the responder's
+                            // half-link state can be reclaimed.
+                            thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                }
+                Err(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(PneumaticError::Resource(format!(
+                            "link to rhash {:02x?} (dest_hash {:02x?}) not established",
+                            rhash, dest_hash.0
+                        )));
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     /// Install the application handler for decrypted inbound packets.
