@@ -4,19 +4,23 @@ title: "Roadmap status 09/20/2026: S1.1–S5.2 landed; S5.3/S5.4/S6 remain"
 type: note
 namespace: pneumatic
 visibility: namespace
-summary: "Tier-1 shielded work at S5.2 (HEAD 1b7e4f0), atop landed PQ hybrid, RNS e2e, and the composite node-server runtime. Remaining: S5.3, S5.4, S6; Tier 2 (zk-VM) out of scope."
+summary: "SUPERSEDED by note-roadmap-status-2026-09-26: Tier-1 shielded work was at S5.2 (HEAD 1b7e4f0); S5.3/S5.4/S6 have since all landed."
 auto_inject: false
-applicable_when: "Answering 'where are we on the roadmap' before planning the next shielded phase"
+applicable_when: "Historical snapshot of the S5.2 frontier (09/20/2026)"
 confidence: 0.95
-verified_at: "09/20/2026"
+verified_at: "09/26/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale once S5.3 lands (new HEAD) — supersede with a dated status note"
+staleness_signal: "Superseded — see note-roadmap-status-2026-09-26"
 tags: [note, roadmap, status, shielded, progress]
 edges:
+  - target: note-roadmap-status-2026-09-26
+    type: followed_by
+    weight: 1.0
+    note: "Superseded by the 09/26 status note (S5.3/S5.4/S6 all landed)"
   - target: event-s5-2-finalizer-wiring
     type: related_to
     weight: 1.0
-    note: "Landed S5.2 = HEAD 1b7e4f0, the current frontier"
+    note: "Landed S5.2 = HEAD 1b7e4f0, the frontier as of this snapshot"
   - target: task-s5-3-pool-append
     type: related_to
     weight: 0.9

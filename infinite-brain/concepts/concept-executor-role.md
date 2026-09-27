@@ -4,11 +4,11 @@ title: "Executor role — transaction computation node"
 type: concept
 namespace: pneumatic
 visibility: namespace
-summary: "The Executor preloads data, runs backpressure-bounded async execution against the DataProvider, then signs and sends the hashed result to Finalizers as an Execute message."
+summary: "The Executor preloads data, runs backpressure-bounded async execution against the DataProvider, signs the result hash, and sends the vote to the assigned Finalizer as a Sign message."
 auto_inject: false
 applicable_when: "Working on executor/, transaction execution, backpressure, or the Executor's place in the pipeline"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/26/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Stale when executor/src/executor.rs changes its pipeline steps, backpressure API, or outbound action"
 tags: [executor, worker-crate, pipeline, backpressure]
@@ -50,6 +50,6 @@ Key mechanics (all code-verified):
 - **Backpressure**: a configurable `max_in_flight` caps concurrent executions; `is_at_capacity()` (`executor.rs:84-87`) gates `preload_for_transaction`, which returns `ExecutorError::AtCapacity` at the limit (`executor.rs:106-134`) — new transactions are rejected immediately rather than queued.
 - **Execution task**: `preload_for_transaction` spawns an async `execute_task` on a lightweight `ExecutorHandle` clone and tracks the result map in `preload_tasks` (`executor.rs:123-134`, `256-267`).
 - **Run pipeline**: `run_execution` loads the tx, transitions it to `Executing`, fetches contract + user data, executes, validates, hashes the output, transitions to `Finalizing` with the finalizer key from the validation result, then broadcasts (`executor.rs:270-367`).
-- **Outbound**: `send_to_finalizer` packages `ExecutionResult { transaction_id, result_data, result_hash }` (`executor.rs:464-471`) as a signed `Message` (action `"Execute"`) under the node's own `NodeIdentity` and broadcasts via `node_registry.send_to_all` to `NodeRegistryType::Finalizer` (`executor.rs:146-187`).
+- **Outbound**: the executor signs the `result_hash` and sends a **`"Sign"` vote** (action `"Sign"`, `executor.rs:495`) under the node's own `NodeIdentity` to the assigned Finalizer — the finalizer's C1 intake expects exactly this (`"Execute"`/`ExecutionResult` was the pre-e2e shape and is no longer sent; the seam was the e2e pipeline blocker, closed per log-organize-vault-20260726-e2e-closed). The `"Preload"` from the sentinel is ordered before the `"Sign"`.
 
 The contract-execution body is still a stub — see task-executor-contract-bytecode.

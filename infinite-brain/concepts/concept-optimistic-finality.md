@@ -25,6 +25,10 @@ edges:
     type: supports
     weight: 0.9
     note: "Conflicts are detected and routed through the candidate registry"
+  - target: concept-quorum-gossip-protocol
+    type: related_to
+    weight: 0.9
+    note: "The quorum gossip is the confirmation/dispute tail that upgrades Optimistic blocks to Confirmed"
   - target: event-s5-2-finalizer-wiring
     type: related_to
     weight: 0.8
