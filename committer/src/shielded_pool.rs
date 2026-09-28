@@ -626,6 +626,7 @@ mod tests {
                 shielded,
                 transaction_id: "tx".to_string(),
                 transaction: Transaction {
+                    payload: vec![], gas_limit: 0,
                     id: "tx".to_string(),
                     action: "ShieldedTransfer".into(),
                     token_id: vec![1],

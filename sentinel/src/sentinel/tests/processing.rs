@@ -44,6 +44,7 @@ fn on_data_received_process_with_valid_body_no_encoding_error() {
         chain_id: "test".into(),
         action: "Process".into(),
         body: serialize_to_bytes_rmp(&Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test_tx".into(),
             action: "Transfer".into(),
             token_id: vec![1],
@@ -101,6 +102,7 @@ fn process_tx_with_valid_sender_signature_accepted() {
     let sender_pk = sender_identity.ed25519.public_key().expect("sender public key");
 
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "c3_valid".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -143,6 +145,7 @@ fn unauthorized_submitter_debit_is_rejected() {
     let attacker_pk = attacker.ed25519.public_key().expect("attacker public key");
 
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "c3_unauth".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -175,6 +178,7 @@ fn forged_sender_signature_rejected() {
     let sender_pk = sender.ed25519.public_key().expect("sender public key");
 
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "c3_forged".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -205,6 +209,7 @@ fn sender_signature_does_not_cross_accounts() {
     let b_claim = vec![7, 7, 7, 7];
 
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "c3_cross".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -265,6 +270,7 @@ fn sentinel_self_signed_token_flow_end_to_end() {
 
     // Create a self-signed transaction (sender == owner)
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_self_signed".into(),
         action: "Transfer".into(),
         token_id: vec![1],
@@ -305,6 +311,7 @@ fn compute_gas_used_with_zero_amount_returns_base_cost() {
         Arc::new(DefaultDataProvider::new()),
     );
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test".into(),
         action: "Process".into(),
         token_id: vec![],
@@ -330,6 +337,7 @@ fn compute_gas_used_preload_with_amount_applies_multiplier() {
         Arc::new(DefaultDataProvider::new()),
     );
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test".into(),
         action: "Preload".into(),
         token_id: vec![],
@@ -355,6 +363,7 @@ fn compute_gas_used_unknown_action_defaults_to_one() {
         Arc::new(DefaultDataProvider::new()),
     );
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test".into(),
         action: "UnknownAction".into(),
         token_id: vec![],
@@ -382,6 +391,7 @@ fn transaction_notifier_send_to_executors_does_not_panic() {
     let notifier = TransactionNotifier::new(config, node_registry);
     let env = make_test_env_data();
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test_tx".into(),
         action: "Preload".into(),
         token_id: vec![1],
@@ -407,6 +417,7 @@ fn transaction_notifier_send_to_finalizer_does_not_panic() {
     let notifier = TransactionNotifier::new(config, node_registry);
     let env = make_test_env_data();
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test_tx".into(),
         action: "Preload".into(),
         token_id: vec![1],
@@ -454,6 +465,7 @@ fn handle_self_signed_enqueues_to_pool() {
 
     // Create a self-signed transaction (receiver is empty)
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_pool_enqueue_signed".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -502,6 +514,7 @@ fn handle_process_request_routes_self_verified_token_owner_operation() {
 
     // The owner signs a Process message (sender == owner, envelope sender == sender).
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_self_signed_owner".into(),
         action: "Transfer".into(),
         token_id: vec![1],
@@ -556,6 +569,7 @@ fn handle_process_request_rejects_self_verified_tx_from_non_owner() {
     let attacker_pk = attacker_identity.ed25519.public_key().expect("attacker pubkey");
 
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_self_signed_non_owner".into(),
         action: "Transfer".into(),
         token_id: vec![1],
@@ -600,6 +614,7 @@ fn handle_process_request_enqueues_standard_tx_to_pool() {
 
     // Create a standard transaction (sender != owner, Executed spec)
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_pool_enqueue_std".into(),
         action: "Process".into(),
         token_id: vec![2],
@@ -668,6 +683,7 @@ fn handle_process_request_rejects_duplicate_nonce() {
 
     // First tx: (token [1], sender, seq=5). Valid signature + envelope binding.
     let mut tx1 = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_nonce_1".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -692,6 +708,7 @@ fn handle_process_request_rejects_duplicate_nonce() {
 
     // Second tx: a DIFFERENT id carrying the SAME (token [1], sender, seq=5) — a replay.
     let mut tx2 = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_nonce_2".into(),
         action: "Process".into(),
         token_id: vec![1],
@@ -722,6 +739,7 @@ fn pool_ordering_is_deterministic() {
     // Pool ordering: sender ASC, then sequence_number ASC, then timestamp ASC.
     for i in 0..3 {
         let tx = Transaction {
+            payload: vec![], gas_limit: 0,
             id: format!("tx_order_{}", i),
             action: "Process".into(),
             token_id: vec![3],
@@ -873,6 +891,7 @@ fn send_to_executor_for_preload_follows_current_epoch() {
         make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data_sharded());
 
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_preload_epoch".to_string(),
         action: "Transfer".to_string(),
         token_id: vec![1],

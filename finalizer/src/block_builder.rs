@@ -377,6 +377,7 @@ mod tests {
 
     fn make_test_transaction() -> Transaction {
         Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test_tx_001".to_string(),
             action: "Transfer".to_string(),
             token_id: vec![0, 1, 2],
@@ -568,6 +569,7 @@ mod tests {
             shielded: None,
             transaction_id: "c2_test".into(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "c2_test".into(),
                 action: "Transfer".into(),
                 token_id: vec![1, 2, 3],

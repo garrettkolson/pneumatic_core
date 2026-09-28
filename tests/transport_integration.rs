@@ -131,6 +131,7 @@ fn make_test_config() -> Config {
         shard_count: 1,
         shard_quorum_percentage: 67.0,
         shielded_root_recency: 10,
+        contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
     };
     let mut env_map = dashmap::DashMap::new();
     env_map.insert("test".to_string(), env_metadata);
@@ -195,6 +196,7 @@ fn make_config_with_env() -> Config {
         shard_count: 1,
         shard_quorum_percentage: 67.0,
         shielded_root_recency: 10,
+        contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
     };
     let mut env_map = dashmap::DashMap::new();
     env_map.insert("test".to_string(), env_metadata);

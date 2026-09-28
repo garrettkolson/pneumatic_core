@@ -219,6 +219,7 @@ pub fn make_finalizing_entry(registry: &PendingTransactionRegistry, tx_id: &str,
     if let Ok(mut entry) = registry.get_transaction_mut(tx_id) {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: tx_id.into(), action: "Transfer".into(),
                 token_id: vec![1], bid: None, sequence_number: 1,
                 sender: vec![1], receiver: vec![2], amount: Some(100),

@@ -390,6 +390,7 @@ mod tests {
 
     fn make_process_message(public_key: Vec<u8>, nonce: usize, amount: u64) -> Message {
         let tx = Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
             sequence_number: nonce, sender: public_key.clone(), receiver: vec![],
             amount: Some(amount), timestamp: 0, result_hash: vec![],
@@ -401,6 +402,7 @@ mod tests {
 
     fn make_preload_message(public_key: Vec<u8>, amount: u64) -> Message {
         let tx = Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
             sequence_number: 0, sender: public_key.clone(), receiver: vec![],
             amount: Some(amount), timestamp: 0, result_hash: vec![],
@@ -431,6 +433,7 @@ mod tests {
         // Phase 5.6 / M12: a "Process" message carrying `amount: None` is rejected.
         let router = make_router();
         let tx = Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test".into(), action: "Transfer".into(), token_id: vec![], bid: None,
             sequence_number: 0, sender: vec![1, 2, 3], receiver: vec![],
             amount: None, timestamp: 0, result_hash: vec![],

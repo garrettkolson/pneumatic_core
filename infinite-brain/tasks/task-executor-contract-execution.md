@@ -49,12 +49,21 @@ source_url: "plans/executor-contract-execution-implementation-plan.md"
 
 Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014). Plan:
-`plans/executor-contract-execution-implementation-plan.md`. Status: **pending**.
+`plans/executor-contract-execution-implementation-plan.md`. Status: **in progress**
+— Phase 1 complete (09/28/2026).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
-- **P1** — `src/contracts.rs` `ContractEngine` substrate in `pneumatic_core` +
-  additive `payload`/`gas_limit` wire fields (ADR-011, ADR-012).
+- **P1 ✅ (09/28/2026)** — `src/contracts.rs` `ContractEngine` substrate in
+  `pneumatic_core` + additive `payload`/`gas_limit` wire fields (ADR-011, ADR-012).
+  Landed: `ContractEngine` trait, `ExecutionInput`/`ExecutionOutput`,
+  `ContractError` → `ValidationFailureReason` mapping (new
+  `ContractExecutionFailed` reason), `ContractEngineRegistry` (DashMap, ADR-002
+  pattern) with fail-closed `Transfer`/`Spec` placeholders, `contract_engines`
+  environment spec (default `["Transfer","Spec"]`, unknown name fails boot),
+  `payload` + `gas_limit` on `Transaction` (skip-if-empty/zero, byte-identical
+  legacy wire — regression-tested) joining `CanonicalTransaction` (sender signs
+  calldata — regression-tested). Workspace `cargo test` green; core suite 558.
 - **P2** — `TransferEngine` + `SpecEngine` (versioned rmp ISA) + determinism
   property tests (ADR-011).
 - **P3** — stub replacement: dispatch by `contract_engine` metadata; fix the

@@ -211,6 +211,7 @@ pub fn make_test_env_data() -> EnvironmentMetadata {
 /// committed block and its registry entry must hash equal.
 pub fn make_test_transaction(tx_id: &str, sender: Vec<u8>) -> Transaction {
     Transaction {
+        payload: vec![], gas_limit: 0,
         id: tx_id.to_string(),
         action: "Process".into(),
         token_id: vec![1],
@@ -850,6 +851,7 @@ pub fn make_gossip_block_at_prev(
         shielded: None,
         transaction_id: trans_id.to_string(),
         transaction: Transaction {
+            payload: vec![], gas_limit: 0,
             id: trans_id.to_string(),
             action: "Process".into(),
             token_id: vec![1],
@@ -921,6 +923,7 @@ pub fn make_test_block_for_token_internal(blockchain: &pneumatic_core::blocks::B
         shielded: None,
         transaction_id: "test".to_string(),
         transaction: Transaction {
+            payload: vec![], gas_limit: 0,
             id: "test".to_string(),
             action: "Process".into(),
             token_id: vec![1],

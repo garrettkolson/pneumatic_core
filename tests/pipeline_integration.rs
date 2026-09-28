@@ -1074,6 +1074,7 @@ fn token_cache() -> Arc<dashmap::DashMap<Vec<u8>, Token>> {
 fn make_transaction(submitter_id: &Arc<NodeIdentity>) -> Transaction {
     let sender = submitter_id.ed25519.public_key().expect("submitter pk");
     let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: TX_ID.to_string(),
         action: "Transfer".to_string(),
         token_id: TOKEN_ID.to_vec(),

@@ -103,6 +103,7 @@ fn acquire_terminal_state_fails() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_failed(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 0,
                 sender: vec![], receiver: vec![], amount: None,
@@ -124,6 +125,7 @@ fn get_validation_result_from_validated_returns_some() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 1,
                 sender: vec![1], receiver: vec![2], amount: Some(100),
@@ -167,6 +169,7 @@ fn release_failed_transaction_returns_true() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_failed(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 0,
                 sender: vec![], receiver: vec![], amount: None,
@@ -190,6 +193,7 @@ fn set_requested_finalizer_validated_succeeds() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 1,
                 sender: vec![1], receiver: vec![2], amount: Some(100),
@@ -216,6 +220,7 @@ fn is_requested_finalizer_matches() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 1,
                 sender: vec![1], receiver: vec![2], amount: Some(100),
@@ -236,6 +241,7 @@ fn is_requested_finalizer_mismatch() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 1,
                 sender: vec![1], receiver: vec![2], amount: Some(100),
@@ -397,6 +403,7 @@ fn concurrent_acquire_terminal_state_rejected() {
         let mut entry = registry.transactions.get_mut("tx1").unwrap();
         entry.transition_to_failed(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 0,
                 sender: vec![], receiver: vec![], amount: None,

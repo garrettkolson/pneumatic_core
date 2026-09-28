@@ -280,6 +280,7 @@ mod tests {
                 shielded: None,
                 transaction_id: "dist_tx".to_string(),
                 transaction: Transaction {
+                    payload: vec![], gas_limit: 0,
                     id: "dist_tx".to_string(),
                     action: "Process".into(),
                     token_id: vec![1],

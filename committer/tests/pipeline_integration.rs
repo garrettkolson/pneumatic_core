@@ -313,6 +313,7 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
         shielded: None,
         transaction_id: "genesis_tx".to_string(),
         transaction: Transaction {
+            payload: vec![], gas_limit: 0,
             id: "genesis_tx".to_string(),
             action: "Genesis".into(),
             token_id: vec![1],
@@ -720,6 +721,7 @@ async fn test_pipeline_no_conflict() {
             shielded: None,
             transaction_id: "test_tx".to_string(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "test_tx".to_string(),
                 action: "Process".into(),
                 token_id: vec![1],
@@ -818,6 +820,7 @@ async fn commit_from_empty_registry_materializes_and_commits() {
             shielded: None,
             transaction_id: "commit_sink_tx".to_string(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "commit_sink_tx".to_string(),
                 action: "Process".into(),
                 token_id: vec![1],
@@ -927,6 +930,7 @@ async fn test_pipeline_conflict_and_slashing() {
             shielded: None,
             transaction_id: "conflict_tx_1".to_string(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "conflict_tx_1".to_string(),
                 action: "Process".into(),
                 token_id: vec![1],
@@ -972,6 +976,7 @@ async fn test_pipeline_conflict_and_slashing() {
             shielded: None,
             transaction_id: "conflict_tx_2".to_string(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "conflict_tx_2".to_string(),
                 action: "Process".into(),
                 token_id: vec![1],

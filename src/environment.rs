@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::ContractEngineRegistry;
 use crate::crypto;
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::errors::PneumaticError;
@@ -162,6 +163,9 @@ pub struct EnvironmentMetadata {
     /// the root-freshness check: a note's `merkle_root` must be one of the
     /// most recent `K` committed pool states, older roots are stale.
     pub shielded_root_recency: usize,
+    /// Contract execution engines (ADR-011) — name-keyed registry of
+    /// `ContractEngine` impls, loaded from the spec's `contract_engines` list.
+    pub contract_engines: Arc<ContractEngineRegistry>,
 }
 
 impl EnvironmentMetadata {
@@ -234,6 +238,20 @@ impl EnvironmentMetadata {
             }
         }
 
+        // Wire contract_engines from JSON into the contract engine registry
+        // (ADR-011). Defaults = the built-in Tier-1 engines; unknown names fail
+        // boot — the same fail-closed pattern as the validator spec lists.
+        let engine_registry = ContractEngineRegistry::new();
+        engine_registry.register_defaults();
+        for name in &spec.contract_engines {
+            if engine_registry.get(name).is_none() {
+                return Err(PneumaticError::Encoding(format!(
+                    "invalid environment spec: unknown contract engine \"{}\" for environment \"{}\"",
+                    name, spec.environment_name
+                )));
+            }
+        }
+
         let mut block_specs = BlockValidatorSpecRegistry::new();
         block_specs.register_defaults();
 
@@ -271,6 +289,7 @@ impl EnvironmentMetadata {
             shard_count: spec.shard_count,
             shard_quorum_percentage: spec.shard_quorum_percentage,
             shielded_root_recency: spec.shielded_root_recency,
+            contract_engines: Arc::new(engine_registry),
         })
     }
 }
@@ -302,11 +321,18 @@ pub struct EnvironmentMetadataSpec {
     /// the root-freshness check. Default 10.
     #[serde(default = "default_shielded_root_recency")]
     pub shielded_root_recency: usize,
+    /// Contract execution engine names (ADR-011). Default = both Tier-1
+    /// built-ins (`Transfer`, `Spec`). An unknown name fails boot.
+    #[serde(default = "default_contract_engines")]
+    pub contract_engines: Vec<String>,
 }
 
 fn default_shard_count() -> u32 { 1 }
 fn default_shard_quorum_percentage() -> f32 { 67.0 }
 fn default_shielded_root_recency() -> usize { 10 }
+fn default_contract_engines() -> Vec<String> {
+    vec!["Transfer".to_string(), "Spec".to_string()]
+}
 
 impl EnvironmentMetadataSpec {
     /// Validate the protocol-relevant numeric fields of an environment spec

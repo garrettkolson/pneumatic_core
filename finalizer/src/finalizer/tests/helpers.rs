@@ -223,6 +223,7 @@ pub fn make_test_node_registry() -> Arc<NodeRegistry> {
 pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
     let registry = Arc::new(PendingTransactionRegistry::new());
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test_tx_001".to_string(),
         action: "Transfer".to_string(),
         token_id: vec![0, 1, 2],

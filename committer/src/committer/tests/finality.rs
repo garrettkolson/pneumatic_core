@@ -325,6 +325,7 @@ async fn handle_block_finalized_unknown_token_returns_error() {
         shielded: None,
         transaction_id: "unknown".to_string(),
         transaction: Transaction {
+            payload: vec![], gas_limit: 0,
             id: "unknown".to_string(),
             action: "Process".into(),
             token_id: vec![99], // not in committer's token cache

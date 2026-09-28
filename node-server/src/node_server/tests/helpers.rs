@@ -407,6 +407,7 @@ pub fn make_e2e_shielded_block(
         shielded: Some(stx.clone()),
         transaction_id: stx.id.clone(),
         transaction: pneumatic_core::transactions::Transaction {
+            payload: vec![], gas_limit: 0,
             id: stx.id.clone(),
             action: "ShieldedTransfer".into(),
             token_id: vec![1],

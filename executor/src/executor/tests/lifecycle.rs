@@ -63,6 +63,7 @@ async fn test_executor_backpressure_rejects() {
 
     // Add a valid preloaded transaction so the capacity check is reached
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "capacity_tx".to_string(),
         action: "Transfer".to_string(),
         token_id: vec![1],
@@ -146,6 +147,7 @@ async fn test_executor_rejects_transaction_in_terminal_state() {
 
     // Add a transaction in Failed state
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "failed_tx".to_string(),
         action: "Transfer".to_string(),
         token_id: vec![],
@@ -214,6 +216,7 @@ async fn full_backpressure_cycle() {
     // Add two transactions to the registry
     for tx_id in ["bp_tx_a", "bp_tx_b"] {
         let tx = Transaction {
+            payload: vec![], gas_limit: 0,
             id: tx_id.to_string(),
             action: "Transfer".to_string(),
             token_id: vec![1],

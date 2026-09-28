@@ -1,5 +1,6 @@
 pub mod config;
 pub mod conns;
+pub mod contracts;
 pub mod crypto;
 pub mod data;
 pub mod encoding;

@@ -189,6 +189,27 @@ pub struct Transaction {
     /// than throwing, not a silent accept.
     #[serde(default)]
     pub sender_signature: Vec<u8>,
+    /// Contract calldata (ADR-012): the input bytes a contract engine consumes.
+    /// Additive wire field — `#[serde(default, skip_serializing_if)]` keeps a
+    /// legacy (empty-payload) transaction byte-identical on the rmp wire
+    /// (Ground Rule 4 pattern, precedent: `SignedTransaction.shielded`). The
+    /// sentinel enforces a size cap on non-empty payloads; the field joins
+    /// `CanonicalTransaction` so the sender signature covers the calldata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<u8>,
+    /// Sender-declared gas cap (ADR-013, stage 1): the maximum metered cost the
+    /// sender allows for this transaction's execution. 0 = none declared (plain
+    /// transfers keep the existing fee formula). Additive + skipped when zero so
+    /// legacy wire bytes are unchanged; the sentinel fails closed when
+    /// `fuel_balance < gas_limit`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub gas_limit: u64,
+}
+
+/// Serde `skip_serializing_if` predicate for the additive `gas_limit` field:
+/// a zero cap (the legacy shape) is omitted so wire bytes are unchanged.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Optional bid attached to a transaction.
@@ -315,6 +336,8 @@ impl SignedTransaction {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
+                payload: vec![],
+                gas_limit: 0,
             },
             total_stake: 42,
             total_voters: 3,
@@ -441,6 +464,8 @@ impl ShieldedTransaction {
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
+            payload: vec![],
+            gas_limit: 0,
         }
     }
 }
@@ -529,6 +554,8 @@ struct CanonicalTransaction<'a> {
     amount: Option<u64>,
     timestamp: i64,
     result_hash: &'a [u8],
+    payload: &'a [u8],
+    gas_limit: u64,
 }
 
 impl Transaction {
@@ -547,6 +574,8 @@ impl Transaction {
             amount: self.amount,
             timestamp: self.timestamp,
             result_hash: &self.result_hash,
+            payload: &self.payload,
+            gas_limit: self.gas_limit,
         };
         crate::encoding::serialize_to_bytes_rmp(&canon)
             .map_err(|e| PneumaticError::Encoding(e.to_string()))
@@ -721,6 +750,8 @@ mod tests {
             timestamp: 1000,
             result_hash: vec![],
             sender_signature: vec![],
+            payload: vec![],
+            gas_limit: 0,
         }
     }
 
@@ -1158,5 +1189,75 @@ mod tests {
         assert_eq!(p1.sequence_number, 0);
         assert_eq!(p1.sender, Vec::<u8>::new());
         assert_eq!(p1.sender_signature, Vec::<u8>::new());
+    }
+
+    // --- ADR-012: additive wire-field regression (Ground Rule 4) ---
+
+    /// The pre-ADR-012 field set, used to prove byte-compatibility: a legacy
+    /// transaction (empty payload, zero gas cap) must serialize to exactly the
+    /// same rmp bytes as before the fields existed.
+    #[derive(serde::Serialize)]
+    struct LegacyTransactionShape {
+        id: String,
+        action: String,
+        token_id: Vec<u8>,
+        bid: Option<Bid>,
+        sequence_number: usize,
+        sender: Vec<u8>,
+        receiver: Vec<u8>,
+        amount: Option<u64>,
+        timestamp: i64,
+        result_hash: Vec<u8>,
+        sender_signature: Vec<u8>,
+    }
+
+    #[test]
+    fn empty_payload_zero_gas_limit_wire_bytes_unchanged() {
+        let tx = make_test_tx();
+        assert!(tx.payload.is_empty() && tx.gas_limit == 0);
+        let legacy = LegacyTransactionShape {
+            id: tx.id.clone(),
+            action: tx.action.clone(),
+            token_id: tx.token_id.clone(),
+            bid: tx.bid.clone(),
+            sequence_number: tx.sequence_number,
+            sender: tx.sender.clone(),
+            receiver: tx.receiver.clone(),
+            amount: tx.amount,
+            timestamp: tx.timestamp,
+            result_hash: tx.result_hash.clone(),
+            sender_signature: tx.sender_signature.clone(),
+        };
+        let now = crate::encoding::serialize_to_bytes_rmp(&tx).expect("rmp");
+        let legacy_bytes = crate::encoding::serialize_to_bytes_rmp(&legacy).expect("rmp");
+        assert_eq!(
+            now, legacy_bytes,
+            "a legacy-shape transaction must serialize byte-identical after ADR-012"
+        );
+        // And the additive fields round-trip when present.
+        let mut rich = tx.clone();
+        rich.payload = vec![1, 2, 3];
+        rich.gas_limit = 42;
+        let bytes = crate::encoding::serialize_to_bytes_rmp(&rich).unwrap();
+        let round: Transaction = crate::encoding::deserialize_rmp_to(&bytes).expect("round-trip");
+        assert_eq!(round.payload, vec![1, 2, 3]);
+        assert_eq!(round.gas_limit, 42);
+    }
+
+    #[test]
+    fn sender_signature_covers_payload_calldata() {
+        // ADR-012: calldata joins the canonical signed form — a relay cannot
+        // swap the payload on a signed transaction.
+        let provider = crate::crypto::Ed25519Provider::generate();
+        let mut tx = make_test_tx();
+        tx.sender = provider.public_key().expect("sender pk");
+        tx.payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let canonical = tx.canonical_signature_bytes().expect("canonical");
+        tx.sender_signature = provider.sign_data(&canonical).expect("sender signs");
+        assert!(tx.verify_sender_signature().expect("verify"));
+
+        // Tamper with the calldata: the signature must no longer verify.
+        tx.payload.push(0xFF);
+        assert!(!tx.verify_sender_signature().expect("verify after tamper"));
     }
 }

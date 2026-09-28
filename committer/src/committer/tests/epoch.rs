@@ -31,6 +31,7 @@ async fn propose_blocks_returns_batch_when_leader_with_pool_items() {
     let tx_id = "tx_propose_1".to_string();
     registry.register_pending(tx_id.clone()).unwrap();
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: tx_id.clone(),
         action: "Process".into(),
         token_id: vec![1],
@@ -90,6 +91,7 @@ async fn run_epoch_loop_commits_leader_proposed_block() {
         .transition_to_validated_and_enqueue(
             &tx_id,
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: tx_id.clone(),
                 action: "Process".into(),
                 token_id: vec![1],

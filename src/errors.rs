@@ -179,6 +179,12 @@ pub enum ValidationFailureReason {
     /// and enforced in-circuit by the value-balance gate, so the network cannot
     /// independently sum them; the advisory spec does not fire this.
     ValueBalanceMismatch,
+    // ── Contract execution (ADR-013, Phase 1) ────────────────────────────────
+    /// Contract execution failed at the engine level — malformed bytecode, an
+    /// explicit revert, an invalid input, or an engine that is registered but
+    /// not implemented. The specific cause is carried by
+    /// `contracts::ContractError`; this reason marks the `Failed` transition.
+    ContractExecutionFailed,
 }
 
 // ---------------------------------------------------------------------------

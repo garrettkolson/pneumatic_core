@@ -43,6 +43,7 @@ pub fn make_env_with_defaults() -> EnvironmentMetadata {
 
 pub fn make_tx(sender: &[u8], receiver: &[u8], amount: Option<u64>, seq: usize) -> Transaction {
     Transaction {
+        payload: vec![], gas_limit: 0,
         id: "t".into(),
         action: "Transfer".into(),
         token_id: vec![1],
@@ -72,6 +73,7 @@ pub fn make_signed_tx_with_fields(
         shielded: None,
         transaction_id: String::from("test_signed_tx"),
         transaction: Transaction {
+            payload: vec![], gas_limit: 0,
             id: String::from("test_tx"),
             action: String::from("Transfer"),
             token_id: vec![1],
@@ -105,6 +107,7 @@ pub fn make_valid_block(signed_tx: SignedTransaction, blockchain: &mut Blockchai
             shielded: None,
             transaction_id: String::from("genesis"),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: String::from("genesis"),
                 action: String::from("Genesis"),
                 token_id: vec![],

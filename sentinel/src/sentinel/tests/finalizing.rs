@@ -136,6 +136,7 @@ fn handle_rejection_terminal_state_returns_error() {
     if let Ok(mut entry) = registry.get_transaction_mut("tx_terminal") {
         entry.transition_to_failed(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx_terminal".into(), action: "Transfer".into(),
                 token_id: vec![], bid: None, sequence_number: 0,
                 sender: vec![], receiver: vec![], amount: None,

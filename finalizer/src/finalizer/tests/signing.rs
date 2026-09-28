@@ -10,6 +10,7 @@ async fn test_handle_preload() {
     let finalizer = make_finalizer(pending_registry);
 
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "preload_tx".to_string(),
         action: "Transfer".to_string(),
         token_id: vec![0, 1, 2],

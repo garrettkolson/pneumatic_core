@@ -1,7 +1,9 @@
 # Executor Implementation Plan — Real Contract Execution
 
-Status: **P0 complete** (2026-09-28) — all decisions Q1–Q6 approved
-(2026-09-27/28, Garrett Olson); ADR-011–014 recorded in the vault; Phase 1 unblocked
+Status: **Phase 1 complete** (2026-09-28) — decisions Q1–Q6 approved
+(2026-09-27/28, Garrett Olson); ADR-011–014 recorded in the vault; Phase 1 landed
+(`src/contracts.rs` substrate + `payload`/`gas_limit` wire fields, workspace tests
+green); Phase 2 next
 Scope: `pneumatic_executor` crate + minimal `pneumatic_core` substrate. The executor
 role's *plumbing* already works end-to-end (verified below); this plan implements the
 missing *computation* — real, deterministic contract execution — and fixes the wiring

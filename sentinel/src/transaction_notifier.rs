@@ -395,11 +395,13 @@ mod tests {
             shard_count: 1,
             shard_quorum_percentage: 67.0,
             shielded_root_recency: 10,
+            contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
         }
     }
 
     fn make_test_tx() -> Transaction {
         Transaction {
+            payload: vec![], gas_limit: 0,
             id: "tx_001".to_string(),
             action: "Transfer".to_string(),
             token_id: vec![1],

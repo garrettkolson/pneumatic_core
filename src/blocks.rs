@@ -662,6 +662,7 @@ pub mod tests {
             shielded: None,
             transaction_id: "block_tx".into(),
             transaction: Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "block_tx".into(),
                 action: "Transfer".into(),
                 token_id: vec![1, 2, 3],

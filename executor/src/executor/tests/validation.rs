@@ -24,6 +24,7 @@ fn validate_execution_result_empty_hash_fails() {
     );
 
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test_tx_001".into(),
         action: "Transfer".into(),
         token_id: vec![0, 1, 2],
@@ -68,6 +69,7 @@ fn validate_execution_result_nonempty_hash_succeeds() {
     );
 
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "test_tx_001".into(),
         action: "Transfer".into(),
         token_id: vec![0, 1, 2],

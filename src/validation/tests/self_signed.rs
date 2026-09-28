@@ -123,6 +123,7 @@ fn self_signed_token_flow_end_to_end() {
 
     // Create transaction with matching sender
     let tx = Transaction {
+        payload: vec![], gas_limit: 0,
         id: "tx_self_signed".into(),
         action: "Transfer".into(),
         token_id: vec![1],

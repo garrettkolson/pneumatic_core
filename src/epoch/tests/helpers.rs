@@ -34,6 +34,7 @@ pub fn make_validated_registry() -> PendingTransactionRegistry {
     if let Ok(mut entry) = registry.get_transaction_mut("tx1") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx1".into(), action: "Transfer".into(),
                 token_id: vec![1, 2], bid: None, sequence_number: 1,
                 sender: vec![10], receiver: vec![20], amount: Some(100),
@@ -55,6 +56,7 @@ pub fn make_validated_registry() -> PendingTransactionRegistry {
     if let Ok(mut entry) = registry.get_transaction_mut("tx2") {
         entry.transition_to_validated(
             Transaction {
+                payload: vec![], gas_limit: 0,
                 id: "tx2".into(), action: "Transfer".into(),
                 token_id: vec![1, 2], bid: None, sequence_number: 2,
                 sender: vec![10], receiver: vec![20], amount: Some(200),
