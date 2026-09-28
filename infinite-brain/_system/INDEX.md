@@ -130,8 +130,8 @@ Last rebuilt: 09/28/2026 (auto-generated from files on disk).
 
 | id | title | summary | edges |
 |---|---|---|---|
-| `fact-executor-backpressure-slot-leak` | Executor backpressure slots are never freed in production | preload_cleanup (executor/src/executor.rs:137) has no production callers; run_execution never removes its tx from preload_tasks, so after max_in_flight txs the executor is permanently AtCapacity. | 1 |
-| `fact-executor-partition-key-defect` | Executor passes env_id where the token partition id belongs | Executor::run_execution calls get_data(key, &self.env_id) at executor/src/executor.rs:291,297 while all other roles pass token_partition_id — against a real data service every execution fetch misses. | 2 |
+| `fact-executor-backpressure-slot-leak` | Executor backpressure slots are never freed in production | RESOLVED (Phase 3, 09/28/2026): backpressure slots were never freed in production (only preload_cleanup removed them); slots now live in a separate active_tasks set and are freed by the spawned task on settle. | 1 |
+| `fact-executor-partition-key-defect` | Executor passes env_id where the token partition id belongs | RESOLVED (Phase 3, 09/28/2026): the executor fetched contract/user data under env_id instead of the token partition id; it now threads token_partition_id (executor `partition_id` field) into get_token/get_user. | 2 |
 | `fact-hybrid-pq-crypto` | Hybrid PQ crypto: (Ed25519·ML-DSA-44) sign, (X25519·ML-KEM-768) KEM | AsymCryptoProvider is fully hybrid (N = N+1): signatures = Ed25519 + ML-DSA-44 concatenated; key exchange = X25519 + ML-KEM-768. Phase 7. | 3 |
 | `fact-hybrid-wire-format` | Hybrid wire format: 3796 B hybrid signature, ~2.3 KB (2332 B) PQC-hybrid KEM ciphertext | Hybrid sig = [Ed25519 64 B][ML-DSA-44 PK 1312 B][ML-DSA-44 sig 2420 B] = 3796 B; KEM ct = 32+1088+1184+12+16 = 2332 B for empty plaintext. | 3 |
 | `fact-port-allocations` | Port-per-registry-type allocations | Each node registry type has dedicated external and internal ports (e.g. Committer=42001 external / 50000 internal); data service on 55555. | 2 |

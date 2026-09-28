@@ -30,6 +30,8 @@ async fn send_to_finalizer_signed_with_executor_identity() {
         make_test_pending_registry(),
         make_test_hash_provider(),
         10,
+        "token".to_string(),
+        make_test_engine_registry(),
     );
 
     // The spawned-task path: ExecutorHandle::send_to_finalizer emits a

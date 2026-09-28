@@ -5,6 +5,10 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use pneumatic_core::contracts::{
+    select_engine, ContractEngineRegistry, ContractError, ExecutionInput, ExecutionOutput,
+    TransferDelta,
+};
 use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
@@ -14,7 +18,9 @@ use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::identity::NodeIdentity;
+use pneumatic_core::tokens::{SmartContract, Token};
 use pneumatic_core::transactions::{Transaction, TransactionState};
+use pneumatic_core::user::User;
 
 // ---------------------------------------------------------------------------
 // Executor — transaction computation node
@@ -45,8 +51,19 @@ pub struct Executor {
     pending_registry: Arc<PendingTransactionRegistry>,
     /// Hash provider for result hashing
     hash_provider: Arc<dyn HashProvider>,
-    /// Backpressure: in-flight execution tasks keyed by transaction ID
-    preload_tasks: Arc<Mutex<HashMap<String, Arc<DashMap<String, ExecutionResult>>>>>,
+    /// Token partition ID for data fetches (defect D3: fetch under the token
+    /// partition, not the environment id).
+    partition_id: String,
+    /// Contract engine registry for per-token engine selection (ADR-011).
+    contract_engine_registry: Arc<ContractEngineRegistry>,
+    /// Per-transaction execution results (observability). Entries persist until
+    /// `preload_cleanup` — independent of the backpressure slot below, so a
+    /// settled task's result stays readable after its slot is freed (defect D4).
+    preload_tasks: Arc<Mutex<HashMap<String, Arc<DashMap<String, Result<ExecutionResult, String>>>>>>,
+    /// Backpressure slots: the transaction IDs currently executing. A slot is
+    /// taken on preload and freed on settle (defect D4: the slot was previously
+    /// never freed, so a leaked slot would exhaust `max_in_flight`).
+    active_tasks: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Maximum number of concurrent execution tasks before backpressure kicks in
     max_in_flight: usize,
 }
@@ -65,6 +82,8 @@ impl Executor {
         pending_registry: Arc<PendingTransactionRegistry>,
         hash_provider: Arc<dyn HashProvider>,
         max_in_flight: usize,
+        partition_id: String,
+        contract_engine_registry: Arc<ContractEngineRegistry>,
     ) -> Self {
         Executor {
             env_id,
@@ -74,7 +93,10 @@ impl Executor {
             data_provider,
             pending_registry,
             hash_provider,
+            partition_id,
+            contract_engine_registry,
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
+            active_tasks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             max_in_flight,
         }
     }
@@ -82,14 +104,14 @@ impl Executor {
     /// Check if the executor is at capacity.
     /// Returns `true` if rejecting new transactions (backpressure).
     pub async fn is_at_capacity(&self) -> bool {
-        let tasks = self.preload_tasks.lock().await;
-        tasks.len() >= self.max_in_flight
+        let active = self.active_tasks.lock().await;
+        active.len() >= self.max_in_flight
     }
 
     /// Get the number of currently in-flight execution tasks.
     pub async fn in_flight_count(&self) -> usize {
-        let tasks = self.preload_tasks.lock().await;
-        tasks.len()
+        let active = self.active_tasks.lock().await;
+        active.len()
     }
 
     /// Preload data for a transaction and begin execution.
@@ -116,7 +138,7 @@ impl Executor {
         if at_capacity {
             return Err(ExecutorError::AtCapacity {
                 max_in_flight: self.max_in_flight,
-                current: self.preload_tasks.lock().await.len(),
+                current: self.active_tasks.lock().await.len(),
             });
         }
 
@@ -127,16 +149,20 @@ impl Executor {
         let handle = self.clone_handle();
         handle.execute_task(tx_id.to_string(), task_results).await;
 
-        // Step 4: Track the task for backpressure
+        // Step 4: Track the task — the results store (observability, persists
+        // until cleanup) and the backpressure slot (freed on settle, defect
+        // D4) are separate, so a settled task's result stays readable.
         self.preload_tasks.lock().await.insert(tx_id.to_string(), results_handle);
+        self.active_tasks.lock().await.insert(tx_id.to_string());
 
         Ok(())
     }
 
     /// Check if a preload task has completed and collect its results.
     pub async fn preload_cleanup(&self, tx_id: &str) {
-        // Remove the task from tracking (backpressure slot freed)
+        // Remove both the results store and any (stale) backpressure slot.
         self.preload_tasks.lock().await.remove(tx_id);
+        self.active_tasks.lock().await.remove(tx_id);
     }
 
     /// Ingest a Preload message body from the Sentinel and begin execution.
@@ -168,40 +194,6 @@ impl Executor {
         self.preload_for_transaction(&tx.id).await
     }
 
-    /// Validate execution results against expected constraints.
-    fn validate_execution_result(
-        &self,
-        _tx: &Transaction,
-        result: &ExecutionResult,
-    ) -> Result<(), Vec<ValidationFailureReason>> {
-        let mut reasons = vec![];
-
-        if result.result_hash.is_empty() {
-            reasons.push(ValidationFailureReason::ContractNotFound);
-        }
-
-        if !reasons.is_empty() {
-            return Err(reasons);
-        }
-
-        Ok(())
-    }
-
-    /// Get the finalizer public key from the transaction's validation result.
-    fn get_finalizer_key(&self, tx_id: &str) -> Vec<u8> {
-        match self.pending_registry.get_transaction_mut(tx_id) {
-            Ok(entry) => {
-                if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
-                    &entry.state
-                {
-                    return validation.finalizer_public_key.clone();
-                }
-            }
-            Err(_) => {}
-        }
-        vec![]
-    }
-
     fn clone_handle(&self) -> ExecutorHandle {
         ExecutorHandle {
             env_id: self.env_id.clone(),
@@ -211,6 +203,10 @@ impl Executor {
             data_provider: self.data_provider.clone(),
             pending_registry: self.pending_registry.clone(),
             hash_provider: self.hash_provider.clone(),
+            partition_id: self.partition_id.clone(),
+            contract_engine_registry: self.contract_engine_registry.clone(),
+            preload_tasks: self.preload_tasks.clone(),
+            active_tasks: self.active_tasks.clone(),
         }
     }
 }
@@ -231,20 +227,43 @@ struct ExecutorHandle {
     data_provider: Arc<dyn DataProvider>,
     pending_registry: Arc<PendingTransactionRegistry>,
     hash_provider: Arc<dyn HashProvider>,
+    partition_id: String,
+    contract_engine_registry: Arc<ContractEngineRegistry>,
+    /// Shared results store (observability) — persists until `preload_cleanup`.
+    preload_tasks: Arc<Mutex<HashMap<String, Arc<DashMap<String, Result<ExecutionResult, String>>>>>>,
+    /// Shared backpressure slots — the spawned task frees its slot on settle
+    /// (defect D4) by removing its id here.
+    active_tasks: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ExecutorHandle {
     /// Spawn an async execution task for a transaction.
+    ///
+    /// The task records its outcome (success **or** failure) in the per-tx
+    /// results map and, on settle, frees its backpressure slot (defect D4:
+    /// the slot was previously only freed by an explicit `preload_cleanup`, so
+    /// a leaked slot would eventually exhaust `max_in_flight`).
     async fn execute_task(
-        mut self,
+        self,
         tx_id: String,
-        results: Arc<DashMap<String, ExecutionResult>>,
+        results: Arc<DashMap<String, Result<ExecutionResult, String>>>,
     ) {
         tokio::spawn(async move {
             let result = self.run_execution(&tx_id).await;
-            if let Ok(exec_result) = result {
-                results.insert(tx_id, exec_result);
+            match &result {
+                Ok(exec_result) => {
+                    results.insert(tx_id.clone(), Ok(exec_result.clone()));
+                }
+                Err(e) => {
+                    // Make execution failures observable (previously dropped).
+                    log::warn!("execution of {} failed: {:?}", tx_id, e);
+                    results.insert(tx_id.clone(), Err(format!("{:?}", e)));
+                }
             }
+            // D4: free the backpressure slot now that the task has settled. The
+            // results entry in `preload_tasks` is left in place (observability)
+            // and is removed only by an explicit `preload_cleanup`.
+            self.active_tasks.lock().await.remove(&tx_id);
         });
     }
 
@@ -285,33 +304,49 @@ impl ExecutorHandle {
             }
         }
 
-        // Step 3: Fetch contract data from DataProvider
-        let contract_data = self
+        // Step 3: Fetch the token asset under the token partition (defect D3:
+        // the data store is addressed by the partition key, not the env id).
+        let token = self
             .data_provider
-            .get_data(&transaction.token_id, &self.env_id)
+            .get_token(&transaction.token_id, &self.partition_id)
             .map_err(ExecutorError::Data)?;
 
-        // Step 4: Fetch user data (sender info) from DataProvider
-        let _user_data = self
+        // Step 4: Fetch the sender's protocol state (defect D6: the fetched
+        // user data is the execution input, no longer discarded).
+        let user = self
             .data_provider
-            .get_data(&transaction.sender, &self.env_id)
+            .get_user(&transaction.sender, &self.partition_id)
             .map_err(ExecutorError::Data)?;
 
-        // Step 5: Execute the contract with the transaction payload
-        let execution_output = self.execute_contract(&transaction, &contract_data)?;
+        // Step 5: Execute the contract via its selected engine (defect D1:
+        // real dispatch replaces the identity stub). A contract-level failure
+        // (unknown engine, missing contract, gas exhaustion, revert) fails the
+        // transaction with the engine's reason — the tx transitions to `Failed`,
+        // it is not just an early return.
+        let execution_output = match self.execute_contract(&transaction, &token, &user) {
+            Ok(output) => output,
+            Err(ExecutorError::Validation(reasons)) => {
+                if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
+                    entry.transition_to_failed(transaction.clone(), reasons.clone());
+                }
+                return Err(ExecutorError::Validation(reasons));
+            }
+            Err(e) => return Err(e),
+        };
 
         // Step 6: Create intermediate result. The output hash is computed
         // BEFORE validation (step 7): `validate_execution_result` rejects an
         // empty `result_hash`, so hashing must precede it — the old ordering
         // validated an always-empty hash and failed every execution.
-        let mut final_result = ExecutionResult {
+        let final_result = ExecutionResult {
             transaction_id: tx_id.to_string(),
-            result_data: execution_output.clone(),
-            result_hash: self.hash_provider.hash(&execution_output),
+            result_data: execution_output.result_data.clone(),
+            result_hash: self.hash_provider.hash(&execution_output.result_data),
+            gas_used: execution_output.gas_used,
         };
 
         // Step 7: Validate execution results
-        let validation_result = self.validate_execution_result(&transaction, &final_result);
+        let validation_result = validate_execution_result(&transaction, &final_result);
         if let Err(reasons) = validation_result {
             // Transition to Failed state
             if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
@@ -359,26 +394,41 @@ impl ExecutorHandle {
         Ok(final_result)
     }
 
-    /// Execute contract logic with the transaction payload.
+    /// Execute the contract for `tx` on `token` via its selected engine
+    /// (defect D1: real dispatch replaces the identity stub).
     ///
-    /// In production, this would:
-    /// - Decode the contract bytecode/ABI from `contract_data`
-    /// - Run the contract with the transaction as input
-    /// - Return the execution output
-    ///
-    /// Currently a stub — returns the transaction body as the "execution output".
+    /// The token's `asset_data` is the deployed [`SmartContract`] (deterministic
+    /// 1:1 contract-token model, ADR-014). The engine is chosen per token by
+    /// [`select_engine`] (ADR-011): the `contract_engine` metadata key names the
+    /// engine, non-contract tokens default to `"Transfer"`, and contract tokens
+    /// without a key fail closed.
     fn execute_contract(
         &self,
-        _tx: &Transaction,
-        _contract_data: &[u8],
-    ) -> Result<Vec<u8>, ExecutorError> {
-        // Stub: serialize the transaction as the execution result.
-        // Production: invoke contract bytecode, return computed output.
-        let _ = _contract_data;
+        tx: &Transaction,
+        token: &Token,
+        user: &User,
+    ) -> Result<ExecutionOutput, ExecutorError> {
+        // The token asset is the deployed contract (1:1 model, ADR-014).
+        // Fail closed if the token carries no contract asset.
+        let contract: SmartContract = token
+            .get_asset::<SmartContract>()
+            .ok_or_else(|| {
+                ExecutorError::Validation(vec![ValidationFailureReason::ContractNotFound])
+            })?;
 
-        // TODO: decode and execute contract bytecode
-        // For now, return a minimal success marker
-        Ok(serialize_to_bytes_rmp(_tx).map_err(ExecutorError::Encoding)?)
+        // Per-token engine selection (ADR-011).
+        let engine = select_engine(&self.contract_engine_registry, token)?;
+
+        // Build the canonical execution input (the fetched user state is the
+        // sender state — defect D6) and run the engine.
+        let input = ExecutionInput {
+            tx,
+            contract: &contract,
+            sender_state: user,
+            token,
+            gas_limit: tx.gas_limit,
+        };
+        engine.execute(&input).map_err(ExecutorError::from)
     }
 
     /// Get the finalizer public key from the transaction's validation result.
@@ -394,25 +444,6 @@ impl ExecutorHandle {
             Err(_) => {}
         }
         vec![]
-    }
-
-    /// Validate execution results against expected constraints.
-    fn validate_execution_result(
-        &self,
-        _tx: &Transaction,
-        result: &ExecutionResult,
-    ) -> Result<(), Vec<ValidationFailureReason>> {
-        let mut reasons = vec![];
-
-        if result.result_hash.is_empty() {
-            reasons.push(ValidationFailureReason::ContractNotFound);
-        }
-
-        if !reasons.is_empty() {
-            return Err(reasons);
-        }
-
-        Ok(())
     }
 
     /// Send the execution result to the Finalizers.
@@ -508,6 +539,57 @@ impl ExecutorHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Execution-result validation
+// ---------------------------------------------------------------------------
+
+/// Validate an execution result against the transaction and the engine's
+/// post-conditions. Pure function of the tx + result (no executor state), so
+/// both the runtime path and the tests share one definition.
+///
+/// Checks:
+/// 1. `result_data` is non-empty (the engine produced an output).
+/// 2. `result_hash` is non-empty (the vote is taken over the hash).
+/// 3. `gas_used` respects the sender-declared `gas_limit` (0 = no cap).
+/// 4. Engine-specific: if `result_data` decodes as a canonical
+///    [`TransferDelta`], its fields must agree with the transaction.
+fn validate_execution_result(
+    tx: &Transaction,
+    result: &ExecutionResult,
+) -> Result<(), Vec<ValidationFailureReason>> {
+    let mut reasons: Vec<ValidationFailureReason> = Vec::new();
+
+    if result.result_data.is_empty() {
+        reasons.push(ValidationFailureReason::ContractExecutionFailed);
+    }
+    if result.result_hash.is_empty() {
+        reasons.push(ValidationFailureReason::MissingResultHash);
+    }
+    if tx.gas_limit > 0 && result.gas_used > tx.gas_limit {
+        reasons.push(ValidationFailureReason::GasLimitExceeded);
+    }
+
+    // Transfer post-condition: decode the canonical delta (if it is one) and
+    // check the fields agree with the transaction. Non-transfer outputs (e.g.
+    // the Spec engine) simply do not decode as a `TransferDelta` and skip this
+    // check.
+    if let Ok(delta) = deserialize_rmp_to::<TransferDelta>(&result.result_data) {
+        if delta.amount != tx.amount.unwrap_or(0)
+            || delta.sender != tx.sender
+            || delta.receiver != tx.receiver
+            || delta.token_id != tx.token_id
+        {
+            reasons.push(ValidationFailureReason::InvalidAmount);
+        }
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ExecutionResult — output from contract execution
 // ---------------------------------------------------------------------------
 
@@ -521,6 +603,9 @@ pub struct ExecutionResult {
     pub result_data: Vec<u8>,
     /// SHA-256 hash of the result data
     pub result_hash: Vec<u8>,
+    /// Metered gas cost from the engine (0 = not metered / legacy).
+    #[serde(default)]
+    pub gas_used: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +654,12 @@ impl From<PneumaticError> for ExecutorError {
     }
 }
 
+impl From<ContractError> for ExecutorError {
+    fn from(e: ContractError) -> Self {
+        ExecutorError::Validation(e.to_failure_reasons())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -576,6 +667,7 @@ impl From<PneumaticError> for ExecutorError {
 #[cfg(test)]
 mod tests {
     pub mod helpers;
+    mod dispatch;
     mod lifecycle;
     mod signing;
     mod validation;

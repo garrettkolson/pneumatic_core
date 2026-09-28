@@ -77,6 +77,8 @@ pub(crate) fn build_role_plugin(
                 pending_registry,
                 hash_provider,
                 100,
+                env_data.token_partition_id.clone(),
+                env_data.contract_engines.clone(),
             );
             Some(Box::new(executor))
         }

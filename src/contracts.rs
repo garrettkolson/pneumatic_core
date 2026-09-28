@@ -266,13 +266,19 @@ pub const TRANSFER_BASE_COST: u64 = 21_000;
 
 /// The canonical transfer delta encoded into `result_data` by
 /// [`TransferEngine`].
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
-struct TransferDelta<'a> {
-    token_id: &'a [u8],
-    sender: &'a [u8],
-    receiver: &'a [u8],
-    amount: u64,
-    sequence_number: usize,
+///
+/// Public and owned so the executor's `validate_execution_result`
+/// post-condition (and the committer's apply path) can decode the exact
+/// `result_data` bytes and check them against the transaction. The owned
+/// `Vec<u8>` fields serialize to the same rmp `binary` bytes as the former
+/// borrowed form, so the wire encoding is unchanged.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TransferDelta {
+    pub token_id: Vec<u8>,
+    pub sender: Vec<u8>,
+    pub receiver: Vec<u8>,
+    pub amount: u64,
+    pub sequence_number: usize,
 }
 
 /// Standard-token transfer engine (name: `"Transfer"`).
@@ -305,9 +311,9 @@ impl ContractEngine for TransferEngine {
             ));
         }
         let delta = TransferDelta {
-            token_id: &input.tx.token_id,
-            sender: &input.tx.sender,
-            receiver: &input.tx.receiver,
+            token_id: input.tx.token_id.clone(),
+            sender: input.tx.sender.clone(),
+            receiver: input.tx.receiver.clone(),
             amount,
             sequence_number: input.tx.sequence_number,
         };
@@ -813,9 +819,9 @@ mod tests {
         assert_eq!(out.gas_used, TRANSFER_BASE_COST);
         // The result must be exactly the canonical delta encoding.
         let expected = TransferDelta {
-            token_id: &tx.token_id,
-            sender: &tx.sender,
-            receiver: &tx.receiver,
+            token_id: tx.token_id.clone(),
+            sender: tx.sender.clone(),
+            receiver: tx.receiver.clone(),
             amount: 50,
             sequence_number: 7,
         };

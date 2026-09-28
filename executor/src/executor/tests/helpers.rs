@@ -113,6 +113,30 @@ pub fn make_test_data_provider() -> Arc<dyn DataProvider> {
     Arc::new(DefaultDataProvider::new())
 }
 
+/// A contract engine registry with the Tier-1 defaults (`Transfer`, `Spec`).
+pub fn make_test_engine_registry() -> Arc<pneumatic_core::contracts::ContractEngineRegistry> {
+    let registry = Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new());
+    registry.register_defaults();
+    registry
+}
+
+/// Build an `Executor` with the standard test fixtures. Tests that need a
+/// custom pending registry or a pre-registered peer build inline instead.
+pub fn make_test_executor(max_in_flight: usize) -> Executor {
+    Executor::new(
+        "test_env".to_string(),
+        vec![1, 2, 3, 4],
+        Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
+        make_test_node_registry(),
+        make_test_data_provider(),
+        make_test_pending_registry(),
+        make_test_hash_provider(),
+        max_in_flight,
+        "token".to_string(),
+        make_test_engine_registry(),
+    )
+}
+
 // -----------------------------------------------------------------------
 // Phase 1.1 regression: Execute dispatch signed with node identity
 // -----------------------------------------------------------------------

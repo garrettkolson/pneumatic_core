@@ -194,10 +194,18 @@ fn role_config(identity: &Arc<NodeIdentity>) -> Config {
 /// (the strict linkage check requires an empty `previous_hash` on an empty
 /// chain).
 fn standard_token() -> Token {
+    // In the 1:1 contract-token model (ADR-014) a standard executed token
+    // carries its contract as asset data — the executor's dispatch reads it.
+    let contract = pneumatic_core::tokens::SmartContract {
+        name: "standard".to_string(),
+        bytecode: vec![1, 2, 3],
+        version: "1".to_string(),
+    };
     let mut token = Token::new();
     token.id = TOKEN_ID.to_vec();
     token.is_self_verified = false;
     token.block_validation_spec_name = "Executed".to_string();
+    token.set_asset(&contract).unwrap();
     token
 }
 
@@ -522,6 +530,13 @@ async fn e2e_standard_pipeline_commits_over_rns() {
         .collect(),
     };
 
+    /// Contract engine registry with the Tier-1 defaults (`Transfer`, `Spec`).
+    fn make_engine_registry() -> Arc<pneumatic_core::contracts::ContractEngineRegistry> {
+        let registry = Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new());
+        registry.register_defaults();
+        registry
+    }
+
     /// Per-node data provider: token + sender user + stake snapshots for
     /// epochs 0 and 1 (the finalizer reads epoch 0; the sentinel's
     /// `current_epoch` defaults to 1) + the executor's `get_data` payloads
@@ -641,6 +656,8 @@ async fn e2e_standard_pipeline_commits_over_rns() {
         Arc::new(PendingTransactionRegistry::new()),
         Arc::new(BasicHashProvider::new()),
         100,
+        PARTITION.to_string(),
+        make_engine_registry(),
     ));
     let e2_executor = Arc::new(Executor::new(
         ENV_ID.to_string(),
@@ -651,6 +668,8 @@ async fn e2e_standard_pipeline_commits_over_rns() {
         Arc::new(PendingTransactionRegistry::new()),
         Arc::new(BasicHashProvider::new()),
         100,
+        PARTITION.to_string(),
+        make_engine_registry(),
     ));
 
     // --- Finalizers F1, F2 (both on N_FIN). Registry peers: both executors

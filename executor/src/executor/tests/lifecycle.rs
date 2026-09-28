@@ -6,21 +6,7 @@ use super::super::*;
 
 #[tokio::test]
 async fn test_executor_creation() {
-    let node_registry = make_test_node_registry();
-    let data_provider = make_test_data_provider();
-    let pending_registry = make_test_pending_registry();
-    let hash_provider = make_test_hash_provider();
-
-    let executor = Executor::new(
-        "test_env".to_string(),
-        vec![1, 2, 3, 4],
-        Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
-        node_registry,
-        data_provider,
-        pending_registry,
-        hash_provider,
-        10,
-    );
+    let executor = make_test_executor(10);
 
     assert!(!executor.is_at_capacity().await);
     assert_eq!(executor.in_flight_count().await, 0);
@@ -28,27 +14,12 @@ async fn test_executor_creation() {
 
 #[tokio::test]
 async fn test_executor_at_capacity() {
-    let node_registry = make_test_node_registry();
-    let data_provider = make_test_data_provider();
-    let pending_registry = make_test_pending_registry();
-    let hash_provider = make_test_hash_provider();
-
-    let executor = Executor::new(
-        "test_env".to_string(),
-        vec![1, 2, 3, 4],
-        Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
-        node_registry,
-        data_provider,
-        pending_registry,
-        hash_provider,
-        1,
-    );
+    let executor = make_test_executor(1);
 
     assert!(!executor.is_at_capacity().await);
 
-    // Manually simulate a task being in-flight
-    let task_results = Arc::new(DashMap::new());
-    executor.preload_tasks.lock().await.insert("test_tx_001".to_string(), task_results);
+    // Manually hold a backpressure slot to simulate a task being in-flight.
+    executor.active_tasks.lock().await.insert("test_tx_001".to_string());
 
     assert!(executor.is_at_capacity().await);
     assert_eq!(executor.in_flight_count().await, 1);
@@ -88,6 +59,8 @@ async fn test_executor_backpressure_rejects() {
         pending_registry,
         hash_provider,
         0, // max_in_flight = 0, always at capacity
+        "token".to_string(),
+        make_test_engine_registry(),
     );
 
     let result = executor.preload_for_transaction("capacity_tx").await;
@@ -102,21 +75,7 @@ async fn test_executor_backpressure_rejects() {
 
 #[tokio::test]
 async fn test_executor_rejects_nonexistent_transaction() {
-    let node_registry = make_test_node_registry();
-    let data_provider = make_test_data_provider();
-    let pending_registry = make_test_pending_registry();
-    let hash_provider = make_test_hash_provider();
-
-    let executor = Executor::new(
-        "test_env".to_string(),
-        vec![1, 2, 3, 4],
-        Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
-        node_registry,
-        data_provider,
-        pending_registry,
-        hash_provider,
-        100,
-    );
+    let executor = make_test_executor(100);
 
     let result = executor.preload_for_transaction("nonexistent_tx").await;
     assert!(result.is_err());
@@ -143,6 +102,8 @@ async fn test_executor_rejects_transaction_in_terminal_state() {
         pending_registry.clone(),
         hash_provider,
         100,
+        "token".to_string(),
+        make_test_engine_registry(),
     );
 
     // Add a transaction in Failed state
@@ -177,25 +138,10 @@ async fn test_executor_rejects_transaction_in_terminal_state() {
 
 #[tokio::test]
 async fn test_executor_cleanup_removes_task() {
-    let node_registry = make_test_node_registry();
-    let data_provider = make_test_data_provider();
-    let pending_registry = make_test_pending_registry();
-    let hash_provider = make_test_hash_provider();
+    let executor = make_test_executor(10);
 
-    let executor = Executor::new(
-        "test_env".to_string(),
-        vec![1, 2, 3, 4],
-        Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory()),
-        node_registry,
-        data_provider,
-        pending_registry,
-        hash_provider,
-        10,
-    );
-
-    // Manually add a task
-    let task_results = Arc::new(DashMap::new());
-    executor.preload_tasks.lock().await.insert("cleanup_test".to_string(), task_results);
+    // Manually hold a backpressure slot.
+    executor.active_tasks.lock().await.insert("cleanup_test".to_string());
 
     assert_eq!(executor.in_flight_count().await, 1);
 
@@ -245,11 +191,13 @@ async fn full_backpressure_cycle() {
         pending_registry,
         hash_provider,
         1, // capacity of 1
+        "token".to_string(),
+        make_test_engine_registry(),
     );
 
-    // First preload should succeed (slot available)
-    let result_a = executor.preload_for_transaction("bp_tx_a").await;
-    assert!(result_a.is_ok());
+    // Hold a slot manually to keep the cycle deterministic — a spawned task
+    // settles too quickly to observe now that slots free on settle (defect D4).
+    executor.active_tasks.lock().await.insert("bp_tx_a".to_string());
     assert_eq!(executor.in_flight_count().await, 1);
     assert!(executor.is_at_capacity().await);
 
@@ -262,13 +210,12 @@ async fn full_backpressure_cycle() {
         panic!("Expected AtCapacity error, got {:?}", result_b);
     }
 
-    // Cleanup the first task frees a slot
+    // Cleanup frees the slot
     executor.preload_cleanup("bp_tx_a").await;
     assert_eq!(executor.in_flight_count().await, 0);
     assert!(!executor.is_at_capacity().await);
 
-    // Now the second preload should succeed
+    // Now the second preload should be admitted (a slot is free)
     let result_b = executor.preload_for_transaction("bp_tx_b").await;
     assert!(result_b.is_ok());
-    assert_eq!(executor.in_flight_count().await, 1);
 }

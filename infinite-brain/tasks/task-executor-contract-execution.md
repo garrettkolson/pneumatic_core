@@ -50,7 +50,7 @@ source_url: "plans/executor-contract-execution-implementation-plan.md"
 Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014). Plan:
 `plans/executor-contract-execution-implementation-plan.md`. Status: **in progress**
-— Phase 2 complete (09/28/2026).
+— Phase 3 complete (09/28/2026).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -80,8 +80,26 @@ Phase checklist (each phase's exit criteria live in the plan):
   an immediate-only emit would make the arithmetic ops unreachable. Determinism
   property test: 25 seeded random cases × both engines × 4 runs (plain ×2, tokio
   current-thread, tokio multi-thread) byte-identical. Core suite 558 → 572.
-- **P3** — stub replacement: dispatch by `contract_engine` metadata; fix the
-  partition-key defect and the backpressure slot leak (facts above).
+- **P3 ✅ (09/28/2026)** — stub replacement: real `execute_contract` dispatch,
+  real `validate_execution_result`, and the D3/D4/D6 defect fixes. Landed in
+  `executor/src/executor.rs`: `execute_contract` resolves the token's
+  `SmartContract` asset (fail-closed `ContractNotFound`), selects the engine via
+  `select_engine` (ADR-011), and runs it over `ExecutionInput` (the fetched
+  sender state is the input — D6). `validate_execution_result` is now a pure
+  module-scope free function (non-empty `result_data`/`result_hash`,
+  `gas_used ≤ gas_limit` when capped, `TransferDelta` post-condition). **D3**:
+  fetch under `token_partition_id` — new `partition_id` field threaded from
+  `env_data.token_partition_id` in `node-server/.../plugins.rs`. **D4**:
+  backpressure slots free on settle — `active_tasks` (slots, `HashSet`) is
+  separated from `preload_tasks` (results, persist until `preload_cleanup`), so
+  `Err` outcomes are recorded (`Result<ExecutionResult, String>`) and the slot
+  is released in the spawned task; a contract-level failure transitions the tx
+  to `Failed` with the engine's reasons. `ExecutionResult` carries `gas_used`;
+  a token must carry a `SmartContract` asset (ADR-014). New tests: 4 dispatch
+  tests (happy-path computed `result_hash` + Sign vote over it, failure→`Failed`,
+  D4 slot-free, D3 partition key) + 5 `validate_execution_result` unit tests;
+  `pipeline_integration` (full wire test) passes with the real dispatch. Core
+  572, executor 17, workspace `cargo test` green.
 - **P4** — safety bounds: instruction budget vs `gas_limit`, wall-clock timeout,
   panic isolation, `GasExhausted` → `Failed` (ADR-013).
 - **P5** — on-chain deployment: `DeployContract` action, deterministic token id,
