@@ -8,7 +8,7 @@ summary: "Executor::execute_contract is a documented stub that serializes the tx
 auto_inject: false
 applicable_when: "Planning real contract execution, reviewing what the executor actually computes today, or assessing optimism-path risk"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "09/28/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Done/stale when execute_contract performs real bytecode decoding/execution — grep executor/src/executor.rs for 'TODO: decode and execute contract bytecode'"
 tags: [executor, contract-execution, stub, todo]
@@ -21,6 +21,10 @@ edges:
     type: related_to
     weight: 0.7
     note: "Until this lands, the output that optimistic finality commits is the stubbed tx serialization, not contract state"
+  - target: task-executor-contract-execution
+    type: followed_by
+    weight: 0.8
+    note: "Superseded by the full implementation task once the stub is replaced (plan Phase 3)"
 related: []
 source_url: "Empty"
 ---
@@ -34,3 +38,5 @@ Genuinely documented pending work in the executor crate — the only TODO found 
 - The downstream pipeline is real and tests it faithfully: the result is validated, SHA-256-hashed, and the optimistic finalizer path commits a block built on this stubbed output, so the stub's semantics (output = tx bytes) are what the finalizer's `build_signed_transaction_optimistic` currently operates on.
 
 Implication: end-to-end pipeline behavior (routing, signatures, quorum, block formation) is fully exercised, but the *computation* itself is identity-like. Landing real bytecode execution here is a semantic change to everything the finalizer commits.
+
+**Status: planned** (09/28/2026). Design decisions are locked — ADR-011 (engine model), ADR-012 (calldata), ADR-013 (read-only executor + gas), ADR-014 (contract model); the implementation is tracked by `task-executor-contract-execution` per `plans/executor-contract-execution-implementation-plan.md`. This node remains the staleness marker until `execute_contract` performs real execution.

@@ -1,6 +1,7 @@
 # Executor Implementation Plan — Real Contract Execution
 
-Status: proposal for review (2026-09-27)
+Status: **P0 complete** (2026-09-28) — all decisions Q1–Q6 approved
+(2026-09-27/28, Garrett Olson); ADR-011–014 recorded in the vault; Phase 1 unblocked
 Scope: `pneumatic_executor` crate + minimal `pneumatic_core` substrate. The executor
 role's *plumbing* already works end-to-end (verified below); this plan implements the
 missing *computation* — real, deterministic contract execution — and fixes the wiring
@@ -58,7 +59,9 @@ defects that make the executor non-functional in production.
    metadata }` (`src/tokens.rs:493-510`), minted via `TokenFactory::mint_contract_token`
    (metadata `token_type = "contract"`). The executor's `contract_data` fetch
    (L289-292) is exactly this blob. `ProxyAuthorization` (contract proxy access) also
-   exists and is unused.
+   exists and is unused. The lifecycle policy for this model is now an explicit
+   decision (Q6 below): contract-as-token, on-chain deployment, Model X
+   cross-contract calls, multisig+timelock upgrades.
 3. **State model.** Global `User { public_key, fuel_balance, stake, nonce }`
    (`src/user.rs:6-15`) + per-token `Account { public_key, balance }` stored in
    `Token.asset_data`. All state lives in the external data service behind
@@ -96,16 +99,29 @@ and determinism audit burden, and it solves a Tier-2 need; (b) fixed
 transfer-only logic — cannot honor the existing `SmartContract`/`bytecode` model or the
 "decode and execute contract bytecode" TODO.
 
+**Approved 2026-09-27.** Sub-decisions locked: engines live in `pneumatic_core`
+(shared by all roles); per-token selection via the token metadata key
+`contract_engine`.
+
 ### Q2 — Calldata
 
 **Recommended: add `payload: Vec<u8>` to `Transaction`**, additive with
-`#[serde(default)]` (Ground Rule 4). Non-contract txs keep `payload = vec![]` and every
-canonical byte sequence derived from existing tx shapes stays unchanged. Contract calls
-carry their input in `payload`; `action` names the entry point (e.g. `"Transfer"`,
-`"ContractCall"`); `amount` is the value moved.
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]` (Ground Rule 4 — the
+skip-if-empty is what keeps every existing tx byte-identical on the wire). Contract
+calls carry their input in `payload`; `action` names the entry point (e.g.
+`"Transfer"`, `"ContractCall"`); `amount` is the value moved. Two refinements:
+`payload` joins `CanonicalTransaction` (the sender's signature must cover calldata —
+without it a relay can swap calldata on a signed tx), and a sentinel-enforced size cap
+(env-configurable, a few KB) bounds the DoS surface and feeds gas (Q3). Client
+convention: `tx.id` derived from the canonical form *including* payload, so
+calldata-differing txs never collide in the registry.
 
-*Alternative rejected:* encoding calldata in `action`/`amount` — unbounded, lossy, and
-breaks the canonical-transaction signing model's clarity.
+*Alternatives rejected:* encoding calldata in `action`/`amount` (overloads a routing
+key, unbounded, lossy); sidecar calldata outside the tx (not covered by the sender
+signature — malleability hole); deferring the field until `SpecEngine` needs it
+(same exercise done twice).
+
+**Approved 2026-09-27.**
 
 ### Q3 — Gas / resource bounds
 
@@ -141,9 +157,49 @@ all roles can parse/verify it. It occupies `SmartContract.bytecode` (rmp-encoded
 is fully deterministic by construction. The format is documented as an ADR and versioned
 (first byte = format version).
 
-*Alternative:* Wasm now — see Q1.
+*Alternative:* Wasm now — see Q1. Note the ISA is designed to accommodate Model X
+cross-contract calls (Q6/C4): `Call` and snapshot-ref instructions are reserved in the
+format, implemented in Phase 7.
 
----
+### Q6 — Contract model & lifecycle
+
+**Approved 2026-09-27** (contract-as-token confirmed; on-chain deployment,
+cross-contract calls, and upgrade governance promoted from "future" to in-scope):
+
+- **C1 — Ontology: contract ≡ contract token (1:1).** One contract = one token = one
+  chain in the block lattice; contract state = the token's `asset_data` (bytecode) +
+  that token's account state. *Rejected:* many contracts inside one token (EVM-style
+  account model) — the pipeline is partitioned per-token end to end.
+- **C2 — On-chain deployment.** A `DeployContract` tx action creates a contract token
+  on-chain (no admin step). The token id is deterministic and derivable before
+  execution: `token_id = H(deployer_pubkey ‖ deployer_nonce ‖ bytecode_hash ‖ name)`
+  (`User.nonce` provides replay protection). Deployment is a protocol op, not contract
+  logic: the executor emits a `CreateToken` state delta (Q4 model) that the data
+  service applies at commit. *Rejected:* admin-gated off-chain genesis.
+- **C3 — Public execution.** Anyone may send a tx to any registered contract token
+  (`token_id` + entry-point `action` + `payload`); effects are constrained by C6.
+  `ProxyAuthorization` remains the (future) inter-contract authorization primitive.
+- **C4 — Cross-contract calls: Model X (snapshot-pinned, non-atomic).** A call from
+  contract A (token T_A) to contract B (token T_B) carries an explicit snapshot ref
+  `B@(height, hash)`; the executor reads B's state at that pinned ref (deterministic
+  across A's shard members); B's side is a cross-referenced tx on B's chain validated
+  against the same ref. A finalizes on its own chain under optimistic finality; if
+  B's side fails, a deterministic revert/compensation tx on A's chain settles it.
+  *Rejected:* two-phase atomic commit — it withholds A's finality until B's finalizes,
+  killing optimistic finality for exactly the tx class being added.
+- **C5 — Upgrades: multisig + timelock.** A contract registers N owner keys; an
+  upgrade tx (new bytecode → new `asset_data`/`asset_hash`) requires M-of-N owner
+  signatures plus a mandatory delay (one epoch) before it applies. Stake-weighted
+  voting is a documented future extension, not a Tier-1 requirement. *Rejected:*
+  admin-gated upgrades; full on-chain voting (a new protocol subsystem).
+- **C6 — Effect scope.** A contract may only move units of *its own* token: state
+  deltas reference that token's accounts, no negative balances (checked at apply
+  time), fuel (`User.fuel_balance`) is untouched.
+
+Follow-on design ADRs (written at the start of each phase, full design):
+**ADR-015** on-chain deployment mechanics, **ADR-016** cross-chain call semantics
+(Model X full design: snapshot-ref validation, revert policy, gas on both chains),
+**ADR-017** upgrade governance (owner registry, M-of-N rules, timelock parameters).
 
 ## 3. Phased implementation
 
@@ -151,12 +207,14 @@ Each phase is independently buildable, testable, and mergeable on top of the las
 
 ### Phase 0 — Lock the decisions (no code)
 
-- Approve Q1–Q5 above (or amend).
-- Write the ADR into the vault: one `decision-*` node for the engine model (Q1/Q5), one
-  for calldata (Q2), one for state semantics (Q4); update
+- Approve Q1–Q6 (status at 2026-09-27: **Q1, Q2, Q4, Q6 approved; Q3, Q5 pending**).
+- Write the ADRs into the vault: `decision-contract-engine-model` (ADR-011, Q1/Q5),
+  `decision-tx-calldata-payload` (ADR-012, Q2), `decision-executor-pure-read-only`
+  (ADR-013, Q3/Q4), `decision-contract-model-lifecycle` (ADR-014, Q6); update
   `task-executor-contract-bytecode` → status "planned"; add a task node for this plan.
 - Record the D3/D4 wiring defects as `fact` nodes (they are independent bugs that ship
   with this work).
+- Execution detail: `plans/executor-p0-decisions-implementation-plan.md`.
 
 **Exit:** decisions approved; vault nodes exist.
 
@@ -259,15 +317,93 @@ timeout load.
 
 **Exit:** no unbounded resource path in the executor; tests green.
 
-### Phase 5 — End-to-end verification + docs
+### Phase 5 — On-chain contract deployment (Q6/C2)
+
+Design ADR first: **ADR-015 — on-chain deployment mechanics** (deterministic token-id
+derivation, bytecode size/format limits, `CreateToken` delta schema, committer →
+data-service apply path, shard selection for a not-yet-existing token id).
+
+Implementation:
+
+- `DeployContract` tx action through the standard pipeline; a sentinel-side
+  `DeployValidationSpec` (bytecode size cap, engine name registered, name rules)
+  fails closed before routing.
+- `DeployEngine` (a protocol op, not contract logic): validates the deployment,
+  computes the deterministic `token_id`, emits `CreateToken { token, contract,
+  initial_state }` as the canonical delta (Q4) — the executor still writes nothing.
+- Data-service apply path at commit: new token record in the token partition
+  (`save_token`), idempotent (re-apply of the same delta is a no-op).
+- Gas: deployment cost = base + f(bytecode size).
+
+Tests: deterministic id (same inputs → same id; replay rejected by nonce); deploy
+e2e through the composite (new token exists in the data service after commit and its
+contract txs then execute); idempotent re-apply.
+
+**Exit:** a contract can be created by a tx, not by an admin; e2e green.
+
+### Phase 6 — Upgrade governance (Q6/C5)
+
+Design ADR first: **ADR-017 — upgrade governance** (owner registry schema, M-of-N
+rules, timelock parameters, interaction with deployment).
+
+Implementation:
+
+- Owner registry in contract metadata (`owners: Vec<PublicKey>`, `threshold: u32`),
+  settable at deployment; an `UpgradeContract` tx action carries new bytecode +
+  owner-set changes (owner-set changes themselves require M-of-N).
+- Upgrade = a `ReplaceAsset` delta (new `asset_data`, new `asset_hash`); the timelock
+  is enforced at the data service at apply time: an upgrade delta only applies at or
+  after proposal epoch + 1 (epoch data from the committer).
+- The sentinel spec validates signature count/quorum; the executor re-validates
+  deterministically (same check, same inputs) so the vote is in the canonical output.
+
+Tests: quorum edges (M-1 sigs rejected, M accepted); timelock (early apply rejected);
+owner-set rotation; a successful upgrade changes the engine behavior of subsequent txs.
+
+**Exit:** upgrades are a governed on-chain act; e2e green.
+
+### Phase 7 — Cross-contract calls, Model X (Q6/C4)
+
+The largest new protocol surface. Design ADR first: **ADR-016 — cross-chain call
+semantics** (snapshot-ref validation, cross-referenced tx schema, deterministic
+revert/compensation policy, gas on both chains, interaction with optimistic finality).
+
+Design constraints fixed by Q6: calls are **non-atomic** — A finalizes on its own
+chain under optimistic finality; B's side is a separate tx on B's chain; failure on
+B's side settles via a deterministic compensation on A's chain.
+
+Implementation:
+
+- ISA extension: `Call(target_token, entry_point, payload, snapshot_ref)` — the
+  executor resolves B's state at `snapshot_ref` (height + block hash, validated
+  against B's chain) and executes B's engine in the same call frame under a
+  sub-budget.
+- B's side: a cross-referenced tx on B's chain carrying `commitment =
+  H(A_tx_id ‖ A_result_hash ‖ snapshot_ref)`; B's sentinel validates the reference;
+  the committer applies B's state changes at/after the pinned ref.
+- Failure: if B's side reverts/fails, A's contract logic observes the deterministic
+  failure result (a call returning an error); an optional compensation delta on A's
+  chain per the contract's declared policy.
+- Both sides charge gas; A's gas budget bounds B's sub-execution.
+
+Tests: snapshot pinning (B's chain advances between two A executors → identical A
+result); revert policy (B-side failure → A settles deterministically); cross-shard
+determinism for calling txs; finality independence (A finalizes without B's side
+finalizing).
+
+**Exit:** Model X semantics implemented and pinned by e2e + determinism tests.
+
+### Phase 8 — End-to-end verification + docs
 
 - **node-server composite e2e** (extend `node-server/src/node_server/tests/e2e.rs`):
   full pipeline `Sentinel Verify → Executor Preload → Finalizer Sign → Committer
-  Commit` for (a) a standard transfer tx and (b) a `SpecEngine` contract tx, asserting
-  the committed block's `result_hash` equals an independently computed
-  `hash(engine_output)`. This is the test that proves the executor "functions".
+  Commit` for (a) a standard transfer tx, (b) a `SpecEngine` contract tx, (c) a
+  deployment tx, (d) a cross-contract call — asserting each committed block's
+  `result_hash` equals an independently computed `hash(engine_output)`. This is the
+  test that proves the executor "functions".
 - **Cross-executor determinism test** (two `Executor` instances, same shard inputs →
-  identical `result_hash` and identical `"Sign"` votes) — the sharding invariant.
+  identical `result_hash` and identical `"Sign"` votes) — the sharding invariant,
+  including a calling tx.
 - Update `TASKS.md` (executor tail), README (Outstanding section), and the vault:
   `task-executor-contract-bytecode` → done/stale per its staleness signal; update
   `concept-executor-role` (pipeline steps changed), add event node; bump
@@ -275,11 +411,11 @@ timeout load.
 
 **Exit:** e2e green; docs + vault current.
 
-### Phase 6 — (Optional, Tier-2) Wasm engine
+### Phase 9 — (Optional, Tier-2) Wasm engine
 
 A `WasmEngine` implementing `ContractEngine` (wasmi, no-std-friendly, deterministic
 feature set only) so third-party `SmartContract.bytecode` can be Wasm. Separate plan;
-blocked on nothing in Phases 1–5.
+blocked on nothing in Phases 1–8.
 
 ---
 
@@ -292,20 +428,30 @@ blocked on nothing in Phases 1–5.
 | `result_hash` semantics change what blocks commit | All downstream block hashes change (intended) | This is the point of the work; e2e test pins the new semantics |
 | D3 partition fix changes what the executor can see | Executions that "worked" on mis-keyed data (they didn't — D3 makes them fail) | D3 is a fix, not a behavior change, against any real data service |
 | Engine bugs (overflow, gas accounting) | Failed txs, wasted gas | Fails closed to `Failed` state; no vote emitted on any engine error |
-| Scope creep toward a full EVM | Slip | Tier-1 ISA is closed and small; Wasm is explicitly Phase 6 |
+| Scope creep toward a full EVM | Slip | Tier-1 ISA is closed and small; Wasm is explicitly Phase 9; Q6 bounds the contract model (no cross-token effects, C6) |
+| Cross-chain snapshot drift (B's state moves between A's execution and B's apply) | Nondeterministic A results → same-parent conflicts, slashing (ADR-008) | Model X pins `B@(height, hash)` inside the call; A's execution reads only the pinned ref; ADR-016 defines the validation |
+| Non-atomic call failure leaves A and B inconsistent | User-visible broken state | Deterministic revert/compensation policy in ADR-016; contracts must be written to tolerate partial failure (documented constraint) |
+| Governance (multisig/timelock) key management | Upgrades blocked by lost keys | Out of protocol scope (documented); M-of-N is the floor, stake-weighted voting is the documented extension |
 
 ## 5. Effort estimate (rough)
 
-- P0: decisions only.
+- P0: decisions only (one session).
 - P1: 1–2 days (core module + wire field + literals).
 - P2: 2–3 days (two engines + ISA doc + property tests).
 - P3: 1–2 days (dispatch + D3/D4 fixes + executor tests).
 - P4: 0.5–1 day.
-- P5: 1 day (e2e + docs + vault).
-- P6: separate estimate.
+- P5 (on-chain deployment): 2–3 days incl. ADR-015 design.
+- P6 (upgrade governance): 2–3 days incl. ADR-017 design.
+- P7 (cross-contract calls, Model X): 5+ days incl. ADR-016 design — highest design risk.
+- P8: 1–2 days (e2e + docs + vault).
+- P9: separate estimate.
+
+Total: **~3–4 weeks** including the design ADRs (the base engine, P1–P4 + P8, is the
+original ~6–9 days).
 
 ## 6. Standing vault duties (per CLAUDE.md)
 
 Update on landing: `task-executor-contract-bytecode` (close), `concept-executor-role`
-(pipeline steps), `decision-*` new nodes (P0), `fact-*` nodes for D3/D4,
-`roadmap-phase-status`, `_system/INDEX.md`, one log node per significant landing.
+(pipeline steps), `decision-*` new nodes (P0: ADR-011–014; then ADR-015/017/016 at
+the start of P5/P6/P7), `fact-*` nodes for D3/D4, `roadmap-phase-status`,
+`_system/INDEX.md`, one log node per significant landing.
