@@ -50,7 +50,7 @@ source_url: "plans/executor-contract-execution-implementation-plan.md"
 Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014). Plan:
 `plans/executor-contract-execution-implementation-plan.md`. Status: **in progress**
-— Phase 1 complete (09/28/2026).
+— Phase 2 complete (09/28/2026).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -64,8 +64,22 @@ Phase checklist (each phase's exit criteria live in the plan):
   `payload` + `gas_limit` on `Transaction` (skip-if-empty/zero, byte-identical
   legacy wire — regression-tested) joining `CanonicalTransaction` (sender signs
   calldata — regression-tested). Workspace `cargo test` green; core suite 558.
-- **P2** — `TransferEngine` + `SpecEngine` (versioned rmp ISA) + determinism
-  property tests (ADR-011).
+- **P2 ✅ (09/28/2026)** — `TransferEngine` + `SpecEngine` (versioned rmp ISA) +
+  determinism property tests (ADR-011). Landed in `src/contracts.rs`:
+  `TransferEngine` (validates amount, emits canonical rmp delta
+  `(token_id, sender, receiver, amount, sequence_number)`; `TRANSFER_BASE_COST =
+  21000`, `gas_limit == 0` = no cap); `SpecEngine` interpreter over
+  `InstructionProgram { version: 1, ops }` — closed ISA `LoadTx(field)`,
+  `LoadConst`, `Add`/`Sub`/`Mul`/`Mod` (checked — overflow/underflow/mod-zero
+  revert), `Cmp` (1 >, 2 ==, 3 <), `Select`, `Emit` (pops stack top → 8-byte LE
+  `result_data`; last emit wins), `Halt` (implicit at end of program); byte fields
+  load as first ≤ 8 bytes, left-zero-padded, big-endian; gas = instruction count.
+  Per-token selection: `select_engine()` — `contract_engine` metadata key, default
+  `Transfer` for non-contract tokens, contract tokens without a key fail closed.
+  Deviation from plan text: `Emit` pops the stack (plan wrote `Emit(value)`);
+  an immediate-only emit would make the arithmetic ops unreachable. Determinism
+  property test: 25 seeded random cases × both engines × 4 runs (plain ×2, tokio
+  current-thread, tokio multi-thread) byte-identical. Core suite 558 → 572.
 - **P3** — stub replacement: dispatch by `contract_engine` metadata; fix the
   partition-key defect and the backpressure slot leak (facts above).
 - **P4** — safety bounds: instruction budget vs `gas_limit`, wall-clock timeout,

@@ -8,7 +8,7 @@ summary: "Pluggable native ContractEngine trait selected per token by name (spec
 auto_inject: false
 applicable_when: "Choosing, adding, or modifying contract execution engines, the ISA, or per-token engine selection"
 confidence: 0.95
-verified_at: "09/27/2026"
+verified_at: "09/28/2026"
 verified_by: "Garrett Olson"
 staleness_signal: "Stale when a Wasm engine lands in Tier-1, the registry selection changes, or engines move out of pneumatic_core"
 tags: [adr, design-decision, contract-execution, engine, determinism, is-a]
@@ -67,3 +67,16 @@ model and the `executor.rs:386` TODO).
 
 **Sub-decisions locked**: engines live in `pneumatic_core` (shared by all roles);
 per-token selection via token metadata key `contract_engine`.
+
+**Phase-2 ISA reference (implemented 09/28/2026, `src/contracts.rs`)**: bytecode
+is the rmp serialization of `InstructionProgram { version: 1, ops: Vec<Op> }`
+(version ≠ 1 → `BadBytecode`). Stack machine, all values `u64`; binary ops pop
+`a` (top) then `b` and compute `b <op> a`. `LoadTx` fields: `amount`,
+`sequence_number`, `gas_limit` (as `u64`); `sender`/`receiver`/`token_id`/
+`payload` (first ≤ 8 bytes, left-zero-padded, big-endian). `Add`/`Sub`/`Mul`
+checked (overflow/underflow revert), `Mod` (zero divisor reverts), `Cmp`
+(pushes 1 if `b > a`, 2 if equal, 3 if `b < a`), `Select` (pops cond, b, a → a if
+cond ≠ 0 else b), `Emit` (pops top → 8-byte little-endian `result_data`; last
+emit wins), `Halt` (implicit at program end). Gas = instruction count against
+`gas_limit` (`0` = no cap; `GasExhausted` → `Failed`, no vote). `TransferEngine`
+cost = `TRANSFER_BASE_COST` = 21000.

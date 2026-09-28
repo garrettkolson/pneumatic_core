@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::{PneumaticError, ValidationFailureReason};
 use crate::tokens::{SmartContract, Token};
@@ -250,20 +250,39 @@ impl ContractEngineRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Tier-1 built-in engines (ADR-011)
+// Tier-1 built-in engines (ADR-011, Phase 2)
 //
-// Phase-1 placeholders: the trait, registry, and environment wiring are the
-// Phase-1 scope; the real interpreter/transfer logic lands in Phase 2 of the
-// executor contract-execution plan. Both are fail-closed — they *refuse* to
-// produce output rather than returning identity-like data (the D1 stub
-// problem this plan exists to remove).
+// Both engines are pure functions of [`ExecutionInput`] (ADR-008): no clock,
+// no RNG, no I/O, no host-dependent behavior. Each counts its own work against
+// `input.gas_limit` (ADR-013 stage 2) and reports `gas_used`.
 // ---------------------------------------------------------------------------
+
+/// Base protocol cost of a standard token transfer (ADR-013 cost table).
+///
+/// A declared `gas_limit` below this value fails closed with
+/// [`ContractError::GasExhausted`]; `gas_limit == 0` means *no cap declared*
+/// (legacy plain transfers) and is never enforced.
+pub const TRANSFER_BASE_COST: u64 = 21_000;
+
+/// The canonical transfer delta encoded into `result_data` by
+/// [`TransferEngine`].
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+struct TransferDelta<'a> {
+    token_id: &'a [u8],
+    sender: &'a [u8],
+    receiver: &'a [u8],
+    amount: u64,
+    sequence_number: usize,
+}
 
 /// Standard-token transfer engine (name: `"Transfer"`).
 ///
-/// Phase-2 scope: validate `amount` (overflow-safe) and emit the canonical
-/// delta `(token_id, sender, receiver, amount, sequence_number)` as
-/// `result_data`.
+/// Validates `amount` (presence + non-zero; a `u64` cannot overflow, so the
+/// validation is presence-only) and encodes the canonical delta
+/// `(token_id, sender, receiver, amount, sequence_number)` as rmp-canonical
+/// `result_data`. This is the standard-token semantics and the replacement
+/// for the executor's identity stub on non-contract transactions (Phase 3
+/// wires the dispatch).
 pub struct TransferEngine;
 
 impl ContractEngine for TransferEngine {
@@ -271,16 +290,94 @@ impl ContractEngine for TransferEngine {
         "Transfer"
     }
 
-    fn execute(&self, _input: &ExecutionInput) -> Result<ExecutionOutput, ContractError> {
-        Err(ContractError::EngineNotImplemented("Transfer".to_string()))
+    fn execute(&self, input: &ExecutionInput) -> Result<ExecutionOutput, ContractError> {
+        // Protocol cost table: a fixed base cost, checked against the
+        // sender-declared cap (0 = no cap).
+        if input.gas_limit > 0 && TRANSFER_BASE_COST > input.gas_limit {
+            return Err(ContractError::GasExhausted);
+        }
+        let amount = input.tx.amount.ok_or_else(|| {
+            ContractError::InvalidInput("transfer requires an amount".to_string())
+        })?;
+        if amount == 0 {
+            return Err(ContractError::InvalidInput(
+                "transfer amount must be non-zero".to_string(),
+            ));
+        }
+        let delta = TransferDelta {
+            token_id: &input.tx.token_id,
+            sender: &input.tx.sender,
+            receiver: &input.tx.receiver,
+            amount,
+            sequence_number: input.tx.sequence_number,
+        };
+        let result_data = crate::encoding::serialize_to_bytes_rmp(&delta)
+            .map_err(|e| ContractError::InvalidInput(format!("canonical encode failed: {}", e)))?;
+        Ok(ExecutionOutput::new(result_data, TRANSFER_BASE_COST))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Spec-AST instruction set (ADR-011 / Q5)
+//
+// The versioned rmp instruction AST stored in `SmartContract.bytecode`.
+// Closed ISA — `Call` is reserved for Phase 7 (cross-contract).
+// ---------------------------------------------------------------------------
+
+/// The versioned instruction AST stored in `SmartContract.bytecode`.
+///
+/// Bytecode is the rmp-canonical serialization of this struct. Only
+/// `version == 1` is supported; anything else fails closed with
+/// [`ContractError::BadBytecode`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct InstructionProgram {
+    pub version: u32,
+    pub ops: Vec<Op>,
+}
+
+/// The closed Phase-2 instruction set.
+///
+/// Stack machine semantics (all values are `u64`): for the binary arithmetic
+/// ops, `a` is the stack top and `b` the value beneath it, and the result is
+/// `b <op> a` (e.g. `LoadConst(10); LoadConst(3); Sub` pushes `7`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Op {
+    /// Push a transaction field. Fields: `amount`, `sequence_number`,
+    /// `gas_limit` (pushed as `u64`); `sender`, `receiver`, `token_id`,
+    /// `payload` (byte fields, pushed as the first ≤ 8 bytes, left-zero-
+    /// padded to 8, read big-endian). An unknown field name reverts.
+    LoadTx(String),
+    /// Push a compile-time constant.
+    LoadConst(u64),
+    /// Pop `a`, `b`; push `b + a`. Overflow reverts.
+    Add,
+    /// Pop `a`, `b`; push `b - a`. Underflow reverts.
+    Sub,
+    /// Pop `a`, `b`; push `b * a`. Overflow reverts.
+    Mul,
+    /// Pop `a`, `b`; push `b % a`. `a == 0` reverts.
+    Mod,
+    /// Pop `a`, `b`; push `1` if `b > a`, `2` if `b == a`, `3` if `b < a`.
+    Cmp,
+    /// Pop `cond`, `b`, `a`; push `a` if `cond != 0`, else `b`.
+    Select,
+    /// Pop the stack top; set `result_data` to its 8-byte little-endian
+    /// encoding. May be used multiple times — the last `Emit` wins.
+    Emit,
+    /// Halt successfully. Reaching the end of the program is an implicit
+    /// `Halt`.
+    Halt,
 }
 
 /// Spec-AST engine (name: `"Spec"`): interprets the versioned rmp instruction
 /// AST stored in `SmartContract.bytecode` (ADR-011 / Q5).
 ///
-/// Phase-2 scope: `LoadTx`, `LoadConst`, `Add`/`Sub`/`Mul`/`Mod` (overflow =
-/// revert), `Cmp`, `Select`, `Emit`, `Halt`; instruction count is the gas meter.
+/// Gas (ADR-013 stage 2): each executed instruction costs one unit against
+/// `input.gas_limit`; exceeding the cap returns [`ContractError::GasExhausted`].
+/// `gas_limit == 0` means no cap. All arithmetic is checked — overflow,
+/// underflow, and modulo-by-zero revert the execution (fail closed, no
+/// wrapping).
 pub struct SpecEngine;
 
 impl ContractEngine for SpecEngine {
@@ -288,9 +385,165 @@ impl ContractEngine for SpecEngine {
         "Spec"
     }
 
-    fn execute(&self, _input: &ExecutionInput) -> Result<ExecutionOutput, ContractError> {
-        Err(ContractError::EngineNotImplemented("Spec".to_string()))
+    fn execute(&self, input: &ExecutionInput) -> Result<ExecutionOutput, ContractError> {
+        let program: InstructionProgram =
+            crate::encoding::deserialize_rmp_to(&input.contract.bytecode)
+                .map_err(|e| ContractError::BadBytecode(format!("undecodable AST: {}", e)))?;
+        if program.version != 1 {
+            return Err(ContractError::BadBytecode(format!(
+                "unsupported program version {}",
+                program.version
+            )));
+        }
+
+        let mut stack: Vec<u64> = Vec::new();
+        let mut result_data: Vec<u8> = Vec::new();
+        let mut gas_used: u64 = 0;
+
+        for op in &program.ops {
+            // Instruction-counted gas meter: every op costs one unit.
+            if input.gas_limit > 0 && gas_used >= input.gas_limit {
+                return Err(ContractError::GasExhausted);
+            }
+            gas_used += 1;
+
+            match op {
+                Op::LoadTx(field) => {
+                    stack.push(load_tx_field(input, field)?);
+                }
+                Op::LoadConst(n) => stack.push(*n),
+                Op::Add => {
+                    let (a, b) = pop_two(&mut stack, "add")?;
+                    stack.push(b.checked_add(a).ok_or_else(|| {
+                        ContractError::Reverted("addition overflow".to_string())
+                    })?);
+                }
+                Op::Sub => {
+                    let (a, b) = pop_two(&mut stack, "sub")?;
+                    stack.push(b.checked_sub(a).ok_or_else(|| {
+                        ContractError::Reverted("subtraction underflow".to_string())
+                    })?);
+                }
+                Op::Mul => {
+                    let (a, b) = pop_two(&mut stack, "mul")?;
+                    stack.push(b.checked_mul(a).ok_or_else(|| {
+                        ContractError::Reverted("multiplication overflow".to_string())
+                    })?);
+                }
+                Op::Mod => {
+                    let (a, b) = pop_two(&mut stack, "mod")?;
+                    if a == 0 {
+                        return Err(ContractError::Reverted("modulo by zero".to_string()));
+                    }
+                    stack.push(b % a);
+                }
+                Op::Cmp => {
+                    let (a, b) = pop_two(&mut stack, "cmp")?;
+                    let r = if b > a {
+                        1
+                    } else if b == a {
+                        2
+                    } else {
+                        3
+                    };
+                    stack.push(r);
+                }
+                Op::Select => {
+                    let cond = pop_one(&mut stack, "select")?;
+                    let b = pop_one(&mut stack, "select")?;
+                    let a = pop_one(&mut stack, "select")?;
+                    stack.push(if cond != 0 { a } else { b });
+                }
+                Op::Emit => {
+                    let value = pop_one(&mut stack, "emit")?;
+                    result_data = value.to_le_bytes().to_vec();
+                }
+                Op::Halt => break,
+            }
+        }
+
+        Ok(ExecutionOutput::new(result_data, gas_used))
     }
+}
+
+/// Pop one value; an empty stack reverts (malformed program, fail closed).
+fn pop_one(stack: &mut Vec<u64>, op: &str) -> Result<u64, ContractError> {
+    stack
+        .pop()
+        .ok_or_else(|| ContractError::Reverted(format!("\"{}\": stack underflow", op)))
+}
+
+/// Pop two values, returning `(a, b)` where `a` is the former top.
+fn pop_two(stack: &mut Vec<u64>, op: &str) -> Result<(u64, u64), ContractError> {
+    let a = pop_one(stack, op)?;
+    let b = pop_one(stack, op)?;
+    Ok((a, b))
+}
+
+/// Resolve a [`Op::LoadTx`] field name to a `u64`.
+///
+/// Byte fields (`sender`, `receiver`, `token_id`, `payload`) are reduced to
+/// the first ≤ 8 bytes, left-zero-padded to 8, read big-endian — a fixed,
+/// host-independent reduction so every executor computes the same value.
+fn load_tx_field(input: &ExecutionInput, field: &str) -> Result<u64, ContractError> {
+    let tx = input.tx;
+    match field {
+        "amount" => tx
+            .amount
+            .ok_or_else(|| ContractError::Reverted("load_tx: amount is not set".to_string())),
+        "sequence_number" => Ok(tx.sequence_number as u64),
+        "gas_limit" => Ok(input.gas_limit),
+        "sender" => Ok(bytes_to_u64(&tx.sender)),
+        "receiver" => Ok(bytes_to_u64(&tx.receiver)),
+        "token_id" => Ok(bytes_to_u64(&tx.token_id)),
+        "payload" => Ok(bytes_to_u64(&tx.payload)),
+        other => Err(ContractError::Reverted(format!(
+            "load_tx: undeclared field \"{}\"",
+            other
+        ))),
+    }
+}
+
+/// First ≤ 8 bytes, left-zero-padded to 8, big-endian `u64`.
+fn bytes_to_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = std::cmp::min(8, bytes.len());
+    buf[8 - n..].copy_from_slice(&bytes[..n]);
+    u64::from_be_bytes(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Per-token engine selection (ADR-011 sub-decision 2)
+// ---------------------------------------------------------------------------
+
+/// Select the engine for `token` from `registry` (ADR-011).
+///
+/// Rule: the token metadata key `contract_engine` names the engine. Tokens
+/// that are not contract tokens (`token_type != "contract"`) default to
+/// `"Transfer"`. Contract tokens must name a registered engine — anything
+/// else fails closed with [`ContractError::UnknownEngine`].
+pub fn select_engine(
+    registry: &ContractEngineRegistry,
+    token: &Token,
+) -> Result<Arc<dyn ContractEngine>, ContractError> {
+    let is_contract_token = token
+        .metadata
+        .get("token_type")
+        .map(|v| v == "contract")
+        .unwrap_or(false);
+    let name = match token.metadata.get("contract_engine") {
+        Some(name) => name.clone(),
+        None if is_contract_token => {
+            return Err(ContractError::UnknownEngine(format!(
+                "contract token {:?} must declare a 'contract_engine' metadata key",
+                token.id
+            )));
+        }
+        None => "Transfer".to_string(),
+    };
+    registry
+        .get(&name)
+        .ok_or_else(|| ContractError::UnknownEngine(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -464,29 +717,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_phase1_placeholders_fail_closed() {
+    fn registry_defaults_are_live_engines() {
+        // Phase 2: the built-ins are real engines, not fail-closed stubs.
         let registry = ContractEngineRegistry::new();
         registry.register_defaults();
         let tx = test_tx();
         let contract = test_contract();
         let user = test_user();
         let token = test_token();
-        let input = ExecutionInput {
-            tx: &tx,
-            contract: &contract,
-            sender_state: &user,
-            token: &token,
-            gas_limit: 100,
-        };
-        for name in ["Transfer", "Spec"] {
-            let engine = registry.get(name).unwrap();
-            let err = engine.execute(&input).unwrap_err();
-            assert!(
-                matches!(err, ContractError::EngineNotImplemented(_)),
-                "phase-1 placeholder must fail closed, got {:?}",
-                err
-            );
-        }
+        let input = exec_input(&tx, &contract, &user, &token, 0); // no cap
+        // Transfer executes a well-formed transfer (test_tx has an amount).
+        let transfer = registry.get("Transfer").unwrap();
+        let out = transfer.execute(&input).expect("transfer executes");
+        assert!(!out.result_data.is_empty());
+        assert_eq!(out.gas_used, TRANSFER_BASE_COST);
+        // Spec with malformed bytecode fails closed (test_contract has 0xAB 0xCD).
+        let spec = registry.get("Spec").unwrap();
+        let err = spec.execute(&input).unwrap_err();
+        assert!(matches!(err, ContractError::BadBytecode(_)), "got {:?}", err);
     }
 
     #[test]
@@ -530,5 +778,534 @@ mod tests {
         // would silently drop the chain field from `Token::new`.
         let _chain = Blockchain::new();
         let _ = _chain;
+    }
+
+    // --- Phase 2: TransferEngine ---
+
+    fn exec_input<'a>(
+        tx: &'a Transaction,
+        contract: &'a SmartContract,
+        user: &'a User,
+        token: &'a Token,
+        gas_limit: u64,
+    ) -> ExecutionInput<'a> {
+        ExecutionInput {
+            tx,
+            contract,
+            sender_state: user,
+            token,
+            gas_limit,
+        }
+    }
+
+    #[test]
+    fn transfer_engine_happy_path_emits_canonical_delta() {
+        let registry = ContractEngineRegistry::new();
+        registry.register_defaults();
+        let engine = registry.get("Transfer").unwrap();
+        let tx = test_tx();
+        let contract = test_contract();
+        let user = test_user();
+        let token = test_token();
+        let input = exec_input(&tx, &contract, &user, &token, 0);
+
+        let out = engine.execute(&input).expect("transfer executes");
+        assert_eq!(out.gas_used, TRANSFER_BASE_COST);
+        // The result must be exactly the canonical delta encoding.
+        let expected = TransferDelta {
+            token_id: &tx.token_id,
+            sender: &tx.sender,
+            receiver: &tx.receiver,
+            amount: 50,
+            sequence_number: 7,
+        };
+        let expected_bytes =
+            crate::encoding::serialize_to_bytes_rmp(&expected).expect("rmp");
+        assert_eq!(out.result_data, expected_bytes);
+    }
+
+    #[test]
+    fn transfer_engine_rejects_missing_and_zero_amount() {
+        let engine = TransferEngine;
+        let contract = test_contract();
+        let user = test_user();
+        let token = test_token();
+
+        let mut no_amount = test_tx();
+        no_amount.amount = None;
+        let in1 = exec_input(&no_amount, &contract, &user, &token, 0);
+        assert!(matches!(
+            engine.execute(&in1),
+            Err(ContractError::InvalidInput(_))
+        ));
+
+        let mut zero_amount = test_tx();
+        zero_amount.amount = Some(0);
+        let in2 = exec_input(&zero_amount, &contract, &user, &token, 0);
+        assert!(matches!(
+            engine.execute(&in2),
+            Err(ContractError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_engine_gas_cap_enforced() {
+        let engine = TransferEngine;
+        let tx = test_tx();
+        let contract = test_contract();
+        let user = test_user();
+        let token = test_token();
+
+        // 0 = no cap declared → executes.
+        assert!(engine
+            .execute(&exec_input(&tx, &contract, &user, &token, 0))
+            .is_ok());
+        // Cap exactly at the base cost → executes.
+        assert!(engine
+            .execute(&exec_input(
+                &tx,
+                &contract,
+                &user,
+                &token,
+                TRANSFER_BASE_COST
+            ))
+            .is_ok());
+        // Cap below the base cost → GasExhausted (fail closed).
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &contract, &user, &token, 1_000)),
+            Err(ContractError::GasExhausted)
+        ));
+    }
+
+    // --- Phase 2: SpecEngine ---
+
+    fn program_bytes(ops: Vec<Op>) -> Vec<u8> {
+        crate::encoding::serialize_to_bytes_rmp(&InstructionProgram {
+            version: 1,
+            ops,
+        })
+        .expect("program rmp")
+    }
+
+    fn spec_contract(bytecode: Vec<u8>) -> SmartContract {
+        SmartContract {
+            name: "spec-contract".to_string(),
+            bytecode,
+            version: "1".to_string(),
+        }
+    }
+
+    #[test]
+    fn spec_engine_happy_path_arithmetic_and_emit() {
+        let engine = SpecEngine;
+        let tx = test_tx();
+        let user = test_user();
+        let token = test_token();
+        let bytecode = program_bytes(vec![
+            Op::LoadConst(7),
+            Op::LoadConst(6),
+            Op::Mul,
+            Op::Emit,
+            Op::Halt,
+        ]);
+        let out = engine
+            .execute(&exec_input(&tx, &spec_contract(bytecode), &user, &token, 0))
+            .expect("spec executes");
+        assert_eq!(out.result_data, 42u64.to_le_bytes());
+        assert_eq!(out.gas_used, 5);
+    }
+
+    #[test]
+    fn spec_engine_gas_exhausted_at_cap() {
+        let engine = SpecEngine;
+        let tx = test_tx();
+        let user = test_user();
+        let token = test_token();
+        // 3 instructions; a cap of 2 lets two run and exhausts on the third.
+        let bytecode = program_bytes(vec![Op::LoadConst(1), Op::LoadConst(2), Op::Add, Op::Emit]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(bytecode), &user, &token, 2)),
+            Err(ContractError::GasExhausted)
+        ));
+        // A cap of 4 covers all four instructions.
+        assert!(engine
+            .execute(&exec_input(&tx, &spec_contract(program_bytes(vec![
+                Op::LoadConst(1),
+                Op::LoadConst(2),
+                Op::Add,
+                Op::Emit
+            ])), &user, &token, 4))
+            .is_ok());
+    }
+
+    #[test]
+    fn spec_engine_malformed_bytecode_fails_closed() {
+        let engine = SpecEngine;
+        let tx = test_tx();
+        let user = test_user();
+        let token = test_token();
+
+        // Garbage bytes: undecodable AST.
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(vec![0xFF, 0x01, 0x02]), &user, &token, 0)),
+            Err(ContractError::BadBytecode(_))
+        ));
+        // Decodable but unsupported version.
+        let bad_version =
+            crate::encoding::serialize_to_bytes_rmp(&InstructionProgram {
+                version: 2,
+                ops: vec![Op::Halt],
+            })
+            .expect("rmp");
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(bad_version), &user, &token, 0)),
+            Err(ContractError::BadBytecode(_))
+        ));
+    }
+
+    #[test]
+    fn spec_engine_checked_arithmetic_reverts() {
+        let engine = SpecEngine;
+        let tx = test_tx();
+        let user = test_user();
+        let token = test_token();
+
+        // Addition overflow.
+        let overflow = program_bytes(vec![
+            Op::LoadConst(u64::MAX),
+            Op::LoadConst(1),
+            Op::Add,
+            Op::Emit,
+        ]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(overflow), &user, &token, 0)),
+            Err(ContractError::Reverted(_))
+        ));
+        // Subtraction underflow.
+        let underflow = program_bytes(vec![
+            Op::LoadConst(1),
+            Op::LoadConst(2),
+            Op::Sub,
+            Op::Emit,
+        ]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(underflow), &user, &token, 0)),
+            Err(ContractError::Reverted(_))
+        ));
+        // Modulo by zero.
+        let mod_zero = program_bytes(vec![
+            Op::LoadConst(5),
+            Op::LoadConst(0),
+            Op::Mod,
+            Op::Emit,
+        ]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(mod_zero), &user, &token, 0)),
+            Err(ContractError::Reverted(_))
+        ));
+        // Stack underflow (binary op with one value).
+        let underflow_stack = program_bytes(vec![Op::LoadConst(1), Op::Add, Op::Emit]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(underflow_stack), &user, &token, 0)),
+            Err(ContractError::Reverted(_))
+        ));
+        // Undeclared LoadTx field.
+        let bad_field = program_bytes(vec![Op::LoadTx("nonce".to_string()), Op::Emit]);
+        assert!(matches!(
+            engine.execute(&exec_input(&tx, &spec_contract(bad_field), &user, &token, 0)),
+            Err(ContractError::Reverted(_))
+        ));
+    }
+
+    #[test]
+    fn spec_engine_cmp_select_control_flow() {
+        let engine = SpecEngine;
+        let tx = test_tx();
+        let user = test_user();
+        let token = test_token();
+        // Cmp: push 10, push 3 → a=3 (top), b=10 → b > a → 1.
+        let cmp = program_bytes(vec![
+            Op::LoadConst(10),
+            Op::LoadConst(3),
+            Op::Cmp,
+            Op::Emit,
+            Op::Halt,
+        ]);
+        let out = engine
+            .execute(&exec_input(&tx, &spec_contract(cmp), &user, &token, 0))
+            .expect("spec executes");
+        assert_eq!(out.result_data, 1u64.to_le_bytes());
+
+        // Select, cond != 0 → picks `a`: push a=7, b=99, cond=1 (cond is the
+        // stack top) → 7.
+        let sel_true = program_bytes(vec![
+            Op::LoadConst(7),
+            Op::LoadConst(99),
+            Op::LoadConst(1),
+            Op::Select,
+            Op::Emit,
+            Op::Halt,
+        ]);
+        let out = engine
+            .execute(&exec_input(&tx, &spec_contract(sel_true), &user, &token, 0))
+            .expect("spec executes");
+        assert_eq!(out.result_data, 7u64.to_le_bytes());
+        assert_eq!(out.gas_used, 6);
+
+        // Select, cond == 0 → picks `b`: push a=7, b=99, cond=0 → 99.
+        let sel_false = program_bytes(vec![
+            Op::LoadConst(7),
+            Op::LoadConst(99),
+            Op::LoadConst(0),
+            Op::Select,
+            Op::Emit,
+            Op::Halt,
+        ]);
+        let out = engine
+            .execute(&exec_input(&tx, &spec_contract(sel_false), &user, &token, 0))
+            .expect("spec executes");
+        assert_eq!(out.result_data, 99u64.to_le_bytes());
+    }
+
+    #[test]
+    fn spec_engine_last_emit_wins_and_loadtx_fields() {
+        let engine = SpecEngine;
+        let user = test_user();
+        let token = test_token();
+        let mut tx = test_tx();
+        tx.amount = Some(42);
+        tx.sequence_number = 5;
+        // amount=42, seq=5 → cmp(5, 42): b=42? pop a=5 (top), b=42 → 42 > 5 → 1.
+        // Emit the cmp result (1), then Emit the amount (42) — last emit wins.
+        let bytecode = program_bytes(vec![
+            Op::LoadTx("amount".to_string()),
+            Op::LoadTx("sequence_number".to_string()),
+            Op::Cmp,
+            Op::Emit,
+            Op::LoadTx("amount".to_string()),
+            Op::Emit,
+            Op::Halt,
+        ]);
+        let out = engine
+            .execute(&exec_input(&tx, &spec_contract(bytecode), &user, &token, 0))
+            .expect("spec executes");
+        assert_eq!(out.result_data, 42u64.to_le_bytes());
+    }
+
+    // --- Phase 2: per-token engine selection ---
+
+    #[test]
+    fn select_engine_default_transfer_for_plain_tokens() {
+        let registry = ContractEngineRegistry::new();
+        registry.register_defaults();
+        let mut token = test_token();
+        token.metadata.remove("token_type"); // plain token, no contract_engine key
+        let engine = select_engine(&registry, &token).expect("default engine");
+        assert_eq!(engine.name(), "Transfer");
+    }
+
+    #[test]
+    fn select_engine_uses_metadata_key_when_present() {
+        let registry = ContractEngineRegistry::new();
+        registry.register_defaults();
+        let mut token = test_token();
+        token
+            .metadata
+            .insert("contract_engine".to_string(), "Spec".to_string());
+        let engine = select_engine(&registry, &token).expect("named engine");
+        assert_eq!(engine.name(), "Spec");
+    }
+
+    #[test]
+    fn select_engine_contract_token_without_key_fails_closed() {
+        let registry = ContractEngineRegistry::new();
+        registry.register_defaults();
+        let token = test_token(); // token_type = "contract", no contract_engine key
+        assert!(matches!(
+            select_engine(&registry, &token),
+            Err(ContractError::UnknownEngine(_))
+        ));
+    }
+
+    #[test]
+    fn select_engine_unregistered_name_fails_closed() {
+        let registry = ContractEngineRegistry::new();
+        registry.register_defaults();
+        let mut token = test_token();
+        token
+            .metadata
+            .insert("contract_engine".to_string(), "Wasm".to_string());
+        assert!(matches!(
+            select_engine(&registry, &token),
+            Err(ContractError::UnknownEngine(_))
+        ));
+    }
+
+    // --- Phase 2: determinism property tests (ADR-008) ---
+    //
+    // Random (tx, contract, user, token, gas_limit) inputs executed repeatedly
+    // — twice plainly, once on a tokio current-thread runtime, once on a
+    // multi-thread runtime — must yield byte-identical `result_data`. A
+    // divergence would mean a non-pure engine (host-dependent iteration order,
+    // RNG, clock, I/O) and a consensus fork.
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn random_bytes(rng: &mut StdRng, max_len: usize) -> Vec<u8> {
+        let len = rng.gen_range(0..=max_len);
+        (0..len).map(|_| rng.gen::<u8>()).collect()
+    }
+
+    /// A random, well-formed program: never underflows the stack; ends in
+    /// Emit (when possible) + Halt.
+    fn random_program(rng: &mut StdRng) -> Vec<Op> {
+        const FIELDS: [&str; 7] = [
+            "amount", "sequence_number", "gas_limit", "sender", "receiver", "token_id", "payload",
+        ];
+        let mut ops: Vec<Op> = vec![Op::LoadConst(rng.gen_range(0..1000))];
+        let mut depth = 1usize;
+        for _ in 0..rng.gen_range(2..16) {
+            match rng.gen_range(0..10) {
+                0..=3 => {
+                    ops.push(Op::LoadConst(rng.gen_range(0..1_000_000)));
+                    depth += 1;
+                }
+                4..=5 => {
+                    ops.push(Op::LoadTx(FIELDS[rng.gen_range(0..FIELDS.len())].to_string()));
+                    depth += 1;
+                }
+                6..=8 => {
+                    if depth >= 2 {
+                        ops.push(match rng.gen_range(0..3) {
+                            0 => Op::Add,
+                            1 => Op::Sub,
+                            _ => Op::Mul,
+                        });
+                        depth -= 1;
+                    } else {
+                        ops.push(Op::LoadConst(1));
+                        depth += 1;
+                    }
+                }
+                9 => {
+                    if depth >= 3 {
+                        ops.push(Op::Select);
+                        depth -= 1;
+                    } else if depth >= 2 {
+                        ops.push(Op::Cmp);
+                        depth -= 1;
+                    } else {
+                        ops.push(Op::LoadConst(2));
+                        depth += 1;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        if depth >= 1 {
+            ops.push(Op::Emit);
+        }
+        ops.push(Op::Halt);
+        ops
+    }
+
+    fn random_case(seed: u64) -> (Transaction, SmartContract, User, Token, u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let tx = Transaction {
+            id: format!("dtx-{}", rng.gen::<u32>()),
+            action: "ContractCall".to_string(),
+            token_id: random_bytes(&mut rng, 12),
+            bid: None,
+            sequence_number: rng.gen_range(0..1000),
+            sender: random_bytes(&mut rng, 24),
+            receiver: random_bytes(&mut rng, 24),
+            amount: Some(rng.gen_range(0..10_000)),
+            timestamp: rng.gen_range(1_600_000_000..1_800_000_000),
+            result_hash: vec![],
+            sender_signature: vec![],
+            payload: random_bytes(&mut rng, 32),
+            gas_limit: [0, 5, 50, 1000][rng.gen_range(0..4)],
+        };
+        let contract = SmartContract {
+            name: format!("dcontract-{}", rng.gen::<u32>()),
+            bytecode: program_bytes(random_program(&mut rng)),
+            version: "1".to_string(),
+        };
+        let gas = tx.gas_limit;
+        let user = User {
+            public_key: random_bytes(&mut rng, 32),
+            fuel_balance: rng.gen_range(0..100_000),
+            stake: rng.gen_range(0..1000),
+            nonce: rng.gen_range(0..1000),
+        };
+        let mut token = Token::new();
+        token.id = random_bytes(&mut rng, 16);
+        token
+            .metadata
+            .insert("token_type".to_string(), "contract".to_string());
+        token
+            .metadata
+            .insert("contract_engine".to_string(), "Spec".to_string());
+        (tx, contract, user, token, gas)
+    }
+
+    fn run_case_both_engines(seed: u64) {
+        let (tx, contract, user, token, gas) = random_case(seed);
+        let input = ExecutionInput {
+            tx: &tx,
+            contract: &contract,
+            sender_state: &user,
+            token: &token,
+            gas_limit: gas,
+        };
+        let transfer = TransferEngine;
+        let spec = SpecEngine;
+
+        // Four runs per engine: plain ×2, current-thread tokio, multi-thread tokio.
+        let rt_ct = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let rt_mt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("multi-thread runtime");
+
+        for engine in [
+            &transfer as &dyn ContractEngine,
+            &spec as &dyn ContractEngine,
+        ] {
+            let r1 = engine.execute(&input);
+            let r2 = engine.execute(&input);
+            let r3 = match rt_ct.block_on(async { engine.execute(&input) }) {
+                Ok(o) => Ok(o.clone()),
+                Err(e) => Err(e.clone()),
+            };
+            let r4 = match rt_mt.block_on(async { engine.execute(&input) }) {
+                Ok(o) => Ok(o.clone()),
+                Err(e) => Err(e.clone()),
+            };
+            for (other, label) in [(r2, "plain-2"), (r3, "tokio-ct"), (r4, "tokio-mt")] {
+                assert_eq!(
+                    r1, other,
+                    "seed {} engine {:?}: run 1 != {}",
+                    seed,
+                    engine.name(),
+                    label
+                );
+            }
+        }
+        drop(rt_ct);
+        drop(rt_mt);
+    }
+
+    #[test]
+    fn determinism_property_transfer_and_spec_engines() {
+        // 25 seeded random cases × 2 engines × 4 runs each.
+        for seed in 0..25u64 {
+            run_case_both_engines(seed);
+        }
     }
 }
