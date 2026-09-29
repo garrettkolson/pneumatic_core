@@ -25,6 +25,12 @@ use crate::tokens::{SmartContract, Token};
 use crate::transactions::Transaction;
 use crate::user::User;
 
+// Tier-2 WasmEngine (ADR-018) — lives in `src/contracts/wasm.rs`. Re-exported so it
+// can be registered by name (`"Wasm"`) via the environment spec; NOT in
+// `register_defaults` (opt-in, ADR-018 QW3).
+mod wasm;
+pub use wasm::WasmEngine;
+
 // ---------------------------------------------------------------------------
 // ContractEngine — the pluggable execution trait (ADR-011)
 // ---------------------------------------------------------------------------

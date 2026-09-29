@@ -1,16 +1,16 @@
 ---
 id: task-executor-contract-execution
-title: "Open: implement executor contract execution (plan Phases 1-8)"
+title: "Open: implement executor contract execution (plan Phases 1-10)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-014 per plan Phases 1-8: engine substrate + payload field, Transfer/Spec engines, stub replacement + D3/D4 fixes, gas bounds, on-chain deploy, upgrade governance, Model X calls, e2e."
+summary: "Implement ADR-011-018 per plan Phases 1-10: engine substrate + payload field, Transfer/Spec engines, stub replacement + D3/D4 fixes, gas bounds, Tier-2 WasmEngine (wasmi, P5+P7), on-chain deploy, upgrade governance, Model X calls, e2e."
 auto_inject: false
 applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
 confidence: 0.9
-verified_at: "09/28/2026"
+verified_at: "09/29/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when execute_contract dispatches to a registered ContractEngine, a composite e2e asserts a real result_hash, and Phases 5-7 (deploy/governance/Model X) are landed or re-scoped"
+staleness_signal: "Done when execute_contract dispatches to a registered ContractEngine, a composite e2e asserts a real result_hash, and Phases 6/8/9 (deploy/governance/Model X) + the WasmEngine (P5/P7) are landed or re-scoped"
 tags: [task, executor, contract-execution, implementation, adr-011, adr-014]
 edges:
   - target: decision-contract-engine-model
@@ -28,7 +28,11 @@ edges:
   - target: decision-contract-model-lifecycle
     type: depends_on
     weight: 0.85
-    note: "Phases 5-7 implement deployment, governance, and Model X calls"
+    note: "Phases 6/8/9 implement deployment, governance, and Model X calls"
+  - target: decision-wasm-engine-tier2
+    type: depends_on
+    weight: 0.9
+    note: "Phases 5 (core) + 7 (storage) implement the Tier-2 WasmEngine"
   - target: concept-executor-role
     type: part_of
     weight: 0.9
@@ -45,12 +49,14 @@ related: ["[[Open: executor contract execution is a stub (TODO at executor.rs:38
 source_url: "plans/executor-contract-execution-implementation-plan.md"
 ---
 
-# Open: implement executor contract execution (plan Phases 1-8)
+# Open: implement executor contract execution (plan Phases 1-10)
 
 Implementation task for the approved contract-execution design (decisions locked
-09/27-09/28/2026, ADR-011–014). Plan:
-`plans/executor-contract-execution-implementation-plan.md`. Status: **in progress**
-— Phase 4 complete (09/28/2026).
+09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
+`plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
+`plans/wasm-engine-design.md`. Status: **in progress** — Phase 5 complete
+(09/29/2026); the Tier-2 WasmEngine **core** is landed (Phases 5; 7 = W3 storage
+remains).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -120,13 +126,47 @@ Phase checklist (each phase's exit criteria live in the plan):
   stale reads in consensus-critical deterministic execution are dangerous).
   Operational limits (max_in_flight, timeout, gas cap) documented in README.
   Core 572, executor 20, workspace `cargo test` green.
-- **P5** — on-chain deployment: `DeployContract` action, deterministic token id,
-  `CreateToken` delta, committer apply (ADR-015 design first).
-- **P6** — upgrade governance: owner registry, M-of-N multisig, 1-epoch timelock
-  (ADR-017 design first).
-- **P7** — Model X cross-contract calls: snapshot-pinned `Call`, cross-referenced
-  tx on B's chain, deterministic revert/compensation (ADR-016 design first).
-- **P8** — composite e2e + cross-executor determinism tests + docs + vault closeout.
+- **P5 ✅ (09/29/2026)** — **WasmEngine core (Tier-2)** (ADR-018). Landed in
+  `pneumatic_core::contracts::wasm` (new `src/contracts/wasm.rs`; `mod wasm` +
+  `pub use wasm::WasmEngine` in `contracts.rs`; re-exported, name `"Wasm"`,
+  **opt-in** — NOT in `register_defaults`, so `select_engine` and the default engine
+  set are unchanged). `wasmi` pinned to **`1.1.0`** with
+  `default-features = false, features = ["std"]` — the `wat`/`wast`/`wasm-encoder` 2.x
+  dependency chain (MSRV 1.88; we're on 1.87) is excluded because we consume binary
+  WASM only, never WAT text. **Gas = WASM fuel** (ADR-013): `gas_limit` is the fuel
+  budget (`0` ⇒ `u64::MAX` unbounded), an out-of-fuel trap
+  (`TrapCode::OutOfFuel`) → `GasExhausted`, and `gas_used = budget − get_fuel()`.
+  **Frozen ABI**: the module exports `__alloc(size)->ptr` +
+  `execute(input_ptr,input_len,output_ptr,output_cap)->output_len`; the host allocates
+  both buffers, writes the canonical `ExecutionInput` bytes in, and reads
+  `result_data` from the output buffer (bounds-checked). **Sandbox**: only the `env`
+  namespace is imported, and only the allow-listed W2 read-only host fns
+  (`tx_amount`, `tx_sequence`, `sender_fuel`, `tx_payload_len`, `tx_payload`,
+  `revert`); any other namespace or import → `BadBytecode` before instantiation.
+  `revert` traps with a `HostError` marker (`downcast_ref`) → `Reverted`. **`f32`/
+  `f64` disallowed** on the ABI boundary (export func/global signatures checked;
+  imports are enforced by type-matching against the integer-only host fns). **Caps**
+  (protocol-tunable): module ≤ 1 MiB, linear memory ≤ 32 MiB (post-call check; fuel
+  metering is the primary bound on memory growth). Determinism: pure-Rust interpreter
+  (no JIT), pinned runtime, state pinned to the execution-time snapshot (Model-X
+  invariant). Six committed fixtures (`src/contracts/wasm_fixtures/*.wasm`, built by
+  `compile.sh` with `--crate-type cdylib`): W1 sum (exact canonical output), W2
+  `tx_amount`, revert, forbidden-import, f32-export, fuel-loop. 10 new tests incl.
+  cross-executor determinism (plain / tokio current-thread / tokio multi-thread
+  byte-identical). Core 572 → 582; workspace `cargo test` green.
+- **P6** — on-chain deployment: `DeployContract` action, deterministic token id,
+  `CreateToken` delta, committer apply — engine-agnostic (Spec + Wasm) (ADR-015 design
+  first).
+- **P7** — **WasmEngine state & storage (W3)**: per-contract `sload`/`sstore`,
+  storage delta in `result_data`, committer apply, storage gas + cap
+  (ADR-018 / design §7).
+- **P8** — upgrade governance: owner registry, M-of-N multisig, 1-epoch timelock —
+  applies to Wasm modules (ADR-017 design first).
+- **P9** — Model X cross-contract calls: snapshot-pinned `Call` (Spec ISA op) + Wasm
+  `call` host import (W4), cross-referenced tx on B's chain, deterministic
+  revert/compensation (ADR-016 design first).
+- **P10** — composite e2e (incl. a Wasm contract) + cross-executor determinism tests +
+  docs + vault closeout.
 
 Supersedes the narrower scope of `task-executor-contract-bytecode` (stub
 replacement only), which stays open as the staleness marker until the code lands.

@@ -10,7 +10,12 @@ fetched-state fixes); Phase 4 landed (safety hardening — wall-clock
 `tokio::time::timeout` backstop (default 5 s, `PNEUMATIC_EXECUTOR_TIMEOUT_SECS`),
 `spawn_blocking` + `catch_unwind` panic isolation, `ExecutionTimeout` failure reason,
 no unbounded resource path — workspace tests green, core suite 572, executor 20);
-Phase 5 next
+**Tier-2 `WasmEngine` designed** (2026-09-28) — `plans/wasm-engine-design.md` +
+ADR-018: `wasmi`-backed, fuel-metered, sandboxed, frozen-ABI `ContractEngine` for rich
+contract logic, capability tiers W1 compute → W2 read state → W3 storage → W4
+cross-contract; the old "Phase 9 (Optional) Wasm" stub is promoted and restructured
+into Phases 5 (Wasm core) + 7 (Wasm storage), with deployment/governance/Model X/e2e
+renumbered to 6/8/9/10); Phase 5 next
 Scope: `pneumatic_executor` crate + minimal `pneumatic_core` substrate. The executor
 role's *plumbing* already works end-to-end (verified below); this plan implements the
 missing *computation* — real, deterministic contract execution — and fixes the wiring
@@ -326,11 +331,56 @@ timeout load.
 
 **Exit:** no unbounded resource path in the executor; tests green.
 
-### Phase 5 — On-chain contract deployment (Q6/C2)
+### Phase 5 — WasmEngine core (Tier-2)
+
+Design ADR first: **ADR-018 — Tier-2 WasmEngine** (full design in
+`plans/wasm-engine-design.md`). A `WasmEngine` (registry name `"Wasm"`) implementing the
+existing `ContractEngine` trait so `SmartContract.bytecode` can be a WASM module with
+general control flow (loops, branching, real arithmetic, arbitrary-length data) — the
+"rich contract logic" the closed `u64` `SpecEngine` ISA cannot express. It is a
+**registry entry, not the substrate** (ADR-011): no changes to the trait,
+`select_engine`, the executor, or the Phase-4 timeout/panic/sandbox plumbing.
+
+Runtime: **`wasmi`** (pure-Rust interpreter) + `wasm-instrument` (fuel metering).
+Chosen over `wasm3` (native JIT) because the interpreter's determinism is **structural**
+(no host-dependent codegen) and its sandbox/attack surface is far smaller — the
+Polkadot choice. Both are **exact-pinned** as security-sensitive deps.
+
+Implementation (capability tiers **W1 + W2** from the design):
+- `WasmEngine` in `pneumatic_core::contracts` (new `wasm.rs`): deserializes `bytecode`
+  as a WASM module, **validates** it (well-formed, size cap, ABI exports, allowed
+  imports), runs it under fuel metering against `input.gas_limit`, maps WASM fuel →
+  `gas_used`, and reads `result_data` from the ABI output buffer.
+- **Frozen ABI**: the module exports `__alloc` + `execute(input_ptr, input_len) ->
+  output_len`; the host writes `input.canonical_bytes()` in and reads `result_data`
+  out. The ABI + allowed WASM feature set + imports are **versioned and frozen**
+  (consensus-critical: the same module must yield the same `result_hash` forever).
+- **Fuel = gas** (ADR-013): out-of-fuel → `ContractError::GasExhausted` → `Failed`
+  (no vote). Memory pages, module size, storage size, and call depth are capped; the
+  wall-clock backstop (Phase 4) is the safety net, fuel is the deterministic bound.
+- W1 pure computation + **W2 read-only host imports** (`get_balance`,
+  `get_token_metadata`, `get_stake_set`), all **pinned to the execution-time snapshot**
+  (identical across shard members — the Model-X determinism invariant).
+- **`Wasm` is opt-in** via the environment `contract_engines` spec (not in
+  `register_defaults`). `f32`/`f64` are **disallowed** in Tier-1 modules (integer-only,
+  so determinism is airtight).
+
+Tests: **cross-executor determinism** (same module + inputs → identical `result_hash`
+and `"Sign"` votes, across plain / current-thread / multi-thread runtimes); fuel
+exhaustion → `GasExhausted`; malformed module → `BadBytecode`; disallowed import
+rejected; a **canary corpus** of fixed modules → fixed `result_hash` (regression-guards
+the pinned runtime).
+
+**Exit:** `Wasm` modules execute deterministically and gas-bounded behind the existing
+trait; `cargo test` green.
+
+### Phase 6 — On-chain contract deployment (Q6/C2)
 
 Design ADR first: **ADR-015 — on-chain deployment mechanics** (deterministic token-id
 derivation, bytecode size/format limits, `CreateToken` delta schema, committer →
 data-service apply path, shard selection for a not-yet-existing token id).
+**Engine-agnostic**: deploys both `Spec` (rmp AST) and `Wasm` (module) contracts; the
+Wasm path adds the Phase-5 module validation (well-formed, size, ABI, imports).
 
 Implementation:
 
@@ -346,14 +396,41 @@ Implementation:
 
 Tests: deterministic id (same inputs → same id; replay rejected by nonce); deploy
 e2e through the composite (new token exists in the data service after commit and its
-contract txs then execute); idempotent re-apply.
+contract txs then execute); idempotent re-apply; a **Wasm module deploy** (validated)
+then executes.
 
 **Exit:** a contract can be created by a tx, not by an admin; e2e green.
 
-### Phase 6 — Upgrade governance (Q6/C5)
+### Phase 7 — WasmEngine state & storage (W3)
+
+Makes the WasmEngine **rich**: a **per-contract key/value store** scoped to the
+contract token (within ADR-014 C6's "own token only" effect scope). Design detail in
+`plans/wasm-engine-design.md` §7 (W3) + ADR-018.
+
+Implementation:
+- Storage lives in the contract token's state (a new `Token`/data-service field).
+- Host imports `sload(key) -> value` and `sstore(key, value)` (delete = tombstone).
+- **Writes are not applied in the sandbox**: `sstore` is recorded by the host into a
+  **storage delta** (ordered `(key, value)` pairs + tombstones), rmp-canonicalized and
+  **emitted in `result_data`** alongside any token-transfer delta. The committer
+  applies it at commit (idempotent, exactly like the `CreateToken` delta). The sandbox
+  stays **pure** (ADR-013): it computes, the host records intent, consensus applies.
+- Gas: `sload` costs fuel; `sstore` costs more (new key > overwrite); a per-contract
+  **storage size cap** bounds it.
+
+Tests: storage round-trip is deterministic across two executors; idempotent re-apply of
+a storage delta; size-cap enforcement; a stateful contract (counter/registry) runs
+identically on two executors.
+
+**Exit:** Wasm contracts can hold and mutate their own persistent state; e2e +
+determinism green.
+
+### Phase 8 — Upgrade governance (Q6/C5)
 
 Design ADR first: **ADR-017 — upgrade governance** (owner registry schema, M-of-N
-rules, timelock parameters, interaction with deployment).
+rules, timelock parameters, interaction with deployment). Applies to Wasm modules too
+(an upgrade swaps `asset_data` — the module — under M-of-N + timelock; the frozen ABI
+guarantees old and new modules speak the same interface).
 
 Implementation:
 
@@ -367,15 +444,19 @@ Implementation:
   deterministically (same check, same inputs) so the vote is in the canonical output.
 
 Tests: quorum edges (M-1 sigs rejected, M accepted); timelock (early apply rejected);
-owner-set rotation; a successful upgrade changes the engine behavior of subsequent txs.
+owner-set rotation; a successful upgrade changes the engine behavior of subsequent txs
+(incl. swapping a Wasm module).
 
 **Exit:** upgrades are a governed on-chain act; e2e green.
 
-### Phase 7 — Cross-contract calls, Model X (Q6/C4)
+### Phase 9 — Cross-contract calls, Model X (Q6/C4)
 
 The largest new protocol surface. Design ADR first: **ADR-016 — cross-chain call
 semantics** (snapshot-ref validation, cross-referenced tx schema, deterministic
 revert/compensation policy, gas on both chains, interaction with optimistic finality).
+**Both engines get the capability, expressed per-engine**: `SpecEngine` via an ISA
+`Call` op; `WasmEngine` via the **W4 `call` host import** (design §7) — same
+semantics, one per-engine surface.
 
 Design constraints fixed by Q6: calls are **non-atomic** — A finalizes on its own
 chain under optimistic finality; B's side is a separate tx on B's chain; failure on
@@ -383,7 +464,7 @@ B's side settles via a deterministic compensation on A's chain.
 
 Implementation:
 
-- ISA extension: `Call(target_token, entry_point, payload, snapshot_ref)` — the
+- Cross-contract call: `Call(target_token, entry_point, payload, snapshot_ref)` — the
   executor resolves B's state at `snapshot_ref` (height + block hash, validated
   against B's chain) and executes B's engine in the same call frame under a
   sub-budget.
@@ -393,38 +474,34 @@ Implementation:
 - Failure: if B's side reverts/fails, A's contract logic observes the deterministic
   failure result (a call returning an error); an optional compensation delta on A's
   chain per the contract's declared policy.
-- Both sides charge gas; A's gas budget bounds B's sub-execution.
+- Both sides charge gas; A's gas budget bounds B's sub-execution; a **call nesting
+  depth cap** bounds recursion.
 
 Tests: snapshot pinning (B's chain advances between two A executors → identical A
 result); revert policy (B-side failure → A settles deterministically); cross-shard
 determinism for calling txs; finality independence (A finalizes without B's side
-finalizing).
+finalizing); a Wasm → Wasm `call` round-trip.
 
 **Exit:** Model X semantics implemented and pinned by e2e + determinism tests.
 
-### Phase 8 — End-to-end verification + docs
+### Phase 10 — End-to-end verification + docs
 
 - **node-server composite e2e** (extend `node-server/src/node_server/tests/e2e.rs`):
   full pipeline `Sentinel Verify → Executor Preload → Finalizer Sign → Committer
   Commit` for (a) a standard transfer tx, (b) a `SpecEngine` contract tx, (c) a
-  deployment tx, (d) a cross-contract call — asserting each committed block's
+  `WasmEngine` contract tx (incl. a stateful W3 storage contract), (d) a deployment tx
+  (Spec + Wasm), (e) a cross-contract call — asserting each committed block's
   `result_hash` equals an independently computed `hash(engine_output)`. This is the
   test that proves the executor "functions".
 - **Cross-executor determinism test** (two `Executor` instances, same shard inputs →
   identical `result_hash` and identical `"Sign"` votes) — the sharding invariant,
-  including a calling tx.
+  including a calling tx and a Wasm module.
 - Update `TASKS.md` (executor tail), README (Outstanding section), and the vault:
   `task-executor-contract-bytecode` → done/stale per its staleness signal; update
   `concept-executor-role` (pipeline steps changed), add event node; bump
   `roadmap-phase-status`.
 
 **Exit:** e2e green; docs + vault current.
-
-### Phase 9 — (Optional, Tier-2) Wasm engine
-
-A `WasmEngine` implementing `ContractEngine` (wasmi, no-std-friendly, deterministic
-feature set only) so third-party `SmartContract.bytecode` can be Wasm. Separate plan;
-blocked on nothing in Phases 1–8.
 
 ---
 
@@ -437,7 +514,8 @@ blocked on nothing in Phases 1–8.
 | `result_hash` semantics change what blocks commit | All downstream block hashes change (intended) | This is the point of the work; e2e test pins the new semantics |
 | D3 partition fix changes what the executor can see | Executions that "worked" on mis-keyed data (they didn't — D3 makes them fail) | D3 is a fix, not a behavior change, against any real data service |
 | Engine bugs (overflow, gas accounting) | Failed txs, wasted gas | Fails closed to `Failed` state; no vote emitted on any engine error |
-| Scope creep toward a full EVM | Slip | Tier-1 ISA is closed and small; Wasm is explicitly Phase 9; Q6 bounds the contract model (no cross-token effects, C6) |
+| Scope creep toward a full EVM | Slip | Tier-1 ISA is closed and small; Wasm is a Tier-2 `wasmi` engine (Phases 5/7) with a frozen, restricted feature set (no FP, capped memory/module/storage); Q6 bounds the contract model (no cross-token effects, C6) |
+| Wasm runtime nondeterminism (JIT codegen, floats) | Same-parent conflicts, slashing (ADR-008) | `wasmi` interpreter (no JIT) + `f32`/`f64` disallowed + exact-pinned runtime + a canary module→`result_hash` corpus (ADR-018) |
 | Cross-chain snapshot drift (B's state moves between A's execution and B's apply) | Nondeterministic A results → same-parent conflicts, slashing (ADR-008) | Model X pins `B@(height, hash)` inside the call; A's execution reads only the pinned ref; ADR-016 defines the validation |
 | Non-atomic call failure leaves A and B inconsistent | User-visible broken state | Deterministic revert/compensation policy in ADR-016; contracts must be written to tolerate partial failure (documented constraint) |
 | Governance (multisig/timelock) key management | Upgrades blocked by lost keys | Out of protocol scope (documented); M-of-N is the floor, stake-weighted voting is the documented extension |
@@ -449,18 +527,24 @@ blocked on nothing in Phases 1–8.
 - P2: 2–3 days (two engines + ISA doc + property tests).
 - P3: 1–2 days (dispatch + D3/D4 fixes + executor tests).
 - P4: 0.5–1 day.
-- P5 (on-chain deployment): 2–3 days incl. ADR-015 design.
-- P6 (upgrade governance): 2–3 days incl. ADR-017 design.
-- P7 (cross-contract calls, Model X): 5+ days incl. ADR-016 design — highest design risk.
-- P8: 1–2 days (e2e + docs + vault).
-- P9: separate estimate.
+- P5 (WasmEngine core, Tier-2): 4–6 days incl. ADR-018 design — `wasmi` integration,
+  frozen ABI, fuel metering, sandbox, determinism + canary tests; the Wasm runtime
+  integration is the main new risk.
+- P6 (on-chain deployment): 2–3 days incl. ADR-015 design (now engine-agnostic: Spec +
+  Wasm).
+- P7 (WasmEngine state & storage, W3): 3–4 days — storage model, `sload`/`sstore`,
+  storage delta + committer apply, storage gas + cap.
+- P8 (upgrade governance): 2–3 days incl. ADR-017 design.
+- P9 (cross-contract calls, Model X, incl. Wasm `call`): 5+ days incl. ADR-016 design —
+  highest design risk.
+- P10: 1–2 days (e2e + docs + vault).
 
-Total: **~3–4 weeks** including the design ADRs (the base engine, P1–P4 + P8, is the
-original ~6–9 days).
+Total: **~5–6 weeks** including the design ADRs and the Wasm tier (the base engine,
+P1–P4 + P10, is the original ~6–9 days; the Wasm tier adds ~P5 + P7).
 
 ## 6. Standing vault duties (per CLAUDE.md)
 
 Update on landing: `task-executor-contract-bytecode` (close), `concept-executor-role`
-(pipeline steps), `decision-*` new nodes (P0: ADR-011–014; then ADR-015/017/016 at
-the start of P5/P6/P7), `fact-*` nodes for D3/D4, `roadmap-phase-status`,
-`_system/INDEX.md`, one log node per significant landing.
+(pipeline steps), `decision-*` new nodes (P0: ADR-011–014; ADR-018 WasmEngine designed
+09/28; then ADR-015/017/016 at the start of P6/P8/P9), `fact-*` nodes for D3/D4,
+`roadmap-phase-status`, `_system/INDEX.md`, one log node per significant landing.

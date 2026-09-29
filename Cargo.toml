@@ -72,6 +72,16 @@ subtle = "=2.6.1"
 # to avoid an API surprise between halo2 releases (mirrors the `=`-pin
 # philosophy used for rns-* here).
 halo2_proofs = "=0.3.5"
+# ADR-018 / Phase 5 — Tier-2 WasmEngine. `wasmi` is a pure-Rust WebAssembly
+# interpreter: the WasmEngine runs third-party contract `bytecode` deterministically
+# (no JIT → host-independent results, which is consensus-critical per ADR-008) and
+# sandboxes it (linear memory + capability model). Pinned exactly: the runtime is the
+# sandbox, so a version bump is a re-audit event, not a routine dependency update.
+# 1.1.0 with `default-features = false, features = ["std"]`: the interpreter core
+# only. wasmi's `default` feature set includes `wat` (the WAT text tooling), which
+# pulls in wat/wast/wasm-encoder 259 that require rustc >= 1.88 — incompatible with
+# our 1.87 toolchain. We only ever feed the engine binary WASM, so `wat` is not needed.
+wasmi = { version = "=1.1.0", default-features = false, features = ["std"] }
 
 # Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
 # (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives
