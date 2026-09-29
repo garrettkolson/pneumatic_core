@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,19 @@ use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::tokens::{SmartContract, Token};
 use pneumatic_core::transactions::{Transaction, TransactionState};
 use pneumatic_core::user::User;
+
+/// Per-execution wall-clock backstop (Q3.2). Read from
+/// `PNEUMATIC_EXECUTOR_TIMEOUT_SECS` (whole seconds, default **5**). This bounds
+/// a single `run_execution` so a stuck engine cannot hang a worker task or pin
+/// a backpressure slot indefinitely (Phase 4 safety hardening).
+fn execution_timeout_from_env() -> Duration {
+    const DEFAULT_TIMEOUT_SECS: u64 = 5;
+    let secs: u64 = std::env::var("PNEUMATIC_EXECUTOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 // ---------------------------------------------------------------------------
 // Executor — transaction computation node
@@ -66,6 +80,12 @@ pub struct Executor {
     active_tasks: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Maximum number of concurrent execution tasks before backpressure kicks in
     max_in_flight: usize,
+    /// Wall-clock backstop for a single execution (Q3.2, Phase 4). If the
+    /// engine does not settle within this, the task is dropped and the
+    /// transaction is failed with `ExecutionTimeout` rather than left in
+    /// `Executing`. Env-configurable via `PNEUMATIC_EXECUTOR_TIMEOUT_SECS`
+    /// (default 5 s).
+    execution_timeout: Duration,
 }
 
 impl Executor {
@@ -98,7 +118,15 @@ impl Executor {
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
             active_tasks: Arc::new(Mutex::new(std::collections::HashSet::new())),
             max_in_flight,
+            execution_timeout: execution_timeout_from_env(),
         }
+    }
+
+    /// Override the per-execution wall-clock backstop (ops/test knob).
+    /// `new` reads it from the environment by default.
+    pub fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = timeout;
+        self
     }
 
     /// Check if the executor is at capacity.
@@ -207,6 +235,7 @@ impl Executor {
             contract_engine_registry: self.contract_engine_registry.clone(),
             preload_tasks: self.preload_tasks.clone(),
             active_tasks: self.active_tasks.clone(),
+            execution_timeout: self.execution_timeout,
         }
     }
 }
@@ -234,6 +263,8 @@ struct ExecutorHandle {
     /// Shared backpressure slots — the spawned task frees its slot on settle
     /// (defect D4) by removing its id here.
     active_tasks: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-execution wall-clock backstop (Q3.2), carried from the `Executor`.
+    execution_timeout: Duration,
 }
 
 impl ExecutorHandle {
@@ -249,7 +280,48 @@ impl ExecutorHandle {
         results: Arc<DashMap<String, Result<ExecutionResult, String>>>,
     ) {
         tokio::spawn(async move {
-            let result = self.run_execution(&tx_id).await;
+            // Wall-clock backstop (Q3.2, Phase 4): a single execution must settle
+            // within `execution_timeout` or it is dropped and the transaction is
+            // failed — a stuck engine must not hang the task or pin its slot.
+            let result =
+                match tokio::time::timeout(self.execution_timeout, self.run_execution(&tx_id)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Timeout: fail the transaction so it is not left in
+                        // `Executing`, and record the wall-clock backstop firing.
+                        // `get_transaction` only exposes Validated-state txs, so
+                        // pull the tx out of its current (non-terminal) state.
+                        let reasons = vec![ValidationFailureReason::ExecutionTimeout];
+                        let tx_to_fail = self
+                            .pending_registry
+                            .get_transaction_mut(&tx_id)
+                            .ok()
+                            .and_then(|entry| match &entry.state {
+                                TransactionState::Preloaded { transaction } => {
+                                    Some(transaction.clone())
+                                }
+                                TransactionState::Validated { transaction, .. } => {
+                                    Some(transaction.clone())
+                                }
+                                TransactionState::Executing { transaction } => {
+                                    Some(transaction.clone())
+                                }
+                                _ => None,
+                            });
+                        if let Some(tx) = tx_to_fail {
+                            if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx_id) {
+                                entry.transition_to_failed(tx, reasons.clone());
+                            }
+                        }
+                        log::error!(
+                            "execution of {} timed out after {:?}; failed with {:?}",
+                            tx_id,
+                            self.execution_timeout,
+                            reasons
+                        );
+                        Err(ExecutorError::ExecutionTimeout)
+                    }
+                };
             match &result {
                 Ok(exec_result) => {
                     results.insert(tx_id.clone(), Ok(exec_result.clone()));
@@ -323,7 +395,7 @@ impl ExecutorHandle {
         // (unknown engine, missing contract, gas exhaustion, revert) fails the
         // transaction with the engine's reason — the tx transitions to `Failed`,
         // it is not just an early return.
-        let execution_output = match self.execute_contract(&transaction, &token, &user) {
+        let execution_output = match self.execute_contract(&transaction, &token, &user).await {
             Ok(output) => output,
             Err(ExecutorError::Validation(reasons)) => {
                 if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
@@ -402,7 +474,13 @@ impl ExecutorHandle {
     /// [`select_engine`] (ADR-011): the `contract_engine` metadata key names the
     /// engine, non-contract tokens default to `"Transfer"`, and contract tokens
     /// without a key fail closed.
-    fn execute_contract(
+    ///
+    /// Phase 4 safety: the engine runs on a **blocking thread** (so a stuck
+    /// engine cannot block the async worker), is bounded by the wall-clock
+    /// backstop [`Self::execution_timeout`] (Q3.2), and its panics are caught
+    /// with `catch_unwind` so a buggy engine fails the transaction deterministically
+    /// instead of unwinding the task.
+    async fn execute_contract(
         &self,
         tx: &Transaction,
         token: &Token,
@@ -419,16 +497,56 @@ impl ExecutorHandle {
         // Per-token engine selection (ADR-011).
         let engine = select_engine(&self.contract_engine_registry, token)?;
 
-        // Build the canonical execution input (the fetched user state is the
-        // sender state — defect D6) and run the engine.
-        let input = ExecutionInput {
-            tx,
-            contract: &contract,
-            sender_state: user,
-            token,
-            gas_limit: tx.gas_limit,
-        };
-        engine.execute(&input).map_err(ExecutorError::from)
+        // The engine is sync and may be slow/buggy, so it runs on a blocking
+        // thread across an ownership boundary. Clone the inputs for that boundary.
+        let tx_id = tx.id.clone();
+        let tx = tx.clone();
+        let contract = contract.clone();
+        let user = user.clone();
+        let token = token.clone();
+
+        // `spawn_blocking` keeps the engine off the async worker (so the Q3.2
+        // wall-clock backstop in `execute_task` can fire against a stuck engine),
+        // and `catch_unwind` isolates panics so a buggy engine fails the
+        // transaction deterministically instead of unwinding the task.
+        let join = tokio::task::spawn_blocking(move || {
+            let input = ExecutionInput {
+                tx: &tx,
+                contract: &contract,
+                sender_state: &user,
+                token: &token,
+                gas_limit: tx.gas_limit,
+            };
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.execute(&input)))
+        });
+
+        match join.await {
+            // Success: the engine produced an output.
+            Ok(Ok(Ok(output))) => Ok(output),
+            // The engine returned a `ContractError`.
+            Ok(Ok(Err(e))) => Err(ExecutorError::from(e)),
+            // `catch_unwind` caught a panic (buggy engine).
+            Ok(Err(_panic)) => {
+                log::error!(
+                    "contract engine panicked while executing tx {:?}; failing the transaction",
+                    tx_id
+                );
+                Err(ExecutorError::Validation(vec![
+                    ValidationFailureReason::ContractExecutionFailed,
+                ]))
+            }
+            // The blocking task failed to join (should be rare now that panics
+            // are caught inside the thread).
+            Err(_join_err) => {
+                log::error!(
+                    "contract engine task for tx {:?} failed to join; failing the transaction",
+                    tx_id
+                );
+                Err(ExecutorError::Validation(vec![
+                    ValidationFailureReason::ContractExecutionFailed,
+                ]))
+            }
+        }
     }
 
     /// Get the finalizer public key from the transaction's validation result.
@@ -634,6 +752,10 @@ pub enum ExecutorError {
         max_in_flight: usize,
         current: usize,
     },
+    /// The wall-clock backstop (Q3.2) fired: the engine did not settle within
+    /// the per-execution timeout. The transaction is failed with
+    /// [`ValidationFailureReason::ExecutionTimeout`].
+    ExecutionTimeout,
 }
 
 impl From<DataError> for ExecutorError {
@@ -669,6 +791,7 @@ mod tests {
     pub mod helpers;
     mod dispatch;
     mod lifecycle;
+    mod safety;
     mod signing;
     mod validation;
 }

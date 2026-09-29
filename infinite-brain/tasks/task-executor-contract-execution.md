@@ -50,7 +50,7 @@ source_url: "plans/executor-contract-execution-implementation-plan.md"
 Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014). Plan:
 `plans/executor-contract-execution-implementation-plan.md`. Status: **in progress**
-— Phase 3 complete (09/28/2026).
+— Phase 4 complete (09/28/2026).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -100,8 +100,26 @@ Phase checklist (each phase's exit criteria live in the plan):
   D4 slot-free, D3 partition key) + 5 `validate_execution_result` unit tests;
   `pipeline_integration` (full wire test) passes with the real dispatch. Core
   572, executor 17, workspace `cargo test` green.
-- **P4** — safety bounds: instruction budget vs `gas_limit`, wall-clock timeout,
-  panic isolation, `GasExhausted` → `Failed` (ADR-013).
+- **P4 ✅ (09/28/2026)** — safety hardening (ADR-013 / Q3.2): no unbounded
+  resource path. Landed in `executor/src/executor.rs` (+ `pneumatic_core::errors`):
+  **wall-clock backstop** — `tokio::time::timeout` around `run_execution` in
+  `execute_task` (default **5 s**, env-configurable via
+  `PNEUMATIC_EXECUTOR_TIMEOUT_SECS`, whole seconds); on fire the tx fails with the
+  new `ValidationFailureReason::ExecutionTimeout` and its backpressure slot is
+  freed (no hang, no leaked slot). **Panic isolation** — the engine runs on a
+  **blocking thread** (`tokio::task::spawn_blocking`, so a stuck engine can't block
+  the async worker) under `std::panic::catch_unwind`; a panicking engine fails the
+  tx with `ContractExecutionFailed` (no new core variant — the existing `Failed`
+  transition handles it). New `ExecutorError::ExecutionTimeout` unit variant;
+  `execution_timeout` field on `Executor`/`ExecutorHandle` + `with_execution_timeout`
+  builder + `execution_timeout_from_env()`. New `safety` test module: 3 tests —
+  sleeping engine → `ExecutionTimeout` + `Failed` (not a hang), panicking engine →
+  `ContractExecutionFailed` + no crash, backpressure under timeout load
+  (`max_in_flight = 1`, sequential timed-out preloads never hit `AtCapacity`).
+  moka LRU deliberately skipped (a perf optimization, not a safety property —
+  stale reads in consensus-critical deterministic execution are dangerous).
+  Operational limits (max_in_flight, timeout, gas cap) documented in README.
+  Core 572, executor 20, workspace `cargo test` green.
 - **P5** — on-chain deployment: `DeployContract` action, deterministic token id,
   `CreateToken` delta, committer apply (ADR-015 design first).
 - **P6** — upgrade governance: owner registry, M-of-N multisig, 1-epoch timelock

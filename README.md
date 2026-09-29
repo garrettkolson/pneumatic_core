@@ -124,6 +124,15 @@ Sender → Sentinel → ──────────────────�
 
 **Gas model:** `CostModel` carries `base_cost`, `global_min_stake`, `admin_public_key`, `admin_tax_percentage`, and per-action multipliers (Process 1.0, Preload 2.0, Sign 1.5); `verify_gas()` checks `fuel_balance` before execution; gas is deducted at commit.
 
+### Executor Operational Limits
+
+The Executor bounds its resource use on three axes so a single misbehaving transaction or engine cannot starve the node (there is no unbounded resource path):
+
+- **Backpressure (`max_in_flight`):** concurrent executions are capped at `max_in_flight` (a constructor parameter). A preload that would exceed the cap is rejected with `ExecutorError::AtCapacity` rather than queued, so worker slots and memory stay bounded.
+- **Wall-clock backstop (`PNEUMATIC_EXECUTOR_TIMEOUT_SECS`):** every execution is wrapped in a `tokio::time::timeout` (default **5 s**, configurable via `PNEUMATIC_EXECUTOR_TIMEOUT_SECS` in whole seconds). The contract engine runs on a **blocking thread** so a stuck engine cannot block the async worker; when the backstop fires the transaction fails with `ExecutionTimeout` and its backpressure slot is freed (no hang, no leaked slot).
+- **Gas cap:** a transaction's `gas_limit` caps the engine's `gas_used`; `gas_limit == 0` means **no cap**. Payload bytes feed the gas meter (3-stage model: static weight → payload → dynamic execution).
+- **Panic isolation:** the engine is invoked under `std::panic::catch_unwind`; a panicking engine fails the transaction with `ContractExecutionFailed` instead of unwinding the worker task.
+
 ### Cryptography
 
 - **Signatures (hybrid, N = N+1):** Ed25519 (64 B) + ML-DSA-44 (key + signature) concatenated — both halves must verify. Wire size ≈ 3,796 B.
@@ -229,9 +238,9 @@ cargo test --workspace
 
 The phase-by-phase checklist (Phases 0–10: foundation, the four worker pipelines, optimistic finality, deterministic routing, sharding, quorum gossip, RNS transport, production readiness, security audit remediation) is tracked in [TASKS.md](TASKS.md); dated status snapshots live in the vault (`infinite-brain/notes/`).
 
-**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), and shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete).
+**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete), and real executor contract execution (pluggable `ContractEngine` registry, per-transaction gas + wall-clock backstop, panic isolation).
 
-**Outstanding:** production readiness (rustdoc, operator runbook, observability, deployment infra — Phase 8), real executor contract execution (currently a documented stub), and the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests).
+**Outstanding:** production readiness (rustdoc, operator runbook, observability, deployment infra — Phase 8), on-chain deployment of the executor (Phase 5 — ADR-015 design first), and the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests).
 
 ## Project Memory: Infinite Brain
 

@@ -185,6 +185,10 @@ pub enum ValidationFailureReason {
     /// not implemented. The specific cause is carried by
     /// `contracts::ContractError`; this reason marks the `Failed` transition.
     ContractExecutionFailed,
+    /// The execution wall-clock backstop (Q3.2) fired: the engine did not
+    /// settle within the executor's per-execution timeout, so the transaction
+    /// is failed rather than left in `Executing` (Phase 4 safety hardening).
+    ExecutionTimeout,
 }
 
 // ---------------------------------------------------------------------------

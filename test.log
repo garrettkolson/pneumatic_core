@@ -499,3 +499,43 @@
 2026-09-28 21:39:09.172748 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
 2026-09-28 21:39:09.194408 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
 2026-09-28 21:39:09.216674 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.506954 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-09-28 22:24:29.518542 UTC: Attempted to distribute block to archivers (hash: 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf)
+2026-09-28 22:24:29.540519 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-09-28 22:24:29.553008 UTC: Attempted to distribute block to archivers (hash: 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf)
+2026-09-28 22:24:29.568068 UTC: Double-proposal detected (same proposer) at commit: slashing 6f74a5550e08f46c5be5d0fd3f8dfdf3ed5b7e408792bd20dae5991eb1be8941 (candidate 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf vs incoming 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf)(token: 01)
+2026-09-28 22:24:29.568281 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 22:24:29.584269 UTC: Double-proposal detected (same proposer) at commit: slashing 6f74a5550e08f46c5be5d0fd3f8dfdf3ed5b7e408792bd20dae5991eb1be8941 (candidate 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf vs incoming 20a3e6833a7527de053a211dc19d266ac7bec6bba2fe7edbf943fd548714a1cf)(token: 01)
+2026-09-28 22:24:29.584430 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 22:24:29.610282 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.633366 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.658932 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.681821 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.741221 UTC: Double-proposal detected (same proposer) at commit: slashing 1d2778f40a2730d5da430d65cb78773add9ef849abb6a343f84b31e9974736c5 (candidate 838bca583b17cb646cd3df2d7abb045ebc1231ed07fe4aceec32ba698c8e1913 vs incoming 838bca583b17cb646cd3df2d7abb045ebc1231ed07fe4aceec32ba698c8e1913)(token: 01)
+2026-09-28 22:24:29.741422 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 22:24:29.757258 UTC: Double-proposal detected (same proposer) at commit: slashing 1d2778f40a2730d5da430d65cb78773add9ef849abb6a343f84b31e9974736c5 (candidate 838bca583b17cb646cd3df2d7abb045ebc1231ed07fe4aceec32ba698c8e1913 vs incoming 838bca583b17cb646cd3df2d7abb045ebc1231ed07fe4aceec32ba698c8e1913)(token: 01)
+2026-09-28 22:24:29.757414 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 22:24:29.780127 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.806249 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.828574 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 22:24:29.894068 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:06.866673 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-09-28 23:31:06.877906 UTC: Attempted to distribute block to archivers (hash: d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20)
+2026-09-28 23:31:06.895418 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-09-28 23:31:06.904934 UTC: Attempted to distribute block to archivers (hash: d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20)
+2026-09-28 23:31:06.919363 UTC: Double-proposal detected (same proposer) at commit: slashing d007b0d661955fc1a3e6e04216ed0617c1f7c4de45990c0d3c8363ba9ac51bdb (candidate d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20 vs incoming d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20)(token: 01)
+2026-09-28 23:31:06.919518 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 23:31:06.933853 UTC: Double-proposal detected (same proposer) at commit: slashing d007b0d661955fc1a3e6e04216ed0617c1f7c4de45990c0d3c8363ba9ac51bdb (candidate d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20 vs incoming d6c5c537c9583df8c4556f76739a36d7a43b678ad3b2e4975088ef63c3eccd20)(token: 01)
+2026-09-28 23:31:06.933984 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 23:31:06.955567 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:06.976457 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:06.998276 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:07.019234 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:07.070218 UTC: Double-proposal detected (same proposer) at commit: slashing 85cf4b320fbc9d9869fe40118888cfd3bfac523d4089c0881576123ff78cbc4c (candidate bb362759a95a18cf342d6410d042fce1bfb5a83ee970135ff608ed2da73b0dc3 vs incoming bb362759a95a18cf342d6410d042fce1bfb5a83ee970135ff608ed2da73b0dc3)(token: 01)
+2026-09-28 23:31:07.070368 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 23:31:07.084658 UTC: Double-proposal detected (same proposer) at commit: slashing 85cf4b320fbc9d9869fe40118888cfd3bfac523d4089c0881576123ff78cbc4c (candidate bb362759a95a18cf342d6410d042fce1bfb5a83ee970135ff608ed2da73b0dc3 vs incoming bb362759a95a18cf342d6410d042fce1bfb5a83ee970135ff608ed2da73b0dc3)(token: 01)
+2026-09-28 23:31:07.084791 UTC: Applied 1 staking ops during epoch reconciliation
+2026-09-28 23:31:07.107471 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:07.128473 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:07.149901 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-09-28 23:31:07.171236 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay

@@ -1,12 +1,16 @@
 # Executor Implementation Plan — Real Contract Execution
 
-Status: **Phase 3 complete** (2026-09-28) — decisions Q1–Q6 approved
+Status: **Phase 4 complete** (2026-09-28) — decisions Q1–Q6 approved
 (2026-09-27/28, Garrett Olson); ADR-011–014 recorded in the vault; Phase 1 landed
 (`src/contracts.rs` substrate + `payload`/`gas_limit` wire fields); Phase 2 landed
 (`TransferEngine` + `SpecEngine` interpreter, per-token engine selection,
 determinism property tests); Phase 3 landed (real `execute_contract` dispatch,
 real `validate_execution_result`, D3 partition-key + D4 backpressure-slot + D6
-fetched-state fixes — workspace tests green, core suite 572, executor 17); Phase 4 next
+fetched-state fixes); Phase 4 landed (safety hardening — wall-clock
+`tokio::time::timeout` backstop (default 5 s, `PNEUMATIC_EXECUTOR_TIMEOUT_SECS`),
+`spawn_blocking` + `catch_unwind` panic isolation, `ExecutionTimeout` failure reason,
+no unbounded resource path — workspace tests green, core suite 572, executor 20);
+Phase 5 next
 Scope: `pneumatic_executor` crate + minimal `pneumatic_core` substrate. The executor
 role's *plumbing* already works end-to-end (verified below); this plan implements the
 missing *computation* — real, deterministic contract execution — and fixes the wiring
