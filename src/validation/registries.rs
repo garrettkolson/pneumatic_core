@@ -49,6 +49,19 @@ impl ValidationSpecRegistry {
     pub fn register_shielded(&mut self) {
         self.register(Box::new(ShieldedValidationSpec::new()));
     }
+
+    /// Register the `DeployContract` validation spec (ADR-015, Phase 6).
+    ///
+    /// Distinct from `register_defaults`: it needs the `ContractEngineRegistry`
+    /// (to confirm the target engine is registered) and the data provider (to
+    /// check the sender nonce). Registered under the name `"DeployContract"`.
+    pub fn register_deploy(
+        &mut self,
+        engines: Arc<crate::contracts::ContractEngineRegistry>,
+        data: Arc<dyn DataProvider>,
+    ) {
+        self.register(Box::new(DeployValidationSpec::new(engines, data)));
+    }
 }
 
 // Blanket impl: Box<dyn TransactionValidationSpec> delegates to the inner trait object.

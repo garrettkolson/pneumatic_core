@@ -32,6 +32,11 @@ use std::sync::{Arc, Mutex};
 
 pub struct TestDataProvider {
     pub users: Mutex<HashMap<Vec<u8>, HashMap<String, User>>>,
+    /// In-memory token store (ADR-015, Phase 6): `token_id -> partition_id ->
+    /// Token`, so `get_token`/`save_token` behave like the real data service.
+    /// Needed for the deploy-apply idempotency test (re-apply is a no-op iff
+    /// the token is present after the first `save_token`).
+    pub tokens: Mutex<HashMap<Vec<u8>, HashMap<String, Token>>>,
     /// When true, `get_user` returns an error (simulates a data-service failure).
     pub fail_get: bool,
     /// When true, `save_user` returns an error (simulates a data-service failure).
@@ -52,6 +57,7 @@ impl TestDataProvider {
     pub fn new() -> Self {
         Self {
             users: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
             fail_get: false,
             fail_save: false,
             fail_snapshot_save: false,
@@ -64,6 +70,7 @@ impl TestDataProvider {
     pub fn with_failures(fail_get: bool, fail_save: bool) -> Self {
         Self {
             users: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
             fail_get,
             fail_save,
             fail_snapshot_save: false,
@@ -97,6 +104,17 @@ impl TestDataProvider {
             .insert(partition_id, user);
     }
 
+    /// Store a token under `(token_id, partition_id)` — the in-memory stand-in
+    /// for the data service's token store (ADR-015, Phase 6).
+    pub fn insert_token(&self, key: Vec<u8>, partition_id: String, token: Token) {
+        self.tokens
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .insert(partition_id, token);
+    }
+
     /// Read a user's stored balance directly from the backing map, bypassing the fail toggles.
     /// Lets an assertion confirm a value survived a simulated data-service failure (when the
     /// normal `get_user` path is deliberately returning `Err`).
@@ -112,10 +130,22 @@ impl TestDataProvider {
 
 
 impl DataProvider for TestDataProvider {
-    fn get_token(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Token, DataError> {
-        Err(DataError::DataNotFound)
+    fn get_token(&self, key: &Vec<u8>, partition_id: &str) -> Result<Token, DataError> {
+        self.tokens
+            .lock()
+            .unwrap()
+            .get(key)
+            .and_then(|partitions| partitions.get(partition_id))
+            .cloned()
+            .ok_or(DataError::DataNotFound)
     }
-    fn save_token(&self, _key: &Vec<u8>, _token: Token, _partition_id: &str) -> Result<(), DataError> {
+    fn save_token(&self, key: &Vec<u8>, token: Token, partition_id: &str) -> Result<(), DataError> {
+        self.tokens
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .insert(partition_id.to_string(), token);
         Ok(())
     }
     fn save_data(&self, _key: &Vec<u8>, _data: Vec<u8>, _partition_id: &str) -> Result<(), DataError> {

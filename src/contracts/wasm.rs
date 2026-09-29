@@ -230,6 +230,30 @@ impl WasmEngine {
     }
 }
 
+/// Validate a Wasm module for execution **or deployment**: the module size cap,
+/// well-formedness, the frozen ABI exports (`__alloc` + `execute`), the sandbox
+/// (only `env.*` allow-listed imports), and no `f32`/`f64` on the ABI boundary.
+/// Returns the compiled [`Module`] and the [`Engine`] on success so the caller
+/// can instantiate it (the deployment path discards both and only checks
+/// `Ok`/`Err`).
+pub fn validate_wasm_module(bytecode: &[u8]) -> Result<(Module, Engine), ContractError> {
+    // 1. Module size cap.
+    if bytecode.len() > WASM_MAX_MODULE_BYTES {
+        return Err(ContractError::BadBytecode(format!(
+            "module size {} bytes exceeds {} byte cap",
+            bytecode.len(),
+            WASM_MAX_MODULE_BYTES
+        )));
+    }
+    // 2. Compile + validate (well-formed WASM).
+    let engine = WasmEngine::build_engine()?;
+    let module = Module::new(&engine, bytecode)
+        .map_err(|e| ContractError::BadBytecode(format!("invalid module: {e}")))?;
+    // 3. ABI + sandbox validation.
+    WasmEngine::validate_abi(&module)?;
+    Ok((module, engine))
+}
+
 impl ContractEngine for WasmEngine {
     fn name(&self) -> &'static str {
         "Wasm"
@@ -238,22 +262,10 @@ impl ContractEngine for WasmEngine {
     fn execute(&self, input: &ExecutionInput) -> Result<ExecutionOutput, ContractError> {
         let bytecode = &input.contract.bytecode;
 
-        // 1. Module size cap.
-        if bytecode.len() > WASM_MAX_MODULE_BYTES {
-            return Err(ContractError::BadBytecode(format!(
-                "module size {} bytes exceeds {} byte cap",
-                bytecode.len(),
-                WASM_MAX_MODULE_BYTES
-            )));
-        }
-
-        // 2. Compile + validate (well-formed WASM).
-        let engine = Self::build_engine()?;
-        let module = Module::new(&engine, bytecode.as_slice())
-            .map_err(|e| ContractError::BadBytecode(format!("invalid module: {e}")))?;
-
-        // 3. ABI + sandbox validation.
-        Self::validate_abi(&module)?;
+        // 1-3. Size cap + compile + ABI/sandbox validation (shared with the
+        // deployment path). Returns the validated module + engine for
+        // instantiation.
+        let (module, engine) = validate_wasm_module(bytecode)?;
 
         // 4. Store with the fuel budget + read-only env snapshot.
         let env = WasmEnv {

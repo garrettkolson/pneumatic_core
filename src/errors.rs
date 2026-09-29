@@ -189,6 +189,11 @@ pub enum ValidationFailureReason {
     /// settle within the executor's per-execution timeout, so the transaction
     /// is failed rather than left in `Executing` (Phase 4 safety hardening).
     ExecutionTimeout,
+    /// A `DeployContract` tx failed the sentinel-side deployment validation
+    /// (ADR-015): unparseable payload, unknown engine, bytecode size/format
+    /// violation, invalid name, a failing Wasm module check, or a nonce
+    /// mismatch. The transaction is failed before routing.
+    ContractDeployFailed,
 }
 
 // ---------------------------------------------------------------------------

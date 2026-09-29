@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::ContractEngineRegistry;
 use crate::crypto;
+use crate::data::{DefaultDataProvider, DataProvider};
 use crate::crypto::{AsymCryptoProvider, AsymCryptoProviderType};
 use crate::errors::PneumaticError;
 use crate::logging::{FileLogger, Logger};
@@ -252,6 +253,16 @@ impl EnvironmentMetadata {
             }
         }
 
+        // ADR-015, Phase 6: wire the `DeployContract` validation spec into the
+        // transaction validation registry. It needs the contract engine registry
+        // (to verify the target engine is registered) and a data provider (to
+        // check the deployer's nonce against the account's sequence number).
+        // `DefaultDataProvider` is a lazy client to the local data service, so
+        // constructing it here has no side effects.
+        let contract_engines: Arc<ContractEngineRegistry> = Arc::new(engine_registry);
+        let deploy_data_provider: Arc<dyn DataProvider> = Arc::new(DefaultDataProvider::new());
+        specs.register_deploy(contract_engines.clone(), deploy_data_provider);
+
         let mut block_specs = BlockValidatorSpecRegistry::new();
         block_specs.register_defaults();
 
@@ -289,7 +300,7 @@ impl EnvironmentMetadata {
             shard_count: spec.shard_count,
             shard_quorum_percentage: spec.shard_quorum_percentage,
             shielded_root_recency: spec.shielded_root_recency,
-            contract_engines: Arc::new(engine_registry),
+            contract_engines,
         })
     }
 }
@@ -655,5 +666,19 @@ mod tests {
                 "block validation spec {name} should be registered"
             );
         }
+    }
+
+    #[test]
+    fn spec_load_registers_deploy_contract_spec() {
+        // ADR-015, Phase 6: the `DeployContract` validation spec is wired
+        // automatically on every environment load (no spec-listing required),
+        // so a deploy transaction is validated by the sentinel out of the box.
+        let value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        let env =
+            EnvironmentMetadata::load_from_spec(parse(value)).expect("valid spec must load");
+        assert!(
+            env.transaction_validation_specs.get("DeployContract").is_some(),
+            "DeployContract spec should be registered on load"
+        );
     }
 }

@@ -5,6 +5,7 @@
 //! private fields (child modules of `crate::committer`).
 
 use super::*;
+use pneumatic_core::transactions::Transaction;
 
 impl Committer {
 
@@ -210,6 +211,15 @@ impl Committer {
             .map_err(|e| self.gas_deduction_err(&transaction.sender, &tx_id, gas_used, &e))?;
         }
 
+        // Step 3.6: Apply a `DeployContract` delta (ADR-015, Phase 6). The
+        // `CreateTokenDelta` is a pure function of the transaction (sender,
+        // nonce, DeployParams, hash), so the committer re-derives it, verifies
+        // it against the signed `result_hash`, and creates the token
+        // idempotently (a replayed deploy is a no-op).
+        if transaction.action == "DeployContract" {
+            self.apply_deploy_delta(&transaction)?;
+        }
+
         // Step 4: Update transaction state
         if is_leader_proposal {
             // Leader-proposal path: remove from pool, then transition to Committed
@@ -235,6 +245,75 @@ impl Committer {
         // Step 6: Distribute the committed block to archivers
         let _ = self.block_services.distribute_to_archivers(&commit.proposed_block).await;
 
+        Ok(())
+    }
+
+    /// Apply a `DeployContract` delta at commit time (ADR-015, Phase 6).
+    ///
+    /// The executor emits a canonical `CreateTokenDelta` in `result_data` and
+    /// the finalizer signs its hash. The committer does not receive the raw
+    /// bytes, but the delta is a **pure function** of the transaction
+    /// (`sender`, `nonce`, `DeployParams`, `hash`) — so it re-derives the
+    /// delta and verifies it against the signed `result_hash` before applying.
+    ///
+    /// The apply is **idempotent**: if the token already exists (a replayed
+    /// deploy), the `save_token` is skipped, so re-committing a deploy never
+    /// creates a duplicate.
+    pub(crate) fn apply_deploy_delta(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<(), CommitterError> {
+        use pneumatic_core::contracts::{deploy_contract, CreateTokenDelta, DeployParams};
+        use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
+        use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
+
+        // 1. Parse the deployment parameters from the payload.
+        let params: DeployParams =
+            deserialize_rmp_to(&transaction.payload).map_err(CommitterError::Deserialization)?;
+
+        // 2. Re-derive the canonical delta (same formula as the executor).
+        let hash = BasicHashProvider::new();
+        let delta: CreateTokenDelta = deploy_contract(
+            &transaction.sender,
+            transaction.sequence_number as u64,
+            &params,
+            &hash,
+        )
+        .map_err(|_| {
+            CommitterError::Core(PneumaticError::Validation(
+                vec![ValidationFailureReason::ContractDeployFailed],
+            ))
+        })?;
+
+        // 3. Integrity: the re-derived delta must hash to the signed
+        //    `result_hash`, binding the apply to the executor's signed output.
+        let result_bytes =
+            serialize_to_bytes_rmp(&delta).map_err(|_| CommitterError::InternalSerialization)?;
+        if hash.hash(&result_bytes) != transaction.result_hash {
+            return Err(CommitterError::TransactionPayloadMismatch(
+                transaction.id.clone(),
+            ));
+        }
+
+        // 4. Idempotent apply: create the token in the environment partition
+        //    (QD4: partition_id == environment_id) only if it is not already
+        //    present.
+        let env_id = &self.env_data.environment_id;
+        let token = delta.to_token(env_id).map_err(|_| {
+            CommitterError::Core(PneumaticError::Validation(
+                vec![ValidationFailureReason::ContractDeployFailed],
+            ))
+        })?;
+        match self.data_provider.get_token(&delta.token_id, env_id) {
+            Ok(_) => {
+                // Already present — idempotent no-op (replayed deploy).
+            }
+            Err(_) => {
+                self.data_provider
+                    .save_token(&delta.token_id, token, env_id)
+                    .map_err(|e| CommitterError::Core(PneumaticError::Data(e)))?;
+            }
+        }
         Ok(())
     }
 

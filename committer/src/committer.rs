@@ -487,4 +487,5 @@ mod tests {
     mod quorum;
     mod distribution;
     mod pool;
+    mod deploy;
 }

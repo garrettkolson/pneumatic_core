@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use pneumatic_core::contracts::{
-    select_engine, ContractEngineRegistry, ContractError, ExecutionInput, ExecutionOutput,
-    TransferDelta,
+    deploy_contract, deploy_gas, select_engine, ContractEngineRegistry, ContractError,
+    CreateTokenDelta, DeployParams, ExecutionInput, ExecutionOutput, TransferDelta,
 };
 use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
 use pneumatic_core::data::{DataError, DataProvider};
@@ -376,26 +376,39 @@ impl ExecutorHandle {
             }
         }
 
-        // Step 3: Fetch the token asset under the token partition (defect D3:
-        // the data store is addressed by the partition key, not the env id).
-        let token = self
-            .data_provider
-            .get_token(&transaction.token_id, &self.partition_id)
-            .map_err(ExecutorError::Data)?;
+        // Steps 3-5: fetch the target token + sender, then execute. A
+        // `DeployContract` tx is a protocol op (ADR-015, Phase 6) that creates
+        // a token, so it has no target token to fetch (step 3) and no engine
+        // to select (step 5); it is handled by `execute_deploy` before the
+        // normal contract path.
+        let execution_output = if transaction.action == "DeployContract" {
+            self.execute_deploy(&transaction)
+        } else {
+            // Step 3: Fetch the token asset under the token partition (defect
+            // D3: the data store is addressed by the partition key, not the
+            // env id).
+            let token = self
+                .data_provider
+                .get_token(&transaction.token_id, &self.partition_id)
+                .map_err(ExecutorError::Data)?;
 
-        // Step 4: Fetch the sender's protocol state (defect D6: the fetched
-        // user data is the execution input, no longer discarded).
-        let user = self
-            .data_provider
-            .get_user(&transaction.sender, &self.partition_id)
-            .map_err(ExecutorError::Data)?;
+            // Step 4: Fetch the sender's protocol state (defect D6: the
+            // fetched user data is the execution input, no longer discarded).
+            let user = self
+                .data_provider
+                .get_user(&transaction.sender, &self.partition_id)
+                .map_err(ExecutorError::Data)?;
 
-        // Step 5: Execute the contract via its selected engine (defect D1:
-        // real dispatch replaces the identity stub). A contract-level failure
-        // (unknown engine, missing contract, gas exhaustion, revert) fails the
-        // transaction with the engine's reason — the tx transitions to `Failed`,
-        // it is not just an early return.
-        let execution_output = match self.execute_contract(&transaction, &token, &user).await {
+            // Step 5: Execute the contract via its selected engine (defect
+            // D1: real dispatch replaces the identity stub).
+            self.execute_contract(&transaction, &token, &user).await
+        };
+
+        // A contract-level failure (unknown engine, missing contract, gas
+        // exhaustion, revert, or a deploy failure) fails the transaction with
+        // the engine's reason — the tx transitions to `Failed`, it is not
+        // just an early return.
+        let execution_output = match execution_output {
             Ok(output) => output,
             Err(ExecutorError::Validation(reasons)) => {
                 if let Ok(mut entry) = self.pending_registry.get_transaction_mut(tx_id) {
@@ -547,6 +560,53 @@ impl ExecutorHandle {
                 ]))
             }
         }
+    }
+
+    /// Execute a `DeployContract` protocol op (ADR-015, Phase 6). There is no
+    /// target token (it is being created) and no engine to select. The op:
+    /// 1. parses the `DeployParams` from the tx payload;
+    /// 2. checks the deployment gas fits the tx's `gas_limit` (if set);
+    /// 3. derives the deterministic token id and builds a canonical
+    ///    `CreateTokenDelta`;
+    /// 4. emits the delta in `result_data` (the executor stays pure, ADR-013 —
+    ///    the data service applies the delta at commit, idempotently).
+    fn execute_deploy(&self, tx: &Transaction) -> Result<ExecutionOutput, ExecutorError> {
+        // 1. Parse the deployment parameters from the payload.
+        let params: DeployParams = deserialize_rmp_to(&tx.payload).map_err(|_| {
+            ExecutorError::Validation(vec![ValidationFailureReason::ContractDeployFailed])
+        })?;
+
+        // 2. The deployment gas must fit the tx's gas limit (if a limit was
+        // set). `gas_limit == 0` means "no limit" (mirrors the engine path).
+        let gas = deploy_gas(params.bytecode.len());
+        if tx.gas_limit > 0 && gas > tx.gas_limit {
+            return Err(ExecutorError::Validation(vec![
+                ValidationFailureReason::GasLimitExceeded,
+            ]));
+        }
+
+        // 3. The op: derive the deterministic token id and build the delta.
+        // The nonce is the sender's tx sequence number (`User.nonce`, per
+        // sender). A reused nonce yields the same id (idempotent apply) and is
+        // rejected upstream by the `DeployValidationSpec` nonce check.
+        let delta: CreateTokenDelta = deploy_contract(
+            &tx.sender,
+            tx.sequence_number as u64,
+            &params,
+            &*self.hash_provider,
+        )
+        .map_err(ExecutorError::from)?;
+
+        // 4. Emit the delta in result_data (rmp-canonical). The data service
+        // applies it at commit.
+        let result_data = serialize_to_bytes_rmp(&delta).map_err(|_| {
+            ExecutorError::Validation(vec![ValidationFailureReason::ContractDeployFailed])
+        })?;
+
+        Ok(ExecutionOutput {
+            result_data,
+            gas_used: gas,
+        })
     }
 
     /// Get the finalizer public key from the transaction's validation result.
@@ -794,4 +854,5 @@ mod tests {
     mod safety;
     mod signing;
     mod validation;
+    mod deploy;
 }

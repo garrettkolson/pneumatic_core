@@ -29,7 +29,13 @@ use crate::user::User;
 // can be registered by name (`"Wasm"`) via the environment spec; NOT in
 // `register_defaults` (opt-in, ADR-018 QW3).
 mod wasm;
-pub use wasm::WasmEngine;
+pub use wasm::{validate_wasm_module, WasmEngine, WASM_MAX_MODULE_BYTES};
+
+mod deploy;
+pub use deploy::{
+    deploy_contract, deploy_gas, derive_token_id, CreateTokenDelta, DeployParams,
+    DEPLOY_GAS_BASE, DEPLOY_GAS_PER_BYTE, SPEC_MAX_BYTECODE,
+};
 
 // ---------------------------------------------------------------------------
 // ContractEngine — the pluggable execution trait (ADR-011)

@@ -4,13 +4,13 @@ title: "Open: implement executor contract execution (plan Phases 1-10)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-018 per plan Phases 1-10: engine substrate + payload field, Transfer/Spec engines, stub replacement + D3/D4 fixes, gas bounds, Tier-2 WasmEngine (wasmi, P5+P7), on-chain deploy, upgrade governance, Model X calls, e2e."
+summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P6 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy). Remaining: P7 Wasm storage, P8 upgrade governance, P9 Model X calls, P10 e2e."
 auto_inject: false
 applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
 confidence: 0.9
 verified_at: "09/29/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when execute_contract dispatches to a registered ContractEngine, a composite e2e asserts a real result_hash, and Phases 6/8/9 (deploy/governance/Model X) + the WasmEngine (P5/P7) are landed or re-scoped"
+staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 7/8/9/10 (Wasm storage, governance, Model X, e2e) are landed or re-scoped; P1-P6 landed 09/29/2026"
 tags: [task, executor, contract-execution, implementation, adr-011, adr-014]
 edges:
   - target: decision-contract-engine-model
@@ -54,9 +54,10 @@ source_url: "plans/executor-contract-execution-implementation-plan.md"
 Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
 `plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
-`plans/wasm-engine-design.md`. Status: **in progress** — Phase 5 complete
-(09/29/2026); the Tier-2 WasmEngine **core** is landed (Phases 5; 7 = W3 storage
-remains).
+`plans/wasm-engine-design.md`; deploy design: `plans/deploy-contract-design.md`.
+Status: **in progress** — Phases 1–6 complete (09/29/2026); the Tier-2 WasmEngine
+**core** is landed (Phase 5) and **on-chain deployment** is landed (Phase 6). Remaining:
+P7 (W3 storage), P8 (governance), P9 (Model X), P10 (e2e).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -154,9 +155,19 @@ Phase checklist (each phase's exit criteria live in the plan):
   `tx_amount`, revert, forbidden-import, f32-export, fuel-loop. 10 new tests incl.
   cross-executor determinism (plain / tokio current-thread / tokio multi-thread
   byte-identical). Core 572 → 582; workspace `cargo test` green.
-- **P6** — on-chain deployment: `DeployContract` action, deterministic token id,
-  `CreateToken` delta, committer apply — engine-agnostic (Spec + Wasm) (ADR-015 design
-  first).
+- **P6 ✅ (09/29/2026)** — **on-chain deployment** (engine-agnostic, Spec + Wasm).
+  Landed: `pneumatic_core::contracts::deploy` (`DeployParams`, `CreateTokenDelta`,
+  `deploy_gas = 50_000 + 10·len`, deterministic CREATE2 `derive_token_id`,
+  `deploy_contract`, `CreateTokenDelta::to_token` with committer metadata keys winning),
+  `DeployValidationSpec` (fail-closed: parse → name 1–64 B → engine registered →
+  Wasm ≤ 1 MiB + `validate_wasm_module` / Spec ≤ 64 KiB → nonce == sequence →
+  `risk ≤ max_risk`), executor `run_execution` special-case for `action ==
+  "DeployContract"`, and the committer `apply_deploy_delta` (re-derive delta as a pure
+  fn of `(sender, nonce, DeployParams)`, `hash(delta) == tx.result_hash` integrity
+  check else `TransactionPayloadMismatch`, idempotent `save_token`). **QD4 partition_id
+  = environment_id** (operator override of the original token_id proposal). 8 deploy +
+  10 validation + 3 committer + 1 executor tests. Core 582 → 601; workspace
+  `cargo test` green.
 - **P7** — **WasmEngine state & storage (W3)**: per-contract `sload`/`sstore`,
   storage delta in `result_data`, committer apply, storage gas + cap
   (ADR-018 / design §7).
