@@ -37,6 +37,13 @@ pub use deploy::{
     DEPLOY_GAS_BASE, DEPLOY_GAS_PER_BYTE, SPEC_MAX_BYTECODE,
 };
 
+// Deploy-time contract scanner (ADR-015 extension) — a deterministic, fail-closed
+// pre-screen that runs in `DeployValidationSpec`: Spec well-formedness + Wasm static
+// walk + a canary run. Lives in `src/contracts/scan.rs`. It is consensus-safe by
+// construction (a pure function of `(engine, bytecode)` + frozen caps, ADR-008).
+mod scan;
+pub use scan::{scan_contract, ScanCode, ScanFinding, Severity};
+
 // ---------------------------------------------------------------------------
 // ContractEngine — the pluggable execution trait (ADR-011)
 // ---------------------------------------------------------------------------

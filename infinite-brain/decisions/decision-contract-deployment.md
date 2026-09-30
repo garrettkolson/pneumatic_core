@@ -33,6 +33,10 @@ edges:
     type: supports
     weight: 0.9
     note: "Phase 6 of the executor contract-execution plan"
+  - target: concept-contract-scanner
+    type: related_to
+    weight: 0.8
+    note: "The deploy-time contract scanner (S0) is check 4b in this spec's validation pipeline — a Reject finding fails the deploy with ContractScanFailed"
   - target: decision-deterministic-leader-election
     type: related_to
     weight: 0.6
@@ -75,3 +79,14 @@ contract token (ADR-014). Landed in `pneumatic_core::contracts::deploy` (new
 token **idempotently** (`get_token` → no-op if present, else `save_token`) so a replay
 cannot double-apply. The committer-forged metadata keys (engine, token_type) win over
 any sender-forged values.
+
+**Contract scanner (S0, landed 2026-09-29)** — a deterministic, fail-closed deploy-time
+pre-screen (`concept-contract-scanner`, `src/contracts/scan.rs`) added as check 4b in
+`DeployValidationSpec` (after the Wasm module check, before the nonce check). It runs the Spec
+well-formedness check, a `wasmparser` Wasm static walk (catches internal `f32`/`f64` opcodes the
+ABI-boundary check misses, disallowed imports), and a canary `execute` on a fixed canonical input
++ `CANARY_FUEL_BUDGET` (catches gas-burn loops / output spam). A `Reject`-severity finding fails
+the deploy with the new `ValidationFailureReason::ContractScanFailed`; `Warn` findings are logged
+(v1). Pure function of `(engine, bytecode)` + frozen caps → identical verdict on every shard
+member (ADR-008). `wasmparser = "=0.239.0"` added as a direct dep (`default-features = false` to
+avoid the `indexmap/serde` bump). Core suite 601 → 623.

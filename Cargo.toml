@@ -82,6 +82,13 @@ halo2_proofs = "=0.3.5"
 # pulls in wat/wast/wasm-encoder 259 that require rustc >= 1.88 — incompatible with
 # our 1.87 toolchain. We only ever feed the engine binary WASM, so `wat` is not needed.
 wasmi = { version = "=1.1.0", default-features = false, features = ["std"] }
+# wasmparser — binary WASM parser used by the deploy-time contract scanner
+# (src/contracts/scan.rs) for the opcode-level static walk (f32/f64 detection,
+# memory.grow counting, loop/section analysis). Pinned to the exact version already
+# resolved transitively by wasmi 1.1.0 in Cargo.lock (0.239.0), so this pulls no new
+# transitive version. Pinned exactly like wasmi: it runs in the consensus-critical
+# validation path, so a bump is a re-audit event.
+wasmparser = { version = "=0.239.0", default-features = false }
 
 # Quantum-secure signatures (ML-DSA / Dilithium, FIPS 204) and key encapsulation
 # (ML-KEM / Kyber, FIPS 203) — combined with the classical Ed25519 / X25519 primitives

@@ -54,7 +54,11 @@ const UNLIMITED_FUEL: u64 = u64::MAX;
 
 /// Allow-listed `env.*` host imports (the W2 read-only capability tier + revert).
 /// Any other import (or any other namespace) is rejected before instantiation.
-const ALLOWED_ENV_IMPORTS: &[&str] = &[
+///
+/// `pub(crate)` so the deploy-time contract scanner (`scan.rs`) reuses the *exact*
+/// same list in its static walk — a single source of truth, so the scanner can never
+/// drift from the runtime sandbox.
+pub(crate) const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "tx_amount",
     "tx_sequence",
     "sender_fuel",

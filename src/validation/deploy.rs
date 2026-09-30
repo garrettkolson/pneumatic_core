@@ -23,6 +23,8 @@ use crate::encoding::deserialize_rmp_to;
 /// 3. the `engine` is registered in the `ContractEngineRegistry`;
 /// 4. the `bytecode` is within the engine's cap (`Wasm` ≤ 1 MiB, else ≤ 64 KiB)
 ///    and, for `Wasm`, passes the module check (`validate_wasm_module`);
+/// 4b. the deterministic deploy-time contract scanner (ADR-015 extension) reports no
+///    `Reject`-severity finding (Spec well-formedness, Wasm static walk, canary run);
 /// 5. the sender nonce (`tx.sequence_number`) matches the sender's `User.nonce`
 ///    (replay protection for the deterministic token id);
 /// 6. the composite risk does not exceed the environment's `max_risk`.
@@ -79,6 +81,31 @@ impl TransactionValidationSpec for DeployValidationSpec {
         }
         if is_wasm && validate_wasm_module(&params.bytecode).is_err() {
             return Err(deploy_failed());
+        }
+
+        // 4b. Deterministic deploy-time contract scanner (ADR-015 extension).
+        //     A `Reject`-severity finding (malformed Spec, a Wasm `f32`/`f64` opcode,
+        //     a disallowed import, a gas-burn canary, an output-spam overflow, …)
+        //     fails the deploy closed. `Warn` findings are logged (v1, QDS5) and do
+        //     not block. The scan is a pure function of `(engine, bytecode)` + frozen
+        //     caps, so every shard member reaches the same verdict (ADR-008).
+        let scan_findings = crate::contracts::scan_contract(
+            &self.engines,
+            &params.engine,
+            &params.bytecode,
+        );
+        for f in &scan_findings {
+            if f.severity == crate::contracts::Severity::Reject {
+                env_data.logger.log(format!("[deploy-scan] REJECT {:?}: {}", f.code, f.detail));
+                return Err(PneumaticError::Validation(vec![
+                    ValidationFailureReason::ContractScanFailed,
+                ]));
+            }
+        }
+        for f in &scan_findings {
+            if f.severity == crate::contracts::Severity::Warn {
+                env_data.logger.log(format!("[deploy-scan] WARN {:?}: {}", f.code, f.detail));
+            }
         }
 
         // 5. Sender nonce matches (partition == environment_id, ADR-015 QD4).
@@ -145,6 +172,15 @@ mod tests {
         DeployValidationSpec::new(engines, Arc::new(data))
     }
 
+    /// A spec with the `WasmEngine` registered (opt-in, ADR-018) so `Wasm` deploys pass
+    /// the engine-registered check and reach the contract scanner.
+    fn spec_with_wasm(data: StubDataProvider) -> DeployValidationSpec {
+        let engines = Arc::new(ContractEngineRegistry::new());
+        engines.register_defaults();
+        engines.register(Arc::new(crate::contracts::WasmEngine));
+        DeployValidationSpec::new(engines, Arc::new(data))
+    }
+
     fn deploy_tx(params: &DeployParams, sequence: usize) -> Transaction {
         let payload = crate::encoding::serialize_to_bytes_rmp(params).expect("rmp ok");
         Transaction {
@@ -173,12 +209,28 @@ mod tests {
         }
     }
 
+    /// A minimal valid `Spec` `InstructionProgram` (`LoadConst(1); Emit; Halt`).
+    /// The deploy scanner now rejects malformed `Spec` bytecode, so the tests that
+    /// exercise *other* checks must use a well-formed program.
+    fn valid_spec_bytecode() -> Vec<u8> {
+        crate::encoding::serialize_to_bytes_rmp(&crate::contracts::InstructionProgram {
+            version: 1,
+            ops: vec![
+                crate::contracts::Op::LoadConst(1),
+                crate::contracts::Op::Emit,
+                crate::contracts::Op::Halt,
+            ],
+        })
+        .expect("rmp ok")
+    }
+
     #[test]
     fn valid_deploy_passes() {
         let data = StubDataProvider::new()
             .with_user(vec![0x42], PARTITION.to_string(), sender_user(5));
         let spec = spec_with(data);
-        let tx = deploy_tx(&spec_params("my-contract", "Spec", b"ast-bytes"), 5);
+        let bytecode = valid_spec_bytecode();
+        let tx = deploy_tx(&spec_params("my-contract", "Spec", &bytecode), 5);
         assert!(spec.validate(&tx, &Token::new(), &test_env_data()).is_ok());
     }
 
@@ -246,7 +298,8 @@ mod tests {
             .with_user(vec![0x42], PARTITION.to_string(), sender_user(5));
         let spec = spec_with(data);
         // sequence_number 7 != user.nonce 5.
-        let tx = deploy_tx(&spec_params("n", "Spec", b"x"), 7);
+        let bytecode = valid_spec_bytecode();
+        let tx = deploy_tx(&spec_params("n", "Spec", &bytecode), 7);
         assert!(spec.validate(&tx, &Token::new(), &test_env_data()).is_err());
     }
 
@@ -255,7 +308,8 @@ mod tests {
         // No user registered for the sender in this partition.
         let data = StubDataProvider::new();
         let spec = spec_with(data);
-        let tx = deploy_tx(&spec_params("n", "Spec", b"x"), 5);
+        let bytecode = valid_spec_bytecode();
+        let tx = deploy_tx(&spec_params("n", "Spec", &bytecode), 5);
         assert!(spec.validate(&tx, &Token::new(), &test_env_data()).is_err());
     }
 
@@ -264,5 +318,63 @@ mod tests {
         let data = StubDataProvider::new();
         let spec = spec_with(data);
         assert_eq!(spec.name(), "DeployContract");
+    }
+
+    // -- Contract scanner integration (ADR-015 extension) --
+    //
+    // The scanner (check 4b) runs at deploy validation. A `Reject`-severity finding
+    // fails the deploy with `ContractScanFailed`; a clean module passes.
+
+    const FP_INTERNAL_WASM: &[u8] =
+        include_bytes!("../contracts/wasm_fixtures/wasm_fp_internal.wasm");
+    const SUM_WASM: &[u8] = include_bytes!("../contracts/wasm_fixtures/wasm_sum.wasm");
+    const LOOP_WASM: &[u8] = include_bytes!("../contracts/wasm_fixtures/wasm_loop.wasm");
+
+    #[test]
+    fn wasm_scan_reject_fails_deploy() {
+        // `wasm_fp_internal.wasm` has integer exports (passes the ABI-boundary check in
+        // `validate_abi`) but internal `f32`/`f64` ops — the scanner's Wasm static walk
+        // catches it → `WasmFloatOpcode` (Reject) → `ContractScanFailed`.
+        let data = StubDataProvider::new()
+            .with_user(vec![0x42], PARTITION.to_string(), sender_user(5));
+        let spec = spec_with_wasm(data);
+        let tx = deploy_tx(&spec_params("fp-contract", "Wasm", FP_INTERNAL_WASM), 5);
+        let err = spec.validate(&tx, &Token::new(), &test_env_data()).unwrap_err();
+        match err {
+            PneumaticError::Validation(reasons) => assert!(
+                reasons.contains(&ValidationFailureReason::ContractScanFailed),
+                "expected ContractScanFailed, got: {reasons:?}"
+            ),
+            other => panic!("expected Validation(ContractScanFailed), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wasm_scan_clean_passes() {
+        // `wasm_sum.wasm` is a clean module (no imports, integer-only, no loops) — the
+        // scanner reports no `Reject` → the deploy passes all checks.
+        let data = StubDataProvider::new()
+            .with_user(vec![0x42], PARTITION.to_string(), sender_user(5));
+        let spec = spec_with_wasm(data);
+        let tx = deploy_tx(&spec_params("sum-contract", "Wasm", SUM_WASM), 5);
+        assert!(spec.validate(&tx, &Token::new(), &test_env_data()).is_ok());
+    }
+
+    #[test]
+    fn wasm_gas_burn_canary_fails_deploy() {
+        // `wasm_loop.wasm` is a valid, clean-per-static-walk module, but the canary run
+        // exhausts its fuel budget → `CanaryGasExhausted` (Reject) → `ContractScanFailed`.
+        let data = StubDataProvider::new()
+            .with_user(vec![0x42], PARTITION.to_string(), sender_user(5));
+        let spec = spec_with_wasm(data);
+        let tx = deploy_tx(&spec_params("loop-contract", "Wasm", LOOP_WASM), 5);
+        let err = spec.validate(&tx, &Token::new(), &test_env_data()).unwrap_err();
+        match err {
+            PneumaticError::Validation(reasons) => assert!(
+                reasons.contains(&ValidationFailureReason::ContractScanFailed),
+                "expected ContractScanFailed, got: {reasons:?}"
+            ),
+            other => panic!("expected Validation(ContractScanFailed), got: {other:?}"),
+        }
     }
 }

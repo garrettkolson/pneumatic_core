@@ -194,6 +194,13 @@ pub enum ValidationFailureReason {
     /// violation, invalid name, a failing Wasm module check, or a nonce
     /// mismatch. The transaction is failed before routing.
     ContractDeployFailed,
+    /// A `DeployContract` tx failed the deterministic deploy-time contract
+    /// scanner (ADR-015 extension; `src/contracts/scan.rs`): a `Reject`-severity
+    /// finding from the Spec well-formedness check, the Wasm static walk, or the
+    /// canary run (e.g. an internal `f32`/`f64` opcode, a disallowed import, a
+    /// gas-burn loop, or an output-spam overflow). The transaction is failed
+    /// closed before routing.
+    ContractScanFailed,
 }
 
 // ---------------------------------------------------------------------------

@@ -1226,6 +1226,7 @@ dependencies = [
  "tokio-macros",
  "tokio-stream",
  "wasmi",
+ "wasmparser",
  "x25519-dalek 3.0.0",
 ]
 

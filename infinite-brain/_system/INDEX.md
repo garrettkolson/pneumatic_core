@@ -35,7 +35,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `decision-tx-calldata-payload` | ADR-012: Additive payload: Vec<u8> on Transaction as contract calldata | Additive payload: Vec<u8> on Transaction carries contract calldata (skip-if-empty keeps legacy wire byte-identical); it joins CanonicalTransaction so the sender signs it, with a sentinel-enforced size cap. | 4 |
 | `decision-wasm-engine-tier2` | ADR-018: Tier-2 WasmEngine (wasmi) behind the ContractEngine trait | WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-metered, sandboxed, frozen ABI) so SmartContract.bytecode can be a WASM module for rich logic; opt-in, tiers W1 compute → W2 read → W3 storage → W4 cross-contract. **Core (W1+W2) landed 09/29/2026 (P5)**; W3 storage (P7), W4 cross-contract (P9) remain. | 5 |
 
-## concept (34)
+## concept (35)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -45,6 +45,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `concept-candidate-registry-conflict` | CandidateRegistry — conflict detection & resolution state | CandidateRegistry is keyed by (token_id, previous_hash): the registry a second valid block for the same slot lands in, triggering conflict detection and the discard/slash path. | 3 |
 | `concept-committer-role` | Committer role — terminal commit pipeline and epoch management | The terminal node: role-gated auth for 7 wire actions, commit with conflict resolution + per-sender gas, block distribution, and the epoch loop (staking, reconciliation, leader proposal). | 5 |
 | `concept-conn-abstraction` | Connection abstraction: ConnFactory + Sender/Stream/Listener trait families with TCP and UDS duality | One factory and four trait families (Connection/Sender/Stream/Listener) abstract TCP and Unix sockets; every local path is UDS-first with TCP fallback. NOTE: legacy/local layer — the production inter-node wire for role traffic is RNS. | 3 |
+| `concept-contract-scanner` | Deploy-time contract scanner — deterministic malware pre-screen (Spec well-formedness + Wasm static walk + canary) | A pure, fail-closed deploy-time scanner (src/contracts/scan.rs) that runs in DeployValidationSpec (check 4b) and fails closed on a Reject finding (ContractScanFailed): Spec AST well-formedness, a wasmparser Wasm static walk (closes the f32/f64 ABI-boundary gap), and a canary execute on a fixed canonical input + fuel budget. | 5 |
 | `concept-data-provider` | DataProvider: MsgPack data-store trait with UDS-first local transport and HMAC option | DataProvider trait with Default-Provider fallbacks; DefaultDataProvider talks MsgPack over UDS (per-UID) or TCP loopback :55555, with optional HMAC shared secret. | 3 |
 | `concept-env-driven-config` | Environment-driven configuration: config.json + /env/ specs | Config::build loads config.json plus every JSON spec in /env/ into per-environment EnvironmentMetadata (partitions, quorum, crypto, cost model, validators); invalid specs fail boot. | 4 |
 | `concept-epoch-and-staking` | Epochs, stake sets, and (stubbed) staking persistence | Epoch (epoch/types.rs:15) + StakeSet/ExecutorSet drive leader election and sharding; IStakingManager/IEpochReconciler exist but StubStakingManager is a no-op (epoch/types.rs:122). | 4 |
@@ -188,4 +189,4 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 
 ## Totals
 
-102 nodes. Logs (append-only, never indexed): see logs/.
+104 nodes. Logs (append-only, never indexed): see logs/.
