@@ -4,13 +4,13 @@ title: "Open: implement executor contract execution (plan Phases 1-10)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P7 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage). Remaining: P8 upgrade governance, P9 Model X calls, P10 e2e."
+summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P8 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage, upgrade governance). Remaining: P9 Model X calls, P10 e2e."
 auto_inject: false
 applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
 confidence: 0.9
 verified_at: "09/29/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 8/9/10 (governance, Model X, e2e) are landed or re-scoped; P1-P7 landed 09/29/2026"
+staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 9/10 (Model X, e2e) are landed or re-scoped; P1-P8 landed 09/29/2026"
 tags: [task, executor, contract-execution, implementation, adr-011, adr-014]
 edges:
   - target: decision-contract-engine-model
@@ -55,10 +55,10 @@ Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
 `plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
 `plans/wasm-engine-design.md`; deploy design: `plans/deploy-contract-design.md`.
-Status: **in progress** — Phases 1–7 complete (09/29/2026); the Tier-2 WasmEngine
-**core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6), and **Wasm
-storage (W3)** is landed (Phase 7). Remaining: P8 (governance), P9 (Model X),
-P10 (e2e).
+Status: **in progress** — Phases 1–8 complete (09/29/2026); the Tier-2 WasmEngine
+**core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6), **Wasm
+storage (W3)** is landed (Phase 7), and **upgrade governance** is landed (Phase 8).
+Remaining: P9 (Model X), P10 (e2e).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -191,8 +191,26 @@ Phase checklist (each phase's exit criteria live in the plan):
   out of bounds). 5 new Wasm tests (round-trip + canonical determinism + base-state read +
   gas + cap) + 7 committer apply tests. Core 582 → 628; committer 102+9; workspace
   `cargo test` green (cross-executor Wasm determinism re-verified).
-- **P8** — upgrade governance: owner registry, M-of-N multisig, 1-epoch timelock —
-  applies to Wasm modules (ADR-017 design first).
+- **P8 ✅ (09/29/2026)** — **upgrade governance** (ADR-017, design first). Landed in
+  `pneumatic_core::contracts::upgrade` (new `src/contracts/upgrade.rs`: `UpgradeParams`,
+  `ReplaceAssetDelta`, `upgrade_gas = 50_000 + 10·len`, `upgrade_digest`, `verify_quorum`,
+  `timelock_satisfied`, `apply_replace_asset`), the `SmartContract` owner fields
+  (`src/tokens.rs`: `owners: Vec<Vec<u8>>` + `threshold: u32`, both `#[serde(default)]`;
+  `threshold == 0` ⇒ immutable), `pneumatic_core::validation::upgrade`
+  (`UpgradeValidationSpec`: parse → contract → threshold>0 → quorum → bytecode cap +
+  `validate_wasm_module` / Spec + scanner no-Reject → risk), the executor dispatch
+  (`execute_upgrade`: re-validates the M-of-N quorum deterministically, emits the
+  `ReplaceAssetDelta` in `result_data`), and the committer `apply_upgrade_delta`
+  (dispatch on `action == "UpgradeContract"`: re-derive delta, `hash(delta) == result_hash`
+  else `TransactionPayloadMismatch`, **threshold-0 no-op (defense in depth)**, timelock
+  gate `epoch >= proposal_epoch + 1` else no-op, `apply_replace_asset`). **QD1** owner
+  registry = dedicated `SmartContract` fields; **QD2** quorum = canonical digest
+  `SHA256(b"PNEUMATIC/UPGRADE/v1" ‖ rmp(token_id, SHA256(bytecode), owners, threshold,
+  epoch))` + Ed25519 M-of-N over the **current** owners (safe rotation); **QD3** timelock =
+  apply-time gate, no pending store. Applies to Wasm modules (the delta swaps the module
+  bytecode). 11 new core tests (7 `contracts::upgrade` + 4 `validation::upgrade`) + 3
+  executor + 7 committer. Core 628 → 639; committer 102 → 109; executor 21 → 24;
+  workspace `cargo test` green.
 - **P9** — Model X cross-contract calls: snapshot-pinned `Call` (Spec ISA op) + Wasm
   `call` host import (W4), cross-referenced tx on B's chain, deterministic
   revert/compensation (ADR-016 design first).

@@ -489,4 +489,5 @@ mod tests {
     mod pool;
     mod deploy;
     mod storage;
+    mod upgrade;
 }

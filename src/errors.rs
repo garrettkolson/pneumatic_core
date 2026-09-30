@@ -201,6 +201,13 @@ pub enum ValidationFailureReason {
     /// gas-burn loop, or an output-spam overflow). The transaction is failed
     /// closed before routing.
     ContractScanFailed,
+    /// An `UpgradeContract` tx failed the sentinel-side upgrade-governance
+    /// validation (ADR-017, Phase 8): unparseable payload, a non-contract target,
+    /// an immutable target (`threshold == 0`), a quorum shortfall (fewer than
+    /// `threshold` distinct current owners sign the canonical digest), a bytecode
+    /// cap violation, or a failing Wasm module check / scanner. The transaction is
+    /// failed before routing.
+    ContractUpgradeFailed,
 }
 
 // ---------------------------------------------------------------------------

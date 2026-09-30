@@ -10,7 +10,7 @@ applicable_when: "Designing, scoping, or implementing on-chain contract deployme
 confidence: 0.95
 verified_at: "09/29/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Core landed (Phase 6, 09/29/2026). Stale when upgrade governance (Phase 8) adds an owner/upgrade path, when initial_state storage (Phase 7) lands and changes the CreateTokenDelta, or when the partition model (QD4) changes"
+staleness_signal: "Core landed (Phase 6, 09/29/2026); W3 storage (Phase 7) + upgrade governance (Phase 8 / ADR-017) landed 09/29/2026 and do not change the CreateTokenDelta. Stale when the partition model (QD4) changes or a new deploy parameter is added"
 tags: [adr, design-decision, contract-execution, deployment, token-id, create-token-delta, committer, engine-agnostic]
 edges:
   - target: decision-contract-model-lifecycle

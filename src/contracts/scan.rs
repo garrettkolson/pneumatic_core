@@ -558,6 +558,8 @@ fn canary_run(
         bytecode: bytecode.to_vec(),
         version: "1".to_string(),
         storage: Default::default(),
+        owners: vec![],
+        threshold: 0,
     };
     let user = User {
         public_key: vec![0u8; 32],

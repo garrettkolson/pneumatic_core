@@ -263,6 +263,12 @@ impl EnvironmentMetadata {
         let deploy_data_provider: Arc<dyn DataProvider> = Arc::new(DefaultDataProvider::new());
         specs.register_deploy(contract_engines.clone(), deploy_data_provider);
 
+        // ADR-017, Phase 8: wire the `UpgradeContract` validation spec into the
+        // transaction validation registry. It needs the contract engine registry
+        // (bytecode cap + Wasm module check + scanner) and reads the environment's
+        // crypto provider at validate time (the M-of-N quorum check).
+        specs.register_upgrade(contract_engines.clone());
+
         let mut block_specs = BlockValidatorSpecRegistry::new();
         block_specs.register_defaults();
 

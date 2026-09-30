@@ -229,6 +229,18 @@ impl Committer {
             self.apply_storage_delta(&transaction)?;
         }
 
+        // Step 3.8: Apply an `UpgradeContract` delta (ADR-017, Phase 8). The
+        // `ReplaceAssetDelta` is a pure function of the transaction, so the committer
+        // re-derives it, verifies it against the signed `result_hash`, and — only
+        // when the committed block's `epoch_number` satisfies the 1-epoch timelock
+        // (QD3) — swaps the target contract's bytecode + owner set.
+        if transaction.action == "UpgradeContract" {
+            self.apply_upgrade_delta(
+                &transaction,
+                commit.proposed_block.epoch_number,
+            )?;
+        }
+
         // Step 4: Update transaction state
         if is_leader_proposal {
             // Leader-proposal path: remove from pool, then transition to Committed
@@ -323,6 +335,98 @@ impl Committer {
                     .map_err(|e| CommitterError::Core(PneumaticError::Data(e)))?;
             }
         }
+        Ok(())
+    }
+
+    /// Apply an `UpgradeContract` delta at commit time (ADR-017, Phase 8).
+    ///
+    /// The executor emits a canonical `ReplaceAssetDelta` in `result_data` and the
+    /// finalizer signs its hash. The delta is a **pure function** of the
+    /// transaction (`token_id`, `UpgradeParams`), so the committer re-derives it and
+    /// verifies it against the signed `result_hash` before applying — binding the
+    /// apply to the executor's signed output.
+    ///
+    /// The apply is gated by the **1-epoch timelock** (QD3): the swap happens only
+    /// when the committed block's `epoch_number >= proposal_epoch + 1`. An early
+    /// commit is a **no-op** — the proposal is admitted (sentinel) and signed
+    /// (executor/finalizer) but not yet appliable; a later block at the right epoch
+    /// applies it.
+    ///
+    /// **No-op** for a missing token, a not-yet-satisfied timelock, or a non-contract
+    /// target (no `SmartContract` asset). The apply is **idempotent** (setting the
+    /// same bytecode + owner set twice is a no-op), so a replayed commit never
+    /// double-applies.
+    pub(crate) fn apply_upgrade_delta(
+        &self,
+        transaction: &Transaction,
+        current_epoch: u64,
+    ) -> Result<(), CommitterError> {
+        use pneumatic_core::contracts::{
+            apply_replace_asset, timelock_satisfied, ReplaceAssetDelta, UpgradeParams,
+        };
+        use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
+        use pneumatic_core::errors::PneumaticError;
+        use pneumatic_core::tokens::SmartContract;
+
+        let env_id = &self.env_data.environment_id;
+
+        // 1. Load the target token; a missing token has nothing to apply.
+        let mut token = match self
+            .data_provider
+            .get_token(&transaction.token_id, env_id)
+        {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+
+        // 2. Parse the upgrade parameters from the payload.
+        let params: UpgradeParams =
+            deserialize_rmp_to(&transaction.payload).map_err(CommitterError::Deserialization)?;
+
+        // 3. Re-derive the canonical delta (same formula as the executor) and verify
+        //    it against the signed `result_hash`.
+        let hash = BasicHashProvider::new();
+        let delta = ReplaceAssetDelta {
+            token_id: transaction.token_id.clone(),
+            new_bytecode: params.new_bytecode.clone(),
+            new_owners: params.new_owners.clone(),
+            new_threshold: params.new_threshold,
+            proposal_epoch: params.proposal_epoch,
+        };
+        let result_bytes =
+            serialize_to_bytes_rmp(&delta).map_err(|_| CommitterError::InternalSerialization)?;
+        if hash.hash(&result_bytes) != transaction.result_hash {
+            return Err(CommitterError::TransactionPayloadMismatch(
+                transaction.id.clone(),
+            ));
+        }
+
+        // 4. Immutable target (defense in depth): an `threshold == 0` contract is
+        //    not upgradable. The sentinel and executor already reject these, but the
+        //    committer is the final authority on chain state and re-checks.
+        if let Some(current) = token.get_asset::<SmartContract>() {
+            if current.threshold == 0 {
+                return Ok(());
+            }
+        }
+
+        // 5. Timelock gate (QD3): the swap applies only when the committed block's
+        //    epoch is at least `proposal_epoch + 1`. An early commit is a no-op.
+        if !timelock_satisfied(params.proposal_epoch, current_epoch) {
+            return Ok(());
+        }
+
+        // 5. Apply the ReplaceAsset delta (swaps bytecode + owner set, preserves
+        //    name/version/storage). A non-contract target (no asset) is a no-op.
+        if apply_replace_asset(&mut token, &delta).is_err() {
+            return Ok(());
+        }
+
+        // 6. Persist the updated token.
+        let token_id = token.id.clone();
+        self.data_provider
+            .save_token(&token_id, token, env_id)
+            .map_err(|e| CommitterError::Core(PneumaticError::Data(e)))?;
         Ok(())
     }
 

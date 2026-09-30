@@ -207,6 +207,8 @@ mod tests {
             engine: engine.to_string(),
             bytecode: bytecode.to_vec(),
             metadata: std::collections::HashMap::new(),
+            owners: vec![],
+            threshold: 0,
         }
     }
 

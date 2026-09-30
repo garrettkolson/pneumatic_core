@@ -48,6 +48,14 @@ pub struct DeployParams {
     /// Extra user-supplied metadata keys (the required `token_type` /
     /// `contract_engine` / `name` keys are set by the committer, not here).
     pub metadata: HashMap<String, String>,
+    /// M-of-N owner registry established at deploy (ADR-017, Phase 8). `#[serde(default)]`
+    /// (empty) keeps a deploy without owners valid — the contract is immutable
+    /// (`threshold = 0`) unless the deployer sets a non-zero threshold.
+    #[serde(default)]
+    pub owners: Vec<Vec<u8>>,
+    /// The M-of-N threshold (ADR-017). `0` == permanently immutable.
+    #[serde(default)]
+    pub threshold: u32,
 }
 
 /// The canonical `CreateToken` state delta the executor emits in `result_data`.
@@ -64,6 +72,12 @@ pub struct CreateTokenDelta {
     pub bytecode: Vec<u8>,
     /// Extra user-supplied metadata keys.
     pub metadata: HashMap<String, String>,
+    /// M-of-N owner registry established at deploy (ADR-017). `#[serde(default)]`.
+    #[serde(default)]
+    pub owners: Vec<Vec<u8>>,
+    /// The M-of-N threshold (ADR-017). `0` == permanently immutable.
+    #[serde(default)]
+    pub threshold: u32,
 }
 
 /// Deployment gas cost for a bytecode of `bytecode_len` bytes.
@@ -141,6 +155,8 @@ pub fn deploy_contract(
         engine: params.engine.clone(),
         bytecode: params.bytecode.clone(),
         metadata: params.metadata.clone(),
+        owners: params.owners.clone(),
+        threshold: params.threshold,
     })
 }
 
@@ -157,6 +173,8 @@ impl CreateTokenDelta {
             bytecode: self.bytecode.clone(),
             version: "1".to_string(),
             storage: Default::default(),
+            owners: self.owners.clone(),
+            threshold: self.threshold,
         };
         let mut token = Token::from_asset(&contract)
             .map_err(|e| ContractError::InvalidInput(format!("from_asset: {e}")))?;
@@ -193,6 +211,8 @@ mod tests {
             engine: engine.to_string(),
             bytecode: bytecode.to_vec(),
             metadata: HashMap::new(),
+            owners: vec![],
+            threshold: 0,
         }
     }
 

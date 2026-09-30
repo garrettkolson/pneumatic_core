@@ -44,6 +44,17 @@ pub use deploy::{
 mod scan;
 pub use scan::{scan_contract, ScanCode, ScanFinding, Severity};
 
+// Upgrade governance (ADR-017, Phase 8) — the canonical upgrade digest, the
+// M-of-N quorum check, the 1-epoch timelock gate, and the `ReplaceAsset` apply.
+// Lives in `src/contracts/upgrade.rs`. Consensus-safe by construction: every
+// step is a pure function of (token, proposal payload, current owner registry)
+// + frozen constants, so every node re-derives the same result (ADR-008).
+mod upgrade;
+pub use upgrade::{
+    apply_replace_asset, timelock_satisfied, upgrade_digest, upgrade_gas, verify_quorum,
+    ReplaceAssetDelta, TIMELOCK_EPOCHS, UPGRADE_GAS_BASE, UPGRADE_GAS_PER_BYTE, UpgradeParams,
+};
+
 // ---------------------------------------------------------------------------
 // ContractEngine — the pluggable execution trait (ADR-011)
 // ---------------------------------------------------------------------------
@@ -684,6 +695,8 @@ mod tests {
             bytecode: vec![0xAB, 0xCD],
             version: "1".to_string(),
             storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
         }
     }
 
@@ -998,6 +1011,8 @@ mod tests {
             bytecode,
             version: "1".to_string(),
             storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
         }
     }
 
@@ -1339,6 +1354,8 @@ mod tests {
             bytecode: program_bytes(random_program(&mut rng)),
             version: "1".to_string(),
             storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
         };
         let gas = tx.gas_limit;
         let user = User {

@@ -24,12 +24,14 @@ pub use self::executed::ExecutedBlockValidatorSpec;
 pub use self::registries::{BlockValidatorSpecRegistry, ValidationSpecRegistry};
 pub use self::shielded::{RootSnapshot, ShieldedValidationDeps, ShieldedValidationSpec};
 pub use self::deploy::DeployValidationSpec;
+pub use self::upgrade::UpgradeValidationSpec;
 // pub(crate) items the test suite reaches through the parent namespace:
 #[cfg(test)]
 pub(crate) use self::shielded::SHIELDED_VALIDATOR_VERIFIER;
 
 pub mod deploy;
 pub mod executed;
+pub mod upgrade;
 pub mod registries;
 pub mod self_signed;
 pub mod shielded;

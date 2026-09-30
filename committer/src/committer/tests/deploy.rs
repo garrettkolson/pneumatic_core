@@ -49,6 +49,8 @@ fn spec_params() -> DeployParams {
         engine: "Spec".to_string(),
         bytecode: vec![1, 2, 3, 4, 5],
         metadata: HashMap::new(),
+        owners: vec![],
+        threshold: 0,
     }
 }
 

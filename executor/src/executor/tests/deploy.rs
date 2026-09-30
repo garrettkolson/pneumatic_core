@@ -89,6 +89,8 @@ async fn deploy_produces_deterministic_token_and_result_hash() {
         engine: "Spec".to_string(),
         bytecode: vec![9, 8, 7, 6, 5, 4, 3, 2, 1],
         metadata: HashMap::new(),
+        owners: vec![],
+        threshold: 0,
     };
     let (pending, params, sender) = deploy_entry(params, vec![0x42; 32], 7);
 

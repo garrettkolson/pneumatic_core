@@ -83,6 +83,8 @@ fn engine_data_provider(
         bytecode: vec![1, 2, 3],
         version: "1".to_string(),
         storage: Default::default(),
+        owners: vec![],
+        threshold: 0,
     };
     let mut token = Token::from_asset(&contract).unwrap().with_id(token_id.clone());
     token

@@ -583,6 +583,8 @@ mod tests {
             bytecode: bytecode.to_vec(),
             version: "1".to_string(),
             storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
         }
     }
 

@@ -62,6 +62,16 @@ impl ValidationSpecRegistry {
     ) {
         self.register(Box::new(DeployValidationSpec::new(engines, data)));
     }
+
+    /// Register the `UpgradeContract` validation spec (ADR-017, Phase 8).
+    ///
+    /// Distinct from `register_defaults`: it needs the `ContractEngineRegistry`
+    /// (bytecode cap + Wasm module check + scanner) and the environment's crypto
+    /// provider (the M-of-N quorum check — read from `env_data` at validate time).
+    /// Registered under the name `"UpgradeContract"`.
+    pub fn register_upgrade(&mut self, engines: Arc<crate::contracts::ContractEngineRegistry>) {
+        self.register(Box::new(crate::validation::UpgradeValidationSpec::new(engines)));
+    }
 }
 
 // Blanket impl: Box<dyn TransactionValidationSpec> delegates to the inner trait object.

@@ -36,6 +36,8 @@ fn wasm_contract_token(token_id: Vec<u8>, initial_storage: BTreeMap<Vec<u8>, Vec
         bytecode: vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
         version: "1".to_string(),
         storage: initial_storage,
+        owners: vec![],
+        threshold: 0,
     };
     token.set_asset(&sc).unwrap();
     token

@@ -201,6 +201,8 @@ fn standard_token() -> Token {
         bytecode: vec![1, 2, 3],
         version: "1".to_string(),
         storage: Default::default(),
+        owners: vec![],
+        threshold: 0,
     };
     let mut token = Token::new();
     token.id = TOKEN_ID.to_vec();

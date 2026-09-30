@@ -509,6 +509,20 @@ pub struct SmartContract {
     /// pre-W3 contract assets (no `storage` key) valid.
     #[serde(default)]
     pub storage: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Upgrade-governance owner registry (ADR-017, Phase 8).
+    ///
+    /// The set of Ed25519 public keys authorized to upgrade this contract. A
+    /// proposal must carry signatures from ≥ `threshold` *distinct* current owners
+    /// over the canonical upgrade digest. Empty + `threshold == 0` (the default)
+    /// marks the contract **immutable** — no upgrade is admissible. Settable at
+    /// deploy time (via `DeployParams::owners`/`threshold`) and rotatable by a
+    /// quorum upgrade. `#[serde(default)]` keeps pre-governance contract assets valid.
+    #[serde(default)]
+    pub owners: Vec<Vec<u8>>,
+    /// Minimum number of distinct current owners required to authorize an upgrade.
+    /// `0` = immutable (no upgrade admissible). See `owners`.
+    #[serde(default)]
+    pub threshold: u32,
 }
 
 /// Authorization for a contract proxy to access resources.
@@ -612,6 +626,8 @@ mod tests {
             bytecode: vec![0x01, 0x02],
             version: String::from("1.0"),
             storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
         };
         let id = vec![4, 5, 6];
         let token = TokenFactory::mint_contract_token(

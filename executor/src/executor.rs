@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use pneumatic_core::contracts::{
-    deploy_contract, deploy_gas, select_engine, ContractEngineRegistry, ContractError,
-    CreateTokenDelta, DeployParams, ExecutionInput, ExecutionOutput, TransferDelta,
+    deploy_contract, deploy_gas, select_engine, upgrade_gas, verify_quorum,
+    ContractEngineRegistry, ContractError, CreateTokenDelta, DeployParams, ExecutionInput,
+    ExecutionOutput, ReplaceAssetDelta, TransferDelta, UpgradeParams,
 };
-use pneumatic_core::crypto::{AsymCryptoProvider, HashProvider};
+use pneumatic_core::crypto::{AsymCryptoProvider, Ed25519Provider, HashProvider};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
@@ -65,6 +66,12 @@ pub struct Executor {
     pending_registry: Arc<PendingTransactionRegistry>,
     /// Hash provider for result hashing
     hash_provider: Arc<dyn HashProvider>,
+    /// Asymmetric crypto provider for the deterministic M-of-N quorum re-check on
+    /// `UpgradeContract` txs (ADR-017, Phase 8). Defaults to a fresh `Ed25519Provider`
+    /// — any such instance verifies any Ed25519 signature against the supplied public
+    /// key, so the default is a universal verifier. `RwLock` because the trait object
+    /// is `!Sync`-guarded by the provider's interior state.
+    crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
     /// Token partition ID for data fetches (defect D3: fetch under the token
     /// partition, not the environment id).
     partition_id: String,
@@ -113,6 +120,11 @@ impl Executor {
             data_provider,
             pending_registry,
             hash_provider,
+            // ADR-017, Phase 8: default crypto provider for the upgrade-quorum
+            // re-check. A fresh `Ed25519Provider` is a universal Ed25519 verifier
+            // (it verifies any signature against the supplied public key), so no
+            // call site needs to supply one.
+            crypto_provider: Arc::new(RwLock::new(Ed25519Provider::generate())),
             partition_id,
             contract_engine_registry,
             preload_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -231,6 +243,7 @@ impl Executor {
             data_provider: self.data_provider.clone(),
             pending_registry: self.pending_registry.clone(),
             hash_provider: self.hash_provider.clone(),
+            crypto_provider: self.crypto_provider.clone(),
             partition_id: self.partition_id.clone(),
             contract_engine_registry: self.contract_engine_registry.clone(),
             preload_tasks: self.preload_tasks.clone(),
@@ -256,6 +269,9 @@ struct ExecutorHandle {
     data_provider: Arc<dyn DataProvider>,
     pending_registry: Arc<PendingTransactionRegistry>,
     hash_provider: Arc<dyn HashProvider>,
+    /// Asymmetric crypto provider for the deterministic M-of-N quorum re-check on
+    /// `UpgradeContract` txs (ADR-017, Phase 8). Cloned from the `Executor`.
+    crypto_provider: Arc<RwLock<dyn AsymCryptoProvider>>,
     partition_id: String,
     contract_engine_registry: Arc<ContractEngineRegistry>,
     /// Shared results store (observability) — persists until `preload_cleanup`.
@@ -399,9 +415,18 @@ impl ExecutorHandle {
                 .get_user(&transaction.sender, &self.partition_id)
                 .map_err(ExecutorError::Data)?;
 
-            // Step 5: Execute the contract via its selected engine (defect
-            // D1: real dispatch replaces the identity stub).
-            self.execute_contract(&transaction, &token, &user).await
+            // ADR-017, Phase 8: `UpgradeContract` is a governance op on an
+            // EXISTING contract token — it needs the token (the current owner
+            // registry) but no engine execution. It re-validates the quorum and
+            // emits a `ReplaceAssetDelta`; the committer applies it under the
+            // 1-epoch timelock.
+            if transaction.action == "UpgradeContract" {
+                self.execute_upgrade(&transaction, &token)
+            } else {
+                // Step 5: Execute the contract via its selected engine (defect
+                // D1: real dispatch replaces the identity stub).
+                self.execute_contract(&transaction, &token, &user).await
+            }
         };
 
         // A contract-level failure (unknown engine, missing contract, gas
@@ -609,6 +634,93 @@ impl ExecutorHandle {
         // applies it at commit.
         let result_data = serialize_to_bytes_rmp(&delta).map_err(|_| {
             ExecutorError::Validation(vec![ValidationFailureReason::ContractDeployFailed])
+        })?;
+
+        Ok(ExecutionOutput {
+            result_data,
+            gas_used: gas,
+        })
+    }
+
+    /// Execute an `UpgradeContract` protocol op (ADR-017, Phase 8). The target
+    /// contract token already exists (fetched in step 3); the op:
+    /// 1. parses the `UpgradeParams` from the tx payload;
+    /// 2. checks the upgrade gas fits the tx's `gas_limit` (if set);
+    /// 3. reads the target contract's *current* owner registry + threshold;
+    /// 4. re-validates the M-of-N quorum **deterministically** (the executor is the
+    ///    authoritative re-check; the sentinel's `UpgradeValidationSpec` is the
+    ///    admission gate);
+    /// 5. builds a canonical `ReplaceAssetDelta` and emits it in `result_data`
+    ///    (the committer re-derives it at commit and verifies `hash == result_hash`).
+    ///
+    /// The 1-epoch timelock (QD3) is NOT checked here — it is an apply-time gate
+    /// enforced by the committer against the committed block's `epoch_number`.
+    fn execute_upgrade(
+        &self,
+        tx: &Transaction,
+        token: &Token,
+    ) -> Result<ExecutionOutput, ExecutorError> {
+        // 1. Parse the upgrade parameters from the payload.
+        let params: UpgradeParams = deserialize_rmp_to(&tx.payload).map_err(|_| {
+            ExecutorError::Validation(vec![ValidationFailureReason::ContractUpgradeFailed])
+        })?;
+
+        // 2. The upgrade gas must fit the tx's gas limit (if a limit was set).
+        let gas = upgrade_gas(params.new_bytecode.len());
+        if tx.gas_limit > 0 && gas > tx.gas_limit {
+            return Err(ExecutorError::Validation(vec![
+                ValidationFailureReason::GasLimitExceeded,
+            ]));
+        }
+
+        // 3. Read the target contract's CURRENT owner registry + threshold.
+        let current: SmartContract = token
+            .get_asset()
+            .ok_or_else(|| {
+                ExecutorError::Validation(vec![
+                    ValidationFailureReason::ContractUpgradeFailed,
+                ])
+            })?;
+        if current.threshold == 0 {
+            // Immutable contract — no upgrade is admissible.
+            return Err(ExecutorError::Validation(vec![
+                ValidationFailureReason::ContractUpgradeFailed,
+            ]));
+        }
+
+        // 4. Re-validate the M-of-N quorum deterministically (QD2).
+        let crypto = self.crypto_provider.read().unwrap();
+        let quorum = verify_quorum(
+            &tx.token_id,
+            &params.new_bytecode,
+            &params.new_owners,
+            params.new_threshold,
+            params.proposal_epoch,
+            &params.owner_signatures,
+            &current.owners,
+            current.threshold,
+            &*crypto,
+            &*self.hash_provider,
+        )
+        .map_err(ExecutorError::from)?;
+        if !quorum {
+            return Err(ExecutorError::Validation(vec![
+                ValidationFailureReason::ContractUpgradeFailed,
+            ]));
+        }
+
+        // 5. Build the canonical ReplaceAssetDelta and emit it in result_data.
+        let delta = ReplaceAssetDelta {
+            token_id: tx.token_id.clone(),
+            new_bytecode: params.new_bytecode.clone(),
+            new_owners: params.new_owners.clone(),
+            new_threshold: params.new_threshold,
+            proposal_epoch: params.proposal_epoch,
+        };
+        let result_data = serialize_to_bytes_rmp(&delta).map_err(|_| {
+            ExecutorError::Validation(vec![
+                ValidationFailureReason::ContractUpgradeFailed,
+            ])
         })?;
 
         Ok(ExecutionOutput {
@@ -863,4 +975,5 @@ mod tests {
     mod signing;
     mod validation;
     mod deploy;
+    mod upgrade;
 }

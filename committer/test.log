@@ -7842,3 +7842,23 @@
 2026-09-30 12:57:20.978308 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
 2026-09-30 12:57:20.979053 UTC: Committed block to token [01] (chain length: 2, seq: 1)
 2026-09-30 12:57:20.980935 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-30 17:55:02.710333 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-30 17:55:02.713647 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-30 17:55:02.715710 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-30 17:55:02.716163 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-30 17:56:15.670600 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-30 17:56:15.671153 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-30 17:56:15.675019 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-30 17:56:15.676625 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-30 18:10:25.138138 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-30 18:10:25.140276 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-30 18:10:25.142162 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-30 18:10:25.144092 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-30 18:12:58.247677 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-30 18:12:58.248543 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-30 18:12:58.249584 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-30 18:12:58.251795 UTC: Attempted to distribute block to archivers (hash: )
+2026-09-30 18:26:34.688961 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-09-30 18:26:34.690822 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-09-30 18:26:34.691575 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-09-30 18:26:34.692464 UTC: Attempted to distribute block to archivers (hash: )
