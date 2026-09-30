@@ -43,7 +43,8 @@ async fn propose_blocks_returns_batch_when_leader_with_pool_items() {
         timestamp: 5000,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     registry.transition_to_validated_and_enqueue(
         &tx_id,
         tx.clone(),
@@ -103,7 +104,8 @@ async fn run_epoch_loop_commits_leader_proposed_block() {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             TransactionValidationResult {
                 is_valid: true,
                 risk: TransactionRiskFactor {

@@ -109,6 +109,7 @@ fn acquire_terminal_state_fails() {
                 sender: vec![], receiver: vec![], amount: None,
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             vec![],
         );
@@ -131,6 +132,7 @@ fn get_validation_result_from_validated_returns_some() {
                 sender: vec![1], receiver: vec![2], amount: Some(100),
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             TransactionValidationResult::valid(
                 vec![1],
@@ -175,6 +177,7 @@ fn release_failed_transaction_returns_true() {
                 sender: vec![], receiver: vec![], amount: None,
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             vec![ValidationFailureReason::InsufficientFunds],
         );
@@ -199,6 +202,7 @@ fn set_requested_finalizer_validated_succeeds() {
                 sender: vec![1], receiver: vec![2], amount: Some(100),
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
         );
@@ -226,6 +230,7 @@ fn is_requested_finalizer_matches() {
                 sender: vec![1], receiver: vec![2], amount: Some(100),
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
         );
@@ -247,6 +252,7 @@ fn is_requested_finalizer_mismatch() {
                 sender: vec![1], receiver: vec![2], amount: Some(100),
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             TransactionValidationResult::valid(vec![], TransactionRiskFactor { affected_parties: 1, amount: 0, is_contract: false, is_multi_party: false }),
         );
@@ -409,6 +415,7 @@ fn concurrent_acquire_terminal_state_rejected() {
                 sender: vec![], receiver: vec![], amount: None,
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             vec![],
         );

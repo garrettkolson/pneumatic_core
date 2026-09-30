@@ -419,7 +419,8 @@ pub fn make_e2e_shielded_block(
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        },
+        
+        result_data: vec![],},
         total_voters: 3,
         total_stake: 42,
         leader_hash: prev_hash.clone(),

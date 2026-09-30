@@ -351,7 +351,7 @@ impl ExecutorHandle {
                     ExecutorError::Registry(format!("{:?}", other))
                 }
             })?;
-        let transaction = match &entry.state {
+        let mut transaction = match &entry.state {
             pneumatic_core::transactions::TransactionState::Preloaded { transaction } => {
                 transaction.clone()
             }
@@ -439,6 +439,13 @@ impl ExecutorHandle {
             }
             return Err(ExecutorError::Validation(reasons));
         }
+
+        // Step 8 (W3, ADR-018): the committed transaction must carry `result_data`
+        // so the committer can apply the Wasm storage delta. Unlike the P6 deploy
+        // delta, a storage delta is NOT re-derivable (it is the module's `sstore`
+        // output), so the executor ships it on the transaction. Set it before the
+        // transaction is serialized for the finalizer/commit path.
+        transaction.result_data = final_result.result_data.clone();
 
         // Step 9: Get finalizer key from validation result
         let finalizer_key = self.get_finalizer_key(tx_id);
@@ -529,6 +536,7 @@ impl ExecutorHandle {
                 sender_state: &user,
                 token: &token,
                 gas_limit: tx.gas_limit,
+                storage: contract.storage.clone(),
             };
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.execute(&input)))
         });

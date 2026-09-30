@@ -14,7 +14,7 @@
 //! Engines live in `pneumatic_core` (sub-decision 1 of ADR-011) so every role —
 //! and a future Tier-2 `WasmEngine` — shares the same trait object.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -86,6 +86,16 @@ pub struct ExecutionInput<'a> {
     pub token: &'a Token,
     /// Sender-declared gas cap (ADR-013 stage 1); 0 = no cap declared.
     pub gas_limit: u64,
+    /// The contract's current key/value state (W3 storage, ADR-018 / Phase 7).
+    ///
+    /// Passed by the executor from the decoded [`SmartContract::storage`] so the
+    /// `WasmEngine`'s `sload` reads the base state and `sstore` records a
+    /// [`StorageDelta`]. **Deliberately owned and excluded from
+    /// [`ExecutionInputCanon`]**: `canonical_bytes()` (and thus a module's
+    /// `execute` input and the `result_hash`) must not change when a contract
+    /// accumulates state, so existing `Wasm`/`Spec` modules keep their
+    /// byte-identical inputs (ADR-008). Non-`Wasm` engines ignore it.
+    pub storage: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// The deterministic view of an [`ExecutionInput`] that `canonical_bytes()`
@@ -152,6 +162,66 @@ pub struct ExecutionOutput {
 impl ExecutionOutput {
     pub fn new(result_data: Vec<u8>, gas_used: u64) -> Self {
         ExecutionOutput { result_data, gas_used }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W3 storage — the canonical storage delta + Wasm result envelope (ADR-018)
+// ---------------------------------------------------------------------------
+
+/// A canonical per-contract storage write-set (W3, ADR-018 / Phase 7).
+///
+/// `Some(value)` = set `key` to `value`; `None` = tombstone (delete `key`).
+/// `BTreeMap` gives a **sorted** key order, so the rmp-canonical serialization
+/// (and any hash derived from it) is deterministic regardless of the order the
+/// module issued its `sstore`/`sdelete` calls (ADR-008). This is the single
+/// source of truth for what the committer applies to [`SmartContract::storage`].
+pub type StorageDelta = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+/// The canonical `WasmEngine` result envelope: the module's raw output **plus**
+/// the storage delta it recorded. This is the `result_data` a `Wasm` contract
+/// produces — `result_hash = hash(rmp(WasmResult))` — and what the committer
+/// decodes to apply the storage delta (the delta is not re-derivable from the
+/// tx, so it must ride in `result_data`; QD-transport).
+///
+/// The envelope is always present for a `Wasm` contract (even with an empty
+/// delta), so the committer's decode is unambiguous and no legacy bare-module
+/// output is mistaken for a delta.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WasmResult {
+    /// The module's raw `result_data` (bytes the module wrote to its output buffer).
+    pub module_output: Vec<u8>,
+    /// The canonical storage write-set the module recorded via `sstore`/`sdelete`.
+    pub storage_delta: StorageDelta,
+}
+
+impl WasmResult {
+    /// Apply this envelope's [`storage_delta`] to a base state map (the
+    /// committer's idempotent apply, and the engine's post-exec cap check).
+    /// `Some(v)` sets `key`; `None` removes it. Returns the new state.
+    pub fn apply_delta_to(&self, base: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut out = base.clone();
+        for (k, v) in &self.storage_delta {
+            match v {
+                Some(val) => {
+                    out.insert(k.clone(), val.clone());
+                }
+                None => {
+                    out.remove(k);
+                }
+            }
+        }
+        out
+    }
+
+    /// Total byte size of the state after applying this delta (the W3 storage
+    /// cap check: keys + values).
+    pub fn post_apply_size(&self, base: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
+        let state = self.apply_delta_to(base);
+        state
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum()
     }
 }
 
@@ -604,6 +674,7 @@ mod tests {
             sender_signature: vec![],
             payload: vec![1, 2, 3, 4],
             gas_limit: 1234,
+            result_data: vec![],
         }
     }
 
@@ -612,6 +683,7 @@ mod tests {
             name: "test-contract".to_string(),
             bytecode: vec![0xAB, 0xCD],
             version: "1".to_string(),
+            storage: Default::default(),
         }
     }
 
@@ -637,6 +709,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: 1234,
+            storage: BTreeMap::new(),
         };
         let b = ExecutionInput {
             tx: &tx,
@@ -644,6 +717,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: 1234,
+            storage: BTreeMap::new(),
         };
 
         let bytes_a = a.canonical_bytes().unwrap();
@@ -679,6 +753,7 @@ mod tests {
             sender_state: &user,
             token: &token_a,
             gas_limit: 100,
+            storage: BTreeMap::new(),
         };
         let b = ExecutionInput {
             tx: &tx,
@@ -686,6 +761,7 @@ mod tests {
             sender_state: &user,
             token: &token_b,
             gas_limit: 100,
+            storage: BTreeMap::new(),
         };
         assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
     }
@@ -708,6 +784,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: 1234,
+            storage: BTreeMap::new(),
         };
         let alt_gas = ExecutionInput {
             tx: &tx_b,
@@ -715,6 +792,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: 9999,
+            storage: BTreeMap::new(),
         };
         let alt_payload = ExecutionInput {
             tx: &tx_c,
@@ -722,6 +800,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: 1234,
+            storage: BTreeMap::new(),
         };
         assert_ne!(base.canonical_bytes().unwrap(), alt_gas.canonical_bytes().unwrap());
         assert_ne!(
@@ -820,6 +899,7 @@ mod tests {
             sender_state: user,
             token,
             gas_limit,
+            storage: BTreeMap::new(),
         }
     }
 
@@ -917,6 +997,7 @@ mod tests {
             name: "spec-contract".to_string(),
             bytecode,
             version: "1".to_string(),
+            storage: Default::default(),
         }
     }
 
@@ -1251,11 +1332,13 @@ mod tests {
             sender_signature: vec![],
             payload: random_bytes(&mut rng, 32),
             gas_limit: [0, 5, 50, 1000][rng.gen_range(0..4)],
+            result_data: vec![],
         };
         let contract = SmartContract {
             name: format!("dcontract-{}", rng.gen::<u32>()),
             bytecode: program_bytes(random_program(&mut rng)),
             version: "1".to_string(),
+            storage: Default::default(),
         };
         let gas = tx.gas_limit;
         let user = User {
@@ -1283,6 +1366,7 @@ mod tests {
             sender_state: &user,
             token: &token,
             gas_limit: gas,
+            storage: BTreeMap::new(),
         };
         let transfer = TransferEngine;
         let spec = SpecEngine;

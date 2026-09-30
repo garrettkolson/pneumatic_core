@@ -60,7 +60,8 @@ fn deploy_entry(
         timestamp: 1000,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let pending =
         PendingTransaction::new("deploy_tx_001".to_string(), TransactionState::Preloaded {
             transaction: tx,

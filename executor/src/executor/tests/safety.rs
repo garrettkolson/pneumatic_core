@@ -82,6 +82,7 @@ fn engine_data_provider(
         name: "test".to_string(),
         bytecode: vec![1, 2, 3],
         version: "1".to_string(),
+        storage: Default::default(),
     };
     let mut token = Token::from_asset(&contract).unwrap().with_id(token_id.clone());
     token
@@ -256,7 +257,8 @@ async fn backpressure_under_timeout_load() {
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        };
+        
+        result_data: vec![],};
         let pending =
             PendingTransaction::new(tx_id.clone(), TransactionState::Preloaded { transaction: tx });
         let _ = pending_registry.add_transaction(tx_id, pending);

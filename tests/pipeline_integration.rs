@@ -200,6 +200,7 @@ fn standard_token() -> Token {
         name: "standard".to_string(),
         bytecode: vec![1, 2, 3],
         version: "1".to_string(),
+        storage: Default::default(),
     };
     let mut token = Token::new();
     token.id = TOKEN_ID.to_vec();
@@ -1105,6 +1106,7 @@ fn make_transaction(submitter_id: &Arc<NodeIdentity>) -> Transaction {
         timestamp: 1_700_000_000,
         result_hash: vec![],
         sender_signature: vec![],
+        result_data: vec![],
     };
     // Sign the canonical tx bytes with the submitter's Ed25519 key (the
     // sentinel's fail-closed sender-auth binds envelope sender == tx.sender).

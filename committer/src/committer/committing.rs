@@ -220,6 +220,15 @@ impl Committer {
             self.apply_deploy_delta(&transaction)?;
         }
 
+        // Step 3.7: Apply a Wasm storage delta (ADR-018, Phase 7). For a
+        // `ContractCall` on a Wasm contract, the executor ships the canonical
+        // `WasmResult` envelope in `result_data`; the committer verifies it
+        // against the signed `result_hash` and applies the `StorageDelta` to the
+        // contract token's state. No-op for non-Wasm calls / empty result_data.
+        if transaction.action == "ContractCall" {
+            self.apply_storage_delta(&transaction)?;
+        }
+
         // Step 4: Update transaction state
         if is_leader_proposal {
             // Leader-proposal path: remove from pool, then transition to Committed
@@ -314,6 +323,95 @@ impl Committer {
                     .map_err(|e| CommitterError::Core(PneumaticError::Data(e)))?;
             }
         }
+        Ok(())
+    }
+
+    /// Apply a Wasm storage delta at commit time (ADR-018, Phase 7).
+    ///
+    /// Unlike the re-derivable `DeployContract` delta, a Wasm `StorageDelta` is the
+    /// module's `sstore` output and CANNOT be recomputed from the transaction. The
+    /// executor therefore ships the canonical `WasmResult` envelope in
+    /// `Transaction::result_data`; the committer verifies it against the signed
+    /// `result_hash` (`hash(result_data) == result_hash`) and applies the delta to
+    /// the contract token's `SmartContract::storage`.
+    ///
+    /// **No-op** for a missing token, a non-Wasm contract, or an empty `result_data`
+    /// (legacy call). The apply is **idempotent** (BTreeMap set/remove), so a
+    /// replayed commit never double-applies a delta.
+    pub(crate) fn apply_storage_delta(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<(), CommitterError> {
+        use pneumatic_core::contracts::WasmResult;
+        use pneumatic_core::crypto::{BasicHashProvider, HashProvider};
+        use pneumatic_core::errors::{PneumaticError, ValidationFailureReason};
+        use pneumatic_core::tokens::SmartContract;
+
+        let env_id = &self.env_data.environment_id;
+
+        // 1. Load the target token; a missing token has nothing to apply.
+        let mut token = match self
+            .data_provider
+            .get_token(&transaction.token_id, env_id)
+        {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+
+        // 2. Only Wasm contract calls carry a `WasmResult` envelope.
+        let is_wasm = token
+            .metadata
+            .get("contract_engine")
+            .map(|e| e == "Wasm")
+            .unwrap_or(false);
+        if !is_wasm {
+            return Ok(());
+        }
+
+        // 3. An empty `result_data` means no storage delta to apply.
+        if transaction.result_data.is_empty() {
+            return Ok(());
+        }
+
+        // 4. Integrity: the shipped `result_data` must hash to the signed
+        //    `result_hash`, binding the apply to the executor's signed output.
+        let hash = BasicHashProvider::new();
+        if hash.hash(&transaction.result_data) != transaction.result_hash {
+            return Err(CommitterError::TransactionPayloadMismatch(
+                transaction.id.clone(),
+            ));
+        }
+
+        // 5. Decode the canonical `WasmResult` envelope.
+        let wasm_result: WasmResult =
+            deserialize_rmp_to(&transaction.result_data).map_err(CommitterError::Deserialization)?;
+
+        // 6. Apply the delta to the contract's storage (idempotent set/remove). A
+        //    Wasm contract token must carry a `SmartContract` asset; if it does
+        //    not, the envelope is inconsistent with the token.
+        let applied = token.update_asset::<SmartContract, _>(|sc: &mut SmartContract| {
+            for (key, value) in &wasm_result.storage_delta {
+                match value {
+                    Some(val) => {
+                        sc.storage.insert(key.clone(), val.clone());
+                    }
+                    None => {
+                        sc.storage.remove(key);
+                    }
+                }
+            }
+        });
+        if applied.is_none() {
+            return Err(CommitterError::Core(PneumaticError::Validation(
+                vec![ValidationFailureReason::ContractDeployFailed],
+            )));
+        }
+
+        // 7. Persist the updated token.
+        let token_id = token.id.clone();
+        self.data_provider
+            .save_token(&token_id, token, env_id)
+            .map_err(|e| CommitterError::Core(PneumaticError::Data(e)))?;
         Ok(())
     }
 

@@ -156,6 +156,7 @@ impl CreateTokenDelta {
             name: self.name.clone(),
             bytecode: self.bytecode.clone(),
             version: "1".to_string(),
+            storage: Default::default(),
         };
         let mut token = Token::from_asset(&contract)
             .map_err(|e| ContractError::InvalidInput(format!("from_asset: {e}")))?;

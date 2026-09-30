@@ -204,6 +204,18 @@ pub struct Transaction {
     /// `fuel_balance < gas_limit`.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub gas_limit: u64,
+    /// Raw execution output bytes (W3 storage, ADR-018 / Phase 7). Set by the executor
+    /// post-execution (the engine's `result_data`, which for a `Wasm` contract is the
+    /// canonical `WasmResult { module_output, storage_delta }` envelope). The finalizer
+    /// signs `hash(result_data)` = `result_hash`; the committer reads this field, verifies
+    /// `hash(result_data) == result_hash`, and applies the embedded storage delta.
+    ///
+    /// Additive wire field — `#[serde(default, skip_serializing_if)]` keeps a legacy
+    /// (empty) transaction byte-identical on the rmp wire (Ground Rule 4, precedent:
+    /// `payload` / `gas_limit` / `SignedTransaction.shielded`). It is **not** part of
+    /// `CanonicalTransaction` (the sender does not sign the execution output).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_data: Vec<u8>,
 }
 
 /// Serde `skip_serializing_if` predicate for the additive `gas_limit` field:
@@ -338,6 +350,7 @@ impl SignedTransaction {
                 sender_signature: vec![],
                 payload: vec![],
                 gas_limit: 0,
+                result_data: vec![],
             },
             total_stake: 42,
             total_voters: 3,
@@ -466,6 +479,7 @@ impl ShieldedTransaction {
             sender_signature: vec![],
             payload: vec![],
             gas_limit: 0,
+            result_data: vec![],
         }
     }
 }
@@ -752,6 +766,7 @@ mod tests {
             sender_signature: vec![],
             payload: vec![],
             gas_limit: 0,
+            result_data: vec![],
         }
     }
 

@@ -337,7 +337,8 @@ async fn handle_block_finalized_unknown_token_returns_error() {
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        },
+        
+        result_data: vec![],},
         total_voters: 3,
         total_stake: 42,
         leader_hash: vec![],

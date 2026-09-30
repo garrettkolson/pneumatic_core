@@ -10,7 +10,7 @@ applicable_when: "Designing, scoping, or implementing the Tier-2 WasmEngine, its
 confidence: 0.95
 verified_at: "09/29/2026"
 verified_by: "Garrett Olson"
-staleness_signal: "Core landed (Phase 5, 09/29/2026). Stale when W3 storage (Phase 7) lands and changes the ABI/caps, or when a different WASM runtime is chosen"
+staleness_signal: "Core (Phase 5) + W3 storage (Phase 7) landed 09/29/2026. Stale when W4 cross-contract (Phase 9) lands and changes the ABI/caps, or when a different WASM runtime is chosen"
 tags: [adr, design-decision, contract-execution, engine, wasm, wasmi, determinism, gas, sandbox]
 edges:
   - target: decision-contract-engine-model
@@ -51,8 +51,26 @@ only). **W1** (pure compute) + **W2** (read-only host fns `tx_amount`, `tx_seque
 `gas_used = budget − get_fuel()`). Frozen ABI (`__alloc` + `execute`), sandbox (only
 `env.*` allow-listed imports), `f32`/`f64` disallowed on the ABI boundary, caps
 (module ≤ 1 MiB, memory ≤ 32 MiB). 10 tests incl. cross-executor determinism. Core
-572 → 582; workspace `cargo test` green. **W3** storage (Phase 7) and **W4**
-cross-contract (Phase 9) remain.
+572 → 582; workspace `cargo test` green.
+
+**Phase 7 (W3 storage) landed 2026-09-29.** Per-contract `sload`/`sstore`/`sdelete`
+host imports (read-your-writes: delta first, then base) write a **storage delta** into
+the Wasm `result_data` envelope — `WasmResult { module_output, storage_delta }`,
+`StorageDelta = BTreeMap<Vec<u8>, Option<Vec<u8>>>` (`None` = tombstone; `BTreeMap` ⇒
+canonical sorted rmp order). **Transport (QD1):** a new additive `Transaction::result_data:
+Vec<u8>` wire field (`#[serde(default, skip_if_empty)]`, NOT in `CanonicalTransaction`) —
+the delta is the module's `sstore` output and is **NOT re-derivable** from the tx (unlike
+the deploy delta), so the executor sets it post-exec and the committer consumes it.
+**Location (QD2):** `SmartContract::storage: BTreeMap<Vec<u8>, Vec<u8>>`
+(`#[serde(default)]`). **Gas + cap (QD3):** `sload` 100 / `sstore`-new 20000 /
+`sstore`-rewrite 5000 / `sdelete` 5000; post-apply total capped at 1 MiB (exceed →
+`Reverted`). The committer's new `apply_storage_delta` (dispatch on `action ==
+"ContractCall"`) verifies `hash(result_data) == result_hash`, decodes the `WasmResult`,
+and applies the delta to `SmartContract::storage` — Wasm-only, idempotent. `WASM_OUTPUT_CAP`
+reduced 64 KiB → 16 KiB (the module's 17-page memory leaves a small heap after the
+host-allocated output buffer; 64 KiB pushed the module's own `__alloc` out of bounds).
+5 new Wasm tests + 7 committer apply tests; core 582 → 628; workspace `cargo test` green
+(cross-executor Wasm determinism re-verified). **W4** cross-contract (Phase 9) remains.
 
 Contract execution gains a **Tier-2** engine, `WasmEngine` (registry name `"Wasm"`),
 implementing the existing `ContractEngine` trait so `SmartContract.bytecode` can be a
@@ -86,8 +104,9 @@ Both are **exact-pinned** as security-sensitive dependencies.
 - **W1** pure computation (the WasmEngine core — Phase 5).
 - **W2** read-only protocol state via host imports (pinned to the execution-time
   snapshot, identical across shard members — Phase 5).
-- **W3** per-contract `sload`/`sstore` storage, emitted as a storage delta (Phase 7) —
-  what makes it "rich" (order books, registries, counters).
+- **W3** per-contract `sload`/`sstore`/`sdelete` storage, emitted as a storage delta
+  (Phase 7 — **landed 09/29/2026**) — what makes it "rich" (order books, registries,
+  counters).
 - **W4** cross-contract `call(target, entry, payload, snapshot_ref)` — the Wasm form of
   Model X (Phase 9, ADR-016).
 

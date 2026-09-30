@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -499,6 +499,16 @@ pub struct SmartContract {
     pub bytecode: Vec<u8>,
     /// Contract version
     pub version: String,
+    /// Per-contract key/value state (W3 storage, ADR-018 / Phase 7).
+    ///
+    /// Scoped to this contract token (ADR-014 "own token only"); persisted with the
+    /// token's `asset_data`. `BTreeMap` gives a canonical (sorted) key order so the
+    /// rmp wire form and any derived hash are deterministic (ADR-008). Written by the
+    /// committer from the canonical `StorageDelta` the WasmEngine emits in `result_data`;
+    /// read by the WasmEngine as the `sload` base state. `#[serde(default)]` keeps
+    /// pre-W3 contract assets (no `storage` key) valid.
+    #[serde(default)]
+    pub storage: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Authorization for a contract proxy to access resources.
@@ -601,6 +611,7 @@ mod tests {
             name: String::from("MyContract"),
             bytecode: vec![0x01, 0x02],
             version: String::from("1.0"),
+            storage: Default::default(),
         };
         let id = vec![4, 5, 6];
         let token = TokenFactory::mint_contract_token(

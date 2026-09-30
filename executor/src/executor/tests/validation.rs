@@ -19,7 +19,8 @@ fn make_tx() -> Transaction {
         timestamp: 1000,
         result_hash: vec![],
         sender_signature: vec![],
-    }
+    
+    result_data: vec![],}
 }
 
 #[test]

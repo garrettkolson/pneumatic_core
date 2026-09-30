@@ -4,13 +4,13 @@ title: "Open: implement executor contract execution (plan Phases 1-10)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P6 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy). Remaining: P7 Wasm storage, P8 upgrade governance, P9 Model X calls, P10 e2e."
+summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P7 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage). Remaining: P8 upgrade governance, P9 Model X calls, P10 e2e."
 auto_inject: false
 applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
 confidence: 0.9
 verified_at: "09/29/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 7/8/9/10 (Wasm storage, governance, Model X, e2e) are landed or re-scoped; P1-P6 landed 09/29/2026"
+staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 8/9/10 (governance, Model X, e2e) are landed or re-scoped; P1-P7 landed 09/29/2026"
 tags: [task, executor, contract-execution, implementation, adr-011, adr-014]
 edges:
   - target: decision-contract-engine-model
@@ -55,9 +55,10 @@ Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
 `plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
 `plans/wasm-engine-design.md`; deploy design: `plans/deploy-contract-design.md`.
-Status: **in progress** — Phases 1–6 complete (09/29/2026); the Tier-2 WasmEngine
-**core** is landed (Phase 5) and **on-chain deployment** is landed (Phase 6). Remaining:
-P7 (W3 storage), P8 (governance), P9 (Model X), P10 (e2e).
+Status: **in progress** — Phases 1–7 complete (09/29/2026); the Tier-2 WasmEngine
+**core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6), and **Wasm
+storage (W3)** is landed (Phase 7). Remaining: P8 (governance), P9 (Model X),
+P10 (e2e).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -168,9 +169,28 @@ Phase checklist (each phase's exit criteria live in the plan):
   = environment_id** (operator override of the original token_id proposal). 8 deploy +
   10 validation + 3 committer + 1 executor tests. Core 582 → 601; workspace
   `cargo test` green.
-- **P7** — **WasmEngine state & storage (W3)**: per-contract `sload`/`sstore`,
-  storage delta in `result_data`, committer apply, storage gas + cap
-  (ADR-018 / design §7).
+- **P7 ✅ (09/29/2026)** — **WasmEngine state & storage (W3)** (ADR-018 / design §7).
+  Landed in `pneumatic_core::contracts::wasm` + committer: `sload`/`sstore`/`sdelete`
+  host imports (read-your-writes: delta first, then base) write a **storage delta** into
+  the Wasm `result_data` envelope — `WasmResult { module_output, storage_delta }`,
+  `StorageDelta = BTreeMap<Vec<u8>, Option<Vec<u8>>>` (`None` = tombstone; `BTreeMap` ⇒
+  canonical sorted rmp order). **Transport (QD1):** new additive `Transaction::result_data:
+  Vec<u8>` wire field (`#[serde(default, skip_if_empty)]`, NOT in `CanonicalTransaction`)
+  — the delta is the module's `sstore` output and is **NOT re-derivable** from the tx
+  (unlike the deploy delta), so the executor sets it post-exec and the committer consumes
+  it. **Location (QD2):** `SmartContract::storage: BTreeMap<Vec<u8>, Vec<u8>>`
+  (`#[serde(default)]`). **Gas + cap (QD3):** `sload` 100 / `sstore`-new 20000 /
+  `sstore`-rewrite 5000 / `sdelete` 5000; post-apply total capped at 1 MiB (exceed →
+  `Reverted`). Executor `execute_contract` now sets `tx.result_data`; new committer
+  `apply_storage_delta` (dispatch on `action == "ContractCall"`) verifies
+  `hash(result_data) == result_hash` (`TransactionPayloadMismatch`), decodes the
+  `WasmResult`, and applies the delta to `SmartContract::storage` — Wasm-only (non-Wasm /
+  missing token / empty `result_data` ⇒ no-op), idempotent (BTreeMap set/remove).
+  `WASM_OUTPUT_CAP` reduced 64 KiB → 16 KiB (the module's 17-page memory leaves a small
+  heap after the host-allocated output buffer; 64 KiB pushed the module's own `__alloc`
+  out of bounds). 5 new Wasm tests (round-trip + canonical determinism + base-state read +
+  gas + cap) + 7 committer apply tests. Core 582 → 628; committer 102+9; workspace
+  `cargo test` green (cross-executor Wasm determinism re-verified).
 - **P8** — upgrade governance: owner registry, M-of-N multisig, 1-epoch timelock —
   applies to Wasm modules (ADR-017 design first).
 - **P9** — Model X cross-contract calls: snapshot-pinned `Call` (Spec ISA op) + Wasm

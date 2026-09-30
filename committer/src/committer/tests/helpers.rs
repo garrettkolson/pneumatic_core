@@ -253,7 +253,8 @@ pub fn make_test_transaction(tx_id: &str, sender: Vec<u8>) -> Transaction {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    }
+    
+    result_data: vec![],}
 }
 
 
@@ -893,7 +894,8 @@ pub fn make_gossip_block_at_prev(
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        },
+        
+        result_data: vec![],},
         total_voters: 3,
         total_stake: 42,
         leader_hash: prev_hash.to_vec(),
@@ -965,7 +967,8 @@ pub fn make_test_block_for_token_internal(blockchain: &pneumatic_core::blocks::B
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        },
+        
+        result_data: vec![],},
         total_voters: 3,
         total_stake: 42,
         leader_hash: prev_hash.clone(),

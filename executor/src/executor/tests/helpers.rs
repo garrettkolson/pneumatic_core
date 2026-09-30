@@ -103,7 +103,8 @@ pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
         timestamp: 1000,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let pending = PendingTransaction::new("test_tx_001".to_string(), TransactionState::Preloaded { transaction: tx });
     let _ = registry.add_transaction("test_tx_001".to_string(), pending);
     registry

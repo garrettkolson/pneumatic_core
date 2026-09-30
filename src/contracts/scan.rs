@@ -551,11 +551,13 @@ fn canary_run(
         sender_signature: Vec::new(),
         payload: Vec::new(),
         gas_limit: CANARY_FUEL_BUDGET,
+        result_data: vec![],
     };
     let contract = SmartContract {
         name: "canary".to_string(),
         bytecode: bytecode.to_vec(),
         version: "1".to_string(),
+        storage: Default::default(),
     };
     let user = User {
         public_key: vec![0u8; 32],
@@ -578,6 +580,7 @@ fn canary_run(
         sender_state: &user,
         token: &token,
         gas_limit: CANARY_FUEL_BUDGET,
+        storage: Default::default(),
     };
 
     match engine.execute(&input) {

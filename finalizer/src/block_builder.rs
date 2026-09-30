@@ -389,7 +389,8 @@ mod tests {
             timestamp: 1000,
             result_hash: vec![1, 2, 3, 4],
             sender_signature: vec![],
-        }
+        
+        result_data: vec![],}
     }
 
     fn make_reconciled_with_executors() -> ReconciledSignatures {
@@ -581,7 +582,8 @@ mod tests {
                 timestamp: 4242,
                 result_hash: vec![0xAA],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             total_stake: 1000,
             total_voters: 5,
             leader_address: vec![11, 22, 33],

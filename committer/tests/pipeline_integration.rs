@@ -325,7 +325,8 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        },
+        
+        result_data: vec![],},
         total_voters: 3,
         total_stake: 42,
         leader_address: vec![],
@@ -733,7 +734,8 @@ async fn test_pipeline_no_conflict() {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             total_voters: 3,
             total_stake: 42,
             leader_address: vec![],
@@ -832,7 +834,8 @@ async fn commit_from_empty_registry_materializes_and_commits() {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             total_voters: 3,
             total_stake: 42,
             leader_address: vec![],
@@ -942,7 +945,8 @@ async fn test_pipeline_conflict_and_slashing() {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             total_voters: 3,
             total_stake: 42,
             leader_address: vec![1],
@@ -988,7 +992,8 @@ async fn test_pipeline_conflict_and_slashing() {
                 timestamp: 0,
                 result_hash: vec![],
                 sender_signature: vec![],
-            },
+            
+            result_data: vec![],},
             total_voters: 3,
             total_stake: 42,
             leader_address: vec![2],

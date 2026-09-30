@@ -674,6 +674,7 @@ pub mod tests {
                 timestamp: 4242,
                 result_hash: vec![0xAA],
                 sender_signature: vec![],
+                result_data: vec![],
             },
             total_stake: 1000,
             total_voters: 5,

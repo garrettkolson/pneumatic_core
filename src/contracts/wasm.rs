@@ -32,12 +32,15 @@
 //! primary bound on memory growth (each `memory.grow` costs fuel); a post-call check
 //! enforces the 32 MiB ceiling.
 
+use std::collections::BTreeMap;
+
 use wasmi::{
     Caller, Config, Engine, Extern, ExternType, Instance, Linker, Memory, Module, Store,
     TrapCode, ValType,
 };
 
-use super::{ContractEngine, ContractError, ExecutionInput, ExecutionOutput};
+use crate::encoding::serialize_to_bytes_rmp;
+use super::{ContractEngine, ContractError, ExecutionInput, ExecutionOutput, WasmResult};
 
 // ---------------------------------------------------------------------------
 // Caps (ADR-018 QW6) — protocol-tunable.
@@ -47,12 +50,35 @@ use super::{ContractEngine, ContractError, ExecutionInput, ExecutionOutput};
 pub const WASM_MAX_MODULE_BYTES: usize = 1 * 1024 * 1024;
 /// Maximum linear memory in bytes (512 pages = 32 MiB).
 pub const WASM_MAX_MEMORY_BYTES: usize = 512 * 64 * 1024;
-/// Output buffer the host allocates for a module's `result_data` (64 KiB).
-const WASM_OUTPUT_CAP: u32 = 64 * 1024;
+/// Output buffer the host allocates for a module's `result_data` (16 KiB).
+///
+/// Sized conservatively: the buffer is carved from the module's own linear-memory
+/// heap (via the module's `__alloc`), which can be small. A module compiled with a
+/// minimal memory (e.g. the 17-page / 1088 KiB test fixtures, whose `__heap_base`
+/// sits at 1 MiB) has only ~64 KiB of heap; the host's input + output buffers must
+/// leave room for the module's own allocations (storage keys/values, etc.). 16 KiB
+/// is far above any realistic `result_data` size while staying safely in budget.
+const WASM_OUTPUT_CAP: u32 = 16 * 1024;
 /// Fuel budget used when `gas_limit == 0` (effectively unbounded).
 const UNLIMITED_FUEL: u64 = u64::MAX;
 
-/// Allow-listed `env.*` host imports (the W2 read-only capability tier + revert).
+// ---------------------------------------------------------------------------
+// W3 storage gas + cap (ADR-018 / Phase 7, QD-gas-cap).
+// ---------------------------------------------------------------------------
+
+/// Gas charged per `sload` (a read-your-writes lookup).
+pub const WASM_SLOAD_GAS: u64 = 100;
+/// Gas charged per `sstore` of a **new** key (first write to an absent key).
+pub const WASM_SSTORE_NEW_GAS: u64 = 20_000;
+/// Gas charged per `sstore` that **rewrites** an existing key.
+pub const WASM_SSTORE_REWRITE_GAS: u64 = 5_000;
+/// Gas charged per `sdelete` (tombstone).
+pub const WASM_SDELETE_GAS: u64 = 5_000;
+/// Per-contract state cap in bytes (sum of key + value lengths post-apply).
+pub const WASM_STORAGE_CAP: usize = 1 * 1024 * 1024;
+
+/// Allow-listed `env.*` host imports (the W2 read-only capability tier + revert,
+/// plus the W3 state tier: `sload`/`sstore`/`sdelete`).
 /// Any other import (or any other namespace) is rejected before instantiation.
 ///
 /// `pub(crate)` so the deploy-time contract scanner (`scan.rs`) reuses the *exact*
@@ -65,21 +91,37 @@ pub(crate) const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "tx_payload_len",
     "tx_payload",
     "revert",
+    // W3 state tier (ADR-018 / Phase 7).
+    "sload",
+    "sstore",
+    "sdelete",
 ];
 
 // ---------------------------------------------------------------------------
 // Host state + revert marker
 // ---------------------------------------------------------------------------
 
-/// The read-only, execution-time-snapshot state the `env.*` host functions read.
-/// Owned by the [`Store`] so the `'static` host closures (required by
-/// [`Linker::func_wrap`]) can reach it via `caller.data()`. Every field is a pure
-/// function of [`ExecutionInput`] — identical across shard members (Model-X invariant).
+/// The execution-time-snapshot state the `env.*` host functions read (and the W3
+/// state tier mutates). Owned by the [`Store`] so the `'static` host closures
+/// (required by [`Linker::func_wrap`]) can reach it via `caller.data()` /
+/// `caller.data_mut()`. Every read-only field is a pure function of
+/// [`ExecutionInput`] — identical across shard members (Model-X invariant). The
+/// storage fields are per-call scratch: `storage` is the base state (read),
+/// `storage_delta` is the write-set the module records (read-your-writes + the
+/// canonical output delta), `storage_gas` accumulates the W3 storage cost.
 struct WasmEnv {
     tx_amount: i64,
     tx_sequence: i64,
     sender_fuel: i64,
     payload: Vec<u8>,
+    /// Base contract state for this call (from [`ExecutionInput::storage`]).
+    /// `sload` reads here after checking [`WasmEnv::storage_delta`].
+    storage: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The module's write-set this call (read-your-writes + the output delta).
+    /// `Some(v)` = set; `None` = tombstone. Drains into the [`WasmResult`] envelope.
+    storage_delta: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// Accumulated W3 storage gas (`sload`/`sstore`/`sdelete` costs).
+    storage_gas: u64,
 }
 
 /// Marker [`wasmi::errors::HostError`] the `env.revert()` import traps with. The
@@ -94,6 +136,34 @@ impl std::fmt::Display for RevertSignal {
 }
 
 impl wasmi::errors::HostError for RevertSignal {}
+
+/// Read up to `len` bytes from the module's linear memory at `ptr` (clamped to the
+/// memory bounds). Returns an owned `Vec` so the `caller` borrow ends before the
+/// next (possibly mutable) host op. Used by the W3 state-tier imports.
+fn read_mem(caller: &mut Caller<WasmEnv>, ptr: i32, len: i32) -> Result<Vec<u8>, wasmi::Error> {
+    let mem = caller
+        .get_export("memory")
+        .and_then(Extern::into_memory)
+        .ok_or_else(|| wasmi::Error::new("no linear memory"))?;
+    let data = mem.data(caller);
+    let start = ptr as usize;
+    let n = (len as usize).min(data.len().saturating_sub(start));
+    Ok(data[start..start + n].to_vec())
+}
+
+/// Write `bytes` to the module's linear memory at `ptr` (clamped to the memory
+/// bounds). Used by the W3 state-tier imports to return `sload` values.
+fn write_mem(caller: &mut Caller<WasmEnv>, ptr: i32, bytes: &[u8]) -> Result<(), wasmi::Error> {
+    let mem = caller
+        .get_export("memory")
+        .and_then(Extern::into_memory)
+        .ok_or_else(|| wasmi::Error::new("no linear memory"))?;
+    let mut data = mem.data_mut(caller);
+    let start = ptr as usize;
+    let n = bytes.len().min(data.len().saturating_sub(start));
+    data[start..start + n].copy_from_slice(&bytes[..n]);
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // WasmEngine
@@ -217,6 +287,46 @@ impl WasmEngine {
                 )))
             })
             .map_err(link_err)?;
+        // W3 state tier (ADR-018 / Phase 7). `sload` is read-your-writes (delta
+        // first, then base); `sstore`/`sdelete` record into `storage_delta` and
+        // charge gas. The module passes key/value as linear-memory slices.
+        linker
+            .func_wrap::<(Caller<WasmEnv>, i32, i32, i32), _>("env", "sload", |mut caller: Caller<WasmEnv>, key_ptr: i32, key_len: i32, out_ptr: i32| {
+                let key = read_mem(&mut caller, key_ptr, key_len)?;
+                let value: Vec<u8> = {
+                    let env = caller.data_mut();
+                    env.storage_gas = env.storage_gas.saturating_add(WASM_SLOAD_GAS);
+                    match env.storage_delta.get(&key) {
+                        Some(Some(v)) => v.clone(),
+                        Some(None) => Vec::new(),
+                        None => env.storage.get(&key).cloned().unwrap_or_default(),
+                    }
+                };
+                write_mem(&mut caller, out_ptr, &value)?;
+                Ok(value.len() as i32)
+            })
+            .map_err(link_err)?;
+        linker
+            .func_wrap::<(Caller<WasmEnv>, i32, i32, i32, i32), _>("env", "sstore", |mut caller: Caller<WasmEnv>, key_ptr: i32, key_len: i32, value_ptr: i32, value_len: i32| {
+                let key = read_mem(&mut caller, key_ptr, key_len)?;
+                let value = read_mem(&mut caller, value_ptr, value_len)?;
+                let env = caller.data_mut();
+                let is_new = !env.storage.contains_key(&key) && !env.storage_delta.contains_key(&key);
+                let gas = if is_new { WASM_SSTORE_NEW_GAS } else { WASM_SSTORE_REWRITE_GAS };
+                env.storage_gas = env.storage_gas.saturating_add(gas);
+                env.storage_delta.insert(key, Some(value));
+                Ok(())
+            })
+            .map_err(link_err)?;
+        linker
+            .func_wrap::<(Caller<WasmEnv>, i32, i32), _>("env", "sdelete", |mut caller: Caller<WasmEnv>, key_ptr: i32, key_len: i32| {
+                let key = read_mem(&mut caller, key_ptr, key_len)?;
+                let env = caller.data_mut();
+                env.storage_gas = env.storage_gas.saturating_add(WASM_SDELETE_GAS);
+                env.storage_delta.insert(key, None);
+                Ok(())
+            })
+            .map_err(link_err)?;
         Ok(())
     }
 
@@ -271,12 +381,16 @@ impl ContractEngine for WasmEngine {
         // instantiation.
         let (module, engine) = validate_wasm_module(bytecode)?;
 
-        // 4. Store with the fuel budget + read-only env snapshot.
+        // 4. Store with the fuel budget + env snapshot (read-only fields + the W3
+        // state-tier scratch: base storage from the input, empty write-set).
         let env = WasmEnv {
             tx_amount: input.tx.amount.unwrap_or(0) as i64,
             tx_sequence: input.tx.sequence_number as i64,
             sender_fuel: input.sender_state.fuel_balance as i64,
             payload: input.tx.payload.clone(),
+            storage: input.storage.clone(),
+            storage_delta: BTreeMap::new(),
+            storage_gas: 0,
         };
         let mut store = Store::new(&engine, env);
         let budget = if input.gas_limit == 0 {
@@ -347,18 +461,64 @@ impl ContractEngine for WasmEngine {
             )));
         }
 
-        let result_data = {
+        let module_output = {
             let data = memory.data(&store);
             data[out_ptr as usize..out_ptr as usize + out_len as usize].to_vec()
         };
 
-        // 8. Fuel → gas.
+        // 8. Extract the W3 state-tier results (write-set + storage gas) from the
+        // per-call env, then enforce the per-contract storage cap. The cap is checked
+        // on the post-apply state (base ∘ delta); exceeding it reverts the call, so no
+        // oversized state is ever committed (ADR-018 / Phase 7, QD-gas-cap).
+        let (storage_delta, storage_gas) = {
+            let env = store.data_mut();
+            (std::mem::take(&mut env.storage_delta), env.storage_gas)
+        };
+        let post_state: BTreeMap<Vec<u8>, Vec<u8>> = {
+            let mut s = input.storage.clone();
+            for (k, v) in &storage_delta {
+                match v {
+                    Some(val) => {
+                        s.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        s.remove(k);
+                    }
+                }
+            }
+            s
+        };
+        let post_size = post_state.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        if post_size > WASM_STORAGE_CAP {
+            return Err(ContractError::Reverted(format!(
+                "storage size {} bytes exceeds {} byte cap",
+                post_size, WASM_STORAGE_CAP
+            )));
+        }
+
+        // 9. The canonical Wasm result envelope: module output + storage delta. This
+        // is the `result_data` the executor stores on the tx and the committer decodes
+        // (the delta is not re-derivable from the tx — QD-transport).
+        let wasm_result = WasmResult {
+            module_output,
+            storage_delta,
+        };
+        let result_data = serialize_to_bytes_rmp(&wasm_result)
+            .map_err(|e| ContractError::InvalidInput(format!("serialize WasmResult: {e}")))?;
+
+        // 10. Fuel → gas, plus the W3 storage gas. The module's fuel budget is
+        // `gas_limit` (when declared), so a call whose total (fuel + storage) exceeds
+        // the declared cap is gas-exhausted (→ the executor's `Failed`, no vote).
         let remaining = store
             .get_fuel()
             .map_err(|e| ContractError::InvalidInput(format!("get_fuel: {e}")))?;
-        let gas_used = budget.saturating_sub(remaining);
+        let fuel_used = budget.saturating_sub(remaining);
+        let gas_used = fuel_used.saturating_add(storage_gas);
+        if input.gas_limit > 0 && gas_used > input.gas_limit {
+            return Err(ContractError::GasExhausted);
+        }
 
-        // 9. Defensive memory cap (fuel metering is the primary bound).
+        // 11. Defensive memory cap (fuel metering is the primary bound).
         let mem_size = memory.data_size(&store);
         if mem_size > WASM_MAX_MEMORY_BYTES {
             return Err(ContractError::BadBytecode(format!(
@@ -386,6 +546,9 @@ mod tests {
     const FORBIDDEN_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_forbidden.wasm");
     const FP_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_fp.wasm");
     const LOOP_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_loop.wasm");
+    const STORAGE_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_storage.wasm");
+    const STORAGE_BIG_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_storage_big.wasm");
+    const SLOAD_ONLY_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_sload_only.wasm");
 
     fn token() -> Token {
         let mut t = Token::new();
@@ -410,6 +573,7 @@ mod tests {
             sender_signature: vec![],
             payload: vec![1, 2, 3, 4],
             gas_limit: 1234,
+            result_data: vec![],
         }
     }
 
@@ -418,6 +582,7 @@ mod tests {
             name: "wasm-contract".to_string(),
             bytecode: bytecode.to_vec(),
             version: "1".to_string(),
+            storage: Default::default(),
         }
     }
 
@@ -447,6 +612,7 @@ mod tests {
             sender_state: &u,
             token: &t,
             gas_limit,
+            storage: Default::default(),
         };
         engine.execute(&input)
     }
@@ -454,6 +620,11 @@ mod tests {
     /// Run and return just the `result_data` bytes.
     fn run_data(bytecode: &[u8], amount: Option<u64>, gas_limit: u64) -> Vec<u8> {
         run(bytecode, amount, gas_limit).expect("execute").result_data
+    }
+
+    /// Decode the canonical [`WasmResult`] envelope from a Wasm `result_data`.
+    fn decode_wasm_result(result_data: &Vec<u8>) -> WasmResult {
+        crate::encoding::deserialize_rmp_to(result_data).expect("decode WasmResult")
     }
 
     // -- W1: pure computation, exact canonical output --------------------------
@@ -470,15 +641,20 @@ mod tests {
             sender_state: &u,
             token: &t,
             gas_limit: 0,
+            storage: Default::default(),
         };
         let out = engine.execute(&input).expect("w1 sum");
         // The module sums every input byte (mod 2^32) and emits it as a little-endian u32.
+        // W3: the `result_data` is the canonical `WasmResult` envelope (module output +
+        // empty storage delta), so decode it before comparing the module's raw output.
         let canon = input.canonical_bytes().unwrap();
         let expected_sum: u32 = canon
             .iter()
             .map(|&b| b as u32)
             .fold(0, |acc, b| acc.wrapping_add(b));
-        assert_eq!(out.result_data, expected_sum.to_le_bytes().to_vec());
+        let wr = decode_wasm_result(&out.result_data);
+        assert_eq!(wr.module_output, expected_sum.to_le_bytes().to_vec());
+        assert!(wr.storage_delta.is_empty(), "sum module writes no storage");
         assert!(out.gas_used > 0);
     }
 
@@ -486,9 +662,89 @@ mod tests {
     #[test]
     fn w2_env_reads_tx_amount() {
         let out = run(ENV_WASM, Some(123_456), 0).expect("w2 env");
-        assert_eq!(out.result_data.len(), 8);
-        let amt = i64::from_le_bytes(out.result_data.as_slice().try_into().unwrap());
+        // W3: decode the envelope; the module's raw output is the tx_amount as a LE i64.
+        let wr = decode_wasm_result(&out.result_data);
+        assert_eq!(wr.module_output.len(), 8);
+        let amt = i64::from_le_bytes(wr.module_output.as_slice().try_into().unwrap());
         assert_eq!(amt, 123_456);
+        assert!(wr.storage_delta.is_empty());
+    }
+
+    // -- W3: storage tier -------------------------------------------------------
+    /// Run `STORAGE_WASM` and return the decoded envelope.
+    fn run_storage() -> WasmResult {
+        let out = run(STORAGE_WASM, Some(50), 0).expect("storage exec");
+        decode_wasm_result(&out.result_data)
+    }
+
+    // store "a"="hello", load (5B), store "a"="hi" (rewrite), load (2B, RYW),
+    // delete "a", load (0B) → output [5,h,e,l,l,o,2,h,i,0]; delta {"a": None}.
+    #[test]
+    fn w3_storage_round_trip_and_delta() {
+        let wr = run_storage();
+        let expected_output = [5u8, b'h', b'e', b'l', b'l', b'o', 2, b'h', b'i', 0];
+        assert_eq!(wr.module_output, expected_output.to_vec());
+        let mut expected_delta: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        expected_delta.insert(b"a".to_vec(), None); // final op is the tombstone
+        assert_eq!(wr.storage_delta, expected_delta);
+    }
+
+    // The envelope (module output + delta) is deterministic: identical inputs produce
+    // byte-identical `result_data` (→ identical `result_hash`). Cross-executor safe.
+    #[test]
+    fn w3_storage_delta_is_canonical_deterministic() {
+        let a = run(STORAGE_WASM, Some(50), 0).expect("run a");
+        let b = run(STORAGE_WASM, Some(50), 0).expect("run b");
+        assert_eq!(a.result_data, b.result_data);
+        assert_eq!(a.gas_used, b.gas_used);
+    }
+
+    // `sload` reads the contract's base state (passed via `ExecutionInput::storage`),
+    // not just the write-set. A read-only module emits the base value; no delta.
+    #[test]
+    fn w3_storage_reads_base_state() {
+        let engine = WasmEngine;
+        let t = token();
+        let tx = tx(Some(50));
+        let c = contract(SLOAD_ONLY_WASM);
+        let u = user();
+        let mut base = BTreeMap::new();
+        base.insert(b"existing".to_vec(), b"base-value".to_vec());
+        let input = ExecutionInput {
+            tx: &tx,
+            contract: &c,
+            sender_state: &u,
+            token: &t,
+            gas_limit: 0,
+            storage: base,
+        };
+        let out = engine.execute(&input).expect("sload base");
+        let wr = decode_wasm_result(&out.result_data);
+        assert_eq!(wr.module_output, b"base-value".to_vec());
+        assert!(wr.storage_delta.is_empty(), "read-only module writes no storage");
+    }
+
+    // Storage ops charge gas: 1 new sstore (20000) + 1 rewrite (5000) + 1 sdelete
+    // (5000) + 3 sloads (100) = 30300 storage gas, on top of the wasmi fuel.
+    #[test]
+    fn w3_storage_gas_is_charged() {
+        let out = run(STORAGE_WASM, Some(50), 0).expect("storage gas");
+        assert!(
+            out.gas_used >= 30_300,
+            "storage gas not charged (got {})",
+            out.gas_used
+        );
+    }
+
+    // A module whose post-apply state exceeds the 1 MiB cap reverts (no oversized
+    // state is committed).
+    #[test]
+    fn w3_storage_cap_exceeded_reverts() {
+        let err = run(STORAGE_BIG_WASM, Some(50), 0).unwrap_err();
+        assert!(
+            matches!(err, ContractError::Reverted(_)),
+            "expected Reverted on cap, got: {err:?}"
+        );
     }
 
     // -- Revert ----------------------------------------------------------------

@@ -56,7 +56,8 @@ fn on_data_received_process_with_valid_body_no_encoding_error() {
             timestamp: 0,
             result_hash: vec![],
             sender_signature: vec![],
-        }).unwrap(),
+        
+        result_data: vec![],}).unwrap(),
         signature: vec![1, 2, 3],
         public_key: vec![4, 5, 6],
         stake_set: None,
@@ -114,7 +115,8 @@ fn process_tx_with_valid_sender_signature_accepted() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     c3_sign(&mut tx, &sender_identity);
 
     let msg = c3_process_message(sender_pk, tx);
@@ -157,7 +159,8 @@ fn unauthorized_submitter_debit_is_rejected() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     // The payload really was authorized by victim, so the signature check passes —
     // only the binding check (network submitter != account) can stop this.
     c3_sign(&mut tx, &victim);
@@ -190,7 +193,8 @@ fn forged_sender_signature_rejected() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![], // empty -> verify returns Ok(false)
-    };
+    
+    result_data: vec![],};
 
     let msg = c3_process_message(sender_pk, tx);
     match sentinel.handle_process_request(msg) {
@@ -221,7 +225,8 @@ fn sender_signature_does_not_cross_accounts() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     // A signs the canonical bytes; the binding (envelope == "B" == tx.sender) holds,
     // but verifying A's signature against "B" fails.
     c3_sign(&mut tx, &a);
@@ -282,7 +287,8 @@ fn sentinel_self_signed_token_flow_end_to_end() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
 
     // Validate with SelfSigned spec directly
     let spec = SelfSignedBlockValidatorSpec::new();
@@ -323,7 +329,8 @@ fn compute_gas_used_with_zero_amount_returns_base_cost() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=0, multiplier=1.0 → 1 + 0 = 1
     assert_eq!(gas, 1);
@@ -349,7 +356,8 @@ fn compute_gas_used_preload_with_amount_applies_multiplier() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=100, Preload multiplier=2.0 → 1 + 200 = 201
     assert_eq!(gas, 201);
@@ -375,7 +383,8 @@ fn compute_gas_used_unknown_action_defaults_to_one() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=100, unknown multiplier=1.0 → 1 + 100 = 101
     assert_eq!(gas, 101);
@@ -403,7 +412,8 @@ fn transaction_notifier_send_to_executors_does_not_panic() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     // Should succeed (spawns async task; no nodes registered means no sends)
     let result = notifier.send_to_executors_for_preload(&tx, &env);
     assert!(result.is_ok());
@@ -429,7 +439,8 @@ fn transaction_notifier_send_to_finalizer_does_not_panic() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     let result = notifier.send_to_finalizer_for_preload(&tx, b"finalizer_key", &env);
     assert!(result.is_ok());
 }
@@ -477,7 +488,8 @@ fn handle_self_signed_enqueues_to_pool() {
         timestamp: 1000,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
 
     // Pre-register the transaction (as handle_self_signed in the real flow does)
     registry.register_pending(tx.id.clone()).unwrap();
@@ -526,7 +538,8 @@ fn handle_process_request_routes_self_verified_token_owner_operation() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     c3_sign(&mut tx, &sender_identity);
     let msg = c3_process_message(sender_pk.clone(), tx);
 
@@ -581,7 +594,8 @@ fn handle_process_request_rejects_self_verified_tx_from_non_owner() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     c3_sign(&mut tx, &attacker_identity);
     let msg = c3_process_message(attacker_pk.clone(), tx);
 
@@ -626,7 +640,8 @@ fn handle_process_request_enqueues_standard_tx_to_pool() {
         timestamp: 2000,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
 
     // Pre-register the transaction (as handle_process_request does)
     let tx_id = tx.id.clone();
@@ -695,7 +710,8 @@ fn handle_process_request_rejects_duplicate_nonce() {
         timestamp: 1,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     c3_sign(&mut tx1, &sender_identity);
     let msg1 = c3_process_message(sender_pk.clone(), tx1);
     // First tx must reach the pool enqueue (Step 6), so the nonce is now consumed.
@@ -720,7 +736,8 @@ fn handle_process_request_rejects_duplicate_nonce() {
         timestamp: 2,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
     c3_sign(&mut tx2, &sender_identity);
     let msg2 = c3_process_message(sender_pk.clone(), tx2);
     match sentinel.handle_process_request(msg2) {
@@ -740,7 +757,7 @@ fn pool_ordering_is_deterministic() {
     for i in 0..3 {
         let tx = Transaction {
             payload: vec![], gas_limit: 0,
-            id: format!("tx_order_{}", i),
+            id: format!("tx_order_{i}"),
             action: "Process".into(),
             token_id: vec![3],
             bid: None,
@@ -751,6 +768,7 @@ fn pool_ordering_is_deterministic() {
             timestamp: 3000,
             result_hash: vec![],
             sender_signature: vec![],
+            result_data: vec![],
         };
         let tx_id = tx.id.clone();
         registry.register_pending(tx_id.clone()).unwrap();
@@ -903,7 +921,8 @@ fn send_to_executor_for_preload_follows_current_epoch() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    };
+    
+    result_data: vec![],};
 
     // advance_epoch(1) is a no-op at boot; routing stays on epoch 1 → valid set.
     sentinel.advance_epoch(1);
