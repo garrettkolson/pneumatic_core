@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 09/30/2026 (auto-generated from files on disk).
+Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 
 ## pillar (2)
 
@@ -10,7 +10,7 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 | `pillar-block-lattice` | Block-lattice PoS consensus | Per-token block lattice (Nano-style) with a 4-role worker pipeline: executor proposes, finalizer optimistically finalizes, committer commits, sentinel monitors. | 4 |
 | `pillar-shielded-value-transfer` | Shielded value transfer (Tier-1 deliverable) | Tier-1 roadmap goal: private token value transfer via note commitments, nullifiers, and halo2 zk-proofs verified on-chain; phases S1.1–S5.2 landed, S5.3+ pending. | 4 |
 
-## decision (21)
+## decision (22)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -51,7 +51,7 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 | `concept-data-provider` | DataProvider: MsgPack data-store trait with UDS-first local transport and HMAC option | DataProvider trait with Default-Provider fallbacks; DefaultDataProvider talks MsgPack over UDS (per-UID) or TCP loopback :55555, with optional HMAC shared secret. | 3 |
 | `concept-env-driven-config` | Environment-driven configuration: config.json + /env/ specs | Config::build loads config.json plus every JSON spec in /env/ into per-environment EnvironmentMetadata (partitions, quorum, crypto, cost model, validators); invalid specs fail boot. | 4 |
 | `concept-epoch-and-staking` | Epochs, stake sets, and (stubbed) staking persistence | Epoch (epoch/types.rs:15) + StakeSet/ExecutorSet drive leader election and sharding; IStakingManager/IEpochReconciler exist but StubStakingManager is a no-op (epoch/types.rs:122). | 4 |
-| `concept-executor-role` | Executor role — transaction computation node | The Executor preloads data, runs backpressure-bounded async execution against the DataProvider, signs the result hash, and sends the vote to the assigned Finalizer as a Sign message (the pre-e2e "Execute" shape is gone). | 6 |
+| `concept-executor-role` | Executor role — transaction computation node | The Executor preloads data, runs backpressure-bounded async execution against the DataProvider through a pluggable ContractEngine registry (Transfer/Spec/Wasm — real contract execution, not a stub), signs the result hash, and sends the vote to the assigned Finalizer as a Sign message. | 7 |
 | `concept-executor-sharding` | Executor sharding per epoch (Shuffler) | Executors are sharded per epoch by the Shuffler: a per-epoch assignment of executor sets determines who proposes/attests, rotated for fairness and liveness. | 3 |
 | `concept-finalizer-role` | Finalizer role — quorum checking, block formation, optimistic commit | The Finalizer = SignatureCollector + BlockBuilder + MessageDispatcher: authenticates executor votes (C1) and commits optimistically on the first authenticated signature; stake-quorum shielded tail. | 5 |
 | `concept-gossip-fanout` | Gossiper: verify-then-dedup fan-out with a content-keyed TTL cache | Gossiper deserializes, verifies the envelope signature, dedups on sha256(sender_key)\|\|sha256(body) in a 10k-entry TTL moka cache, then fans out to handlers; send_to_type broadcasts by registry type. | 3 |
@@ -97,17 +97,18 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 | `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | COMPLETED 09/23/2026: all seven steps landed (cache dedup, 4 crate splits, 4 root-lib splits, core authenticate_envelope C1 helper, executor tests move). Workspace 828/32/0. | 5 |
 | `task-data-provider-wire-tests` | Open gap: DefaultDataProvider wire-format tests (data.rs) | Open gap in TASKS.md's 'Remaining test gaps': wire-format tests for the DefaultDataProvider (data.rs); siblings: server.rs async poison, epoch stubs, registry send_to_all, config helpers. | 3 |
 | `task-e2e-pipeline-integration-test` | DONE: e2e pipeline integration test (sentinel → executor → finalizer → committer) | CLOSED 07/26/2026: full-pipeline test at tests/pipeline_integration.rs — SUB→SENT→EXEC→FIN→COMM over RNS (5 nodes, 9 identities, 2/role); closes the audit's Done-when. Findings: Resource path needs a direct link; rns-net 0.7.0 port-wiring rule. | 4 |
-| `task-executor-contract-bytecode` | Open: executor contract execution is a stub (TODO at executor.rs:386) | Executor::execute_contract is a documented stub that serializes the tx itself as the 'output'; TODO at executor/src/executor.rs:386: decode and execute real contract bytecode. | 2 |
-| `task-executor-contract-execution` | Open: implement executor contract execution (plan Phases 1-10) | Implement ADR-011-018 per plan Phases 1-10. **P1–P7 ✅ (09/29/2026)**: substrate + payload field, Transfer/Spec engines, stub replacement + D3/D4 fixes, gas/safety bounds, Tier-2 WasmEngine core (wasmi 1.1.0, W1+W2, opt-in), on-chain deploy, Wasm storage (sload/sstore/sdelete + storage delta + committer apply). Remaining: upgrade governance (P8), Model X calls (P9), e2e (P10). | 8 |
+| `task-executor-contract-bytecode` | Done (stale): executor contract-execution stub — replaced by real engines (P3, 09/29) | RESOLVED: the execute_contract stub (serialized the tx as its own 'output'; TODO at executor.rs:386) was replaced in plan Phase 3 (09/29) by real ContractEngine dispatch (Transfer/Spec/Wasm). Retained only as the historical staleness marker. | 2 |
+| `task-executor-contract-execution` | Complete: executor contract execution (plan Phases 1-10) — all 10 phases landed | All 10 phases landed (09/28-10/01): substrate+payload, Transfer/Spec/Wasm engines, stub replacement, gas bounds, WasmEngine core+deploy+W3 storage, upgrade governance, Model X cross-contract calls, and P10 e2e (7 composite pipeline + 2 cross-executor determinism tests). Full workspace suite green (988 passed / 0 failed). | 9 |
 | `task-s5-3-pool-append` | S5.3 — Committer: pool append, persistence, nullifier commit | Wire the committer to apply shielded pool updates at commit: authoritative proof re-check, idempotent replay, first-spent-wins StaleNullifier, K-freshness, atomic rollback, durable nullifiers. | 7 |
 | `task-s5-4-real-pool-swap` | S5.4 — Composite node-server: real Arc<ShieldedPool> wiring | DONE 2026-09-22: composite role views are the shared Arc<ShieldedPool> itself (no composed view); fast action-gate discriminator + live e2e (4 dispatch hops) + live conflict lockstep-rollback tests; 847 passed / 16 ignored. | 7 |
 | `task-s6-shielded-completion` | S6 — Shielded Tier-1 completion: attacks, concurrency, cross-crate pipeline, proving UX | CLOSED 2026-09-25: attack suite + nullifier/Merkle concurrency + cross-crate 4-hop pipeline with wire-byte privacy assertion + prove/verify timing; 834/37/0; Tier-1 feature-complete. | 5 |
 
-## event (5)
+## event (6)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `event-node-server-composite` | Composite node-server runtime (4 role plugins) | Commit e96a00a: the node-server composite runtime — one process hosting executor, finalizer, committer, and sentinel as plugins for full-node deployments. | 3 |
+| `event-p10-e2e-determinism` | P10: contract-execution plan closed — composite e2e + cross-executor determinism (10/01/2026) | 2026-10-01: Phase 10 closes the executor contract-execution plan — 7 node-server pipeline e2e tests (transfer/Spec/Wasm/W3/deploy-Spec/deploy-Wasm/cross-contract) each assert committed result_hash == hash(engine_output), plus 2 cross-executor determinism tests. Deploy e2e forced the rmp named-maps wire fix; workspace 988/0/37. | 5 |
 | `event-pq-hybrid` | Phase 7: hybrid PQ crypto landed | Commit 503c8b6: the N = N+1 hybrid crypto — every signature (Ed25519·ML-DSA-44) and KEM (X25519·ML-KEM-768) is a classical+PQC concatenation. | 2 |
 | `event-rns-e2e` | RNS end-to-end transport tests landed | Commit 451a00d: end-to-end tests over the Reticulum (RNS) transport layer — messages sent/received through the full rns-net stack with the exact pinned versions. | 2 |
 | `event-s5-2-finalizer-wiring` | S5.2: finalizer wiring for shielded transactions | Commit 1b7e4f0 (09/20/2026): 'feat: finalizer wiring for zk-shielded transactions' — the shielded validation spec is now on the finalizer's block path. | 3 |
@@ -131,7 +132,7 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | Hypothesis: Phase 8 production-readiness work is planned, not done | Phase 8 production readiness (rustdoc, ADR docs, operator runbook; LOW, Post-MVP) is documented as planned in TASKS.md; the other roadmap phases verify as done, so Phase 8 items are likely still outstanding. | 4 |
 
-## fact (14)
+## fact (15)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -140,10 +141,11 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 | `fact-hybrid-pq-crypto` | Hybrid PQ crypto: (Ed25519·ML-DSA-44) sign, (X25519·ML-KEM-768) KEM | AsymCryptoProvider is fully hybrid (N = N+1): signatures = Ed25519 + ML-DSA-44 concatenated; key exchange = X25519 + ML-KEM-768. Phase 7. | 3 |
 | `fact-hybrid-wire-format` | Hybrid wire format: 3796 B hybrid signature, ~2.3 KB (2332 B) PQC-hybrid KEM ciphertext | Hybrid sig = [Ed25519 64 B][ML-DSA-44 PK 1312 B][ML-DSA-44 sig 2420 B] = 3796 B; KEM ct = 32+1088+1184+12+16 = 2332 B for empty plaintext. | 3 |
 | `fact-port-allocations` | Port-per-registry-type allocations | Each node registry type has dedicated external and internal ports (e.g. Committer=42001 external / 50000 internal); data service on 55555. | 2 |
+| `fact-rmp-wire-named-maps` | rmp wire format is named maps, not positional arrays (migrated 10/01 for the deploy fix) | serialize_to_bytes_rmp uses rmp_serde::to_vec_named (named maps), not to_vec (positional arrays), since 10/01/2026. Positional arrays + skip_serializing_if shift slots on deploy txs (TypeMismatch(Array16) at commit); named maps make it safe. Reads stay backward-compatible, but block-hash canonical bytes changed. | 4 |
 | `fact-rns-nodeconfig` | RNS NodeConfig: ~45 fields, no Default — RnsNodeConfigBuilder is the single choke point | rns-net 0.7.0 NodeConfig has ~45 fields and no Default; the full literal lives at config_builder.rs:120-172 (UDP 4242, per-peer udp_port+i, no TCP in v1, 48h dest TTL). | 3 |
 | `fact-rns-pinning` | RNS transport: rns-net =0.7.0, rns-crypto =0.1.9, rns-core =0.1.16 (exact pins) | Reticulum (RNS) transport pinned to exact versions in workspace Cargo.toml; NodeConfig (~45 fields, no Default) built via RnsNodeConfigBuilder; e2e tests over RNS exist. | 3 |
 | `fact-shielded-stack` | Shielded ZK stack: module map (S1–S6 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble, S6 test layer. S1–S6 complete — Tier-1 feature-complete. | 4 |
-| `fact-test-suite` | Test baseline 2026-09-26: 835 passed / 37 ignored / 0 failed | 09/26/2026 workspace test baseline: 835 passed / 37 ignored / 0 failed — core 548, committer 101 (92 lib + 9 integration), executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 19. | 2 |
+| `fact-test-suite` | Test baseline 2026-10-01: 988 passed / 37 ignored / 0 failed | 10/01/2026 workspace test baseline: 988 passed / 37 ignored / 0 failed — core 654 lib (+11 integration), committer 118 (109 lib + 9 integration), executor 33, finalizer 61, node-server 39, prover 15, sentinel 57. | 2 |
 | `fact-test-suite-s6` | Test baseline 2026-07-26: 835 passed / 37 ignored / 0 failed | 07/26/2026 workspace baseline after the e2e pipeline test + finalizer/executor test-module compile fixes: 835 passed / 37 ignored / 0 failed — core 553/19, committer 101/7, prover 15/2, rest unchanged. Use `cargo test --workspace` (plain `cargo test` runs only the root crate). | 2 |
 | `fact-wasmparser-read-var-i32-bug` | wasmparser 0.239.0 read_var_i32 corrupts single-byte 0x40..0x7F immediates | wasmparser 0.239.0's read_var_i32 single-byte fast path mis-decodes i32.const immediates of 0x40..0x7F (yields byte-128); hand-assembled Wasm fixtures must encode every i32.const as 2-byte SLEB128 (sleb_force2). Also: the validator rejects popping a value at a control frame's baseline, and fixtures must omit the data section (section-id swap 11/12). | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
@@ -167,12 +169,13 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 | id | title | summary | edges |
 |---|---|---|---|
 
-## note (3)
+## note (4)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `note-roadmap-status-2026-09-20` | Roadmap status 09/20/2026: S1.1–S5.2 landed; S5.3/S5.4/S6 remain | SUPERSEDED by note-roadmap-status-2026-09-26: Tier-1 shielded work was at S5.2 (HEAD 1b7e4f0); S5.3/S5.4/S6 have since all landed. | 9 |
-| `note-roadmap-status-2026-09-26` | Roadmap status 09/26/2026: shielded Tier-1 feature-complete; production readiness next | S1.1–S6 all landed (S5.3 pool append, S5.4 real-pool swap 09/22, S6 close 09/25): shielded Tier-1 is feature-complete atop PQ hybrid, RNS e2e, and the composite runtime. Remaining: Phase 8 production readiness, the executor contract stub, and the TASKS.md test-gap tail. | 6 |
+| `note-roadmap-status-2026-09-26` | Roadmap status 09/26/2026: shielded Tier-1 feature-complete; production readiness next | SUPERSEDED by note-roadmap-status-2026-10-01: S1.1–S6 all landed (S5.3 pool append, S5.4 real-pool swap 09/22, S6 close 09/25); shielded Tier-1 feature-complete. Remaining then: Phase 8, the executor contract stub (now done), and the TASKS.md test-gap tail. | 7 |
+| `note-roadmap-status-2026-10-01` | Roadmap status 10/01/2026: executor contract execution complete (Phases 1-10); production readiness next | The executor contract-execution plan is fully landed (Phases 1-10, 09/28→10/01): real Transfer/Spec/Wasm engines, W3 storage, deploy, upgrade governance, Model X cross-contract calls, plus P10 e2e + determinism. The rmp wire format moved to named maps (deploy fix). Remaining: Phase 8 production readiness + the TASKS.md test-gap tail. | 6 |
 | `note-threadpool-hybrid-pool` | ThreadPool: hybrid sync+async worker pool | ThreadPool (server.rs:10) pairs each worker with one std thread (sync closures) and one tokio task (async futures) draining two mpsc channels; new() asserts size > 0. | 2 |
 
 ## contact (0)
@@ -192,4 +195,4 @@ Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 
 ## Totals
 
-106 nodes. Logs (append-only, never indexed): see logs/.
+110 nodes. Logs (append-only, never indexed): see logs/.

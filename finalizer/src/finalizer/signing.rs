@@ -101,12 +101,37 @@ pub async fn handle_preload(&self, message: &Message) -> Result<Vec<u8>, Pneumat
     // the transaction from `self.pending_registry` and fails closed if the
     // entry is missing. The entry must be in an executable state
     // (Preloaded/Validated/Executing), so a fresh Pending entry is transitioned
-    // to Preloaded with the deserialized transaction. A re-preload of an
-    // already-registered tx is a no-op (the entry is past Pending).
+    // to Preloaded with the deserialized transaction.
     if self.pending_registry.contains(&tx.id) {
         if let Ok(mut entry) = self.pending_registry.get_transaction_mut(&tx.id) {
-            if matches!(entry.state, TransactionState::Pending) {
-                entry.transition_to_preloaded(tx.clone());
+            match &entry.state {
+                TransactionState::Pending => {
+                    entry.transition_to_preloaded(tx.clone());
+                }
+                // P10 (composite shared registry): the preloaded tx is the
+                // executor's stamped view (`result_hash` + `result_data` set)
+                // — newer than the sentinel-registered copy. Refresh the
+                // canonical entry so the wire block the finalizer commits and
+                // the registry entry the committer hash-matches (H12) carry
+                // the identical transaction. Terminal states are never
+                // overwritten.
+                TransactionState::Preloaded { .. }
+                | TransactionState::Validated { .. }
+                | TransactionState::Executing { .. } => {
+                    let state = match &entry.state {
+                        TransactionState::Validated { validation, .. } => {
+                            TransactionState::Validated {
+                                transaction: tx.clone(),
+                                validation: validation.clone(),
+                            }
+                        }
+                        _ => TransactionState::Preloaded {
+                            transaction: tx.clone(),
+                        },
+                    };
+                    entry.state = state;
+                }
+                _ => {}
             }
         }
     } else {

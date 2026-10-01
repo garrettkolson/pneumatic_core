@@ -1,9 +1,20 @@
 use std::io::{Error, ErrorKind};
 
+/// Serialize to MsgPack bytes.
+///
+/// Structs are encoded as **named maps** (`to_vec_named`) rather than the
+/// default positional arrays. The default `to_vec` writes structs as bare
+/// tuples, which is incompatible with `#[serde(skip_serializing_if)]`: a
+/// skipped field removes an array slot and shifts every later field, so the
+/// positional deserializer reads a value of the wrong type (e.g. a `u64`
+/// field landing on a `Vec<u8>` array) and fails with `TypeMismatch`. Named
+/// maps identify fields by name, so skipped fields are safe. The rmp-serde
+/// deserializer accepts both maps and arrays, so this is backward-compatible
+/// on read.
 pub fn serialize_to_bytes_rmp<T>(obj: &T) -> Result<Vec<u8>, Error>
     where T: serde::Serialize
 {
-    match rmp_serde::to_vec(obj) {
+    match rmp_serde::to_vec_named(obj) {
         Ok(r) => Ok(r),
         Err(e) => Err(Error::new(ErrorKind::InvalidData, e))
     }

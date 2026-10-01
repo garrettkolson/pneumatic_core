@@ -1,14 +1,14 @@
 ---
 id: fact-test-suite
-title: "Test baseline 2026-09-26: 835 passed / 37 ignored / 0 failed"
+title: "Test baseline 2026-10-01: 988 passed / 37 ignored / 0 failed"
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "09/26/2026 workspace test baseline: 835 passed / 37 ignored / 0 failed — core 548, committer 101 (92 lib + 9 integration), executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 19."
+summary: "10/01/2026 workspace test baseline: 988 passed / 37 ignored / 0 failed — core 654 lib (+11 integration), committer 118 (109 lib + 9 integration), executor 33, finalizer 61, node-server 39, prover 15, sentinel 57."
 auto_inject: false
 applicable_when: "Checking test health, regressing after a change, or quoting baseline counts"
 confidence: 1.0
-verified_at: "09/26/2026"
+verified_at: "10/01/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Stale whenever the workspace test counts change — re-run cargo test --workspace"
 tags: [tests, baseline, ci, quality]
@@ -25,10 +25,20 @@ related: []
 source_url: "Empty"
 ---
 
-# Test baseline 2026-09-26
+# Test baseline 2026-10-01
 
-`cargo test --workspace` at HEAD on 09/26/2026: **835 passed, 37 ignored, 0 failed**.
+`cargo test --workspace` at HEAD on 10/01/2026: **988 passed, 37 ignored, 0 failed**.
 
-Per crate: pneumatic_core 548 passed / 19 ignored (+1 doc-test); committer 101 passed / 7 ignored (92 lib + 9 integration); executor 10; finalizer 61; node-server 32 / 2 ignored; prover 15 / 2 ignored; sentinel 57 / 1 ignored; workspace integration 19 passed (committer 9 + transport 6 + pipeline 2 + shielded-pipeline 2); rns_live 0 / 1 ignored.
+Per crate (lib + integration): pneumatic_core 654 lib / 19 ignored + 11 integration (pipeline 1 +
+shielded_attacks 2 + shielded_pipeline 2 + transport 6 + rns_live 0/1-ignored); committer 118
+(109 lib + 9 integration) / 7 ignored; executor 33; finalizer 61; node-server 39 / 2 ignored;
+prover 15 / 2 ignored; sentinel 57 / 1 ignored.
 
-Delta vs the 09/23 baseline (828 passed / 32 ignored): **+7 passed / +5 ignored** — core 546→548 (+2) with integration/doc growth in the workspace-level suites. Historical: the 09/23 figure came after the modularization program (count-neutral moves) + 5 `auth::tests` cases; the 09/23 → 09/25 period added the S6.1–S6.4 fast tests and moved 16 long-running tests to `#[ignore]` (623c7f3); the 09/25 → 09/26 period landed the e2e-pipeline work (see log-organize-vault-20260726-e2e-closed and the 09/25 transport-layer log), which re-landed the suite at the 835/37 total.
+Delta vs the 09/26 baseline (835 passed / 37 ignored): **+153 passed / 0 ignored** — the contract
+execution plan (Phases 1–10, all landed 09/28→10/01) is the driver: core 548→654 (+106, the
+`ContractEngine` substrate, Transfer/Spec/Wasm engines, W3 storage, deploy, upgrade governance,
+ADR-016 cross-contract calls, and the `wasm_call_wasm_round_trip` re-pin), committer 101→118 (+17,
+deploy/commit paths), executor 10→33 (+23, incl. the 2 cross-executor determinism tests), node-server
+32→39 (+7, the 7 composite e2e pipeline tests). The P10 e2e also forced the rmp named-maps wire fix
+(`fact-rmp-wire-named-maps`), which re-pinned `NON_SHIELDED_BASELINE` and regenerated the
+`wasm_caller.wasm` fixture — count-neutral to the suite but byte-significant to the wire format.

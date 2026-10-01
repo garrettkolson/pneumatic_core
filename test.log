@@ -1132,3 +1132,52 @@
 2026-10-01 02:30:49.000672 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
 2026-10-01 02:30:49.021737 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
 2026-10-01 02:30:49.043145 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 11:19:29.792454 UTC: [deploy-scan] REJECT WasmFloatOpcode: internal f32/f64 opcode detected (integer-only contract)
+2026-10-01 11:19:29.794232 UTC: [deploy-scan] WARN WasmExtraExport: non-ABI export present (frozen ABI is __alloc + execute)
+2026-10-01 11:19:29.886798 UTC: [deploy-scan] REJECT CanaryGasExhausted: canary exhausted the 1000000 fuel budget (gas-burn vector)
+2026-10-01 12:00:36.757770 UTC: [deploy-scan] WARN WasmExtraExport: non-ABI export present (frozen ABI is __alloc + execute)
+2026-10-01 12:00:36.760222 UTC: [deploy-scan] REJECT WasmFloatOpcode: internal f32/f64 opcode detected (integer-only contract)
+2026-10-01 12:00:36.854719 UTC: [deploy-scan] REJECT CanaryGasExhausted: canary exhausted the 1000000 fuel budget (gas-burn vector)
+2026-10-01 12:00:42.890651 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-10-01 12:00:42.900592 UTC: Attempted to distribute block to archivers (hash: 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821)
+2026-10-01 12:00:42.917390 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-10-01 12:00:42.926687 UTC: Attempted to distribute block to archivers (hash: 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821)
+2026-10-01 12:00:42.940106 UTC: Double-proposal detected (same proposer) at commit: slashing d5de57e73015eae26a7c381b4c6fbbcedc15f4512c7e6f6c2fb5e24080a83f6b (candidate 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821 vs incoming 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821)(token: 01)
+2026-10-01 12:00:42.940261 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 12:00:42.953822 UTC: Double-proposal detected (same proposer) at commit: slashing d5de57e73015eae26a7c381b4c6fbbcedc15f4512c7e6f6c2fb5e24080a83f6b (candidate 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821 vs incoming 66cf2ba3268c32a68ece88c2638f0db7da91dc4c148fe868889307a71672a821)(token: 01)
+2026-10-01 12:00:42.953952 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 12:00:42.975122 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:42.996187 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.017849 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.039167 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.088050 UTC: Double-proposal detected (same proposer) at commit: slashing 4bd986f8e540ef0f7fb333faf2196a13d43a55579837d690219e4f7a309814e1 (candidate 700cceb43ff9d3f279c68989624fc7300f8f48f1a425909515bd52e6be76b84b vs incoming 700cceb43ff9d3f279c68989624fc7300f8f48f1a425909515bd52e6be76b84b)(token: 01)
+2026-10-01 12:00:43.088206 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 12:00:43.101748 UTC: Double-proposal detected (same proposer) at commit: slashing 4bd986f8e540ef0f7fb333faf2196a13d43a55579837d690219e4f7a309814e1 (candidate 700cceb43ff9d3f279c68989624fc7300f8f48f1a425909515bd52e6be76b84b vs incoming 700cceb43ff9d3f279c68989624fc7300f8f48f1a425909515bd52e6be76b84b)(token: 01)
+2026-10-01 12:00:43.101877 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 12:00:43.122693 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.143422 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.164156 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 12:00:43.184800 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:23.912237 UTC: [deploy-scan] WARN WasmExtraExport: non-ABI export present (frozen ABI is __alloc + execute)
+2026-10-01 15:56:23.916381 UTC: [deploy-scan] REJECT WasmFloatOpcode: internal f32/f64 opcode detected (integer-only contract)
+2026-10-01 15:56:24.015349 UTC: [deploy-scan] REJECT CanaryGasExhausted: canary exhausted the 1000000 fuel budget (gas-burn vector)
+2026-10-01 15:56:33.858759 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-10-01 15:56:33.868923 UTC: Attempted to distribute block to archivers (hash: 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f)
+2026-10-01 15:56:33.885842 UTC: Committed block to token [01] (chain length: 1, seq: 1)
+2026-10-01 15:56:33.895330 UTC: Attempted to distribute block to archivers (hash: 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f)
+2026-10-01 15:56:33.909342 UTC: Double-proposal detected (same proposer) at commit: slashing 1f439c53bea78c84a21189b75211305d503f887f47682fca288efb0b28cc831d (candidate 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f vs incoming 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f)(token: 01)
+2026-10-01 15:56:33.909497 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 15:56:33.923888 UTC: Double-proposal detected (same proposer) at commit: slashing 1f439c53bea78c84a21189b75211305d503f887f47682fca288efb0b28cc831d (candidate 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f vs incoming 8d95099a3c739b3f27a0588e5d0c6d484607fb8b5773f46e667c42e49e495c3f)(token: 01)
+2026-10-01 15:56:33.924022 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 15:56:33.946002 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:33.967544 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:33.988197 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:34.009391 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:34.062019 UTC: Double-proposal detected (same proposer) at commit: slashing b45574b0d2838c4d71c11d70c84110d9d2e1f35b2092e08573821ebb084c2333 (candidate 7ab65f688dab9b42921d259ebc7071894d66b5bb5cb36f0c74ef5ecafceec883 vs incoming 7ab65f688dab9b42921d259ebc7071894d66b5bb5cb36f0c74ef5ecafceec883)(token: 01)
+2026-10-01 15:56:34.062169 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 15:56:34.076949 UTC: Double-proposal detected (same proposer) at commit: slashing b45574b0d2838c4d71c11d70c84110d9d2e1f35b2092e08573821ebb084c2333 (candidate 7ab65f688dab9b42921d259ebc7071894d66b5bb5cb36f0c74ef5ecafceec883 vs incoming 7ab65f688dab9b42921d259ebc7071894d66b5bb5cb36f0c74ef5ecafceec883)(token: 01)
+2026-10-01 15:56:34.077100 UTC: Applied 1 staking ops during epoch reconciliation
+2026-10-01 15:56:34.098863 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:34.119672 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:34.140969 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay
+2026-10-01 15:56:34.162208 UTC: BlockFinalized: buffered out-of-order block for token [01] for replay

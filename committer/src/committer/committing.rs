@@ -74,27 +74,57 @@ impl Committer {
                 .map_err(|_| CommitterError::TransactionNotInFinalizing(tx_id.clone()))?;
         }
 
-        // Step 1: Acquire lock on the transaction
-        self.pending_registry
-            .acquire_transaction(&tx_id)
-            .map_err(|_| CommitterError::TransactionNotInFinalizing(tx_id.clone()))?;
+        // Step 1: Acquire lock on the transaction.
+        //
+        // P10 (composite shared registry): the finalizer's optimistic path
+        // books the shared entry `Committed` the moment it dispatches the
+        // Commit, so by the time the committer processes the message the entry
+        // can already be terminal. The wire block is the authoritative
+        // artifact — the finalizer built and signed it, and the committer's
+        // chain-linkage check in `Token::commit_block` rejects a true replay
+        // of a block already on the chain — so when the entry is `Committed`
+        // with THIS exact block hash we proceed wire-authoritative: the wire
+        // transaction is committed without a lock. Any other state (including
+        // `Committed` with a different block hash) fails closed. In a split
+        // deployment the committer's registry only ever sees H4-materialized
+        // entries, so this branch only fires in the composite.
+        let mut wire_authoritative = false;
+        if let Err(_) = self.pending_registry.acquire_transaction(&tx_id) {
+            if let Ok(entry) = self.pending_registry.get_transaction_mut(&tx_id) {
+                if let TransactionState::Committed { ref block_hash, .. } = entry.state {
+                    if *block_hash == commit.proposed_block.current_hash {
+                        wire_authoritative = true;
+                    }
+                }
+            }
+            if !wire_authoritative {
+                return Err(CommitterError::TransactionNotInFinalizing(tx_id.clone()));
+            }
+        }
 
         // Step 2: Extract transaction from either Finalizing (standard pipeline)
-        // or Validated (leader-proposal) state.
+        // or Validated (leader-proposal) state. Wire-authoritative commits
+        // (see Step 1) use the wire block's own transaction — the registry
+        // entry is already terminal and the wire block is the signed source
+        // of truth.
         let (transaction, is_leader_proposal) = {
-            let entry = self
-                .pending_registry
-                .get_transaction_mut(&tx_id)?;
+            if wire_authoritative {
+                (commit.proposed_block.signed_trans.transaction.clone(), false)
+            } else {
+                let entry = self
+                    .pending_registry
+                    .get_transaction_mut(&tx_id)?;
 
-            match &entry.state {
-                TransactionState::Finalizing { transaction, .. } => {
-                    (transaction.clone(), false)
-                }
-                TransactionState::Validated { transaction, .. } => {
-                    (transaction.clone(), true)
-                }
-                _ => {
-                    return Err(CommitterError::TransactionNotInFinalizing(tx_id));
+                match &entry.state {
+                    TransactionState::Finalizing { transaction, .. } => {
+                        (transaction.clone(), false)
+                    }
+                    TransactionState::Validated { transaction, .. } => {
+                        (transaction.clone(), true)
+                    }
+                    _ => {
+                        return Err(CommitterError::TransactionNotInFinalizing(tx_id));
+                    }
                 }
             }
         };

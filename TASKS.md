@@ -853,17 +853,29 @@ Conflict detection operates locally at epoch boundaries via `CandidateRegistry` 
 **File:** `sentinel/src/transaction_notifier.rs`
 **Completed:** Injected `Arc<NodeRegistry>` into `TransactionNotifier`. `send_to_nodes` spawns a bare OS thread that creates its own mini Tokio runtime to drive the async `registry.send_to_all()`. Works with or without an existing reactor. All 5 methods (`send_to_executors_for_preload`, `send_to_finalizer_for_preload`, `notify_clear_to_process`, `notify_delete`, `request_finalizer`) now use real networking. Added `From<NotifyError> for SentinelError` impl. Sentinel's `send_to_executor_for_preload` now calls `self.transaction_notifier.send_to_executors_for_preload()` instead of being a no-op. 4 new tests.
 
-### pneumatic_executor — Priority 3 (Started — Phase 3 complete, ~560 lines, 6 tests)
+### pneumatic_executor — Priority 3 (Complete — 33 tests; contract execution fully implemented, Phases 1–10)
 
-#### Executor — stub contract execution
-**File:** `executor/src/executor.rs:369-381`
-`execute_contract()` serializes the transaction as "execution output" instead of invoking contract bytecode. Comment reads `// TODO: decode and execute contract bytecode`.
-**Action:** Replace stub with actual contract execution logic.
+#### ~~Executor — stub contract execution~~
+**File:** `executor/src/executor.rs`
+**FIXED (2026-09-28→10-01):** the `// TODO: decode and execute contract bytecode` stub is gone. `execute_contract()` now dispatches to a `ContractEngine` from the `ContractEngineRegistry` (`register_defaults()` → `Transfer` + `Spec`; `Wasm` is `register`-ed on demand) inside `spawn_blocking` + `catch_unwind`. Landed per the approved contract-execution plan (ADR-011–018): Tier-1 `SpecEngine` (typed op stack), Tier-2 `WasmEngine` (wasmi, W3 storage), on-chain deploy, Wasm storage, upgrade governance, and ADR-016 Model X cross-contract calls (`Spec Op::Call` + Wasm `env.call` via the shared `execute_call` core + `SnapshotRef` pin). See `task-executor-contract-execution` in the vault.
 
-#### Executor — finalizer networking has action bug
-**File:** `executor/src/executor.rs:141-181, 344-356`
-`send_to_finalizer()` is wired into `run_execution()` but uses `Message(action="Execute")` while the Finalizer's `handle_signature` method (line 263) expects action `"Sign"`. The Finalizer will never receive these messages — hits `UnknownAction` error path. Method is duplicated in both `Executor` and `ExecutorHandle` (lines 418-445).
-**Action:** Fix action string from `"Execute"` to `"Sign"`; deduplicate between Executor and ExecutorHandle.
+#### ~~Executor — finalizer networking has action bug~~
+**File:** `executor/src/executor.rs`
+**FIXED (2026-09-30):** `send_to_finalizer()` now emits `Message(action="Sign")` with a `TransactionSignature` body (`transaction_hash` = the engine's `result_hash`, hybrid Ed25519·ML-DSA signature), matching the Finalizer's `handle_signature` handler. The "Execute" action string and the `Executor`/`ExecutorHandle` duplication are gone.
+
+#### Executor — contract execution Phases 1–10 (2026-09-28 → 10-01)
+**Plan:** `plans/executor-contract-execution-implementation-plan.md`. All 10 phases landed:
+- **P1–P2** — `ContractEngine` substrate + `payload`/`gas_limit` wire fields; `Transfer`/`Spec` engines.
+- **P3** — stub replacement; `env_id` partition-key + preload slot-leak fixes.
+- **P4** — gas bounds (delta model, `ExecutionInput`/`ExecutionOutput`).
+- **P5–P7** — Tier-2 `WasmEngine` core, on-chain deploy, W3 storage.
+- **P8** — upgrade governance.
+- **P9** — ADR-016 Model X cross-contract calls (Spec + Wasm round-trip proven with a hand-assembled 578-byte caller fixture).
+- **P10** — composite e2e (`node-server`: 7 pipeline tests — transfer / Spec / Wasm / stateful W3 / deploy-Spec / deploy-Wasm / cross-contract, each asserting the committed block's `result_hash` == `hash(engine_output)`) + cross-executor determinism (2 tests: calling tx + Wasm module → identical `result_hash`, both "Sign" votes verify under the identity key).
+
+**Deploy wire fix (2026-10-01):** `serialize_to_bytes_rmp` switched from `rmp_serde::to_vec` (positional arrays) to `to_vec_named` (named maps) — positional arrays + `skip_serializing_if` (on `gas_limit`/`payload`/`result_data`) shift array slots on deploy txs (`TypeMismatch(Array16)` at commit). Named maps make `skip_serializing_if` safe; the deserializer accepts both, so reads stay backward-compatible. The one-time consequence: the rmp wire form (and thus block-hash canonical bytes) changed — re-pinned `NON_SHIELDED_BASELINE` (`transactions.rs`) and regenerated `wasm_caller.wasm`'s baked-in genesis ref hash (`generate_caller.py`).
+
+**Tests:** full workspace `cargo test` green — **988 passed / 0 failed / 37 ignored** (core 654 lib + 11 integration; committer 118; finalizer 61; sentinel 57; executor 33; node-server 39; prover 15).
 
 #### ~~Executor — `validate_execution_result` never called~~
 **File:** `executor/src/executor.rs:184-193`

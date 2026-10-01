@@ -1,16 +1,16 @@
 ---
 id: task-executor-contract-bytecode
-title: "Open: executor contract execution is a stub (TODO at executor.rs:386)"
+title: "Done (stale): executor contract-execution stub — replaced by real engines (P3, 09/29)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Executor::execute_contract is a documented stub that serializes the tx itself as the 'output'; TODO at executor/src/executor.rs:386: decode and execute real contract bytecode."
+summary: "RESOLVED: the execute_contract stub (serialized the tx as its own 'output'; TODO at executor.rs:386) was replaced in plan Phase 3 (09/29) by real ContractEngine dispatch (Transfer/Spec/Wasm). Retained only as the historical staleness marker."
 auto_inject: false
-applicable_when: "Planning real contract execution, reviewing what the executor actually computes today, or assessing optimism-path risk"
+applicable_when: "Recalling that the executor's contract-execution stub was replaced, or auditing the closed staleness marker"
 confidence: 1.0
-verified_at: "09/28/2026"
+verified_at: "10/01/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done/stale when execute_contract performs real bytecode decoding/execution — grep executor/src/executor.rs for 'TODO: decode and execute contract bytecode'"
+staleness_signal: "Closed — the stub no longer exists (grep for 'TODO: decode and execute contract bytecode' returns nothing). See task-executor-contract-execution for the landed implementation."
 tags: [executor, contract-execution, stub, todo]
 edges:
   - target: concept-executor-role
@@ -39,4 +39,4 @@ Genuinely documented pending work in the executor crate — the only TODO found 
 
 Implication: end-to-end pipeline behavior (routing, signatures, quorum, block formation) is fully exercised, but the *computation* itself is identity-like. Landing real bytecode execution here is a semantic change to everything the finalizer commits.
 
-**Status: planned** (09/28/2026). Design decisions are locked — ADR-011 (engine model), ADR-012 (calldata), ADR-013 (read-only executor + gas), ADR-014 (contract model); the implementation is tracked by `task-executor-contract-execution` per `plans/executor-contract-execution-implementation-plan.md`. This node remains the staleness marker until `execute_contract` performs real execution.
+**Status: DONE / STALE** (closed 10/01/2026). The stub was replaced in plan **Phase 3 (09/29/2026)**: `execute_contract` now dispatches to a `ContractEngine` from the `ContractEngineRegistry` (Transfer/Spec defaults, Wasm on demand) under `spawn_blocking` + `catch_unwind`, and the `// TODO: decode and execute contract bytecode` line is gone. This node is retained only as the historical staleness marker; the full implementation (all 10 phases) is tracked by `task-executor-contract-execution`.

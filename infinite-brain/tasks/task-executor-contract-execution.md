@@ -1,16 +1,16 @@
 ---
 id: task-executor-contract-execution
-title: "Open: implement executor contract execution (plan Phases 1-10)"
+title: "Complete: executor contract execution (plan Phases 1-10) — all 10 phases landed"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P9 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage, upgrade governance, Model X cross-contract calls). Remaining: P10 e2e."
+summary: "All 10 phases landed (09/28-10/01): substrate+payload, Transfer/Spec/Wasm engines, stub replacement, gas bounds, WasmEngine core+deploy+W3 storage, upgrade governance, Model X cross-contract calls, and P10 e2e (7 composite pipeline + 2 cross-executor determinism tests). Full workspace suite green (988 passed / 0 failed)."
 auto_inject: false
-applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
-confidence: 0.9
-verified_at: "09/30/2026"
+applicable_when: "Recalling what the executor's contract-execution work landed, or re-scoping a new engine/storage requirement"
+confidence: 1.0
+verified_at: "10/01/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when a composite e2e asserts a real result_hash and Phase 10 (e2e) is landed or re-scoped; P1-P9 landed (P9 09/30/2026)"
+staleness_signal: "Complete. Re-open only if a new contract-execution requirement lands (a new engine tier, storage model, or a change to the e2e/determinism invariants)."
 tags: [task, executor, contract-execution, implementation, adr-011, adr-014, adr-016]
 edges:
   - target: decision-contract-engine-model
@@ -59,10 +59,10 @@ Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
 `plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
 `plans/wasm-engine-design.md`; deploy design: `plans/deploy-contract-design.md`.
-Status: **in progress** — Phases 1–9 complete (P1–P8 09/29/2026, **P9 09/30/2026**); the
-Tier-2 WasmEngine **core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6),
-**Wasm storage (W3)** is landed (Phase 7), **upgrade governance** is landed (Phase 8), and
-**Model X cross-contract calls** are landed (Phase 9, ADR-016). Remaining: P10 (e2e).
+Status: **COMPLETE** — all 10 phases landed (P1–P8 09/29/2026, P9 09/30/2026, **P10 10/01/2026**).
+The Tier-2 WasmEngine **core** (Phase 5), **on-chain deployment** (Phase 6), **Wasm storage (W3)**
+(Phase 7), **upgrade governance** (Phase 8), and **Model X cross-contract calls** (Phase 9, ADR-016)
+are all landed, and **Phase 10 (e2e + determinism + docs)** closed the plan 10/01/2026.
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -246,8 +246,18 @@ Phase checklist (each phase's exit criteria live in the plan):
   tests (6 provider fail-closed: unknown token, ref out of range, ref hash mismatch, no
   contract asset, missing user; + 1 full `execute_contract` wiring). Core 639 → 654;
   executor 24 → 31; workspace `cargo test` green (0 failed).
-- **P10** — composite e2e (incl. a Wasm contract) + cross-executor determinism tests +
-  docs + vault closeout.
+- **P10 ✅ (10/01/2026)** — composite e2e + cross-executor determinism + docs + vault closeout.
+  **7 `node-server` pipeline e2e tests** (transfer / Spec / Wasm / stateful W3 / deploy-Spec /
+  deploy-Wasm / cross-contract) each assert the committed block's `result_hash` == an independently
+  computed `hash(engine_output)`. **2 determinism tests** (`executor/src/executor/tests/determinism.rs`):
+  two independent `Executor` instances over the same shard inputs produce an identical `result_hash`
+  and two "Sign" votes that both verify under the identity key (the hybrid Ed25519·ML-DSA signature is
+  **not** byte-reproducible — ML-DSA-44 uses a fresh random nonce — so determinism is asserted as
+  identical `result_hash` + both signatures verifying, NOT byte-equal signatures). Landing the deploy
+  e2e surfaced the rmp wire fix (`to_vec`→`to_vec_named`, see `fact-rmp-wire-named-maps`), whose
+  one-time collateral re-pinned `NON_SHIELDED_BASELINE` and regenerated `wasm_caller.wasm`'s baked-in
+  genesis ref hash. Docs (TASKS.md executor tail, README Outstanding) + vault closeout updated.
+  Full workspace `cargo test` green: **988 passed / 0 failed / 37 ignored**.
 
 Supersedes the narrower scope of `task-executor-contract-bytecode` (stub
 replacement only), which stays open as the staleness marker until the code lands.

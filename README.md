@@ -13,7 +13,7 @@
 cargo check              # Verify compilation
 cargo build              # Build all workspace crates
 cargo build -p pneumatic_node_server   # The deployment binary (`node-server`)
-cargo test --workspace --lib   # 815 lib tests across 7 crates
+cargo test --workspace --lib   # 968 lib tests across 7 crates
 cargo test --workspace         # 835 passed / 37 ignored (lib + integration + doc)
 cargo test <filter>      # Run a single test, e.g. cargo test leader_selector
 ```
@@ -229,18 +229,18 @@ A single process — `pneumatic_node_server` (binary `node-server`) — *is* the
 
 ```bash
 cargo test --workspace --lib
-# 815 lib tests: 548 core + 92 committer + 10 executor + 61 finalizer + 32 node-server + 15 prover + 57 sentinel
+# 968 lib tests: 654 core + 109 committer + 33 executor + 61 finalizer + 39 node-server + 15 prover + 57 sentinel
 cargo test --workspace
-# 835 passed / 37 ignored: lib + integration (pipeline, transport, shielded) + doc tests
+# 988 passed / 37 ignored: lib + integration (pipeline, transport, shielded) + doc tests
 ```
 
 ## Roadmap
 
 The phase-by-phase checklist (Phases 0–10: foundation, the four worker pipelines, optimistic finality, deterministic routing, sharding, quorum gossip, RNS transport, production readiness, security audit remediation) is tracked in [TASKS.md](TASKS.md); dated status snapshots live in the vault (`infinite-brain/notes/`).
 
-**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete), and real executor contract execution (pluggable `ContractEngine` registry, per-transaction gas + wall-clock backstop, panic isolation).
+**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete), and **complete executor contract execution** (pluggable `ContractEngine` registry — `Transfer`/`Spec`/`Wasm` engines, per-transaction gas + wall-clock backstop, panic isolation, on-chain deploy, W3 Wasm storage, upgrade governance, ADR-016 Model X cross-contract calls) — verified end-to-end (7 composite pipeline tests + 2 cross-executor determinism tests; 988-test workspace suite green).
 
-**Outstanding:** production readiness (rustdoc, operator runbook, observability, deployment infra — Phase 8), on-chain deployment of the executor (Phase 5 — ADR-015 design first), and the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests).
+**Outstanding:** production readiness (rustdoc, operator runbook, observability, deployment infra — Phase 8) and the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests).
 
 ## Project Memory: Infinite Brain
 

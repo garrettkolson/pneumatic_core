@@ -4,14 +4,14 @@ title: "Executor role — transaction computation node"
 type: concept
 namespace: pneumatic
 visibility: namespace
-summary: "The Executor preloads data, runs backpressure-bounded async execution against the DataProvider, signs the result hash, and sends the vote to the assigned Finalizer as a Sign message."
+summary: "The Executor preloads data, runs backpressure-bounded async execution against the DataProvider through a pluggable ContractEngine registry (Transfer/Spec/Wasm — real contract execution, not a stub), signs the result hash, and sends the vote to the assigned Finalizer as a Sign message."
 auto_inject: false
-applicable_when: "Working on executor/, transaction execution, backpressure, or the Executor's place in the pipeline"
+applicable_when: "Working on executor/, transaction execution, backpressure, contract engines, or the Executor's place in the pipeline"
 confidence: 1.0
-verified_at: "09/26/2026"
+verified_at: "10/01/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when executor/src/executor.rs changes its pipeline steps, backpressure API, or outbound action"
-tags: [executor, worker-crate, pipeline, backpressure]
+staleness_signal: "Stale when executor/src/executor.rs changes its pipeline steps, backpressure API, outbound action, or the ContractEngine registry"
+tags: [executor, worker-crate, pipeline, backpressure, contract-execution]
 edges:
   - target: concept-optimistic-finality
     type: related_to
@@ -32,11 +32,15 @@ edges:
   - target: fact-wire-protocol
     type: related_to
     weight: 0.7
-    note: "Outbound Execute messages are identity-signed Message frames over the wire format"
+    note: "Outbound Sign votes are identity-signed Message frames over the wire format (named-map rmp, see fact-rmp-wire-named-maps)"
   - target: fact-workspace-layout
     type: derived_from
     weight: 0.6
     note: "Crate pneumatic_executor is one of the five worker crates around pneumatic_core"
+  - target: task-executor-contract-execution
+    type: part_of
+    weight: 0.9
+    note: "The executor's computation stage was completed by the contract-execution plan (Phases 1-10, all landed 10/01)"
 related: []
 source_url: "Empty"
 ---
@@ -52,4 +56,4 @@ Key mechanics (all code-verified):
 - **Run pipeline**: `run_execution` loads the tx, transitions it to `Executing`, fetches contract + user data, executes, validates, hashes the output, transitions to `Finalizing` with the finalizer key from the validation result, then broadcasts (`executor.rs:270-367`).
 - **Outbound**: the executor signs the `result_hash` and sends a **`"Sign"` vote** (action `"Sign"`, `executor.rs:495`) under the node's own `NodeIdentity` to the assigned Finalizer — the finalizer's C1 intake expects exactly this (`"Execute"`/`ExecutionResult` was the pre-e2e shape and is no longer sent; the seam was the e2e pipeline blocker, closed per log-organize-vault-20260726-e2e-closed). The `"Preload"` from the sentinel is ordered before the `"Sign"`.
 
-The contract-execution body is still a stub — see task-executor-contract-bytecode.
+The contract-execution body is **real** (the old stub is gone — see the closed marker `task-executor-contract-bytecode`): `execute_contract` selects a `ContractEngine` from the `ContractEngineRegistry` (`register_defaults()` → `Transfer` + `Spec`; `Wasm` is `register`-ed on demand) and runs it under `spawn_blocking` + `catch_unwind`. The Tier-1 `SpecEngine` (typed op stack) and Tier-2 `WasmEngine` (wasmi, W3 storage) are landed, along with on-chain deploy, upgrade governance, and ADR-016 Model X cross-contract calls — all 10 phases of the contract-execution plan closed 10/01/2026 (`task-executor-contract-execution`). The committed `result_hash` is the SHA-256 of the engine's `result_data`, asserted end-to-end against an independent `hash(engine_output)` in the `node-server` e2e suite.

@@ -70,7 +70,14 @@ async fn try_finalize(&self, tx_id: &str) -> Result<Vec<u8>, PneumaticError> {
     let transaction = match entry.state {
         TransactionState::Preloaded { ref transaction }
         | TransactionState::Validated { ref transaction, .. }
-        | TransactionState::Executing { ref transaction } => {
+        | TransactionState::Executing { ref transaction }
+        // P10 (composite shared registry): the executor transitions the
+        // shared entry to Finalizing at the end of execution (step 10)
+        // before its "Sign" vote arrives, so the finalizer must accept an
+        // already-Finalizing entry. In split deployments the finalizer's
+        // own copy is Preloaded/Validated/Executing — Finalizing is
+        // unreachable there until this very call.
+        | TransactionState::Finalizing { ref transaction, .. } => {
             transaction.clone()
         }
         _ => {
@@ -169,7 +176,13 @@ pub(crate) async fn try_finalize_optimistic(
     let transaction = match entry.state {
         TransactionState::Preloaded { ref transaction }
         | TransactionState::Validated { ref transaction, .. }
-        | TransactionState::Executing { ref transaction } => {
+        | TransactionState::Executing { ref transaction }
+        // P10 (composite shared registry): the executor leaves the shared
+        // entry in Finalizing (execution step 10) before this vote arrives —
+        // the optimistic path must accept it. The entry's transaction is the
+        // executor's stamped view (result_data set); `result_hash` is stamped
+        // below and written back via the Finalizing/Committed transitions.
+        | TransactionState::Finalizing { ref transaction, .. } => {
             transaction.clone()
         }
         _ => {
@@ -180,6 +193,17 @@ pub(crate) async fn try_finalize_optimistic(
         }
     };
     drop(entry);
+
+    // P10: stamp the verified executor vote hash onto the canonical tx
+    // BEFORE it goes into the block, so the shared-registry entry and the
+    // wire block the finalizer commits carry the identical transaction. In
+    // the composite (one shared pending registry) the committer's H12
+    // hash-match compares the registry entry against the wire block's
+    // embedded tx; an unstamped registry copy would mismatch and fail
+    // closed. In a split deployment the committer materializes its own
+    // entry from the wire block (H4), so the stamp is harmless there.
+    let mut transaction = transaction;
+    transaction.result_hash = single_sig.transaction_hash.clone();
 
     // Step 2: Get the finalizer key from the transaction state
     let finalizer_key = match self.pending_registry.get_transaction_mut(tx_id) {

@@ -446,3 +446,993 @@ async fn live_composite_conflict_rollback_lockstep() {
         "post-rollback root history is coherent"
     );
 }
+
+// ===========================================================================
+// P10 (executor plan, Phase 10): end-to-end contract execution over the
+// STANDARD pipeline in the composite — Sentinel `Verify` → Executor
+// `Preload` → Finalizer `Sign` → Committer `Commit` — for every Tier-1
+// engine path:
+//
+//   (a) standard transfer tx        (TransferEngine)
+//   (b) `Spec` contract tx          (SpecEngine, rmp-AST bytecode)
+//   (c) `Wasm` contract tx          (WasmEngine — pure + stateful W3 storage)
+//   (d) deployment tx               (ADR-015 — Spec and Wasm)
+//   (e) cross-contract call tx      (ADR-016 Model X, Spec → Spec)
+//
+// The terminal assertion in every case: the committed block's
+// `signed_trans.transaction.result_hash` equals `hash(engine_output)`
+// computed by running the engine DIRECTLY (no pipeline involvement) —
+// the end-to-end determinism property the plan requires.
+//
+// These tests also exercise the composite shared-registry path end to
+// end: one `PendingTransactionRegistry` shared by all four roles, so the
+// finalizer's `Committed` booking and the stamped `result_hash` must be
+// reconciled with the committer's commit (see the P10 fixes in
+// finalizer/signing.rs, finalizer/finalizing.rs, committer/committing.rs).
+// ===========================================================================
+
+use pneumatic_core::contracts::{
+    deploy_contract, CallContext, ContractEngine, ContractEngineRegistry, ContractError,
+    DeployParams, ExecutionInput, InstructionProgram, Op, PinnedTarget, SnapshotRef,
+    TargetStateProvider, TransferDelta, WasmEngine, WasmResult,
+};
+use pneumatic_core::crypto::{AsymCryptoProvider, Ed25519Provider};
+use pneumatic_core::data::DataError;
+use pneumatic_core::tokens::SmartContract;
+use pneumatic_core::transactions::Transaction;
+
+/// The environment spec for the contract pipeline. `load_from_spec` only
+/// validates the built-in Tier-1 engine list (`["Transfer", "Spec"]`), so
+/// `Wasm` (opt-in) is registered on the env's `ContractEngineRegistry` AFTER
+/// load in `contract_runtime_config` (ADR-011).
+const CONTRACT_SPEC: &str = r#"{
+    "environment_id": "test_env",
+    "environment_name": "Contract Pipeline E2E Environment",
+    "partitions": [
+        {"id": "token", "partition_type": "Token"},
+        {"id": "reconciliation", "partition_type": "Slush"}
+    ],
+    "asym_crypto_provider": "Ed25519",
+    "sym_crypto_provider": "AES-256-GCM",
+    "serialization_provider": "rmp-serde",
+    "quorum_percentage": 67.0,
+    "override_quorum_percentage": 67.0,
+    "max_risk": 1.0,
+    "allowed_token_types": [],
+    "trans_validation_specs": [],
+    "block_validation_specs": [],
+    "log_file": "/tmp/test.log",
+    "shard_count": 1,
+    "shard_quorum_percentage": 67.0,
+    "contract_engines": ["Transfer", "Spec"]
+}"#;
+
+/// In-memory multi-token / multi-user `DataProvider` for the contract
+/// pipeline. Unlike `E2eDataProvider` (single token, single user) it serves
+/// a fixed set of tokens + users, persists `save_token` / `save_user`
+/// (the committer's gas deduction and deploy apply write back through
+/// here), and answers every stake-snapshot read with the fixed staker set.
+#[derive(Clone)]
+struct ContractE2eProvider {
+    tokens: Arc<DashMap<Vec<u8>, Token>>,
+    users: Arc<DashMap<Vec<u8>, User>>,
+    stakers: Arc<std::sync::Mutex<HashMap<Vec<u8>, u64>>>,
+}
+
+impl ContractE2eProvider {
+    fn new(
+        tokens: Vec<(Vec<u8>, Token)>,
+        users: Vec<(Vec<u8>, User)>,
+        stakers: Vec<(Vec<u8>, u64)>,
+    ) -> Self {
+        ContractE2eProvider {
+            tokens: Arc::new(DashMap::from_iter(tokens)),
+            users: Arc::new(DashMap::from_iter(users)),
+            stakers: Arc::new(std::sync::Mutex::new(HashMap::from_iter(stakers))),
+        }
+    }
+}
+
+impl DataProvider for ContractE2eProvider {
+    fn get_token(&self, key: &Vec<u8>, _partition_id: &str) -> Result<Token, DataError> {
+        self.tokens
+            .get(key)
+            .map(|t| t.clone())
+            .ok_or(DataError::DataNotFound)
+    }
+    fn save_token(&self, key: &Vec<u8>, token: Token, _partition_id: &str) -> Result<(), DataError> {
+        self.tokens.insert(key.clone(), token);
+        Ok(())
+    }
+    fn get_user(&self, key: &Vec<u8>, _partition_id: &str) -> Result<User, DataError> {
+        self.users
+            .get(key)
+            .map(|u| u.clone())
+            .ok_or(DataError::DataNotFound)
+    }
+    fn save_user(&self, key: &Vec<u8>, user: User, _partition_id: &str) -> Result<(), DataError> {
+        self.users.insert(key.clone(), user);
+        Ok(())
+    }
+    fn get_stake_snapshot(
+        &self,
+        _epoch: u64,
+        _partition_id: &str,
+    ) -> Result<StakeSet, DataError> {
+        Ok(StakeSet {
+            stakers: self.stakers.lock().unwrap().clone(),
+        })
+    }
+    fn save_stake_snapshot(
+        &self,
+        _epoch: u64,
+        _snapshot: StakeSet,
+        _partition_id: &str,
+    ) -> Result<(), DataError> {
+        Ok(())
+    }
+    fn get_executor_set(
+        &self,
+        _epoch: u64,
+        _partition_id: &str,
+    ) -> Result<pneumatic_core::epoch::ExecutorSet, DataError> {
+        Err(DataError::StoreNotFound)
+    }
+    fn save_executor_set(
+        &self,
+        _epoch: u64,
+        _set: pneumatic_core::epoch::ExecutorSet,
+        _partition_id: &str,
+    ) -> Result<(), DataError> {
+        Ok(())
+    }
+}
+
+/// A `Config` whose `test_env` declares the three contract engines and
+/// whose `DeployContract` spec is wired to the TEST data provider:
+/// `load_from_spec` auto-registers the deploy spec against a lazy
+/// `DefaultDataProvider` (an unreachable TCP/UDS client), so without this
+/// re-registration the deploy nonce check can never see our users and
+/// fails closed. `register` overwrites by name.
+fn contract_runtime_config(
+    bootstrap: Vec<BootstrapPeer>,
+    type_configs: Arc<DashMap<NodeRegistryType, NodeTypeConfig>>,
+    provider: Arc<dyn DataProvider>,
+) -> Arc<Config> {
+    let spec = serde_json::from_str::<EnvironmentMetadataSpec>(CONTRACT_SPEC)
+        .expect("valid contract environment spec");
+    let mut env = EnvironmentMetadata::load_from_spec(spec).expect("contract spec loads");
+    // `Wasm` is opt-in: `load_from_spec` only validates the built-in Tier-1
+    // list (`Transfer`, `Spec`), so the env registry gains the Wasm engine
+    // AFTER load (ADR-011 opt-in path).
+    env.contract_engines.register(Arc::new(WasmEngine));
+    let mut specs = ValidationSpecRegistry::new();
+    specs.register_defaults();
+    specs.register_deploy(env.contract_engines.clone(), provider);
+    env.transaction_validation_specs = Arc::new(specs);
+    let registry = Arc::new(DashMap::new());
+    registry.insert(env.environment_id.clone(), env);
+    let mut cfg = Config::new_for_testing("test_env".into(), registry, type_configs);
+    cfg.bootstrap_peers = bootstrap;
+    Arc::new(cfg)
+}
+
+// --- fixtures -------------------------------------------------------------
+
+/// A fresh genesis-chained pipeline token: `Executed` block validation
+/// (registered in the env's block-spec registry by `load_from_spec`),
+/// non-self-verified (the standard pipeline applies).
+fn pipeline_token(id: Vec<u8>) -> Token {
+    let mut t = Token::new();
+    t.id = id;
+    t.block_validation_spec_name = "Executed".to_string();
+    let mut block = pneumatic_core::blocks::Block {
+        signed_trans: pneumatic_core::transactions::SignedTransaction::test_transaction(),
+        token_metadata: HashMap::new(),
+        previous_hash: vec![],
+        current_hash: vec![],
+        timestamp: 0,
+        finality_status: FinalityStatus::Optimistic,
+        proposer_key: vec![],
+        epoch_number: 0,
+    };
+    block.current_hash = BlockFactory::create_hash(&block).expect("genesis hashes");
+    t.blockchain.add_block(block);
+    t
+}
+
+/// A `SmartContract` asset with the given engine bytecode.
+fn contract_asset(name: &str, bytecode: Vec<u8>) -> SmartContract {
+    SmartContract {
+        name: name.to_string(),
+        bytecode,
+        version: "1".to_string(),
+        storage: Default::default(),
+        owners: vec![],
+        threshold: 0,
+    }
+}
+
+/// A plain (non-contract) pipeline token: a `SmartContract` asset (the
+/// executor's contract path requires one) but no `contract_engine`
+/// metadata, so `select_engine` falls through to `"Transfer"`.
+fn transfer_token(id: Vec<u8>) -> Token {
+    let mut t = pipeline_token(id);
+    t.set_asset(&contract_asset("plain-token", vec![])).expect("asset");
+    t
+}
+
+/// A contract pipeline token (`token_type = "contract"`) naming `engine`.
+fn contract_token(id: Vec<u8>, engine: &str, name: &str, bytecode: Vec<u8>) -> Token {
+    let mut t = pipeline_token(id);
+    t.set_metadata("token_type".into(), "contract".into());
+    t.set_metadata("contract_engine".into(), engine.to_string());
+    t.set_asset(&contract_asset(name, bytecode)).expect("asset");
+    t
+}
+
+/// The sender account: a deterministic Ed25519 key (the `tx.sender`
+/// public key + the `sender_signature` + the inner "Process" envelope all
+/// derive from it — the sentinel's C3 gate requires
+/// `message.public_key == tx.sender`).
+fn pipeline_sender() -> (Ed25519Provider, Vec<u8>) {
+    let account = Ed25519Provider::from_seed([0x42u8; 32]);
+    let pk = account.public_key().expect("ed25519 public key");
+    (account, pk)
+}
+
+/// A sender-signed pipeline transaction (C3: `sender_signature` over
+/// `canonical_signature_bytes`, `sequence_number == 1` matching the
+/// sender's `User.nonce`).
+fn pipeline_tx(
+    account: &Ed25519Provider,
+    sender: &Vec<u8>,
+    id: &str,
+    action: &str,
+    token_id: &Vec<u8>,
+    receiver: &Vec<u8>,
+    amount: Option<u64>,
+    payload: Vec<u8>,
+) -> Transaction {
+    let mut tx = Transaction {
+        id: id.to_string(),
+        action: action.to_string(),
+        token_id: token_id.clone(),
+        bid: None,
+        sequence_number: 1,
+        sender: sender.clone(),
+        receiver: receiver.clone(),
+        amount,
+        timestamp: 1_700_000_000,
+        result_hash: vec![],
+        sender_signature: vec![],
+        payload,
+        gas_limit: 0,
+        result_data: vec![],
+    };
+    let canon = tx.canonical_signature_bytes().expect("canonical signature bytes");
+    tx.sender_signature = account.sign_data(&canon).expect("sender signs the tx");
+    tx
+}
+
+/// The sender's `User` record: ample fuel for the committer's gas
+/// deduction and `nonce == 1` (the deploy spec's replay gate).
+fn pipeline_user(pk: &Vec<u8>) -> User {
+    User {
+        public_key: pk.clone(),
+        fuel_balance: 1_000_000,
+        stake: 0,
+        nonce: 1,
+    }
+}
+
+/// One recorder per role bucket — the composite registers the node's own
+/// key in all four buckets, and the relay re-dispatches what each bucket
+/// recorded.
+struct PipelineRecorders {
+    sentinels: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    executors: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    finalizers: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    committers: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+fn fresh_recorders() -> PipelineRecorders {
+    let r = || Arc::new(std::sync::Mutex::new(Vec::new()));
+    PipelineRecorders {
+        sentinels: r(),
+        executors: r(),
+        finalizers: r(),
+        committers: r(),
+    }
+}
+
+/// Drive one transaction through the full standard pipeline:
+/// `Verify` (inner `Process`) → `Preload` (executor) → `Preload` + `Sign`
+/// (finalizer) → `Commit` (committer). Every relay polls the recorder
+/// with a 5 s deadline, so a silent pipeline failure (sentinel validation
+/// drop, executor failure, finalizer gate) panics with a clear message
+/// instead of a vague assertion.
+async fn drive_pipeline_to_commit(
+    server: &NodeServer,
+    rec: &PipelineRecorders,
+    tx: &Transaction,
+    account: &Ed25519Provider,
+    sender_pk: &Vec<u8>,
+) {
+    // Hop 1: the sentinel's "Verify" — body is the signed inner "Process".
+    let inner_body = serialize_to_bytes_rmp(tx).expect("tx serializes");
+    let inner = Message {
+        signature: account.sign_data(&inner_body).expect("sender signs the process body"),
+        public_key: sender_pk.clone(),
+        chain_id: "test_env".to_string(),
+        action: "Process".to_string(),
+        body: inner_body,
+        stake_set: None,
+    };
+    let outer = msg("Verify");
+    let outer = Message {
+        chain_id: outer.chain_id,
+        action: outer.action,
+        body: serialize_to_bytes_rmp(&inner).expect("inner message serializes"),
+        signature: outer.signature,
+        public_key: outer.public_key,
+        stake_set: None,
+    };
+    server.dispatch(outer).await.expect("sentinel Verify dispatch");
+
+    // Hop 2: the executor's "Preload" (the sentinel's broadcast).
+    let exec_preload = next_recorded(&rec.executors, "Preload").await;
+    server
+        .dispatch(exec_preload)
+        .await
+        .expect("executor Preload dispatch");
+
+    // Hop 3: the finalizer's "Preload" (the executor's) then "Sign".
+    // The executor's "Preload" to the finalizer is NOT relayed through the
+    // dispatcher: the composite's finalizer does not own the "Preload"
+    // action (that routes back to the executor and would re-execute). In the
+    // composite the finalizer reads the tx straight from the shared pending
+    // registry, so only the "Sign" vote is relayed.
+    let _ = next_recorded(&rec.finalizers, "Preload").await;
+    let fin_sign = next_recorded(&rec.finalizers, "Sign").await;
+    server
+        .dispatch(fin_sign)
+        .await
+        .expect("finalizer Sign dispatch");
+
+    // Hop 4: the committer's "Commit" (the finalizer's optimistic block).
+    let commit = next_recorded(&rec.committers, "Commit").await;
+    server
+        .dispatch(commit)
+        .await
+        .expect("committer Commit dispatch");
+}
+
+
+/// The P10 terminal assertion: the token's chain grew by exactly one
+/// block and that block's `result_hash` equals `hash(expected)`, where
+/// `expected` is the engine output computed OUTSIDE the pipeline.
+fn assert_committed_result_hash(
+    server: &NodeServer,
+    token_id: &Vec<u8>,
+    expected_result_data: &[u8],
+    label: &str,
+) {
+    let hash = BasicHashProvider::new();
+    let expected = hash.hash(expected_result_data);
+    let token_cache = server.tokens();
+    let token = token_cache
+        .get(token_id)
+        .unwrap_or_else(|| panic!("{label}: token {:02x?} missing from the committer cache", token_id));
+    assert_eq!(
+        token.blockchain.get_count(),
+        2,
+        "{label}: chain must hold genesis + exactly one committed block"
+    );
+    let block = token
+        .blockchain
+        .get_block_at(1)
+        .expect("{label}: committed block present");
+    assert_eq!(
+        block.signed_trans.transaction.result_hash,
+        expected,
+        "{label}: committed block result_hash must equal hash(engine_output)"
+    );
+}
+
+/// A composite with all four roles installed (one shared registry), the
+/// node's own key recorded in every role bucket, and the given tokens
+/// seeded in BOTH the provider and the committer's token cache (the
+/// finalizer's `resolve_previous_hash` reads the provider; the committer's
+/// `commit_block` reads the cache — the same objects in both).
+async fn contract_composite(
+    provider: Arc<ContractE2eProvider>,
+    tokens: Vec<(Vec<u8>, Token)>,
+) -> (
+    Arc<Config>,
+    NodeServer,
+    PipelineRecorders,
+    Vec<u8>,
+    Arc<ContractE2eProvider>,
+) {
+    let provider_dyn: Arc<dyn DataProvider> = provider.clone();
+    let cfg = contract_runtime_config(
+        vec![bad_peer()],
+        type_config_floor(0),
+        provider_dyn.clone(),
+    );
+    let own_key = cfg.public_key.clone();
+    let stake = Arc::new(MapStakeProvider::with_default(2_000));
+    let server = build_runtime(cfg.clone(), stake, provider_dyn.clone())
+        .expect("composite boots");
+
+    let rec = fresh_recorders();
+    let reg = server.node_registry();
+    let c = |r: Arc<std::sync::Mutex<Vec<Vec<u8>>>>| {
+        Box::new(RecordingConnection { recorder: r }) as Box<dyn Connection>
+    };
+    assert!(
+        reg.register_peer(own_key.clone(), [1u8; 16], &NodeRegistryType::Sentinel, c(rec.sentinels.clone())),
+        "sentinel peer registers"
+    );
+    assert!(
+        reg.register_peer(own_key.clone(), [2u8; 16], &NodeRegistryType::Executor, c(rec.executors.clone())),
+        "executor peer registers"
+    );
+    assert!(
+        reg.register_peer(own_key.clone(), [3u8; 16], &NodeRegistryType::Finalizer, c(rec.finalizers.clone())),
+        "finalizer peer registers"
+    );
+    assert!(
+        reg.register_peer(own_key.clone(), [4u8; 16], &NodeRegistryType::Committer, c(rec.committers.clone())),
+        "committer peer registers"
+    );
+
+    for (id, token) in tokens {
+        provider.tokens.insert(id.clone(), token.clone());
+        server.tokens().insert(id, token);
+    }
+    // Composite invariant: every token the pipeline can touch must be in the
+    // committer's shared cache as well — `BlockServices::commit_block` reads
+    // the cache, never the data provider.
+    for entry in provider.tokens.iter() {
+        server
+            .tokens()
+            .entry(entry.key().clone())
+            .or_insert_with(|| entry.value().clone());
+    }
+
+    (cfg, server, rec, own_key, provider)
+}
+
+// --- (a) standard transfer -------------------------------------------------
+
+#[tokio::test]
+async fn pipeline_transfer_tx_commits_with_independent_transfer_hash() {
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry, TransferDelta};
+
+    let (account, sender_pk) = pipeline_sender();
+    let token = transfer_token(vec![0x0A]);
+    let token_id = token.id.clone();
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(token_id.clone(), token.clone())],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, _provider) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_transfer_1",
+        "Transfer",
+        &token_id,
+        &vec![0x77],
+        Some(100),
+        vec![],
+    );
+
+    // Independent expected output: run the TransferEngine directly.
+    let contract = token
+        .get_asset::<SmartContract>()
+        .expect("transfer token carries a contract asset");
+    let user = pipeline_user(&sender_pk);
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    let engine = engines.get("Transfer").expect("Transfer registered");
+    let out = engine
+        .execute(&ExecutionInput {
+            tx: &tx,
+            contract: &contract,
+            sender_state: &user,
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("transfer engine executes");
+    let expected = out.result_data.clone();
+    // Cross-check the canonical delta shape.
+    let delta: TransferDelta =
+        deserialize_rmp_to(&expected).expect("transfer result is a TransferDelta");
+    assert_eq!(delta.amount, 100);
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &token_id, &expected, "transfer");
+}
+
+fn own_staker_key() -> Vec<u8> {
+    // The composite's own key is the staker; the stake snapshot is only
+    // read for stake-gated role checks (all floors are 0), so the key's
+    // value is unimportant — it just must be non-empty.
+    vec![0xE0, 0x01]
+}
+
+// --- (b) Spec contract ------------------------------------------------------
+
+#[tokio::test]
+async fn pipeline_spec_contract_tx_commits_with_independent_spec_hash() {
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry};
+
+    let (account, sender_pk) = pipeline_sender();
+    // 7 + 35 → 42, emitted as an 8-byte LE u64.
+    let program = pneumatic_core::contracts::InstructionProgram {
+        version: 1,
+        ops: vec![
+            pneumatic_core::contracts::Op::LoadConst(7),
+            pneumatic_core::contracts::Op::LoadConst(35),
+            pneumatic_core::contracts::Op::Add,
+            pneumatic_core::contracts::Op::Emit,
+        ],
+    };
+    let bytecode = serialize_to_bytes_rmp(&program).expect("spec program serializes");
+    let token = contract_token(vec![0x0B], "Spec", "spec-adder", bytecode);
+    let token_id = token.id.clone();
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(token_id.clone(), token.clone())],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, _provider) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_spec_1",
+        "ContractCall",
+        &token_id,
+        &vec![],
+        Some(10),
+        vec![],
+    );
+
+    // Independent expected output: run the SpecEngine directly.
+    let contract = token
+        .get_asset::<SmartContract>()
+        .expect("spec token carries a contract asset");
+    let user = pipeline_user(&sender_pk);
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    let engine = engines.get("Spec").expect("Spec registered");
+    let out = engine
+        .execute(&ExecutionInput {
+            tx: &tx,
+            contract: &contract,
+            sender_state: &user,
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("spec engine executes");
+    assert_eq!(out.result_data, 42u64.to_le_bytes().to_vec());
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &token_id, &out.result_data, "spec");
+}
+
+// --- (c) Wasm contract (pure + stateful W3) ---------------------------------
+
+#[tokio::test]
+async fn pipeline_wasm_sum_tx_commits_with_independent_wasm_hash() {
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry, WasmEngine};
+
+    let (account, sender_pk) = pipeline_sender();
+    let wasm_bytes = include_bytes!("../../../../src/contracts/wasm_fixtures/wasm_sum.wasm");
+    let token = contract_token(vec![0x0C], "Wasm", "wasm-sum", wasm_bytes.to_vec());
+    let token_id = token.id.clone();
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(token_id.clone(), token.clone())],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, _provider) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_wasm_sum_1",
+        "ContractCall",
+        &token_id,
+        &vec![],
+        Some(10),
+        vec![],
+    );
+
+    // Independent expected output: run the WasmEngine directly (the module
+    // sums the canonical-input bytes and emits a LE u32; `result_data` is
+    // the canonical `WasmResult` envelope).
+    let contract = token
+        .get_asset::<SmartContract>()
+        .expect("wasm token carries a contract asset");
+    let user = pipeline_user(&sender_pk);
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    engines.register(Arc::new(WasmEngine));
+    let engine = engines.get("Wasm").expect("Wasm registered");
+    let out = engine
+        .execute(&ExecutionInput {
+            tx: &tx,
+            contract: &contract,
+            sender_state: &user,
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("wasm engine executes");
+    let envelope: pneumatic_core::contracts::WasmResult =
+        deserialize_rmp_to(&out.result_data).expect("wasm result envelope");
+    assert_eq!(envelope.module_output.len(), 4, "sum module emits a LE u32");
+    assert!(envelope.storage_delta.is_empty());
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &token_id, &out.result_data, "wasm-sum");
+}
+
+#[tokio::test]
+async fn pipeline_wasm_storage_tx_commits_with_independent_wasm_hash() {
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry, WasmEngine};
+
+    let (account, sender_pk) = pipeline_sender();
+    let wasm_bytes =
+        include_bytes!("../../../../src/contracts/wasm_fixtures/wasm_storage.wasm");
+    let token = contract_token(vec![0x0D], "Wasm", "wasm-storage", wasm_bytes.to_vec());
+    let token_id = token.id.clone();
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(token_id.clone(), token.clone())],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, _provider) =
+        contract_composite(provider.clone(), vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_wasm_storage_1",
+        "ContractCall",
+        &token_id,
+        &vec![],
+        Some(10),
+        vec![],
+    );
+
+    // Independent expected output: run the WasmEngine directly (the W3
+    // stateful module: store/load/rewrite/delete — the envelope carries the
+    // tombstone delta).
+    let contract = token
+        .get_asset::<SmartContract>()
+        .expect("wasm token carries a contract asset");
+    let user = pipeline_user(&sender_pk);
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    engines.register(Arc::new(WasmEngine));
+    let engine = engines.get("Wasm").expect("Wasm registered");
+    let out = engine
+        .execute(&ExecutionInput {
+            tx: &tx,
+            contract: &contract,
+            sender_state: &user,
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("wasm engine executes");
+    let envelope: pneumatic_core::contracts::WasmResult =
+        deserialize_rmp_to(&out.result_data).expect("wasm result envelope");
+    assert_eq!(
+        envelope.module_output,
+        [5u8, b'h', b'e', b'l', b'l', b'o', 2, b'h', b'i', 0].to_vec(),
+        "storage module output"
+    );
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &token_id, &out.result_data, "wasm-storage");
+
+    // The committer applies the storage delta to the contract token's
+    // persisted state (the provider's copy — the W3 write-back).
+    let stored = provider
+        .get_token(&token_id, "token")
+        .expect("provider serves the wasm token");
+    let stored_contract = stored
+        .get_asset::<SmartContract>()
+        .expect("wasm token carries a contract asset");
+    // Final op is the "a" tombstone → the key is gone.
+    assert!(
+        !stored_contract.storage.contains_key(&b"a"[..]),
+        "the tombstoned key is removed from the persisted contract state"
+    );
+}
+
+// --- (d) deployment (Spec + Wasm) -------------------------------------------
+
+#[tokio::test]
+async fn pipeline_deploy_spec_tx_creates_token_and_commits() {
+    use pneumatic_core::contracts::deploy_contract;
+    use pneumatic_core::contracts::{
+        ContractEngine, ContractEngineRegistry, DeployParams,
+    };
+
+    let (account, sender_pk) = pipeline_sender();
+    let program = pneumatic_core::contracts::InstructionProgram {
+        version: 1,
+        ops: vec![
+            pneumatic_core::contracts::Op::LoadConst(42),
+            pneumatic_core::contracts::Op::Emit,
+        ],
+    };
+    let bytecode = serialize_to_bytes_rmp(&program).expect("spec program serializes");
+    let params = DeployParams {
+        name: "spec-deployed".to_string(),
+        engine: "Spec".to_string(),
+        bytecode: bytecode.clone(),
+        metadata: Default::default(),
+        owners: vec![],
+        threshold: 0,
+    };
+    let payload = serialize_to_bytes_rmp(&params).expect("deploy params serialize");
+
+    // The deploy tx targets the empty token id (the token being created).
+    let placeholder = pipeline_token(vec![]);
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(vec![], placeholder)],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, provider_ref) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_deploy_spec_1",
+        "DeployContract",
+        &vec![],
+        &vec![],
+        None,
+        payload,
+    );
+
+    // Independent expected output: re-derive the CreateTokenDelta (the
+    // committer does the same — a pure function of sender/nonce/params).
+    let hash = BasicHashProvider::new();
+    let delta = deploy_contract(&sender_pk, 1, &params, &hash).expect("deploy delta");
+    let expected = serialize_to_bytes_rmp(&delta).expect("delta serializes");
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &vec![], &expected, "deploy-spec");
+
+    // The committer applied the delta: the new token exists in the data
+    // store with the deployed bytecode.
+    let created = provider_ref
+        .get_token(&delta.token_id, "test_env")
+        .expect("deployed token exists in the data store");
+    let created_contract = created
+        .get_asset::<SmartContract>()
+        .expect("deployed token carries a contract asset");
+    assert_eq!(created_contract.bytecode, bytecode);
+}
+
+#[tokio::test]
+async fn pipeline_deploy_wasm_tx_creates_token_and_commits() {
+    use pneumatic_core::contracts::{deploy_contract, DeployParams};
+
+    let (account, sender_pk) = pipeline_sender();
+    let wasm_bytes = include_bytes!("../../../../src/contracts/wasm_fixtures/wasm_sum.wasm");
+    let params = DeployParams {
+        name: "wasm-deployed".to_string(),
+        engine: "Wasm".to_string(),
+        bytecode: wasm_bytes.to_vec(),
+        metadata: Default::default(),
+        owners: vec![],
+        threshold: 0,
+    };
+    let payload = serialize_to_bytes_rmp(&params).expect("deploy params serialize");
+
+    let placeholder = pipeline_token(vec![]);
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(vec![], placeholder)],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, provider_ref) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_deploy_wasm_1",
+        "DeployContract",
+        &vec![],
+        &vec![],
+        None,
+        payload,
+    );
+
+    let hash = BasicHashProvider::new();
+    let delta = deploy_contract(&sender_pk, 1, &params, &hash).expect("deploy delta");
+    let expected = serialize_to_bytes_rmp(&delta).expect("delta serializes");
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &vec![], &expected, "deploy-wasm");
+
+    let created = provider_ref
+        .get_token(&delta.token_id, "test_env")
+        .expect("deployed token exists in the data store");
+    let created_contract = created
+        .get_asset::<SmartContract>()
+        .expect("deployed token carries a contract asset");
+    assert_eq!(created_contract.bytecode, wasm_bytes.to_vec());
+}
+
+// --- (e) cross-contract call (ADR-016 Model X) -------------------------------
+
+/// A fixed [`TargetStateProvider`] for the independent expected-output
+/// computation: resolves exactly the pinned target B (the same state the
+/// executor's provider resolves through the data service).
+#[derive(Clone)]
+struct PinnedProvider {
+    target: Token,
+    contract: SmartContract,
+    user: User,
+}
+
+impl TargetStateProvider for PinnedProvider {
+    fn resolve(
+        &self,
+        target_token: &[u8],
+        snapshot_ref: &pneumatic_core::contracts::SnapshotRef,
+        _sender_key: &[u8],
+    ) -> Result<PinnedTarget, pneumatic_core::contracts::ContractError> {
+        if target_token != self.target.id {
+            return Err(pneumatic_core::contracts::ContractError::InvalidInput(
+                "pinned provider: wrong target".to_string(),
+            ));
+        }
+        Ok(PinnedTarget {
+            token: self.target.clone(),
+            contract: self.contract.clone(),
+            sender_state: self.user.clone(),
+            snapshot_ref: snapshot_ref.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn pipeline_cross_contract_call_tx_commits_with_call_status() {
+    use pneumatic_core::contracts::{CallContext, ContractEngine, ContractEngineRegistry};
+
+    let (account, sender_pk) = pipeline_sender();
+
+    // Target B: a Spec contract that emits 42.
+    let b_program = pneumatic_core::contracts::InstructionProgram {
+        version: 1,
+        ops: vec![
+            pneumatic_core::contracts::Op::LoadConst(42),
+            pneumatic_core::contracts::Op::Emit,
+        ],
+    };
+    let b_bytecode = serialize_to_bytes_rmp(&b_program).expect("B program serializes");
+    let target_b = contract_token(vec![0x0E], "Spec", "call-target", b_bytecode);
+    let b_id = target_b.id.clone();
+    let b_genesis_hash = target_b
+        .blockchain
+        .get_block_at(0)
+        .expect("B genesis")
+        .current_hash
+        .clone();
+
+    // Caller A: a Spec program that calls B at B's genesis pin and emits
+    // the call status (1 = success).
+    let a_program = pneumatic_core::contracts::InstructionProgram {
+        version: 1,
+        ops: vec![
+            pneumatic_core::contracts::Op::Call {
+                target_token: b_id.clone(),
+                entry_point: String::new(),
+                call_payload: vec![],
+                ref_height: 0,
+                ref_hash: b_genesis_hash.clone(),
+            },
+            pneumatic_core::contracts::Op::Emit,
+        ],
+    };
+    let a_bytecode = serialize_to_bytes_rmp(&a_program).expect("A program serializes");
+    let caller_a = contract_token(vec![0x0F], "Spec", "call-origin", a_bytecode);
+    let a_id = caller_a.id.clone();
+
+    let provider = Arc::new(ContractE2eProvider::new(
+        vec![(a_id.clone(), caller_a), (b_id.clone(), target_b)],
+        vec![(sender_pk.clone(), pipeline_user(&sender_pk))],
+        vec![(own_staker_key(), 2_000)],
+    ));
+
+    let (_cfg, server, rec, _own_key, _provider) =
+        contract_composite(provider, vec![]).await;
+
+    let tx = pipeline_tx(
+        &account,
+        &sender_pk,
+        "e2e_xcall_1",
+        "ContractCall",
+        &a_id,
+        &vec![],
+        Some(10),
+        vec![],
+    );
+
+    // Independent expected output: run A's SpecEngine directly with a
+    // pinned B — the call succeeds (B's program emits 42) and A emits the
+    // status `1`.
+    let token_cache = server.tokens();
+    let a_token = token_cache.get(&a_id).expect("A in cache").clone();
+    let a_contract = a_token
+        .get_asset::<SmartContract>()
+        .expect("A carries a contract asset");
+    let b_token = token_cache.get(&b_id).expect("B in cache").clone();
+    let b_contract = b_token
+        .get_asset::<SmartContract>()
+        .expect("B carries a contract asset");
+    let user = pipeline_user(&sender_pk);
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    let pinned = PinnedProvider {
+        target: b_token.clone(),
+        contract: b_contract.clone(),
+        user: user.clone(),
+    };
+    let engine = engines.get("Spec").expect("Spec registered");
+    let out = engine
+        .execute(&ExecutionInput {
+            tx: &tx,
+            contract: &a_contract,
+            sender_state: &user,
+            token: &a_token,
+            gas_limit: 0,
+            storage: a_contract.storage.clone(),
+            call_ctx: Some(Arc::new(CallContext::new(
+                Arc::new(pinned),
+                engines.clone(),
+            ))),
+        })
+        .expect("caller spec engine executes");
+    assert_eq!(
+        out.result_data,
+        1u64.to_le_bytes().to_vec(),
+        "the call succeeds and A emits the status 1"
+    );
+
+    drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
+    assert_committed_result_hash(&server, &a_id, &out.result_data, "xcall");
+}

@@ -17,6 +17,10 @@ edges:
     type: preceded_by
     weight: 1.0
     note: "Supersedes the 09/20 snapshot (S5.2 frontier)"
+  - target: note-roadmap-status-2026-10-01
+    type: supersedes
+    weight: 1.0
+    note: "Superseded by the 10/01 snapshot (contract-execution plan complete)"
   - target: event-s6-shielded-completion
     type: related_to
     weight: 0.9

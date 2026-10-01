@@ -1048,4 +1048,5 @@ mod tests {
     mod deploy;
     mod upgrade;
     mod call;
+    mod determinism;
 }
