@@ -8,9 +8,9 @@ summary: "WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-me
 auto_inject: false
 applicable_when: "Designing, scoping, or implementing the Tier-2 WasmEngine, its gas/sandbox model, storage, or cross-contract host functions"
 confidence: 0.95
-verified_at: "09/29/2026"
-verified_by: "Garrett Olson"
-staleness_signal: "Core (Phase 5) + W3 storage (Phase 7) landed 09/29/2026. Stale when W4 cross-contract (Phase 9) lands and changes the ABI/caps, or when a different WASM runtime is chosen"
+verified_at: "09/30/2026"
+verified_by: "dsh-agent"
+staleness_signal: "W1-W4 all landed (W4 cross-contract 09/30/2026, ADR-016). Stale when a different WASM runtime is chosen, or when the P10 B-side wire changes the W4 call ABI/caps"
 tags: [adr, design-decision, contract-execution, engine, wasm, wasmi, determinism, gas, sandbox]
 edges:
   - target: decision-contract-engine-model
@@ -70,7 +70,18 @@ and applies the delta to `SmartContract::storage` — Wasm-only, idempotent. `WA
 reduced 64 KiB → 16 KiB (the module's 17-page memory leaves a small heap after the
 host-allocated output buffer; 64 KiB pushed the module's own `__alloc` out of bounds).
 5 new Wasm tests + 7 committer apply tests; core 582 → 628; workspace `cargo test` green
-(cross-executor Wasm determinism re-verified). **W4** cross-contract (Phase 9) remains.
+(cross-executor Wasm determinism re-verified).
+
+**W4 (cross-contract call) landed 2026-09-30 (Phase 9, ADR-016).** The `env.call` host
+import — `env.call(target_ptr,len, entry_ptr,len, payload_ptr,len, ref_height, ref_hash_ptr,
+len, out_ptr,out_cap) -> i32` (result length; **0 on any failure, never traps**) — is in
+`ALLOWED_ENV_IMPORTS`; `call_gas` is folded into `gas_used` (`XCALL_CALL_BASE_WASM = 100`).
+It shares the `execute_call` core with the Spec `Op::Call` (ADR-016): B's state is resolved
+pinned at the `SnapshotRef` by the executor's `TargetStateProvider` and B's engine runs in
+the same frame under the sub-budget. The Wasm→Wasm round-trip is proven by a hand-assembled
+578-byte `wasm_caller.wasm` fixture (see `fact-wasmparser-read-var-i32-bug` for the
+`wasmparser 0.239.0` encoding workarounds the fixture requires). 2 new Wasm call tests;
+workspace `cargo test` green. **All four capability tiers (W1–W4) are now landed.**
 
 Contract execution gains a **Tier-2** engine, `WasmEngine` (registry name `"Wasm"`),
 implementing the existing `ContractEngine` trait so `SmartContract.bytecode` can be a
@@ -108,7 +119,7 @@ Both are **exact-pinned** as security-sensitive dependencies.
   (Phase 7 — **landed 09/29/2026**) — what makes it "rich" (order books, registries,
   counters).
 - **W4** cross-contract `call(target, entry, payload, snapshot_ref)` — the Wasm form of
-  Model X (Phase 9, ADR-016).
+  Model X (Phase 9, ADR-016 — **landed 09/30/2026**).
 
 **Opt-in:** `register_defaults` keeps only `Transfer` + `Spec`; `Wasm` is enabled per
 environment via the `contract_engines` spec (QW3). `f32`/`f64` are disallowed in Tier-1

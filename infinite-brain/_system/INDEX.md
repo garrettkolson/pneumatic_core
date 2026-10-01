@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 09/29/2026 (auto-generated from files on disk).
+Last rebuilt: 09/30/2026 (auto-generated from files on disk).
 
 ## pillar (2)
 
@@ -10,7 +10,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `pillar-block-lattice` | Block-lattice PoS consensus | Per-token block lattice (Nano-style) with a 4-role worker pipeline: executor proposes, finalizer optimistically finalizes, committer commits, sentinel monitors. | 4 |
 | `pillar-shielded-value-transfer` | Shielded value transfer (Tier-1 deliverable) | Tier-1 roadmap goal: private token value transfer via note commitments, nullifiers, and halo2 zk-proofs verified on-chain; phases S1.1–S5.2 landed, S5.3+ pending. | 4 |
 
-## decision (20)
+## decision (21)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -19,6 +19,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `decision-contract-deployment` | ADR-015: On-chain contract deployment (engine-agnostic Spec+Wasm) | A DeployContract tx deploys a contract as a 1:1 token: deterministic CREATE2 token id, a CreateToken delta in result_data (executor pure), re-derived + integrity-checked + applied idempotently at commit; engine-agnostic, partition_id = environment_id. | 6 |
 | `decision-contract-engine-model` | ADR-011: Pluggable native ContractEngine registry (Wasm deferred to Tier-2) | Pluggable native ContractEngine trait selected per token by name (spec-registry pattern); Tier-1 ships TransferEngine + SpecEngine (versioned rmp AST); Wasm is a Tier-2 engine, not the substrate. | 5 |
 | `decision-contract-model-lifecycle` | ADR-014: Contract model and lifecycle (on-chain deploy, Model X calls) | Contract ≡ contract token; on-chain deploy (deterministic token id); public execution; Model X snapshot-pinned non-atomic cross-contract calls; M-of-N multisig + 1-epoch timelock upgrades. | 6 |
+| `decision-cross-contract-calls` | ADR-016: Model X cross-contract calls (snapshot-pinned, non-atomic, gas-bounded) | A contract on token A invokes a contract on token B via Call(target, entry, payload, snapshot_ref): the executor resolves B's state pinned at the ref (fail-closed) and runs B's engine in the same frame under a sub-gas budget; B's side is a cross-referenced commitment, A's finality independent. Spec Op::Call + Wasm env.call share one execute_call core. **Landed 09/30/2026 (P9).** | 6 |
 | `decision-dashmap-registries` | ADR-002: DashMap for concurrent registry state | NodeRegistry, CandidateRegistry, PendingTransactionRegistry, and StakeStore all back their state with DashMap — per-shard locking beats Mutex<HashMap> for read-heavy, multi-async access keyed by public-key bytes. | 4 |
 | `decision-deterministic-leader-election` | ADR-003: Deterministic leader election via seeded RNG | LeaderSelector seeds a StdRng with a SHA-256 digest and walks a sorted stake set — a pure function of (StakeSet, epoch inputs), because thread_rng() would let identical nodes elect different leaders. | 4 |
 | `decision-deterministic-per-tx-routing` | ADR-004: Deterministic per-transaction routing (not epoch-wide leader) | Each transaction routes to its own finalizer via deterministic_select(stakers, tx_id, epoch) over a stake snapshot frozen at the epoch boundary — the epoch-wide leader is a throughput bottleneck. | 4 |
@@ -34,7 +35,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `decision-trait-based-abstraction` | ADR-001: Trait-based abstraction over inheritance | All pluggable components are Rust traits with concrete impls (Connection, Sender, Stream, Listener, DataProvider, BlockValidator, Logger, AsymCryptoProvider, HashProvider, IActionRouter) — zero-cost, stub-testable, swappable. | 4 |
 | `decision-tx-calldata-payload` | ADR-012: Additive payload: Vec<u8> on Transaction as contract calldata | Additive payload: Vec<u8> on Transaction carries contract calldata (skip-if-empty keeps legacy wire byte-identical); it joins CanonicalTransaction so the sender signs it, with a sentinel-enforced size cap. | 4 |
 | `decision-upgrade-governance` | ADR-017: Upgrade governance (owner registry + M-of-N multisig + 1-epoch timelock) | An UpgradeContract tx swaps a contract's bytecode + owner set, gated by an M-of-N owner quorum over a canonical Ed25519 digest and a 1-epoch apply-time timelock; the executor re-validates + emits a re-derivable ReplaceAssetDelta the committer applies under the timelock. **Landed 09/29/2026 (P8)**; applies to Wasm modules. | 6 |
-| `decision-wasm-engine-tier2` | ADR-018: Tier-2 WasmEngine (wasmi) behind the ContractEngine trait | WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-metered, sandboxed, frozen ABI) so SmartContract.bytecode can be a WASM module for rich logic; opt-in, tiers W1 compute → W2 read → W3 storage → W4 cross-contract. **Core (W1+W2) landed 09/29/2026 (P5)**; **W3 storage (P7) landed 09/29/2026**; W4 cross-contract (P9) remains. | 5 |
+| `decision-wasm-engine-tier2` | ADR-018: Tier-2 WasmEngine (wasmi) behind the ContractEngine trait | WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-metered, sandboxed, frozen ABI) so SmartContract.bytecode can be a WASM module for rich logic; opt-in, tiers W1 compute → W2 read → W3 storage → W4 cross-contract. **Core (W1+W2) landed 09/29/2026 (P5)**; **W3 storage (P7) landed 09/29/2026**; **W4 cross-contract (P9) landed 09/30/2026** (env.call host import, ADR-016). | 5 |
 
 ## concept (35)
 
@@ -130,7 +131,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | Hypothesis: Phase 8 production-readiness work is planned, not done | Phase 8 production readiness (rustdoc, ADR docs, operator runbook; LOW, Post-MVP) is documented as planned in TASKS.md; the other roadmap phases verify as done, so Phase 8 items are likely still outstanding. | 4 |
 
-## fact (13)
+## fact (14)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -144,6 +145,7 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 | `fact-shielded-stack` | Shielded ZK stack: module map (S1–S6 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble, S6 test layer. S1–S6 complete — Tier-1 feature-complete. | 4 |
 | `fact-test-suite` | Test baseline 2026-09-26: 835 passed / 37 ignored / 0 failed | 09/26/2026 workspace test baseline: 835 passed / 37 ignored / 0 failed — core 548, committer 101 (92 lib + 9 integration), executor 10, finalizer 61, node-server 32, prover 15, sentinel 57, integration 19. | 2 |
 | `fact-test-suite-s6` | Test baseline 2026-07-26: 835 passed / 37 ignored / 0 failed | 07/26/2026 workspace baseline after the e2e pipeline test + finalizer/executor test-module compile fixes: 835 passed / 37 ignored / 0 failed — core 553/19, committer 101/7, prover 15/2, rest unchanged. Use `cargo test --workspace` (plain `cargo test` runs only the root crate). | 2 |
+| `fact-wasmparser-read-var-i32-bug` | wasmparser 0.239.0 read_var_i32 corrupts single-byte 0x40..0x7F immediates | wasmparser 0.239.0's read_var_i32 single-byte fast path mis-decodes i32.const immediates of 0x40..0x7F (yields byte-128); hand-assembled Wasm fixtures must encode every i32.const as 2-byte SLEB128 (sleb_force2). Also: the validator rejects popping a value at a control frame's baseline, and fixtures must omit the data section (section-id swap 11/12). | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
 | `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/26/2026 (cargo test --workspace) | Verified per-crate 09/26/2026: core 548 + 19 ignored, committer 92 lib + 9 integration (+7 ignored), executor 10, finalizer 61, node-server 32 + 2 ignored, prover 15 + 2 ignored, sentinel 57 + 1 ignored — 0 failed in every crate. | 2 |
 | `fact-workspace-layout` | Workspace layout: 7 crates, 27 root modules | Rust workspace: root pneumatic_core lib (27 modules in lib.rs incl. rns, shielded) + sentinel, executor, finalizer, committer, node-server, prover crates. | 3 |
@@ -190,4 +192,4 @@ Last rebuilt: 09/29/2026 (auto-generated from files on disk).
 
 ## Totals
 
-104 nodes. Logs (append-only, never indexed): see logs/.
+106 nodes. Logs (append-only, never indexed): see logs/.

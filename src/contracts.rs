@@ -55,6 +55,20 @@ pub use upgrade::{
     ReplaceAssetDelta, TIMELOCK_EPOCHS, UPGRADE_GAS_BASE, UPGRADE_GAS_PER_BYTE, UpgradeParams,
 };
 
+// Model X cross-contract calls (ADR-016, Phase 9) — snapshot-pinned, non-atomic
+// calls: `SnapshotRef` + `validate_snapshot_ref`, the `TargetStateProvider`
+// (the executor's I/O surface, supplied to engines via `CallContext`), the shared
+// `execute_call` core (used by the Spec `Call` op and the Wasm `env.call`
+// import), and the B-side `CrossChainCommitment` schema + hash. Consensus-safe
+// by construction: every step is a pure function of (A input, pinned B state,
+// frozen constants) (ADR-008).
+mod call;
+pub use call::{
+    execute_call, synthesize_call_tx, validate_snapshot_ref, CallContext, CallFailure,
+    CallOutcome, CrossChainCommitment, PinnedTarget, SnapshotRef, TargetStateProvider,
+    MAX_CALL_DEPTH, XCALL_CALL_BASE_SPEC, XCALL_CALL_BASE_WASM, XCALL_COMMIT_DOMAIN,
+};
+
 // ---------------------------------------------------------------------------
 // ContractEngine — the pluggable execution trait (ADR-011)
 // ---------------------------------------------------------------------------
@@ -107,6 +121,15 @@ pub struct ExecutionInput<'a> {
     /// accumulates state, so existing `Wasm`/`Spec` modules keep their
     /// byte-identical inputs (ADR-008). Non-`Wasm` engines ignore it.
     pub storage: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The Model X call context (ADR-016, Phase 9): the `TargetStateProvider`
+    /// (the executor's I/O surface for resolving call targets at their pinned
+    /// snapshot refs), the shared engine registry (selects the callee's engine),
+    /// and the nesting depth. **Deliberately owned and excluded from
+    /// [`ExecutionInputCanon`]** (same rule as `storage`): a contract that never
+    /// calls sees byte-identical inputs, so no existing module's `result_hash`
+    /// changes (ADR-008). `None` = no call capability; a `Call` op / `env.call`
+    /// with no context fails deterministically (fail closed).
+    pub call_ctx: Option<Arc<CallContext>>,
 }
 
 /// The deterministic view of an [`ExecutionInput`] that `canonical_bytes()`
@@ -441,11 +464,15 @@ pub struct InstructionProgram {
     pub ops: Vec<Op>,
 }
 
-/// The closed Phase-2 instruction set.
+/// The closed instruction set.
 ///
 /// Stack machine semantics (all values are `u64`): for the binary arithmetic
 /// ops, `a` is the stack top and `b` the value beneath it, and the result is
 /// `b <op> a` (e.g. `LoadConst(10); LoadConst(3); Sub` pushes `7`).
+///
+/// `Call` (Phase 9, ADR-016) is an ISA extension: adding the variant is
+/// additive — existing v1 programs decode unchanged, and a `Call` program on an
+/// old node fails closed at decode (Ground Rule 4). The format `version` stays 1.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -474,6 +501,25 @@ pub enum Op {
     /// Halt successfully. Reaching the end of the program is an implicit
     /// `Halt`.
     Halt,
+    /// Model X cross-contract call (ADR-016, Phase 9). The call parameters are
+    /// **static immediates** in the AST (closed ISA, deterministic by
+    /// construction): the target token, its entry point, the calldata, and the
+    /// snapshot ref (`ref_height` + `ref_hash` anchoring the target's chain).
+    ///
+    /// The target's engine runs in this call frame under a sub-budget
+    /// (`A_remaining − CALL_BASE_SPEC`); the op pushes the **status**: `1` =
+    /// success, `0` = failure (a deterministic [`CallFailure`] the program can
+    /// branch on — a call never reverts A). The callee's result bytes are not
+    /// exposed to the `u64` stack (documented Tier-1 Spec constraint; the Wasm
+    /// `env.call` import returns the bytes). A `Call` with no `call_ctx`
+    /// reverts deterministically (fail closed).
+    Call {
+        target_token: Vec<u8>,
+        entry_point: String,
+        call_payload: Vec<u8>,
+        ref_height: u64,
+        ref_hash: Vec<u8>,
+    },
 }
 
 /// Spec-AST engine (name: `"Spec"`): interprets the versioned rmp instruction
@@ -565,6 +611,51 @@ impl ContractEngine for SpecEngine {
                     result_data = value.to_le_bytes().to_vec();
                 }
                 Op::Halt => break,
+                Op::Call {
+                    target_token,
+                    entry_point,
+                    call_payload,
+                    ref_height,
+                    ref_hash,
+                } => {
+                    // Model X call (ADR-016): resolve the target at the pinned ref
+                    // and run its engine in this call frame under a sub-budget.
+                    // A call never kills A — the outcome (success/failure) is data
+                    // pushed as a status; the program branches on it.
+                    let Some(ctx) = &input.call_ctx else {
+                        return Err(ContractError::Reverted(
+                            "call: no call context".to_string(),
+                        ));
+                    };
+                    // Sub-budget: A's remaining gas minus the call base cost, so the
+                    // call can never push A past A's cap (ADR-016 Q4).
+                    let remaining = if input.gas_limit > 0 {
+                        input.gas_limit.saturating_sub(gas_used)
+                    } else {
+                        u64::MAX
+                    };
+                    let sub = remaining.saturating_sub(XCALL_CALL_BASE_SPEC);
+                    let ref_ = SnapshotRef {
+                        height: *ref_height,
+                        block_hash: ref_hash.clone(),
+                    };
+                    let outcome = execute_call(
+                        ctx,
+                        input.tx,
+                        target_token,
+                        entry_point,
+                        call_payload,
+                        &ref_,
+                        sub,
+                    );
+                    // A charges the call base + B's sub-execution work.
+                    gas_used = gas_used
+                        .saturating_add(XCALL_CALL_BASE_SPEC + outcome.b_gas_used());
+                    if input.gas_limit > 0 && gas_used > input.gas_limit {
+                        return Err(ContractError::GasExhausted);
+                    }
+                    stack.push(u64::from(outcome.is_success()));
+                }
             }
         }
 
@@ -723,6 +814,7 @@ mod tests {
             token: &token,
             gas_limit: 1234,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         let b = ExecutionInput {
             tx: &tx,
@@ -731,6 +823,7 @@ mod tests {
             token: &token,
             gas_limit: 1234,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
 
         let bytes_a = a.canonical_bytes().unwrap();
@@ -767,6 +860,7 @@ mod tests {
             token: &token_a,
             gas_limit: 100,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         let b = ExecutionInput {
             tx: &tx,
@@ -775,6 +869,7 @@ mod tests {
             token: &token_b,
             gas_limit: 100,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
     }
@@ -798,6 +893,7 @@ mod tests {
             token: &token,
             gas_limit: 1234,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         let alt_gas = ExecutionInput {
             tx: &tx_b,
@@ -806,6 +902,7 @@ mod tests {
             token: &token,
             gas_limit: 9999,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         let alt_payload = ExecutionInput {
             tx: &tx_c,
@@ -814,6 +911,7 @@ mod tests {
             token: &token,
             gas_limit: 1234,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         assert_ne!(base.canonical_bytes().unwrap(), alt_gas.canonical_bytes().unwrap());
         assert_ne!(
@@ -913,6 +1011,7 @@ mod tests {
             token,
             gas_limit,
             storage: BTreeMap::new(),
+            call_ctx: None,
         }
     }
 
@@ -1384,6 +1483,7 @@ mod tests {
             token: &token,
             gas_limit: gas,
             storage: BTreeMap::new(),
+            call_ctx: None,
         };
         let transfer = TransferEngine;
         let spec = SpecEngine;

@@ -8,8 +8,9 @@ use tokio::sync::Mutex;
 
 use pneumatic_core::contracts::{
     deploy_contract, deploy_gas, select_engine, upgrade_gas, verify_quorum,
-    ContractEngineRegistry, ContractError, CreateTokenDelta, DeployParams, ExecutionInput,
-    ExecutionOutput, ReplaceAssetDelta, TransferDelta, UpgradeParams,
+    CallContext, ContractEngineRegistry, ContractError, CreateTokenDelta, DeployParams,
+    ExecutionInput, ExecutionOutput, PinnedTarget, ReplaceAssetDelta, SnapshotRef,
+    TargetStateProvider, TransferDelta, UpgradeParams, validate_snapshot_ref,
 };
 use pneumatic_core::crypto::{AsymCryptoProvider, Ed25519Provider, HashProvider};
 use pneumatic_core::data::{DataError, DataProvider};
@@ -283,6 +284,62 @@ struct ExecutorHandle {
     execution_timeout: Duration,
 }
 
+/// The executor's [`TargetStateProvider`] (ADR-016, Phase 9). Resolves a target
+/// token's pinned state at a [`SnapshotRef`] through the data service:
+///
+/// 1. fetch B's token under the partition key (fail closed on any data error);
+/// 2. validate the ref against B's embedded `blockchain` (the block must exist
+///    and hash-match — [`validate_snapshot_ref`]);
+/// 3. decode B's contract asset (fail closed if the token carries none);
+/// 4. fetch the caller's user state for B's partition (fail closed).
+///
+/// Every failure path is a deterministic [`ContractError`] the calling contract
+/// observes as a `CallFailure` — the provider never panics and never returns a
+/// partially-resolved target.
+#[derive(Clone)]
+struct ExecutorTargetProvider {
+    data_provider: Arc<dyn DataProvider>,
+    partition_id: String,
+}
+
+impl TargetStateProvider for ExecutorTargetProvider {
+    fn resolve(
+        &self,
+        target_token: &[u8],
+        snapshot_ref: &SnapshotRef,
+        sender_key: &[u8],
+    ) -> Result<PinnedTarget, ContractError> {
+        // 1. B's token, under the partition key (defect D3 addressing).
+        let token = self
+            .data_provider
+            .get_token(&target_token.to_vec(), &self.partition_id)
+            .map_err(|e| {
+                ContractError::InvalidInput(format!("target token fetch failed: {e}"))
+            })?;
+        // 2. The ref must anchor in B's chain (block exists + hash matches).
+        validate_snapshot_ref(&token.blockchain, snapshot_ref)
+            .map_err(ContractError::InvalidInput)?;
+        // 3. B's contract asset (1:1 model — the token IS the contract).
+        let contract = token.get_asset::<SmartContract>().ok_or_else(|| {
+            ContractError::InvalidInput("target token has no contract asset".to_string())
+        })?;
+        // 4. The caller's user state for B's partition (the committer applies
+        //    B's deltas against B-partition user state at commit).
+        let sender_state = self
+            .data_provider
+            .get_user(&sender_key.to_vec(), &self.partition_id)
+            .map_err(|e| {
+                ContractError::InvalidInput(format!("target sender fetch failed: {e}"))
+            })?;
+        Ok(PinnedTarget {
+            token,
+            contract,
+            sender_state,
+            snapshot_ref: snapshot_ref.clone(),
+        })
+    }
+}
+
 impl ExecutorHandle {
     /// Spawn an async execution task for a transaction.
     ///
@@ -550,6 +607,19 @@ impl ExecutorHandle {
         let user = user.clone();
         let token = token.clone();
 
+        // Model X cross-contract calls (ADR-016, Phase 9): the engine resolves
+        // pinned target state through the executor's data service. The provider
+        // is part of the engine's input — the engine stays a pure function of
+        // `ExecutionInput`; the data-service I/O lives here, in the executor.
+        let provider = ExecutorTargetProvider {
+            data_provider: self.data_provider.clone(),
+            partition_id: self.partition_id.clone(),
+        };
+        let call_ctx = Some(Arc::new(CallContext::new(
+            Arc::new(provider),
+            self.contract_engine_registry.clone(),
+        )));
+
         // `spawn_blocking` keeps the engine off the async worker (so the Q3.2
         // wall-clock backstop in `execute_task` can fire against a stuck engine),
         // and `catch_unwind` isolates panics so a buggy engine fails the
@@ -562,6 +632,7 @@ impl ExecutorHandle {
                 token: &token,
                 gas_limit: tx.gas_limit,
                 storage: contract.storage.clone(),
+                call_ctx,
             };
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.execute(&input)))
         });
@@ -976,4 +1047,5 @@ mod tests {
     mod validation;
     mod deploy;
     mod upgrade;
+    mod call;
 }

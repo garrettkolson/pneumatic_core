@@ -19,28 +19,6 @@ use pneumatic_core::tokens::{SmartContract, Token};
 use pneumatic_core::transactions::TransactionSignature;
 use pneumatic_core::user::User;
 
-/// Poll until the spawned task has settled (its backpressure slot is freed),
-/// then read the recorded outcome from the per-tx results map. Returns
-/// `None` on timeout.
-async fn wait_for_settle(
-    executor: &Executor,
-    tx_id: &str,
-) -> Option<Result<ExecutionResult, String>> {
-    for _ in 0..500 {
-        let active = executor.active_tasks.lock().await;
-        let settled = !active.contains(tx_id);
-        drop(active);
-        if settled {
-            let tasks = executor.preload_tasks.lock().await;
-            return tasks
-                .get(tx_id)
-                .and_then(|results| results.get(tx_id).map(|r| r.clone()));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    None
-}
-
 /// A data provider holding a token (with a `SmartContract` asset) and a sender
 /// user, both under the `"token"` partition — the shape `run_execution`
 /// expects for a full successful dispatch.

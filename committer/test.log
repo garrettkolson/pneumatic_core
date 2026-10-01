@@ -7862,3 +7862,23 @@
 2026-09-30 18:26:34.690822 UTC: Committed block to token [01] (chain length: 2, seq: 1)
 2026-09-30 18:26:34.691575 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
 2026-09-30 18:26:34.692464 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 00:20:04.917093 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-01 00:20:04.919717 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-10-01 00:20:04.919718 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-01 00:20:04.921536 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 01:00:18.537176 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-01 01:00:18.539705 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-01 01:00:18.540087 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-10-01 01:00:18.541335 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 01:34:07.426234 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-01 01:34:07.429246 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-01 01:34:07.430431 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-10-01 01:34:07.430927 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 01:34:40.410188 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-01 01:34:40.414016 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-10-01 01:34:40.414567 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-01 01:34:40.416670 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 02:30:19.529201 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-01 02:30:19.531485 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-01 02:30:19.533135 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-01 02:30:19.533383 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)

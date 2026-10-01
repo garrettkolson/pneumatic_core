@@ -33,6 +33,7 @@
 //! enforces the 32 MiB ceiling.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use wasmi::{
     Caller, Config, Engine, Extern, ExternType, Instance, Linker, Memory, Module, Store,
@@ -40,7 +41,9 @@ use wasmi::{
 };
 
 use crate::encoding::serialize_to_bytes_rmp;
-use super::{ContractEngine, ContractError, ExecutionInput, ExecutionOutput, WasmResult};
+use crate::transactions::Transaction;
+use super::call::{execute_call, SnapshotRef, XCALL_CALL_BASE_WASM};
+use super::{CallContext, ContractEngine, ContractError, ExecutionInput, ExecutionOutput, WasmResult};
 
 // ---------------------------------------------------------------------------
 // Caps (ADR-018 QW6) — protocol-tunable.
@@ -95,6 +98,8 @@ pub(crate) const ALLOWED_ENV_IMPORTS: &[&str] = &[
     "sload",
     "sstore",
     "sdelete",
+    // Model X cross-contract call (ADR-016 / Phase 9).
+    "call",
 ];
 
 // ---------------------------------------------------------------------------
@@ -110,6 +115,9 @@ pub(crate) const ALLOWED_ENV_IMPORTS: &[&str] = &[
 /// `storage_delta` is the write-set the module records (read-your-writes + the
 /// canonical output delta), `storage_gas` accumulates the W3 storage cost.
 struct WasmEnv {
+    /// The calling (A) transaction — the basis for the virtual-tx synthesis in
+    /// `env.call` (ADR-016).
+    tx: Transaction,
     tx_amount: i64,
     tx_sequence: i64,
     sender_fuel: i64,
@@ -122,6 +130,11 @@ struct WasmEnv {
     storage_delta: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// Accumulated W3 storage gas (`sload`/`sstore`/`sdelete` costs).
     storage_gas: u64,
+    /// The Model X call context (ADR-016, Phase 9): `None` = no call capability
+    /// (an `env.call` returns `0` deterministically, never traps).
+    call_ctx: Option<Arc<CallContext>>,
+    /// Accumulated Model X call gas (`XCALL_CALL_BASE_WASM + B work` per `env.call`).
+    call_gas: u64,
 }
 
 /// Marker [`wasmi::errors::HostError`] the `env.revert()` import traps with. The
@@ -327,6 +340,74 @@ impl WasmEngine {
                 Ok(())
             })
             .map_err(link_err)?;
+        // Model X cross-contract call (ADR-016 / Phase 9). The guest passes the
+        // call arguments as linear-memory slices + immediates:
+        // `call(target, entry_point, payload, ref_height, ref_hash) -> len`.
+        // Returns the callee result's byte length (written to `out`) on success,
+        // or `0` on **any** failure — no call context, non-UTF-8 entry point,
+        // negative ref height, no memory, or any deterministic [`CallFailure`].
+        // A call never traps the caller: the failure is data the guest observes.
+        linker
+            .func_wrap::<(Caller<WasmEnv>, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32), _>(
+                "env", "call",
+                |mut caller: Caller<WasmEnv>,
+                 target_ptr: i32, target_len: i32,
+                 entry_ptr: i32, entry_len: i32,
+                 payload_ptr: i32, payload_len: i32,
+                 ref_height: i32,
+                 ref_hash_ptr: i32, ref_hash_len: i32,
+                 out_ptr: i32, out_cap: i32|
+                 -> Result<i32, wasmi::Error> {
+                    // 1. Read the arguments (memory faults → deterministic 0, never a trap).
+                    let t = read_mem(&mut caller, target_ptr, target_len);
+                    let e = read_mem(&mut caller, entry_ptr, entry_len);
+                    let p = read_mem(&mut caller, payload_ptr, payload_len);
+                    let r = read_mem(&mut caller, ref_hash_ptr, ref_hash_len);
+                    let (target, entry, payload, ref_hash) = match (t, e, p, r) {
+                        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+                        _ => return Ok(0),
+                    };
+                    let entry = match String::from_utf8(entry) {
+                        Ok(s) => s,
+                        Err(_) => return Ok(0), // non-UTF-8 entry point
+                    };
+                    if ref_height < 0 {
+                        return Ok(0); // refs are 0-based block indices
+                    }
+                    // 2. No call context = no call capability (fail closed, deterministic).
+                    let Some(ctx) = caller.data().call_ctx.clone() else {
+                        return Ok(0);
+                    };
+                    let a_tx = caller.data().tx.clone();
+                    let snapshot_ref = SnapshotRef {
+                        height: ref_height as u64,
+                        block_hash: ref_hash,
+                    };
+                    // 3. Sub-budget: A's remaining fuel minus the call base cost, so the
+                    //    call can never push A past A's cap (ADR-016 Q4).
+                    let remaining = caller.get_fuel().unwrap_or(0);
+                    let sub = remaining.saturating_sub(XCALL_CALL_BASE_WASM);
+                    // 4. The shared ADR-016 call core (resolve at the pin, run B, fold).
+                    let outcome = execute_call(&ctx, &a_tx, &target, &entry, &payload, &snapshot_ref, sub);
+                    // 5. Charge A: base + B's sub-execution work.
+                    caller.data_mut().call_gas = caller
+                        .data_mut()
+                        .call_gas
+                        .saturating_add(XCALL_CALL_BASE_WASM + outcome.b_gas_used());
+                    // 6. Deterministic 0 on any failure (observable, never a trap).
+                    let super::call::CallOutcome::Success { result_data, .. } = &outcome else {
+                        return Ok(0);
+                    };
+                    if result_data.len() > out_cap as usize {
+                        return Ok(0); // doesn't fit the guest buffer: deterministic failure
+                    }
+                    if write_mem(&mut caller, out_ptr, result_data).is_err() {
+                        return Ok(0);
+                    }
+                    Ok(result_data.len() as i32)
+                },
+            )
+            .map_err(link_err)?;
         Ok(())
     }
 
@@ -384,6 +465,7 @@ impl ContractEngine for WasmEngine {
         // 4. Store with the fuel budget + env snapshot (read-only fields + the W3
         // state-tier scratch: base storage from the input, empty write-set).
         let env = WasmEnv {
+            tx: input.tx.clone(),
             tx_amount: input.tx.amount.unwrap_or(0) as i64,
             tx_sequence: input.tx.sequence_number as i64,
             sender_fuel: input.sender_state.fuel_balance as i64,
@@ -391,6 +473,8 @@ impl ContractEngine for WasmEngine {
             storage: input.storage.clone(),
             storage_delta: BTreeMap::new(),
             storage_gas: 0,
+            call_ctx: input.call_ctx.clone(),
+            call_gas: 0,
         };
         let mut store = Store::new(&engine, env);
         let budget = if input.gas_limit == 0 {
@@ -470,9 +554,13 @@ impl ContractEngine for WasmEngine {
         // per-call env, then enforce the per-contract storage cap. The cap is checked
         // on the post-apply state (base ∘ delta); exceeding it reverts the call, so no
         // oversized state is ever committed (ADR-018 / Phase 7, QD-gas-cap).
-        let (storage_delta, storage_gas) = {
+        let (storage_delta, storage_gas, call_gas) = {
             let env = store.data_mut();
-            (std::mem::take(&mut env.storage_delta), env.storage_gas)
+            (
+                std::mem::take(&mut env.storage_delta),
+                env.storage_gas,
+                env.call_gas,
+            )
         };
         let post_state: BTreeMap<Vec<u8>, Vec<u8>> = {
             let mut s = input.storage.clone();
@@ -506,14 +594,18 @@ impl ContractEngine for WasmEngine {
         let result_data = serialize_to_bytes_rmp(&wasm_result)
             .map_err(|e| ContractError::InvalidInput(format!("serialize WasmResult: {e}")))?;
 
-        // 10. Fuel → gas, plus the W3 storage gas. The module's fuel budget is
-        // `gas_limit` (when declared), so a call whose total (fuel + storage) exceeds
-        // the declared cap is gas-exhausted (→ the executor's `Failed`, no vote).
+        // 10. Fuel → gas, plus the W3 storage gas and the Model X call gas (the
+        // `env.call` base + each callee's sub-execution work, ADR-016 Q4). The
+        // module's fuel budget is `gas_limit` (when declared), so a call whose
+        // total (fuel + storage + call) exceeds the declared cap is gas-exhausted
+        // (→ the executor's `Failed`, no vote).
         let remaining = store
             .get_fuel()
             .map_err(|e| ContractError::InvalidInput(format!("get_fuel: {e}")))?;
         let fuel_used = budget.saturating_sub(remaining);
-        let gas_used = fuel_used.saturating_add(storage_gas);
+        let gas_used = fuel_used
+            .saturating_add(storage_gas)
+            .saturating_add(call_gas);
         if input.gas_limit > 0 && gas_used > input.gas_limit {
             return Err(ContractError::GasExhausted);
         }
@@ -534,6 +626,10 @@ impl ContractEngine for WasmEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{
+        ContractEngineRegistry, PinnedTarget, SpecEngine, TargetStateProvider,
+        validate_snapshot_ref,
+    };
     use crate::tokens::{SmartContract, Token};
     use crate::transactions::Transaction;
     use crate::user::User;
@@ -549,6 +645,7 @@ mod tests {
     const STORAGE_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_storage.wasm");
     const STORAGE_BIG_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_storage_big.wasm");
     const SLOAD_ONLY_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_sload_only.wasm");
+    const CALLER_WASM: &[u8] = include_bytes!("wasm_fixtures/wasm_caller.wasm");
 
     fn token() -> Token {
         let mut t = Token::new();
@@ -615,6 +712,7 @@ mod tests {
             token: &t,
             gas_limit,
             storage: Default::default(),
+            call_ctx: None,
         };
         engine.execute(&input)
     }
@@ -644,6 +742,7 @@ mod tests {
             token: &t,
             gas_limit: 0,
             storage: Default::default(),
+            call_ctx: None,
         };
         let out = engine.execute(&input).expect("w1 sum");
         // The module sums every input byte (mod 2^32) and emits it as a little-endian u32.
@@ -719,6 +818,7 @@ mod tests {
             token: &t,
             gas_limit: 0,
             storage: base,
+            call_ctx: None,
         };
         let out = engine.execute(&input).expect("sload base");
         let wr = decode_wasm_result(&out.result_data);
@@ -827,4 +927,138 @@ mod tests {
         assert_eq!(plain, multi_thread);
         assert!(!plain.is_empty());
     }
+
+    // -- Model X: Wasm → Wasm call round-trip (ADR-016, Phase 9) ----------------
+    //
+    // The caller fixture (`wasm_caller.wasm`) calls `env.call` with hardcoded
+    // arguments: target token 0xBB, entry "execute", payload [1,2,3,4], and the
+    // B chain's deterministic genesis ref (baked into the fixture). The provider
+    // serves the `wasm_sum` fixture as the callee at that pin.
+
+    /// Deterministic block (fixed timestamp + canonical test tx): the B chain's
+    /// genesis hash is a test constant — identical on every run and every host.
+    fn det_block(prev: Vec<u8>) -> crate::blocks::Block {
+        use crate::blocks::{Block, BlockFactory, FinalityStatus};
+        use crate::transactions::SignedTransaction;
+        use std::collections::HashMap;
+        let mut b = Block {
+            signed_trans: SignedTransaction::test_transaction(),
+            token_metadata: HashMap::new(),
+            previous_hash: prev,
+            current_hash: vec![],
+            timestamp: 1_700_000_000,
+            finality_status: FinalityStatus::Optimistic,
+            proposer_key: vec![],
+            epoch_number: 0,
+        };
+        b.current_hash = BlockFactory::create_hash(&b).expect("well-formed block hashes");
+        b
+    }
+
+    /// Test provider: serves the pinned target for token `0xbb` (validating the
+    /// ref against the target's chain), fails closed for any other token.
+    struct WasmCallProvider {
+        target: PinnedTarget,
+    }
+
+    impl TargetStateProvider for WasmCallProvider {
+        fn resolve(
+            &self,
+            target_token: &[u8],
+            snapshot_ref: &SnapshotRef,
+            _sender_key: &[u8],
+        ) -> Result<PinnedTarget, ContractError> {
+            if target_token != [0xbb] {
+                return Err(ContractError::InvalidInput("unknown target token".into()));
+            }
+            validate_snapshot_ref(&self.target.token.blockchain, snapshot_ref)
+                .map_err(ContractError::InvalidInput)?;
+            Ok(PinnedTarget {
+                snapshot_ref: snapshot_ref.clone(),
+                ..self.target.clone()
+            })
+        }
+    }
+
+    fn wasm_call_ctx() -> CallContext {
+        let b0 = det_block(vec![]);
+        let mut b_token = Token::new();
+        b_token.id = vec![0xbb];
+        b_token
+            .metadata
+            .insert("token_type".to_string(), "contract".to_string());
+        b_token
+            .metadata
+            .insert("contract_engine".to_string(), "Wasm".to_string());
+        b_token.blockchain.add_block(b0);
+        let b_contract = contract(SUM_WASM);
+        let provider = WasmCallProvider {
+            target: PinnedTarget {
+                token: b_token,
+                contract: b_contract,
+                sender_state: user(),
+                snapshot_ref: SnapshotRef {
+                    height: 0,
+                    block_hash: vec![],
+                },
+            },
+        };
+        let registry = {
+            let r = ContractEngineRegistry::new();
+            r.register(Arc::new(WasmEngine));
+            r.register(Arc::new(SpecEngine));
+            Arc::new(r)
+        };
+        CallContext::new(Arc::new(provider), registry)
+    }
+
+    fn run_caller(ctx: Option<CallContext>) -> ExecutionOutput {
+        let t = token();
+        let c = contract(CALLER_WASM);
+        let u = user();
+        let x = tx(None);
+        let input = ExecutionInput {
+            tx: &x,
+            contract: &c,
+            sender_state: &u,
+            token: &t,
+            gas_limit: 0,
+            storage: Default::default(),
+            call_ctx: ctx.map(Arc::new),
+        };
+        WasmEngine.execute(&input).expect("caller runs")
+    }
+
+    #[test]
+    fn wasm_call_wasm_round_trip() {
+        let out = run_caller(Some(wasm_call_ctx()));
+        let env: WasmResult =
+            crate::encoding::deserialize_rmp_to(&out.result_data).expect("outer envelope");
+        // Success: the callee's own WasmResult envelope comes back as the caller's
+        // module output (not the single-byte 0 failure marker).
+        assert!(env.module_output.len() > 4, "envelope too small: {:?}", env.module_output);
+        let inner: WasmResult =
+            crate::encoding::deserialize_rmp_to(&env.module_output.clone().into())
+                .expect("inner envelope");
+        assert_eq!(inner.module_output.len(), 4, "wasm_sum emits 4 LE bytes");
+        // The caller is charged at least the call base cost.
+        assert!(out.gas_used >= XCALL_CALL_BASE_WASM);
+
+        // Cross-executor determinism: an independently built context yields
+        // byte-identical output (the pin is the only B state involved).
+        let out2 = run_caller(Some(wasm_call_ctx()));
+        assert_eq!(out.result_data, out2.result_data);
+        assert_eq!(out.gas_used, out2.gas_used);
+    }
+
+    #[test]
+    fn wasm_call_without_context_returns_failure_marker() {
+        // No call context = no call capability: `env.call` returns 0, the fixture
+        // emits the single-byte 0 marker, and A settles deterministically.
+        let out = run_caller(None);
+        let env: WasmResult =
+            crate::encoding::deserialize_rmp_to(&out.result_data).expect("outer envelope");
+        assert_eq!(env.module_output, vec![0]);
+    }
+
 }

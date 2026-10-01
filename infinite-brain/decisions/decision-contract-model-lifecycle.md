@@ -8,7 +8,7 @@ summary: "Contract ≡ contract token; on-chain deploy (deterministic token id);
 auto_inject: false
 applicable_when: "Deploying, upgrading, or calling contracts; designing cross-token interactions or contract governance"
 confidence: 0.9
-verified_at: "09/27/2026"
+verified_at: "09/30/2026"
 verified_by: "Garrett Olson"
 staleness_signal: "Stale when contracts stop being 1:1 with tokens, deployment returns to admin-only, calls become atomic two-phase, or governance moves to stake-weighted voting"
 tags: [adr, design-decision, contract-model, deployment, cross-contract-calls, governance]
@@ -75,5 +75,5 @@ Approved by Garrett Olson, 09/27/2026.
   untouched).
 
 Follow-on design ADRs (written at the start of their phases): **ADR-015** on-chain
-deployment mechanics, **ADR-016** cross-chain call semantics (full Model X design),
-**ADR-017** upgrade governance.
+deployment mechanics, **ADR-016** cross-chain call semantics (full Model X design —
+**landed 09/30/2026**, Phase 9), **ADR-017** upgrade governance.

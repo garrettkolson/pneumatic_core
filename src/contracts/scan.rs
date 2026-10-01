@@ -256,6 +256,8 @@ fn scan_spec(bytecode: &[u8]) -> Vec<ScanFinding> {
             Op::Add | Op::Sub | Op::Mul | Op::Mod | Op::Cmp => (2, 1),
             Op::Select => (3, 1),
             Op::Emit => (1, 0),
+            // Model X call: pops nothing, pushes the status (0/1) (ADR-016).
+            Op::Call { .. } => (0, 1),
             Op::Halt => unreachable!(),
         };
         if depth < pops {
@@ -583,6 +585,7 @@ fn canary_run(
         token: &token,
         gas_limit: CANARY_FUEL_BUDGET,
         storage: Default::default(),
+        call_ctx: None,
     };
 
     match engine.execute(&input) {

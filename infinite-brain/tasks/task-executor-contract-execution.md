@@ -4,14 +4,14 @@ title: "Open: implement executor contract execution (plan Phases 1-10)"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P8 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage, upgrade governance). Remaining: P9 Model X calls, P10 e2e."
+summary: "Implement ADR-011-018 per plan Phases 1-10: P1-P9 landed (substrate+payload, Transfer/Spec engines, stub replacement, gas bounds, Tier-2 WasmEngine core, on-chain deploy, Wasm storage, upgrade governance, Model X cross-contract calls). Remaining: P10 e2e."
 auto_inject: false
 applicable_when: "Planning, scoping, or tracking the executor contract-execution implementation"
 confidence: 0.9
-verified_at: "09/29/2026"
+verified_at: "09/30/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Done when a composite e2e asserts a real result_hash and Phases 9/10 (Model X, e2e) are landed or re-scoped; P1-P8 landed 09/29/2026"
-tags: [task, executor, contract-execution, implementation, adr-011, adr-014]
+staleness_signal: "Done when a composite e2e asserts a real result_hash and Phase 10 (e2e) is landed or re-scoped; P1-P9 landed (P9 09/30/2026)"
+tags: [task, executor, contract-execution, implementation, adr-011, adr-014, adr-016]
 edges:
   - target: decision-contract-engine-model
     type: depends_on
@@ -33,6 +33,10 @@ edges:
     type: depends_on
     weight: 0.9
     note: "Phases 5 (core) + 7 (storage) implement the Tier-2 WasmEngine"
+  - target: decision-cross-contract-calls
+    type: depends_on
+    weight: 0.9
+    note: "Phase 9 implements ADR-016 Model X cross-contract calls (Spec Op::Call + Wasm env.call)"
   - target: concept-executor-role
     type: part_of
     weight: 0.9
@@ -55,10 +59,10 @@ Implementation task for the approved contract-execution design (decisions locked
 09/27-09/28/2026, ADR-011–014; **ADR-018 WasmEngine designed 09/28/2026**). Plan:
 `plans/executor-contract-execution-implementation-plan.md`; WasmEngine design:
 `plans/wasm-engine-design.md`; deploy design: `plans/deploy-contract-design.md`.
-Status: **in progress** — Phases 1–8 complete (09/29/2026); the Tier-2 WasmEngine
-**core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6), **Wasm
-storage (W3)** is landed (Phase 7), and **upgrade governance** is landed (Phase 8).
-Remaining: P9 (Model X), P10 (e2e).
+Status: **in progress** — Phases 1–9 complete (P1–P8 09/29/2026, **P9 09/30/2026**); the
+Tier-2 WasmEngine **core** is landed (Phase 5), **on-chain deployment** is landed (Phase 6),
+**Wasm storage (W3)** is landed (Phase 7), **upgrade governance** is landed (Phase 8), and
+**Model X cross-contract calls** are landed (Phase 9, ADR-016). Remaining: P10 (e2e).
 
 Phase checklist (each phase's exit criteria live in the plan):
 
@@ -211,9 +215,37 @@ Phase checklist (each phase's exit criteria live in the plan):
   bytecode). 11 new core tests (7 `contracts::upgrade` + 4 `validation::upgrade`) + 3
   executor + 7 committer. Core 628 → 639; committer 102 → 109; executor 21 → 24;
   workspace `cargo test` green.
-- **P9** — Model X cross-contract calls: snapshot-pinned `Call` (Spec ISA op) + Wasm
-  `call` host import (W4), cross-referenced tx on B's chain, deterministic
-  revert/compensation (ADR-016 design first).
+- **P9 ✅ (09/30/2026)** — **Model X cross-contract calls** (ADR-016; design first in
+  `plans/model-x-call-design.md`, ADR-014 C4). Landed in `pneumatic_core::contracts::call`
+  (new `src/contracts/call.rs`): `SnapshotRef { height, block_hash }` (0-based pin into B's
+  chain), the `TargetStateProvider` trait (the executor's I/O surface — resolve
+  `(target, ref, sender)` → `PinnedTarget`, **fail-closed** on any miss), `CallContext
+  { provider, registry, depth }` riding a new `ExecutionInput.call_ctx: Option<Arc<..>>`
+  (**excluded from `canonical_bytes()`** — same rule as `storage`, so no existing
+  `result_hash` changes), `validate_snapshot_ref` (block exists at `height` AND
+  `current_hash == ref.block_hash`), `synthesize_call_tx` (virtual B tx
+  `id = "xcall/{A_tx_id}/{target_hex}"`, `action = entry_point`, `gas_limit = sub_budget`,
+  `amount = None` — no cross-token value flow), and `execute_call` (resolve → select B's
+  engine → run under the sub-budget `A_remaining − CALL_BASE` with `call_ctx = ctx.child()`;
+  A charges `CALL_BASE + B.gas_used`; `MAX_CALL_DEPTH = 8`; a failed call charges
+  `CALL_BASE` and is **data to A**, not a trap). Surfaces (Q5): `SpecEngine` gains
+  `Op::Call { target_token, entry_point, call_payload, ref_height, ref_hash }` (pushes status
+  1/0 on the stack); `WasmEngine` gains the W4 `env.call(target_ptr,len, entry_ptr,len,
+  payload_ptr,len, ref_height, ref_hash_ptr,len, out_ptr,out_cap) -> i32` host import
+  (result length, **0 on any failure — never traps**; `call_gas` folded into `gas_used`; in
+  `ALLOWED_ENV_IMPORTS`). Gas constants `XCALL_CALL_BASE_SPEC = 10`, `XCALL_CALL_BASE_WASM =
+  100`; commitment domain `b"PNEUMATIC/XCALL/COMMIT/v1"` (B-side
+  `commitment = H(A_tx_id ‖ A_result_hash ‖ snapshot_ref)`, settled at commit on B's chain —
+  **A's finality independent**, no two-phase atomic commit). Executor wiring
+  (`executor/src/executor.rs`): private `ExecutorTargetProvider` (get_token →
+  `validate_snapshot_ref` → `get_asset::<SmartContract>()` → get_user, all fail-closed to
+  `InvalidInput`) + `call_ctx` built in `execute_contract`. **Wasm→Wasm round-trip** proven
+  with a hand-assembled 578-byte `wasm_caller.wasm` fixture (see
+  `fact-wasmparser-read-var-i32-bug` for the mandatory `sleb_force2` + no-data-section +
+  `control.height` workarounds). 13 core call tests + 2 Wasm round-trip tests + 7 executor
+  tests (6 provider fail-closed: unknown token, ref out of range, ref hash mismatch, no
+  contract asset, missing user; + 1 full `execute_contract` wiring). Core 639 → 654;
+  executor 24 → 31; workspace `cargo test` green (0 failed).
 - **P10** — composite e2e (incl. a Wasm contract) + cross-executor determinism tests +
   docs + vault closeout.
 
