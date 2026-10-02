@@ -85,6 +85,7 @@ Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact nod
 | `question-constrained-proving-ux` | Client-side proving performance on constrained devices (wallet UX) | Open: S6.4 will measure client proving time to decide if client-side Halo2 proving is acceptable on the intended wallet hardware class; seconds-scale proving may be too slow. | 4 |
 | `question-external-audit-before-real-value` | External audit of the Action circuit before real value | Open: before shielded transfers touch real value, the Action circuit needs external review/audit — a silently-accepting invalid proof is a zk constraint bug, a different risk class from a Rust bug. | 5 |
 | `question-viewing-keys-compliance` | Viewing keys / compliance: open product decision | Unresolved: should recipients (merchants, auditors, compliance) receive viewing keys that can decrypt note ciphertexts? Roadmark flags this as a product decision, not an engineering one. | 3 |
+| `question-anonymity-bootstrap-policy` | Anonymity bootstrap: production anonymity-set / genesis policy for the shielded tree | Open: the Merkle tree starts at one leaf in tests — anonymity set at genesis is trivially small; how many notes before a transfer is "anonymous", and does genesis seed a synthetic set? Audit S-close item #4, no code prescribes it. | 2 |
 | `question-conns-review-flags` | RESOLVED 10/01/2026: conns review flags confirmed and fixed | All three verified defects fixed: two never-constructed ConnError variants + zero-reference HEARTBEAT_PORT deleted; StreamReader::read_exact normalized to Result<(), ConnError>; suite stayed 997/0/37. | 2 |
 
 ## playbook (0)
@@ -201,4 +202,4 @@ Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact nod
 
 ## Totals
 
-116 nodes. Logs (append-only, never indexed): see logs/.
+117 nodes. Logs (append-only, never indexed): see logs/.
