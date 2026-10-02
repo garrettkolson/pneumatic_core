@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
+Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact node, task-data-provider-wire-tests resolved).
 
 ## pillar (2)
 
@@ -97,7 +97,7 @@ Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
 | id | title | summary | edges |
 |---|---|---|---|
 | `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | COMPLETED 09/23/2026: all seven steps landed (cache dedup, 4 crate splits, 4 root-lib splits, core authenticate_envelope C1 helper, executor tests move). Workspace 828/32/0. | 5 |
-| `task-data-provider-wire-tests` | Open gap: DefaultDataProvider wire-format tests (data.rs) | Open gap in TASKS.md's 'Remaining test gaps': wire-format tests for the DefaultDataProvider (data.rs); siblings: server.rs async poison, epoch stubs, registry send_to_all, config helpers. | 3 |
+| `task-data-provider-wire-tests` | RESOLVED 10/01/2026: DefaultDataProvider wire-format tests (data.rs) — all five test-gap items closed | CLOSED: wire_format_tests (9) in data.rs plus siblings — server.rs async poison (2), epoch stubs (3), config load/parse (10 via path-injected seams); send_to_all already covered by Phase 6.2 fanout.rs. Suite 997 → 1021/37/0. | 3 |
 | `task-e2e-pipeline-integration-test` | DONE: e2e pipeline integration test (sentinel → executor → finalizer → committer) | CLOSED 07/26/2026: full-pipeline test at tests/pipeline_integration.rs — SUB→SENT→EXEC→FIN→COMM over RNS (5 nodes, 9 identities, 2/role); closes the audit's Done-when. Findings: Resource path needs a direct link; rns-net 0.7.0 port-wiring rule. | 4 |
 | `task-executor-contract-bytecode` | Done (stale): executor contract-execution stub — replaced by real engines (P3, 09/29) | RESOLVED: the execute_contract stub (serialized the tx as its own 'output'; TODO at executor.rs:386) was replaced in plan Phase 3 (09/29) by real ContractEngine dispatch (Transfer/Spec/Wasm). Retained only as the historical staleness marker. | 2 |
 | `task-executor-contract-execution` | Complete: executor contract execution (plan Phases 1-10) — all 10 phases landed | All 10 phases landed (09/28-10/01): substrate+payload, Transfer/Spec/Wasm engines, stub replacement, gas bounds, WasmEngine core+deploy+W3 storage, upgrade governance, Model X cross-contract calls, and P10 e2e (7 composite pipeline + 2 cross-executor determinism tests). Full workspace suite green (988 passed / 0 failed). | 9 |
@@ -150,6 +150,7 @@ Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
 | `fact-shielded-stack` | Shielded ZK stack: module map (S1–S6 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble, S6 test layer. S1–S6 complete — Tier-1 feature-complete. | 4 |
 | `fact-test-suite` | Test baseline 2026-10-01: 988 passed / 37 ignored / 0 failed | 10/01/2026 workspace test baseline: 988 passed / 37 ignored / 0 failed — core 654 lib (+11 integration), committer 118 (109 lib + 9 integration), executor 33, finalizer 61, node-server 39, prover 15, sentinel 57. | 2 |
 | `fact-test-suite-phase8` | Test baseline 2026-10-01 (post-Phase-8): 997 passed / 37 ignored / 0 failed | Post-Phase-8 baseline: 997/37/0 (+9: 7 telemetry unit + 2 deploy-example guard); core lib 661, integration 22; Docker image pneumatic:phase8 builds green. | 2 |
+| `fact-test-suite-testgap-tail` | Test baseline 2026-10-01 (test-gap tail): 1021 passed / 37 ignored / 0 failed | Workspace baseline after closing the TASKS.md test-gaps tail (+24: 9 data wire-format, 10 config load/parse, 3 epoch stubs, 2 ThreadPool async); core lib 685; supersedes fact-test-suite-phase8. | 2 |
 | `fact-test-suite-s6` | Test baseline 2026-07-26: 835 passed / 37 ignored / 0 failed | 07/26/2026 workspace baseline after the e2e pipeline test + finalizer/executor test-module compile fixes: 835 passed / 37 ignored / 0 failed — core 553/19, committer 101/7, prover 15/2, rest unchanged. Use `cargo test --workspace` (plain `cargo test` runs only the root crate). | 2 |
 | `fact-wasmparser-read-var-i32-bug` | wasmparser 0.239.0 read_var_i32 corrupts single-byte 0x40..0x7F immediates | wasmparser 0.239.0's read_var_i32 single-byte fast path mis-decodes i32.const immediates of 0x40..0x7F (yields byte-128); hand-assembled Wasm fixtures must encode every i32.const as 2-byte SLEB128 (sleb_force2). Also: the validator rejects popping a value at a control frame's baseline, and fixtures must omit the data section (section-id swap 11/12). | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
@@ -200,4 +201,4 @@ Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
 
 ## Totals
 
-115 nodes. Logs (append-only, never indexed): see logs/.
+116 nodes. Logs (append-only, never indexed): see logs/.

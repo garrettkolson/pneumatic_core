@@ -47,5 +47,6 @@ mod tests {
     mod proposer;
     mod snapshot_cache;
     mod stake_sets;
+    mod stubs;
     mod types;
 }

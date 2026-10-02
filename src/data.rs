@@ -952,3 +952,328 @@ mod snapshot_envelope_tests {
         assert!(matches!(dp2.get_stake_snapshot(2, "token"), Err(DataError::SnapshotCorrupt(_))));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wire-format tests (TASKS.md test-gap tail, 10/01/2026): a fake data
+// service in-process, speaking the real channel protocol end to end —
+// frame `[4B BE len][auth_tag(32) || body]`, request body =
+// rmp(DataRequest); the tag is HMAC-SHA256(secret, body), or 32 zero
+// bytes (verifying vacuously) when no secret is configured. This is the
+// wire half the StubDataProvider suite could never cover: it proves the
+// provider's own serialize → frame → send → receive → deserialize path,
+// including the envelope integrity discipline across a real socket.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+    use crate::conns::uds::{sign_payload, verify_payload};
+    use std::collections::HashMap as StdHashMap;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    /// Mirror of `senders::AUTH_TAG_LEN` (private there); the wire contract
+    /// this suite exists to pin.
+    const AUTH_TAG_LEN_T: usize = 32;
+
+    /// Spawn a fake data service on a temp UDS path. It serves exactly
+    /// `expect_connections` framed requests: each decoded [`DataRequest`] —
+    /// plus whether its request tag verified under `secret` — is forwarded on
+    /// the returned receiver; the reply body comes from `handler`.
+    fn spawn_fake_data_service<F>(
+        secret: Option<Vec<u8>>,
+        expect_connections: usize,
+        handler: F,
+    ) -> (tempfile::TempDir, String, mpsc::Receiver<(DataRequest, bool)>)
+    where
+        F: Fn(&DataRequest) -> Vec<u8> + Send + 'static,
+    {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sock_path = temp_dir.path().join("data.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+        let listener = UnixListener::bind(&sock_str).unwrap();
+        let (req_tx, req_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..expect_connections {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                // A misbehaving client fails this test via the timeout, not a hang.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut header = [0u8; 4];
+                if stream.read_exact(&mut header).is_err() { return; }
+                let len = u32::from_be_bytes(header) as usize;
+                if len < AUTH_TAG_LEN_T { return; }
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() { return; }
+                let (tag, payload) = body.split_at(AUTH_TAG_LEN_T);
+                let tag_ok = verify_payload(secret.as_deref(), tag, payload);
+                let Ok(request) = deserialize_rmp_to::<DataRequest>(&payload.to_vec()) else { return };
+                // Reply first so the provider's blocking read completes even
+                // when the test later fails on request-shape assertions.
+                let reply = handler(&request);
+                let (reply_tag, reply_body) = sign_payload(secret.as_deref(), &reply);
+                let mut frame = Vec::with_capacity(4 + AUTH_TAG_LEN_T + reply_body.len());
+                frame.extend_from_slice(
+                    &((AUTH_TAG_LEN_T + reply_body.len()) as u32).to_be_bytes(),
+                );
+                frame.extend_from_slice(&reply_tag);
+                frame.extend_from_slice(&reply_body);
+                if stream.write_all(&frame).is_err() { return; }
+                let _ = req_tx.send((request, tag_ok));
+            }
+        });
+        (temp_dir, sock_str, req_rx)
+    }
+
+    /// Provider pointed at a fake service socket. `secret` is applied BEFORE
+    /// `with_timeout` because `with_secret` replaces the conn factory (which
+    /// would otherwise silently drop the shorter timeout).
+    fn provider_at(sock: &str, secret: Option<Vec<u8>>) -> DefaultDataProvider {
+        let p = DefaultDataProvider::new()
+            .with_source(ConnTarget::Local(LocalTarget::Unix(sock.to_string())));
+        let p = match secret {
+            Some(s) => p.with_secret(s),
+            None => p,
+        };
+        p.with_timeout(Duration::from_secs(2))
+    }
+
+    #[test]
+    fn wire_get_user_round_trip() {
+        let want = User { public_key: vec![1, 2, 3], fuel_balance: 42, stake: 7, nonce: 9 };
+        let (_tmp, sock, reqs) =
+            spawn_fake_data_service(None, 1, move |_req| serialize_to_bytes_rmp(&want).unwrap());
+        let dp = provider_at(&sock, None);
+
+        let got = dp.get_user(&vec![9u8; 4], "token").expect("user must survive the wire");
+        assert_eq!(got.public_key, vec![1, 2, 3]);
+        assert_eq!(got.fuel_balance, 42);
+        assert_eq!(got.stake, 7);
+        assert_eq!(got.nonce, 9);
+
+        // The request the service actually received: key, op, and partition
+        // as the provider serialized them.
+        let (req, tag_ok) = reqs.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(req.key, vec![9u8; 4]);
+        assert_eq!(req.partition_id, "token");
+        assert!(matches!(req.op, DataOp::Get(GetOp::User)));
+        assert!(tag_ok, "no-secret path: zero tag verifies vacuously");
+    }
+
+    #[test]
+    fn wire_save_user_carries_framed_payload() {
+        let (_tmp, sock, reqs) = spawn_fake_data_service(None, 1, |_req| vec![]);
+        let dp = provider_at(&sock, None);
+        let user = User { public_key: vec![7], fuel_balance: 1, stake: 2, nonce: 3 };
+
+        dp.save_user(&vec![7], user, "token").expect("save acknowledged");
+
+        let (req, _tag_ok) = reqs.recv_timeout(Duration::from_secs(5)).unwrap();
+        match req.op {
+            DataOp::Save(SaveOp::User(u)) => {
+                assert_eq!(u.public_key, vec![7]);
+                assert_eq!(u.fuel_balance, 1);
+                assert_eq!(u.stake, 2);
+                assert_eq!(u.nonce, 3);
+            }
+            other => panic!("expected Save(User) on the wire, got {other}"),
+        }
+    }
+
+    #[test]
+    fn wire_get_data_round_trip() {
+        let (_tmp, sock, reqs) = spawn_fake_data_service(None, 1, |_req| {
+            serialize_to_bytes_rmp(&vec![1u8, 2, 3, 4]).unwrap()
+        });
+        let dp = provider_at(&sock, None);
+
+        let bytes = dp.get_data(&b"k".to_vec(), "token").expect("raw bytes must round-trip");
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+
+        let (req, _) = reqs.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(req.op, DataOp::Get(GetOp::Data)));
+    }
+
+    // The envelope discipline (H9/M8) over a REAL socket: a snapshot saved
+    // through the provider is replayed verbatim by the fake service and must
+    // load clean — and a tampered hash must fail closed as SnapshotCorrupt,
+    // never as a trusted value.
+    #[test]
+    fn wire_stake_snapshot_envelope_round_trip_and_corruption() {
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_save = captured.clone();
+        let cap_get = captured.clone();
+        let (_tmp, sock, reqs) =
+            spawn_fake_data_service(None, 2, move |req| match &req.op {
+                DataOp::Save(SaveOp::StakeSnapshot(env)) => {
+                    let bytes = serialize_to_bytes_rmp(env).unwrap();
+                    *cap_save.lock().unwrap() = bytes.clone();
+                    vec![] // ack
+                }
+                DataOp::Get(GetOp::StakeSnapshot(_)) => cap_get.lock().unwrap().clone(),
+                other => panic!("unexpected op on the wire: {other}"),
+            });
+        let dp = provider_at(&sock, None);
+
+        let mut stakers = StdHashMap::new();
+        stakers.insert(b"alice".to_vec(), 100u64);
+        stakers.insert(b"bob".to_vec(), 7u64);
+        dp.save_stake_snapshot(1, StakeSet { stakers: stakers.clone() }, "token")
+            .expect("stake snapshot save acknowledged");
+
+        let loaded = dp.get_stake_snapshot(1, "token").expect("envelope must verify on load");
+        assert_eq!(loaded.stakers, stakers);
+
+        // The bytes that hit the wire are the ENVELOPE (hash + epoch present),
+        // not the bare payload — assert the envelope form, then the op shape.
+        let (get_req, _) = reqs.iter().skip(1).next().expect("get request captured");
+        assert!(matches!(get_req.op, DataOp::Get(GetOp::StakeSnapshot(1))));
+
+        // Corrupted hash: the fake service replays the envelope with the hash
+        // zeroed — the provider must refuse it.
+        let tampered = {
+            let bytes = captured.lock().unwrap().clone();
+            let mut env: StakeSnapshotEnvelope = deserialize_rmp_to(&bytes).unwrap();
+            env.hash = [0u8; 32];
+            serialize_to_bytes_rmp(&env).unwrap()
+        };
+        let (_tmp2, sock2, _reqs2) = spawn_fake_data_service(None, 1, move |_req| tampered.clone());
+        let dp2 = provider_at(&sock2, None);
+        assert!(
+            matches!(dp2.get_stake_snapshot(1, "token"), Err(DataError::SnapshotCorrupt(_))),
+            "a tampered envelope over the wire must fail closed"
+        );
+    }
+
+    #[test]
+    fn wire_shielded_pool_round_trip_and_corruption() {
+        let state = ShieldedPoolState {
+            root: [1u8; 32],
+            leaf_count: 1,
+            leaves: vec![[2u8; 32]],
+            nullifiers: vec![[3u8; 32]],
+            applied: vec![],
+        };
+
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap_save = captured.clone();
+        let cap_get = captured.clone();
+        let (_tmp, sock, _reqs) =
+            spawn_fake_data_service(None, 2, move |req| match &req.op {
+                DataOp::Save(SaveOp::ShieldedPool(env)) => {
+                    let bytes = serialize_to_bytes_rmp(env).unwrap();
+                    *cap_save.lock().unwrap() = bytes.clone();
+                    vec![]
+                }
+                DataOp::Get(GetOp::ShieldedPool) => cap_get.lock().unwrap().clone(),
+                other => panic!("unexpected op on the wire: {other}"),
+            });
+        let dp = provider_at(&sock, None);
+
+        dp.save_shielded_pool(&state, "token").expect("pool save acknowledged");
+        let loaded = dp
+            .get_shielded_pool("token")
+            .expect("pool envelope must verify on load")
+            .expect("pool state present");
+        assert_eq!(loaded.root, state.root);
+        assert_eq!(loaded.leaf_count, 1);
+        assert_eq!(loaded.leaves, state.leaves);
+        assert_eq!(loaded.nullifiers, state.nullifiers);
+
+        // S5.3 boot contract: a corrupt pool read is an Err (the committer
+        // refuses to re-seed) — a tampered envelope must produce exactly that.
+        let tampered = {
+            let bytes = captured.lock().unwrap().clone();
+            let mut env: ShieldedPoolStateEnvelope = deserialize_rmp_to(&bytes).unwrap();
+            env.hash = [0u8; 32];
+            serialize_to_bytes_rmp(&env).unwrap()
+        };
+        let (_tmp2, sock2, _reqs2) = spawn_fake_data_service(None, 1, move |_req| tampered.clone());
+        let dp2 = provider_at(&sock2, None);
+        assert!(
+            matches!(dp2.get_shielded_pool("token"), Err(DataError::SnapshotCorrupt(_))),
+            "a tampered pool envelope must fail closed, never re-seed"
+        );
+    }
+
+    #[test]
+    fn wire_garbage_response_is_deserialization_error() {
+        let (_tmp, sock, _reqs) =
+            spawn_fake_data_service(None, 1, |_req| b"\xc1 not msgpack at all".to_vec());
+        let dp = provider_at(&sock, None);
+        assert!(
+            matches!(dp.get_user(&b"k".to_vec(), "token"), Err(DataError::DeserializationError(_))),
+            "undecodable response must surface as DeserializationError"
+        );
+    }
+
+    #[test]
+    fn wire_hmac_authenticated_round_trip_and_tamper() {
+        let secret = b"shared-data-secret".to_vec();
+
+        // Matched secrets: authenticated round-trip, and the service-side tag
+        // check passes on the provider's request frame.
+        let (_tmp, sock, reqs) = {
+            let secret = secret.clone();
+            spawn_fake_data_service(Some(secret), 1, move |_req| {
+                serialize_to_bytes_rmp(&User {
+                    public_key: vec![5],
+                    fuel_balance: 1,
+                    stake: 1,
+                    nonce: 1,
+                })
+                .unwrap()
+            })
+        };
+        let dp = provider_at(&sock, Some(secret.clone()));
+        let got = dp.get_user(&b"k".to_vec(), "token").expect("authenticated round-trip");
+        assert_eq!(got.public_key, vec![5]);
+        let (req, tag_ok) = reqs.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(tag_ok, "provider must emit a valid HMAC over the request body");
+        assert!(matches!(req.op, DataOp::Get(GetOp::User)));
+
+        // Mismatched service key: the response tag fails verification —
+        // DataError::PeerUnauthenticated, not a trusted payload.
+        let (_tmp2, sock2, _reqs2) = spawn_fake_data_service(
+            Some(b"attacker-key".to_vec()),
+            1,
+            |_req| serialize_to_bytes_rmp(&User::default()).unwrap(),
+        );
+        let dp2 = provider_at(&sock2, Some(secret));
+        assert!(
+            matches!(dp2.get_user(&b"k".to_vec(), "token"), Err(DataError::PeerUnauthenticated(_))),
+            "a response tagged under the wrong key must fail authentication"
+        );
+    }
+
+    #[test]
+    fn wire_connect_refusal_is_store_not_found_or_from_store() {
+        // Nothing is listening on this path: the sender creation itself
+        // succeeds, so the failure surfaces where it actually lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nobody-home.sock");
+        let dp = provider_at(missing.to_str().unwrap(), None);
+        let err = dp.get_user(&b"k".to_vec(), "token").expect_err("must fail without a service");
+        assert!(
+            matches!(err, DataError::StoreNotFound | DataError::FromStore(_)),
+            "connect refusal must fail closed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn internal_op_guards_reject_mismatched_ops() {
+        // The get/save internals each refuse the other's op class BEFORE any
+        // I/O — defensive guards only reachable in-module, so tested here.
+        let dp = DefaultDataProvider::new();
+        assert!(matches!(
+            dp.get_data_internal::<User>(&vec![], DataOp::Save(SaveOp::Data(vec![])), "p"),
+            Err(DataError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            dp.save_data_internal::<User>(&vec![], DataOp::Get(GetOp::User), "p"),
+            Err(DataError::InvalidOperation(_))
+        ));
+    }
+}

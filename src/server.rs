@@ -247,8 +247,73 @@ mod tests {
         }));
     }
 
-    // OK: deferred — test uses thread::spawn with async block (invalid).
-    // Fix: use tokio::spawn + tokio::time::timeout to avoid hanging on poisoned mutex.
-    // #[tokio::test]
-    // async fn calling_thread_pool_execute_async_with_poisoned_mutex_should_not_run_the_closure() { ... }
+    // -----------------------------------------------------------------------
+    // The async counterpart of `calling_thread_pool_execute_with_poisoned_mutex_should_not_run_the_closure`
+    // (deferred 10/01/2026, now fixed). Two facts shape it:
+    //
+    // 1. `tokio::sync::Mutex` — unlike `std::sync::Mutex` — has NO poisoning:
+    //    a task that panics while holding the guard releases the lock and the
+    //    next `lock()` succeeds (see the guard test below). So "poisoned async
+    //    mutex" is not a reachable state in this design.
+    // 2. What IS reachable, and is the true async analogue, is a job future
+    //    that panics inside `get_async_thread`'s loop: the panic unwinds the
+    //    whole async worker task, so the loop is gone and no later job runs.
+    //    The test below asserts the deferred test's intent — the closure must
+    //    not run after the async worker has been killed.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn async_job_panic_terminates_the_async_worker_and_later_jobs_never_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pool = ThreadPool::new(1);
+
+        // Job 1: panics while awaited inside the async worker loop, killing
+        // that task (tokio isolates panics to the task; the runtime survives).
+        let _ = pool.execute_async(Box::pin(async {
+            panic!("poison the async worker loop");
+        }));
+        // Let the worker pick job 1 up and die with it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Job 2: must never run — the loop that would have driven it is dead.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let _ = pool.execute_async(Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the async worker loop died with the panicking job; \
+             a later job must never be driven"
+        );
+    }
+
+    // Semantic-assumption guard: this test pins WHY the poison formulation
+    // above changed. If a future tokio version ever introduces Mutex poisoning,
+    // this test fails and the async-worker failure semantics must be
+    // re-audited — exactly the situation the deferred test was groping at.
+    #[tokio::test]
+    async fn tokio_async_mutex_is_not_poisoned_by_a_panicking_holder() {
+        let m = Arc::new(tokio::sync::Mutex::new(7u32));
+        let m_holder = m.clone();
+        let killer = tokio::spawn(async move {
+            let _guard = m_holder.lock().await;
+            panic!("holder panics while the async mutex is locked");
+        });
+        // The panicking task is contained: await yields JoinError, not a propagation.
+        assert!(killer.await.unwrap_err().is_panic());
+
+        // The lock survived its holder: lock() succeeds and the data is intact —
+        // the `std::sync` poisoned-mutex path simply does not exist here.
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            m.lock(),
+        )
+        .await
+        .expect("tokio Mutex must not poison: lock() must not block forever");
+        assert_eq!(*guard, 7);
+        drop(guard);
+    }
 }

@@ -145,7 +145,14 @@ impl Config {
     }
 
     fn load_spec() -> Result<ConfigSpec, Error> {
-        let file_read = &match fs::read(Self::CONFIG_FILE_LOCATION) {
+        Config::load_spec_from(Path::new(Self::CONFIG_FILE_LOCATION))
+    }
+
+    /// Filesystem half of `load_spec`, with the path injected so the load/parse
+    /// behavior is unit-testable without changing the process CWD
+    /// (TASKS.md test-gap tail, 10/01/2026).
+    fn load_spec_from(path: &Path) -> Result<ConfigSpec, Error> {
+        let file_read = &match fs::read(path) {
             Ok(r) => r,
             Err(e) => return Err(e)
         };
@@ -154,8 +161,15 @@ impl Config {
     }
 
     fn get_environment_metadata() -> Result<Arc<DashMap<String, EnvironmentMetadata>>, Error> {
+        Config::get_environment_metadata_from(Path::new(Self::ENV_FILE_LOCATION))
+    }
+
+    /// Directory-scoped half of `get_environment_metadata` with the directory
+    /// injected, so spec loading + validation + fail-closed behavior is
+    /// unit-testable against a temp dir (TASKS.md test-gap tail, 10/01/2026).
+    fn get_environment_metadata_from(dir: &Path) -> Result<Arc<DashMap<String, EnvironmentMetadata>>, Error> {
         let mut env_specs = vec![];
-        for file in fs::read_dir(Self::ENV_FILE_LOCATION)? {
+        for file in fs::read_dir(dir)? {
             let file_path_buf = file?.path();
             let file_path = file_path_buf.as_path();
             let env_file_read = &match fs::read(file_path) {
@@ -423,5 +437,166 @@ mod config_tests {
             .public_key()
             .expect("in-memory identity yields a real key");
         assert_eq!(config.public_key, identity_key);
+    }
+
+    // -----------------------------------------------------------------------
+    // Load/parse tests (TASKS.md test-gap tail, 10/01/2026): exercise the
+    // path-injected seams — the same file handling `Config::build()` performs
+    // against `config.json` and `/env`, but against temp dirs.
+    // -----------------------------------------------------------------------
+
+    /// The real deploy environment spec (also parse-validated by
+    /// `tests/deploy_examples.rs`), with `log_file` redirected into the test's
+    /// temp dir so `load_from_spec` can build its FileLogger anywhere.
+    fn valid_env_spec_json(log_path: &str) -> String {
+        let mut spec: serde_json::Value =
+            serde_json::from_str(include_str!("../deploy/config/env/env.json")).unwrap();
+        spec["log_file"] = serde_json::json!(log_path);
+        spec.to_string()
+    }
+
+    #[test]
+    fn load_spec_from_reads_valid_minimal_file_and_applies_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, base_spec().to_string()).unwrap();
+
+        let spec = Config::load_spec_from(&path).expect("valid config.json must parse");
+        assert_eq!(spec.main_env_id, "env");
+        assert_eq!(spec.rest_api_version, 1);
+        assert!(spec.is_full_node);
+        assert_eq!(spec.reconciliation_partition_id, "default");
+        // Optional fields default exactly as Config::build() expects:
+        assert!(spec.identity_path.is_none(), "absent identity_path => keystore default");
+        assert!(spec.bootstrap_peers.is_empty());
+        assert!(spec.rns_port.is_none(), "absent rns_port => DEFAULT_UDP_PORT at build");
+        assert!(!spec.transport_enabled, "leaf by default");
+    }
+
+    #[test]
+    fn load_spec_from_parses_full_shape_with_optional_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut full = base_spec();
+        full["identity_path"] = serde_json::json!("keys/id.json");
+        full["rns_port"] = serde_json::json!(4343u64);
+        full["transport_enabled"] = serde_json::json!(true);
+        full["bootstrap_peers"] = serde_json::json!([{
+            "public_key": "ab".repeat(64), // 128 hex chars = 64-byte key
+            "ip": "127.0.0.1",
+            "port": 4242u64,
+        }]);
+        std::fs::write(&path, full.to_string()).unwrap();
+
+        let spec = Config::load_spec_from(&path).expect("full-shape spec must parse");
+        assert_eq!(spec.identity_path.as_deref(), Some("keys/id.json"));
+        assert_eq!(spec.rns_port, Some(4343));
+        assert!(spec.transport_enabled);
+        assert_eq!(spec.bootstrap_peers.len(), 1);
+        assert_eq!(spec.bootstrap_peers[0].port, 4242);
+    }
+
+    #[test]
+    fn load_spec_from_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match Config::load_spec_from(&dir.path().join("nope.json")) {
+            Err(e) => e,
+            Ok(_) => panic!("missing file must fail"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn load_spec_from_unparseable_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{ not json at all").unwrap();
+        assert!(Config::load_spec_from(&path).is_err(), "corrupt config.json must fail boot");
+    }
+
+    #[test]
+    fn load_spec_from_missing_required_field_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut spec = base_spec();
+        spec.as_object_mut().unwrap().remove("main_env_id");
+        std::fs::write(&path, spec.to_string()).unwrap();
+        assert!(
+            Config::load_spec_from(&path).is_err(),
+            "a spec missing a required field must not build"
+        );
+    }
+
+    #[test]
+    fn env_dir_loads_valid_specs_keyed_by_environment_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("pneumatic.log");
+        std::fs::write(
+            dir.path().join("env.json"),
+            valid_env_spec_json(log.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let metas = Config::get_environment_metadata_from(dir.path())
+            .expect("valid env spec must load");
+        assert_eq!(metas.len(), 1);
+        let env = metas.get("env").expect("keyed by environment_id");
+        assert_eq!(env.environment_id, "env");
+    }
+
+    #[test]
+    fn env_dir_skips_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("pneumatic.log");
+        std::fs::write(
+            dir.path().join("env.json"),
+            valid_env_spec_json(log.to_str().unwrap()),
+        )
+        .unwrap();
+        // The loader explicitly skips zero-length reads (e.g. editor swap files).
+        std::fs::write(dir.path().join(".env.json.swp"), b"").unwrap();
+
+        let metas = Config::get_environment_metadata_from(dir.path())
+            .expect("empty file must be skipped, not fatal");
+        assert_eq!(metas.len(), 1);
+    }
+
+    #[test]
+    fn env_dir_rejects_out_of_range_spec() {
+        // Phase 5.7 / H6: a security-relevant field outside its valid range
+        // fails load (boot) — a neutered quorum must never boot.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("pneumatic.log");
+        let mut spec: serde_json::Value =
+            serde_json::from_str(include_str!("../deploy/config/env/env.json")).unwrap();
+        spec["log_file"] = serde_json::json!(log.to_str().unwrap());
+        spec["quorum_percentage"] = serde_json::json!(150.0);
+        std::fs::write(dir.path().join("env.json"), spec.to_string()).unwrap();
+
+        let err = match Config::get_environment_metadata_from(dir.path()) {
+            Ok(_) => panic!("invalid quorum must fail load"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn env_dir_rejects_unparseable_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("env.json"), b"nonsense not json").unwrap();
+        assert!(
+            Config::get_environment_metadata_from(dir.path()).is_err(),
+            "an unreadable env file must fail boot"
+        );
+    }
+
+    #[test]
+    fn env_dir_missing_directory_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match Config::get_environment_metadata_from(&dir.path().join("no-env-dir")) {
+            Ok(_) => panic!("missing /env equivalent must fail build"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
