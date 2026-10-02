@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact node, task-data-provider-wire-tests resolved).
+Last rebuilt: 10/01/2026 (manual update for the audit Phase 7 close: +1 fact, +1 event; earlier same day: +1 question anonymity-bootstrap, +1 fact test-gap-tail).
 
 ## pillar (2)
 
@@ -117,6 +117,7 @@ Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact nod
 | `event-s5-2-finalizer-wiring` | S5.2: finalizer wiring for shielded transactions | Commit 1b7e4f0 (09/20/2026): 'feat: finalizer wiring for zk-shielded transactions' — the shielded validation spec is now on the finalizer's block path. | 3 |
 | `event-s6-shielded-completion` | S6: shielded Tier-1 feature-complete | 2026-09-25: S6 closes the shielded plan — attack suite, concurrency, cross-crate 4-hop pipeline with wire-byte privacy assertion, prove/verify timing. Workspace 834/37/0; Tier-1 feature-complete. | 4 |
 | `event-phase8-production-readiness` | Phase 8: production readiness landed (telemetry, graceful shutdown, Docker, runbook) — 10/01/2026 | Phase 8 closes the last planned roadmap phase: pneumatic_core::telemetry, SIGINT/SIGTERM drain in both binaries, the real node-server binary, Docker+compose with guard-tested examples, the runbook, rustdoc; 997/0/37; image builds + container smoke test green. | 4 |
+| `event-audit-phase7-closed` | Audit checklist: Phase 7 complete — all code-side items closed 10/01/2026 | 7.2 determinism fixture + 7.3 reconcile-then-advance written; six other 7.4 scenarios and 7.3 siblings confirmed already covered, checklist backfilled with evidence. Only the four S-close decision gates remain open. Baseline at close: 1029/37/0. | 3 |
 
 ## pattern (7)
 
@@ -152,6 +153,7 @@ Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact nod
 | `fact-test-suite` | Test baseline 2026-10-01: 988 passed / 37 ignored / 0 failed | 10/01/2026 workspace test baseline: 988 passed / 37 ignored / 0 failed — core 654 lib (+11 integration), committer 118 (109 lib + 9 integration), executor 33, finalizer 61, node-server 39, prover 15, sentinel 57. | 2 |
 | `fact-test-suite-phase8` | Test baseline 2026-10-01 (post-Phase-8): 997 passed / 37 ignored / 0 failed | Post-Phase-8 baseline: 997/37/0 (+9: 7 telemetry unit + 2 deploy-example guard); core lib 661, integration 22; Docker image pneumatic:phase8 builds green. | 2 |
 | `fact-test-suite-testgap-tail` | Test baseline 2026-10-01 (test-gap tail): 1021 passed / 37 ignored / 0 failed | Workspace baseline after closing the TASKS.md test-gaps tail (+24: 9 data wire-format, 10 config load/parse, 3 epoch stubs, 2 ThreadPool async); core lib 685; supersedes fact-test-suite-phase8. | 2 |
+| `fact-test-suite-audit7x` | Test baseline 2026-10-01 (audit Phase 7 close): 1029 passed / 37 ignored / 0 failed | Baseline after closing AUDIT_CHECKLIST Phase 7 (+8: 4 determinism fixture, 2 reconcile-then-advance, 1 quorum-100 boundary, 1 unsigned heartbeat); core lib 691, committer 111; supersedes fact-test-suite-testgap-tail. | 2 |
 | `fact-test-suite-s6` | Test baseline 2026-07-26: 835 passed / 37 ignored / 0 failed | 07/26/2026 workspace baseline after the e2e pipeline test + finalizer/executor test-module compile fixes: 835 passed / 37 ignored / 0 failed — core 553/19, committer 101/7, prover 15/2, rest unchanged. Use `cargo test --workspace` (plain `cargo test` runs only the root crate). | 2 |
 | `fact-wasmparser-read-var-i32-bug` | wasmparser 0.239.0 read_var_i32 corrupts single-byte 0x40..0x7F immediates | wasmparser 0.239.0's read_var_i32 single-byte fast path mis-decodes i32.const immediates of 0x40..0x7F (yields byte-128); hand-assembled Wasm fixtures must encode every i32.const as 2-byte SLEB128 (sleb_force2). Also: the validator rejects popping a value at a control frame's baseline, and fixtures must omit the data section (section-id swap 11/12). | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
@@ -202,4 +204,4 @@ Last rebuilt: 10/01/2026 (manual update for the test-gap-tail close: +1 fact nod
 
 ## Totals
 
-117 nodes. Logs (append-only, never indexed): see logs/.
+119 nodes. Logs (append-only, never indexed): see logs/.

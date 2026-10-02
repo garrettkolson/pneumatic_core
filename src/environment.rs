@@ -503,6 +503,23 @@ mod tests {
         assert!(parse(value).validate().is_ok());
     }
 
+    // AUDIT 7.4 boundary completion (10/01/2026): the quorum range is the
+    // half-open interval (0, 100]. Zero rejection and >100 rejection were
+    // already pinned; this pins the INCLUSIVE upper bound — 100.0 (unanimous
+    // quorum) is legal, so an accidental strict `< 100.0` would be caught.
+    #[test]
+    fn spec_validate_accepts_quorum_exactly_100() {
+        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        value["quorum_percentage"] = json!(100.0);
+        value["shard_quorum_percentage"] = json!(100.0);
+        value["override_quorum_percentage"] = json!(100.0);
+        assert!(parse(value).validate().is_ok(), "100.0 is inside the inclusive bound");
+        // And its mirror: just over the bound still fails.
+        let mut over: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
+        over["quorum_percentage"] = json!(100.1);
+        assert!(parse(over).validate().is_err(), "100.1 must be rejected");
+    }
+
     // --- Phase S4.3: shielded_root_recency consensus parameter ---
 
     #[test]

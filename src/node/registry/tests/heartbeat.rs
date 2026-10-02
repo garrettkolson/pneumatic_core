@@ -68,6 +68,41 @@ fn authenticated_heartbeat_refreshes_last_seen() {
 }
 
 #[test]
+fn heartbeat_without_any_signature_does_not_refresh_last_seen() {
+    // AUDIT 7.4 literal case (closed 10/01/2026): the forged-heartbeat test
+    // uses a 32-byte bogus signature; this is the plain UNSIGNED variant — an
+    // empty binding_signature must be rejected too, not treated as "no
+    // signature required".
+    let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 5)]);
+    let victim = NodeIdentity::generate_in_memory();
+    register_node(&reg, &victim, NodeRegistryType::Finalizer);
+    let key = victim.ed25519.public_key().unwrap();
+
+    {
+        let mut nodes = reg.get_nodes(&NodeRegistryType::Finalizer).unwrap();
+        let mut stored = nodes.get_mut(&key).expect("victim registered");
+        stored.value_mut().last_seen = Instant::now() - Duration::from_secs(100);
+    }
+
+    let unsigned = NodeRequest {
+        requester_key: key.clone(),
+        requester_rhash: victim.rhash,
+        request_type: NodeRequestType::Heartbeat,
+        requester_types: vec![NodeRegistryType::Finalizer],
+        requested_type: NodeRegistryType::Finalizer,
+        binding_signature: vec![], // literally no signature
+    };
+    reg.handle_heartbeat(&unsigned);
+
+    let nodes = reg.get_nodes(&NodeRegistryType::Finalizer).unwrap();
+    let stored = nodes.get(&key).expect("victim still registered");
+    assert!(
+        stored.last_seen < Instant::now() - Duration::from_secs(5),
+        "an unsigned heartbeat must not refresh last_seen"
+    );
+}
+
+#[test]
 fn heartbeat_binding_is_tuple_specific() {
     // A valid signature over one (rhash, type, types) tuple cannot be
     // replayed against a different rhash — the rhash is part of the signed

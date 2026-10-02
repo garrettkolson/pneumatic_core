@@ -306,3 +306,73 @@ async fn advance_epoch_to_surfaces_snapshot_save_error() {
         result
     );
 }
+
+// AUDIT Phase 7.3 (closed 10/01/2026): the reconcile-then-advance interaction.
+// `handle_epoch_reconcile` is the wire `EpochReconcile` entry point:
+// reconcile → (apply_ops when non-empty) → advance via the single guarded
+// writer. The advance half was covered (H9/M8 tests above); these pin the
+// full sequence the wire path actually runs.
+#[tokio::test]
+async fn handle_epoch_reconcile_advances_epoch_and_detector_together() {
+    let (committer, _registry, _dp) =
+        make_committer_for_leader_test(b"leader".to_vec(), b"leader".to_vec());
+    // Spread stakers so the epoch advance elects a real leader (as in the
+    // advance-discriminator test above).
+    for i in 0..256 {
+        committer.stake_store.add_staker(vec![i as u8], 1);
+    }
+
+    let epoch_before = committer.current_epoch_number();
+    committer
+        .handle_epoch_reconcile()
+        .await
+        .expect("clean reconciliation must complete");
+    let epoch_after = committer.current_epoch_number();
+    assert_eq!(
+        epoch_after,
+        epoch_before + 1,
+        "reconcile advances exactly one epoch"
+    );
+
+    // The detector (authoritative source) and the mirrored counter agree after
+    // the reconcile — the interaction H9/M8 requires, exercised through the
+    // wire entry point rather than advance_epoch directly.
+    {
+        let guard = committer.epoch_detector.lock().await;
+        assert_eq!(
+            guard.as_ref().unwrap().current_epoch.epoch_number,
+            epoch_after,
+            "detector must track the counter after reconcile"
+        );
+    }
+
+    // A second reconcile advances again — the path is repeatable, not a
+    // one-shot (the epoch loop runs it every interval).
+    committer
+        .handle_epoch_reconcile()
+        .await
+        .expect("second reconcile must complete");
+    assert_eq!(
+        committer.current_epoch_number(),
+        epoch_after + 1,
+        "reconcile is repeatable"
+    );
+}
+
+#[tokio::test]
+async fn handle_epoch_reconcile_surfaces_snapshot_persist_failure() {
+    // The advance inside reconcile must propagate snapshot-persistence failure
+    // (fail closed: a reconcile that cannot persist its snapshots has not
+    // durably advanced, and the caller must see that).
+    let dp = Arc::new(TestDataProvider::new().with_snapshot_save_failure(true));
+    let (committer, _registry, _dp) =
+        build_committer_for_leader_test(b"leader".to_vec(), b"leader".to_vec(), dp);
+    committer.stake_store.add_staker(b"leader".to_vec(), 100);
+
+    let result = committer.handle_epoch_reconcile().await;
+    assert!(
+        matches!(result, Err(CommitterError::SnapshotPersist { kind: "stake", .. })),
+        "reconcile must surface the advance's persistence failure, got {:?}",
+        result.err()
+    );
+}

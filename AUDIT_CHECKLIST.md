@@ -404,11 +404,12 @@ change without a wire-compat note; fail closed, never silent-accept.*
   **Budget decision (recorded, feeds open item #3):** the 100 ms Tier-1 plan target was NOT met on this box (124 ms measured — first verify, right after a 25 s prove in the same process; the margin to target is within box noise). The test asserts a **200 ms tripwire** (~1.6× measured; trips on a 2×+ regression) rather than the unmet 100 ms target. Wherever proving runs for end users (open item #3: embedded wallet vs prover service) must expect ~25 s of CPU for a single transfer on this class of machine.
   **Zero new packages (ground rule):** all S6 work uses dependencies already in the root `Cargo.toml` (`tempfile` + the four worker-crate dev-deps were added with S6.2; `rand`/`ed25519-dalek`/`pasta_curves`/`ff`/`dashmap`/`async-trait` pre-existed).
   **Final suite:** 834 passed / 37 ignored / 0 failed (`cargo test --workspace`) — monotonic over the post-S6.2 baseline of 832 / 33 / 0; the four new live tests (pipeline ×2, attacks' second, prover timing) join the `#[ignore]`d benchmark lane.
-- [ ] **Open items at close (NOT code — operational/decision gates):**
-  1. **Circuit audit hard gate** — the ActionCircuit (k=10, 7 public inputs) has NO independent audit; the S6 tests prove the pipeline is internally consistent, not that the circuit is sound beyond its own construction. A third-party (or at minimum second-party) circuit review is a launch gate.
-  2. **Viewing-key policy** — S3.3.4's `scan_for_notes` viewing-key path is implemented and tested, but the key-handling policy (where viewing keys are stored, who can request scans, audit/export flows) is undecided.
-  3. **Proving UX** — S6.4 numbers (above) quantify prove/verify; a product decision is still open on where proving runs for end users (embedded wallet vs prover service) given the measured prove time.
-  4. **Anonymity bootstrap** — the Merkle tree starts at one leaf in tests; a production anonymity set (how many notes exist before a transfer can be "anonymous") needs a genesis policy.
+- [ ] **Open items at close (NOT code — operational/decision gates):** *(tracked in the vault;
+  status 10/01/2026 — all four still open)*
+  1. **Circuit audit hard gate** — the ActionCircuit (k=10, 7 public inputs) has NO independent audit; the S6 tests prove the pipeline is internally consistent, not that the circuit is sound beyond its own construction. A third-party (or at minimum second-party) circuit review is a launch gate. *(vault: `question-external-audit-before-real-value`)*
+  2. **Viewing-key policy** — S3.3.4's `scan_for_notes` viewing-key path is implemented and tested, but the key-handling policy (where viewing keys are stored, who can request scans, audit/export flows) is undecided. *(vault: `question-viewing-keys-compliance`)*
+  3. **Proving UX** — S6.4 numbers (above) quantify prove/verify; a product decision is still open on where proving runs for end users (embedded wallet vs prover service) given the measured prove time. *(vault: `question-constrained-proving-ux`)*
+  4. **Anonymity bootstrap** — the Merkle tree starts at one leaf in tests; a production anonymity set (how many notes exist before a transfer can be "anonymous") needs a genesis policy. *(vault: `question-anonymity-bootstrap-policy`)*
 
 ## Phase 1 — Wire integrity: sign, verify, dedup correctly
 *Closes: C1, C4, C7, L1. This is the highest-leverage phase — it makes the wire path actually
@@ -1514,19 +1515,72 @@ repo.*
   tests above. Because the remediation does not alter the wire shape, the AUDIT compatibility note
   called out in the original finding's option (a) is **not** required here. Full workspace suite green
   (429+ tests); `cargo check` clean.
-- [ ] **7.2 Cross-process determinism fixture** — same stake set in different key orders /
+- [x] **7.2 Cross-process determinism fixture** — same stake set in different key orders /
   serializations → identical leader, shards, and finalizer selection; same logical block →
-  identical hash (guards 2.1/2.2 permanently).
-- [ ] **7.3 Concurrency tests** — `BlockFinalized` append race; registration capacity TOCTOU
+  identical hash (guards 2.1/2.2 permanently). — *done 2026-10-01*
+  Files: `src/epoch/tests/determinism.rs` (4 tests).
+  Same 7-staker / 6-executor logical sets inserted in three orders (as-is / reversed / rotated)
+  swept across all four selection domains × 4 epochs × 3 tips × 3 salts: `deterministic_select`
+  (leader + finalizer + shard-index + shuffle domains), `LeaderSelector::select`,
+  `deterministic_select_shard` (shard counts 1–3, multiple tx ids — asserts zero-stake exclusion
+  per variant), and `ExecutorSet::shuffler` permutations — all order-invariant. Canonical
+  `canonical_bytes`/`fingerprint` invariance pinned for both `StakeSet` and `ExecutorSet` with a
+  non-vacuity control. Block hashing: same logical block with `token_metadata` and
+  `executor_sigs` HashMaps inserted in different orders → identical `create_hash`, plus three
+  discriminating controls (timestamp, metadata value, dropped signature all change the hash).
+  Full workspace suite green (1029 / 37 / 0).
+- [x] **7.3 Concurrency tests** — `BlockFinalized` append race; registration capacity TOCTOU
   (admission closed by 6.3);
   reconcile-then-advance epoch interaction; ThreadPool job-panic → worker death → Drop.
-- [ ] **7.4 Boundary & adversarial tests** — quorum 0.0/100.0; duplicate nonce; mixed
+  — *done 2026-10-01 (three parts pre-existing, one landed now)*
+  - Append race: `committer/src/committer/tests/finality.rs` —
+    `concurrent_block_finalized_submissions_no_panic` + `concurrent_sibling_blocks_exactly_one_appended`.
+  - Registration capacity TOCTOU: `src/node/registry/tests/registration.rs` —
+    `concurrent_admission_never_exceeds_capacity` (admission itself closed by 6.3).
+  - Reconcile-then-advance: **new** `committer/src/committer/tests/epoch.rs` —
+    `handle_epoch_reconcile_advances_epoch_and_detector_together` (wire entry point advances
+    exactly one epoch, detector mirrors the counter, repeatable) and
+    `handle_epoch_reconcile_surfaces_snapshot_persist_failure` (fail-closed propagation).
+  - ThreadPool job-panic → worker death: `src/server.rs` —
+    `async_job_panic_terminates_the_async_worker_and_later_jobs_never_run` (+ the tokio
+    non-poisoning assumption guard), replacing the C#-port-era deferred test.
+- [x] **7.4 Boundary & adversarial tests** — quorum 0.0/100.0; duplicate nonce; mixed
   zero-stake selection sets; EOF/busy-spin on `TcpConnection`; hung data service; directory
   response with poisoned entries; heartbeat without signature; over-limit frames.
+  — *done 2026-10-01 (all cases covered; two added now, six pre-existing and listed here)*
+  - Quorum bounds: zero rejected (`spec_validate_rejects_quorum_percentage_zero`,
+    `..._shard_quorum_percentage_zero`), >100 rejected (`..._over_100`); inclusive 100.0
+    acceptance **new 10/01/2026** (`spec_validate_accepts_quorum_exactly_100`).
+  - Duplicate nonce: `src/registry/tests/pending.rs` — `enqueue_to_pool_rejects_duplicate_nonce`.
+  - Mixed zero-stake selection: `src/epoch/tests/leader.rs` —
+    `deterministic_select_zero_stake_returns_none`, `..._skips_zero_stake_key`,
+    `deterministic_select_shard_excludes_zero_stake_executor` (Phase 6.6 set).
+  - EOF/busy-spin on `TcpConnection`: `src/conns.rs` — Phase 6.4 trio:
+    `tcp_connection_read_loop_exits_on_peer_disconnect`, mid-frame-EOF variant,
+    `tcp_connection_healthy_then_disconnect`.
+  - Hung data service: `src/data.rs` — `get_user_returns_timeout_on_non_responding_data_service`
+    (+ the 10/01 `wire_format_tests` connect-refusal / garbage cases).
+  - Poisoned directory entries: `src/node/registry/tests/registration.rs` — five cases:
+    valid-registers, `rejects_invalid_signature`, `rejects_unregistered_responder`,
+    `rejects_real_key_attacker_rhash`, `poisoned_cannot_change_registered_rhash`,
+    `rejects_tampered_registry_type`.
+  - Heartbeat without signature: `forged_heartbeat_does_not_refresh_last_seen` (bogus sig,
+    Phase 1.6) + **new** `heartbeat_without_any_signature_does_not_refresh_last_seen`
+    (literally-empty signature variant, 10/01/2026).
+  - Over-limit frames: `src/conns/senders.rs` — `test_uds_sender_rejects_oversized`
+    (MAX_FRAME_SIZE pre-allocation guard in `get_data`/`get_data_async`).
 
 ## Done-when (overall)
 
-1. All boxes checked, each with its regression test in place.
-2. `cargo check` clean; full workspace test suite green (including the new 7.x tests).
+1. All boxes checked, each with its regression test in place. — *met 10/01/2026: every phase
+   item is checked; the remaining unchecked list is exactly the four S-close DECISION gates
+   (circuit audit, viewing-key policy, proving UX, anonymity bootstrap) — operational/decision
+   gates by the list's own header, not code items, each tracked as a question node in the vault.*
+2. `cargo check` clean; full workspace test suite green (including the new 7.x tests). — *met
+   10/01/2026: 1029 passed / 37 ignored / 0 failed.*
 3. A clean multi-process (≥ 2 nodes per role) run completes a transaction end-to-end over the
-   real wire path — the scenario the audit found inoperable.
+   real wire path — the scenario the audit found inoperable. — *partially met: the e2e pipeline
+   test (`tests/pipeline_integration.rs`) runs ≥2 instances per role over real RNS UDP sockets
+   in-process (5 RNS nodes, 9 identities), and the composite node-server container boots the full
+   stack; a separate-process-per-role deployment run has not been executed (blocked on the
+   external data service, by design fail-closed at boot). Kept open deliberately.*

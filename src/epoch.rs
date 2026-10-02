@@ -43,6 +43,7 @@ mod tests {
     pub mod helpers;
     mod boundary;
     mod candidates;
+    mod determinism;
     mod leader;
     mod proposer;
     mod snapshot_cache;
