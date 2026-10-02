@@ -8,7 +8,7 @@ summary: "One factory and four trait families (Connection/Sender/Stream/Listener
 auto_inject: false
 applicable_when: "Adding a transport, touching src/conns/**, or building a new local service-to-service channel. For inter-node role traffic, see concept-rns-transport (RNS is the production wire)."
 confidence: 0.95
-verified_at: "09/25/2026"
+verified_at: "10/01/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If the Connection/Sender/Stream/Listener trait shapes in src/conns change, or a third transport type is added"
 tags: [networking, traits, tcp, uds, factory, framing]
@@ -25,6 +25,10 @@ edges:
     type: supports
     weight: 0.8
     note: "UDS symlink rejection and the 16 MiB frame cap are fail-closed instantiations"
+  - target: question-conns-review-flags
+    type: related_to
+    weight: 0.6
+    note: "RESOLVED 10/01/2026: the dead ConnError variants and HEARTBEAT_PORT are deleted, and StreamReader::read_exact now mirrors the sync trait's unit-returning contract"
 related: []
 source_url: "Empty"
 ---
@@ -35,7 +39,7 @@ source_url: "Empty"
 
 - **`Connection`** (src/conns.rs:79-82): `async send(&self, data: &Vec<u8>) -> Result<(), ConnError>` — the node-to-node connection primitive; `TcpConnection` implements it with a read-loop `JoinHandle`.
 - **`Sender`** (src/conns/senders.rs:18-23): request/response over a fresh socket; wire form is `[4-byte BE length][auth_tag(32) || body]`. The 32-byte HMAC tag is a no-op when no shared secret is configured; `CONNECT_TIMEOUT_SECS = 5` (senders.rs:12), `AUTH_TAG_LEN = 32` (senders.rs:14).
-- **`Stream`** (src/conns/streams.rs): synchronous `read_exact`/`write_all`/`into_split`; `into_split` flips the socket nonblocking and hands it to tokio via `from_std`, powering the async `StreamReader`/`StreamWriter` traits.
+- **`Stream`** (src/conns/streams.rs): synchronous `read_exact`/`write_all`/`into_split`; `into_split` flips the socket nonblocking and hands it to tokio via `from_std`, powering the async `StreamReader`/`StreamWriter` traits. Both traits' `read_exact` return success-with-unit (normalized 10/01/2026): EOF-before-fill is always `ConnError::ReadError` / an io error — a short-but-successful read is not expressible.
 - **`Listener`** (src/conns/listeners.rs:1-57): `accept() -> Box<dyn Stream>`; `CoreUdsListener::new` runs `prepare_socket_path` first.
 
 `ConnFactory` (src/conns/factories.rs:112) ties them together: `get_sender` / `get_listener` / `create_connection`, with a default 15 s read/write timeout (factories.rs:17) and `shared_secret: Option<Vec<u8>>`. `ConnTarget::Remote(addr)` maps to TCP; `Local(LocalTarget::Tcp | LocalTarget::Unix)` picks the local transport — and UDS **fails loudly** (`NOT_UNIX_MESSAGE`) on non-Unix builds instead of silently falling back.

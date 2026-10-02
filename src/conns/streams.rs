@@ -192,15 +192,15 @@ impl Stream for CoreTcpStream {
 #[async_trait]
 pub trait StreamReader : Send + Sync {
     /// Fill `buffer` completely, awaiting readiness between socket reads
-    /// (Tokio loops the partial reads itself). Returns the number of bytes
-    /// read, which on success is `buffer.len()`. If the peer closes before the
+    /// (Tokio loops the partial reads itself). If the peer closes before the
     /// buffer is full, Tokio's `read_exact` fails with `UnexpectedEof` and this
     /// surfaces as `ConnError::ReadError` — EOF is an error, never a
-    /// short-but-successful read. The `TcpConnection` read loop treats that
-    /// error as terminal (its `Err(_) => break` arm in `conns.rs`). No
-    /// deadline is applied; a silent peer
-    /// parks the future indefinitely.
-    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<usize, ConnError>;
+    /// short-but-successful read, which is why the success arm carries no byte
+    /// count (a completed fill is always `buffer.len()`; the count could carry
+    /// no information). The `TcpConnection` read loop treats the error as
+    /// terminal (its `Err(_) => break` arm in `conns.rs`). No deadline is
+    /// applied; a silent peer parks the future indefinitely.
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), ConnError>;
 }
 
 /// Async read half over a Unix domain socket: owns the
@@ -221,9 +221,11 @@ impl UdsReader {
 
 #[async_trait]
 impl StreamReader for UdsReader {
-    async fn read_exact(&mut self, mut buffer: &mut [u8]) -> Result<usize, ConnError> {
-        match self.inner_reader.read_exact(&mut buffer).await {
-            Ok(bytes_read) => Ok(bytes_read),
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), ConnError> {
+        match self.inner_reader.read_exact(buffer).await {
+            // Tokio reports Ok(buffer.len()) on a completed fill; the count is
+            // deliberately dropped — see the trait contract above.
+            Ok(_) => Ok(()),
             Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
         }
     }
@@ -248,9 +250,11 @@ impl TcpReader {
 
 #[async_trait]
 impl StreamReader for TcpReader {
-    async fn read_exact(&mut self, mut buffer: &mut [u8]) -> Result<usize, ConnError>{
-        match self.inner_reader.read_exact(&mut buffer).await {
-            Ok(bytes_read) => Ok(bytes_read),
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), ConnError> {
+        match self.inner_reader.read_exact(buffer).await {
+            // Tokio reports Ok(buffer.len()) on a completed fill; the count is
+            // deliberately dropped — see the trait contract above.
+            Ok(_) => Ok(()),
             Err(err) => Err(ConnError::ReadError(Some(err.to_string())))
         }
     }
@@ -460,8 +464,7 @@ pub mod streams_tests {
             writer.write_all(&msg).await.unwrap();
             
             let mut buf = vec![0; msg.len()];
-            let n = reader.read_exact(&mut buf).await.unwrap();
-            assert_eq!(n, msg.len());
+            reader.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, msg);
         });
     }
@@ -488,8 +491,7 @@ pub mod streams_tests {
             writer.write_all(&msg).await.unwrap();
             
             let mut buf = vec![0; msg.len()];
-            let n = reader.read_exact(&mut buf).await.unwrap();
-            assert_eq!(n, msg.len());
+            reader.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, msg);
         });
     }

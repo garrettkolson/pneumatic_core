@@ -85,7 +85,7 @@ Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
 | `question-constrained-proving-ux` | Client-side proving performance on constrained devices (wallet UX) | Open: S6.4 will measure client proving time to decide if client-side Halo2 proving is acceptable on the intended wallet hardware class; seconds-scale proving may be too slow. | 4 |
 | `question-external-audit-before-real-value` | External audit of the Action circuit before real value | Open: before shielded transfers touch real value, the Action circuit needs external review/audit — a silently-accepting invalid proof is a zk constraint bug, a different risk class from a Rust bug. | 5 |
 | `question-viewing-keys-compliance` | Viewing keys / compliance: open product decision | Unresolved: should recipients (merchants, auditors, compliance) receive viewing keys that can decrypt note ciphertexts? Roadmark flags this as a product decision, not an engineering one. | 3 |
-| `question-conns-review-flags` | Conns-layer review flags from the Phase 8 rustdoc pass | Dead ConnError variants (CouldNotEstablishStream, ConnectionRejectedByRemote), HEARTBEAT_PORT declared but bound nowhere, sync/async read_exact return-type asymmetry — each needs wire/delete/document. | 3 |
+| `question-conns-review-flags` | RESOLVED 10/01/2026: conns review flags confirmed and fixed | All three verified defects fixed: two never-constructed ConnError variants + zero-reference HEARTBEAT_PORT deleted; StreamReader::read_exact normalized to Result<(), ConnError>; suite stayed 997/0/37. | 2 |
 
 ## playbook (0)
 

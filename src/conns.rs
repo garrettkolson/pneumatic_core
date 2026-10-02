@@ -260,8 +260,6 @@ pub enum ConnError {
     /// A peer sent a frame the framing contract forbids — in practice a
     /// length header exceeding [`MAX_FRAME_SIZE`] (the SA_08 DoS guard).
     MalformedData(String),
-    /// A connection was attempted but no usable stream resulted.
-    CouldNotEstablishStream,
     /// A framed write failed partway; the stream is no longer trusted to be
     /// in sync with the peer's frame parser.
     WriteError(Option<String>),
@@ -269,9 +267,6 @@ pub enum ConnError {
     /// completed, i.e. the peer disconnected (the terminal signal the
     /// `TcpConnection` read loop breaks on).
     ReadError(Option<String>),
-    /// The remote side refused the connection at the protocol level, as
-    /// opposed to an I/O failure.
-    ConnectionRejectedByRemote,
     /// Cryptographic decryption failure on a network-reachable path
     DecryptError(String),
     /// Blocking read/write exceeded its timeout (hung peer)
@@ -285,12 +280,8 @@ impl Debug for ConnError {
         match self {
             ConnError::IO(msg) => f.debug_tuple("IO").field(msg).finish(),
             ConnError::MalformedData(msg) => f.debug_tuple("MalformedData").field(msg).finish(),
-            ConnError::CouldNotEstablishStream => f.write_str("CouldNotEstablishStream"),
             ConnError::WriteError(msg) => f.debug_tuple("WriteError").field(msg).finish(),
             ConnError::ReadError(msg) => f.debug_tuple("ReadError").field(msg).finish(),
-            ConnError::ConnectionRejectedByRemote => {
-                f.write_str("ConnectionRejectedByRemote")
-            }
             ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
             ConnError::Timeout(msg) => f.debug_tuple("Timeout").field(msg).finish(),
             ConnError::Unauthenticated(msg) => f.debug_tuple("Unauthenticated").field(msg).finish(),
@@ -303,12 +294,8 @@ impl Display for ConnError {
         match self {
             ConnError::IO(msg) => write!(f, "IO({})", msg),
             ConnError::MalformedData(msg) => write!(f, "MalformedData({})", msg),
-            ConnError::CouldNotEstablishStream => f.write_str("CouldNotEstablishStream"),
             ConnError::WriteError(msg) => write!(f, "WriteError({:?})", msg),
             ConnError::ReadError(msg) => write!(f, "ReadError({:?})", msg),
-            ConnError::ConnectionRejectedByRemote => {
-                f.write_str("ConnectionRejectedByRemote")
-            }
             ConnError::DecryptError(msg) => f.debug_tuple("DecryptError").field(msg).finish(),
             ConnError::Timeout(msg) => write!(f, "Timeout({})", msg),
             ConnError::Unauthenticated(msg) => write!(f, "Unauthenticated({})", msg),
@@ -320,11 +307,6 @@ impl Display for ConnError {
 /// Prevents memory-exhaustion DoS from attacker-controlled `data_length`.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
-/// Heartbeat/liveness channel port (42000). Reserved in the table; the
-/// current heartbeat protocol runs over the registry connections
-/// (`node/registry/heartbeat.rs`) and does not bind this port — see the
-/// Phase 8 review note.
-pub const HEARTBEAT_PORT: u16 = 42000;
 /// External (peer-facing) port for the Committer. See [`get_external_port`]
 /// for the port-pair table and its distinctness invariant.
 pub const COMMITTER_PORT: u16 = 42001;
