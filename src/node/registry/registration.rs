@@ -89,6 +89,56 @@ pub fn register_peer(
     true
 }
 
+/// Install a peer **vouchably**, using the binding carried by `binding` (a
+/// `Register` we accepted, or a `RegisterAck` we received).
+///
+/// Same placement rules as [`register_peer`] (an existing key is refreshed and
+/// re-addressed, a new one is admitted only under the type's capacity), but the
+/// node is stored with [`NodeRegistryNode::with_binding`] so our own directory
+/// responses can list it — `handle_request` skips entries with an empty
+/// `directory_signature`. That adds no new trust: the signature covers
+/// `(that node's rhash, requested_type, node_types)`, the very triple the
+/// caller verified before invoking this.
+pub fn register_peer_with_binding(
+    &self,
+    key: Vec<u8>,
+    rhash: [u8; 16],
+    node_type: &NodeRegistryType,
+    conn: Box<dyn Connection>,
+    binding: &NodeRequest,
+) -> bool {
+    let Some(nodes) = self.get_nodes(node_type) else {
+        return false;
+    };
+
+    if let Some(mut entry) = nodes.get_mut(&key) {
+        let entry = entry.value_mut();
+        entry.rhash = rhash;
+        entry.conn = conn;
+        entry.last_seen = Instant::now();
+        entry.directory_signature = binding.binding_signature.clone();
+        entry.directory_requested_type = binding.requested_type.clone();
+        entry.directory_node_types = binding.requester_types.clone();
+        return true;
+    }
+
+    if nodes.len() >= self.config.get_max_node_number(node_type) {
+        return false;
+    }
+
+    nodes.insert(
+        key,
+        NodeRegistryNode::with_binding(
+            rhash,
+            conn,
+            binding.binding_signature.clone(),
+            binding.requested_type.clone(),
+            binding.requester_types.clone(),
+        ),
+    );
+    true
+}
+
 pub(crate) fn select_registration_node_type(&self, request: &NodeRequest) -> Option<NodeRegistryType> {
     self.select_registration_node_types(request).into_iter().next()
 }
@@ -157,13 +207,87 @@ pub fn handle_control(&self, request: NodeRequest) -> Result<(), PneumaticError>
 
 /// Respond to a directory request with our entries for `requested_type`.
 fn handle_request(&self, request: &NodeRequest) {
-    let requested_type = request.requested_type.clone();
     let requester_rhash = request.requester_rhash;
 
-    // Build directory entries only from nodes we vouched for at
-    // registration (a non-empty `directory_signature`). A node learned
-    // via a directory response carries no binding of its own here, so we
-    // cannot re-vouch for it.
+    let Some(response) = self.build_directory_response(request) else {
+        return;
+    };
+
+    let Some(network) = &self.network else {
+        return;
+    };
+
+    let Ok(data) = serialize_to_bytes_rmp(&response) else {
+        eprintln!("[pneumatic] failed to serialize directory response; dropping response");
+        return;
+    };
+
+    // The response is data only — deliberately no `control` echo. It used to
+    // carry a `Request` in `control`, and because both binaries dispatch
+    // `control` and `data` independently rather than `else if`, the receiver ran
+    // `handle_control(Request)` on its own answer and replied to it: two peers
+    // exchange directory responses forever, each round a multi-KB Resource
+    // transfer, with no termination condition anywhere. A response is not a
+    // request. (Harmless while nothing sent directory requests; the peering
+    // initiator put traffic on this path.)
+    let frame = NetworkPacket {
+        control: None,
+        data: Some(data),
+    };
+    if let Err(e) = network.send_control_frame(requester_rhash, &frame) {
+        eprintln!(
+            "[pneumatic] directory response delivery to {:02x?} failed: {}",
+            requester_rhash, e
+        );
+    }
+}
+
+/// Build our answer to a directory request, or `None` when we must not answer.
+///
+/// Two gates, both fail-closed. **The requester must be a node we registered,
+/// and must prove it with its own binding.** Nothing sent directory requests
+/// before the peering initiator existed, so this handler had never been
+/// exercised on a live path and answered *anyone* — an open enumeration of the
+/// validator set to whichever UDP peer asked, and the reply loop described in
+/// [`NodeRegistry::handle_request`]. A node now registers first (the peering
+/// loop does exactly that) and can then ask; a request that arrives before its
+/// own `Register` is simply unanswered and retried on the next tick.
+///
+/// **Only nodes we hold a binding for are listed** — a node learned from a
+/// directory response carries no binding of its own here, so we cannot
+/// re-vouch for it.
+pub(crate) fn build_directory_response(
+    &self,
+    request: &NodeRequest,
+) -> Option<NodeRegistryResponse> {
+    let requested_type = request.requested_type.clone();
+
+    // Verify before looking anything up, so a forged request never reaches the
+    // registry (same order as `handle_heartbeat`).
+    if !NodeIdentity::verify_binding(
+        &request.requester_key,
+        &request.requester_rhash,
+        &request.requested_type,
+        &request.requester_types,
+        &request.binding_signature,
+    ) {
+        eprintln!(
+            "[pneumatic] directory request from {:02x?} failed binding verification; not answering",
+            request.requester_rhash
+        );
+        return None;
+    }
+    if self
+        .find_node_type_by_public_key(&request.requester_key)
+        .is_none()
+    {
+        eprintln!(
+            "[pneumatic] directory request from unregistered node {:02x?}; not answering",
+            request.requester_rhash
+        );
+        return None;
+    }
+
     let entries: Vec<NodeRegistryEntry> = self
         .get_nodes(&requested_type)
         .map(|nodes| {
@@ -191,51 +315,21 @@ fn handle_request(&self, request: &NodeRequest) {
         directory_response_signature_payload(&entries, &requested_type, &self.config.rhash)
     else {
         eprintln!("[pneumatic] failed to serialize directory response; dropping response");
-        return;
+        return None;
     };
 
     let Ok(signature) = self.config.identity.sign_message(&payload_bytes) else {
         eprintln!("[pneumatic] failed to sign directory response; dropping response");
-        return;
+        return None;
     };
 
-    let response = NodeRegistryResponse {
+    Some(NodeRegistryResponse {
         responder_key: self.config.public_key.clone(),
         responder_rhash: self.config.rhash,
-        registry_type: requested_type.clone(),
+        registry_type: requested_type,
         entries,
         signature,
-    };
-
-    let Some(network) = &self.network else {
-        return;
-    };
-
-    let Ok(packet_bytes) = serialize_to_bytes_rmp(&NetworkPacket {
-        control: Some(NodeRequest {
-            requester_key: self.config.public_key.clone(),
-            requester_rhash: self.config.rhash,
-            request_type: NodeRequestType::Request,
-            requester_types: self.config.node_registry_types.clone(),
-            requested_type: requested_type.clone(),
-            binding_signature: vec![],
-        }),
-        data: Some(serialize_to_bytes_rmp(&response).unwrap_or_default()),
-    }) else {
-        eprintln!("[pneumatic] failed to serialize directory response; dropping response");
-        return;
-    };
-
-    if packet_bytes.is_empty() {
-        return;
-    }
-
-    if let Err(e) = network.send_to(requester_rhash, &packet_bytes) {
-        eprintln!(
-            "[pneumatic] directory response delivery to {:02x?} failed: {}",
-            requester_rhash, e
-        );
-    }
+    })
 }
 
 pub(crate) fn handle_register(&self, request: NodeRequest) {
@@ -414,48 +508,90 @@ fn handle_register_ack(
         return;
     }
 
-    let conn: Box<dyn Connection> = match &self.network {
-        Some(network) => Box::new(RnsConnection::new(responder_rhash, Arc::clone(network))),
-        None => Box::new(NullConnection),
+    // Which buckets the *responder* belongs in is what it declared for itself
+    // in this ack: `requester_types`, which the binding signature just verified
+    // covers. The ack's `node_type` is a different thing — it is the primary
+    // type *we* were registered under by the responder
+    // (`handle_register`, registration.rs:298-306). Filing the responder under
+    // that, which this handler used to do, puts a committer into our Finalizer
+    // bucket merely because *we* are a finalizer: we then send it `Sign`
+    // traffic it cannot serve, and still find nobody in the buckets we
+    // actually route to.
+    //
+    // A compliant responder never declares nothing (`reply_register_ack` fills
+    // the set from config), so the fallback keeps a legacy peer reachable
+    // instead of installing it nowhere.
+    let install_types: Vec<NodeRegistryType> = if request.requester_types.is_empty() {
+        vec![node_type.clone()]
+    } else {
+        request.requester_types.clone()
     };
 
-    if !self.register_peer(responder_key.clone(), responder_rhash, &node_type, conn) {
+    let mut admitted = 0;
+    for install_type in &install_types {
+        let conn: Box<dyn Connection> = match &self.network {
+            Some(network) => Box::new(RnsConnection::new(responder_rhash, Arc::clone(network))),
+            None => Box::new(NullConnection),
+        };
+        // Stored with the ack's binding: a peer we learned this way is vouchable
+        // in *our* directory responses, which is how a cluster grows past its
+        // bootstrap lists.
+        if self.register_peer_with_binding(
+            responder_key.clone(),
+            responder_rhash,
+            install_type,
+            conn,
+            request,
+        ) {
+            admitted += 1;
+        }
+    }
+    if admitted == 0 {
         eprintln!(
-            "[pneumatic] accepted RegisterAck for peer {:02x?} but directory is full",
+            "[pneumatic] accepted RegisterAck for peer {:02x?} but no bucket took it (unknown type or directory full)",
             responder_rhash
         );
     }
 }
 
-/// Reply to a `Register` with a signed `RegisterAck`. The ack is itself a
-/// `NodeRequest`, so it carries our own binding signature over
-/// `(our rhash, node_type, our types)` — the requester verifies it before
-/// storing us. `node_type` is the type the peer was actually registered
-/// under, which may differ from its `requested_type` when priority
-/// selection chose a different type.
-fn reply_register_ack(
+/// Build the `RegisterAck` for a peer whose `Register` we just processed (or
+/// rejected). Split out from [`reply_register_ack`] so the exact bytes a
+/// requester is going to verify can be produced — and asserted — without a
+/// socket, the same reason the peering module has builders.
+///
+/// The ack is itself a `NodeRequest`, carrying our binding signature over
+/// `(our rhash, node_type, our declared roles)`; the requester verifies it
+/// before storing us. `node_type` is the type the *peer* was registered under,
+/// which may differ from its `requested_type` when priority selection chose
+/// another.
+pub(crate) fn build_register_ack(
     &self,
-    peer_rhash: [u8; 16],
     accepted: bool,
     node_type: NodeRegistryType,
     reason: &str,
-) {
+) -> Option<NodeRequest> {
     let responder_key = if accepted {
         self.config.public_key.clone()
     } else {
         Vec::new()
     };
 
-    let Ok(binding) = self.config.identity.sign_binding(
-        &self.config.rhash,
-        &node_type,
-        &self.config.node_registry_types,
-    ) else {
+    // Declare the roles we actually serve, not `config.node_registry_types`
+    // (all four for a full node): the requester files us under exactly this
+    // set, so over-declaring would put a committer-only binary into its peers'
+    // Finalizer/Executor/Sentinel buckets. Same source as the peering builders,
+    // so a node's `Register` and its acks can never disagree about itself.
+    let declared = self.declared_roles();
+    let Ok(binding) = self
+        .config
+        .identity
+        .sign_binding(&self.config.rhash, &node_type, &declared)
+    else {
         eprintln!("[pneumatic] failed to sign RegisterAck binding; dropping ack");
-        return;
+        return None;
     };
 
-    let ack = NodeRequest {
+    Some(NodeRequest {
         requester_key: self.config.public_key.clone(),
         requester_rhash: self.config.rhash,
         request_type: NodeRequestType::RegisterAck {
@@ -464,9 +600,23 @@ fn reply_register_ack(
             responder_key,
             reason: reason.to_string(),
         },
-        requester_types: self.config.node_registry_types.clone(),
+        requester_types: declared,
         requested_type: node_type,
         binding_signature: binding,
+    })
+}
+
+/// Reply to a `Register` with a signed `RegisterAck` (see
+/// [`build_register_ack`]) over the transport, if there is one.
+fn reply_register_ack(
+    &self,
+    peer_rhash: [u8; 16],
+    accepted: bool,
+    node_type: NodeRegistryType,
+    reason: &str,
+) {
+    let Some(ack) = self.build_register_ack(accepted, node_type, reason) else {
+        return;
     };
 
     let Some(network) = &self.network else {
@@ -474,15 +624,16 @@ fn reply_register_ack(
         return;
     };
 
-    let Ok(packet_bytes) = serialize_to_bytes_rmp(&NetworkPacket {
+    let ack_frame = NetworkPacket {
         control: Some(ack),
         data: None,
-    }) else {
-        eprintln!("[pneumatic] failed to serialize RegisterAck; dropping ack");
-        return;
     };
 
-    if let Err(e) = network.send_to(peer_rhash, &packet_bytes) {
+    // Non-blocking on purpose: an ack to a peer whose route is not live yet
+    // simply fails here, and the requester's peering loop re-sends its
+    // `Register` on the next tick. Blocking 30 s inside a packet-handler thread
+    // would stall every other peer's traffic behind it.
+    if let Err(e) = network.send_control_frame(peer_rhash, &ack_frame) {
         eprintln!(
             "[pneumatic] RegisterAck delivery to {:02x?} failed: {}",
             peer_rhash, e

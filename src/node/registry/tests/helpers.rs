@@ -3,6 +3,7 @@
 //! here, pub-ified, re-exporting the module header's test-only types).
 
 use super::super::*;
+use crate::config::BootstrapPeer;
 
 
 pub fn registry_with_capacity(types: &[(NodeRegistryType, usize)]) -> NodeRegistry {
@@ -186,4 +187,63 @@ impl Connection for RecordingConnection {
             .try_send(data.clone())
             .map_err(|_| ConnError::IO("RecordingConnection channel full".into()))
     }
+}
+
+/// A fresh node identity. `Arc` because the peering tests hand the same
+/// identity to a `Config` (which stores `Arc<NodeIdentity>`) and still need to
+/// sign with and read from it.
+pub fn test_identity() -> Arc<NodeIdentity> {
+    Arc::new(NodeIdentity::generate_in_memory())
+}
+
+/// The `bootstrap_peers` wire form of an identity: its **RNS** public key in
+/// hex, which is what `Config::bootstrap_peers` stores and what a peer's rhash
+/// derives from — not the Ed25519 key.
+pub fn bootstrap_peer_for(identity: &NodeIdentity, port: u16) -> BootstrapPeer {
+    BootstrapPeer {
+        public_key: hex::encode(identity.rns.get_public_key().expect("rns public key")),
+        ip: "127.0.0.1".to_string(),
+        port,
+    }
+}
+
+/// A registry whose `Config` carries a *specific* identity, declared roles and
+/// bootstrap peers.
+///
+/// [`registry_with_capacity`] mints a throwaway identity it never exposes; the
+/// peering tests must control it, because a `Register` is only accepted when
+/// its binding verifies against the key the sender advertises, and a bootstrap
+/// peer's rhash must match the identity under test.
+pub fn registry_for(
+    identity: &Arc<NodeIdentity>,
+    types: &[(NodeRegistryType, usize)],
+    declared: &[NodeRegistryType],
+    bootstrap_peers: Vec<BootstrapPeer>,
+) -> NodeRegistry {
+    let mut type_configs = DashMap::new();
+    for (t, max) in types {
+        type_configs.insert(
+            t.clone(),
+            NodeTypeConfig { min: 0, max: *max, min_stake: 0 },
+        );
+    }
+    let mut config = Config::new_for_testing(
+        "test_env".to_string(),
+        Arc::new(DashMap::new()),
+        Arc::new(type_configs),
+    );
+    config.identity = Arc::clone(identity);
+    config.rhash = identity.rhash;
+    config.public_key = identity.ed25519.public_key().expect("ed25519 public key");
+    config.node_registry_types = declared.to_vec();
+    config.bootstrap_peers = bootstrap_peers;
+    NodeRegistry::init(Arc::new(config), None, Arc::new(|_, _| true))
+}
+
+/// How many nodes sit under `node_type`. Panics if the type has no registry,
+/// which in a test means the fixture forgot to configure that type.
+pub fn bucket_len(reg: &NodeRegistry, node_type: &NodeRegistryType) -> usize {
+    reg.get_nodes(node_type)
+        .expect("type configured in this fixture")
+        .len()
 }

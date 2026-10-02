@@ -442,13 +442,69 @@ impl RnsNetwork {
             control: None,
             data: Some(payload.to_vec()),
         };
-        let frame_bytes = crate::encoding::serialize_to_bytes_rmp(&frame)
-            .map_err(|e| PneumaticError::Network(format!("data-plane frame serialize: {e}")))?;
+        self.send_frame(rhash, &frame)
+    }
+
+    /// Serialize an already-framed [`crate::node::NetworkPacket`] and route it
+    /// by size — the single place that rule lives, shared by the data plane
+    /// ([`send_data_packet`]) and the control plane
+    /// (`NodeRegistry::send_control`, which used to call `send_to` directly and
+    /// so could never deliver a control frame).
+    ///
+    /// The control plane needs the same split for the reason audit 7.1 found
+    /// for the data plane: a control frame is ~5.9 KB once the binding
+    /// signature carries the PQC hybrid (`[Ed25519 sig · ML-DSA pk · ML-DSA
+    /// sig]`), so the ~481 B direct-packet cap cannot carry a `Register` at
+    /// all. Above the cap the frame rides the Resource path, which has no size
+    /// limit but does need a live route — which is why
+    /// [`NodeRegistry::send_control`] checks [`route_is_live`] first instead of
+    /// blocking 30 s inside [`send_resource_to`] on a peer whose announce has
+    /// not arrived yet.
+    pub fn send_frame(
+        &self,
+        rhash: [u8; 16],
+        frame: &crate::node::NetworkPacket,
+    ) -> Result<(), PneumaticError> {
+        let frame_bytes = crate::encoding::serialize_to_bytes_rmp(frame)
+            .map_err(|e| PneumaticError::Network(format!("frame serialize: {e}")))?;
         if frame_bytes.len() <= DIRECT_PACKET_PLAINTEXT_MAX {
             self.send_to(rhash, &frame_bytes)
         } else {
             self.send_resource_to(rhash, frame_bytes)
         }
+    }
+
+    /// Deliver a control-plane frame, **without ever blocking** on a route that
+    /// is not up yet.
+    ///
+    /// Same size rule as [`send_frame`]; the difference is the not-live case.
+    /// Control frames are ~5.9 KB (the hybrid binding signature is ~3.8 KB), so
+    /// they always take the Resource path, and [`send_resource_to`] waits up to
+    /// 30 s for a link to come up. Its callers are the packet-handler threads
+    /// and the peering loop — stalling four workers on a peer that has not
+    /// announced yet would delay every other peer's traffic behind it. So this
+    /// answers "not yet" immediately. It is the correct answer for all three
+    /// control senders (`Register`, `RegisterAck`, directory response), because
+    /// each is idempotent and each has a retry loop behind it: the failed ack or
+    /// response costs one tick, not the peering.
+    pub fn send_control_frame(
+        &self,
+        rhash: [u8; 16],
+        frame: &crate::node::NetworkPacket,
+    ) -> Result<(), PneumaticError> {
+        let frame_bytes = crate::encoding::serialize_to_bytes_rmp(frame)
+            .map_err(|e| PneumaticError::Network(format!("control frame serialize: {e}")))?;
+        if frame_bytes.len() <= DIRECT_PACKET_PLAINTEXT_MAX {
+            return self.send_to(rhash, &frame_bytes);
+        }
+        if !self.route_is_live(rhash) {
+            return Err(PneumaticError::Resource(format!(
+                "no live route to {rhash:02x?} for a {} B control frame (direct cap {DIRECT_PACKET_PLAINTEXT_MAX} B); \
+                 retry after its announce",
+                frame_bytes.len()
+            )));
+        }
+        self.send_resource_to(rhash, frame_bytes)
     }
 
     /// Send `payload` over the native Resource transfer path to `rhash`, bypassing

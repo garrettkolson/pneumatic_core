@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data service, the get_user trait-default defect, the 1047 baseline, and the open testnet-launcher task).
+Last rebuilt: 10/02/2026 (control-plane peering: +4 facts — the peering initiator, four silent control-plane drop paths, the RegisterAck bucket-placement defect, the 1064 baseline; task-testnet-launcher downgraded to PARTIAL; section headers/totals reconciled against files on disk — the fact, question and event headers were each under-counting).
 
 ## pillar (2)
 
@@ -78,7 +78,7 @@ Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data servi
 | `concept-validation-specs` | Validation spec framework: traits, registries, fail-closed lookup | TransactionValidationSpec/BlockValidatorSpec traits with name-keyed registries; SelfSigned vs Executed specs; unregistered specs and unknown shielded actions fail closed. | 4 |
 | `concept-telemetry-health-metrics` | Telemetry layer: tracing + Prometheus-text metrics + HTTP health, with graceful-shutdown ordering | src/telemetry.rs is the ops surface: init_tracing, atomic Metrics (Prometheus text), HealthState (200→503 draining), minimal HTTP over tokio, wait_for_shutdown_signal; fixed binary drain order; no consensus hot path instrumented. | 3 |
 
-## question (4)
+## question (5)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -97,7 +97,7 @@ Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data servi
 
 | id | title | summary | edges |
 |---|---|---|---|
-| `task-testnet-launcher` | Testnet launcher: peering initiator, key/genesis generator, sparse-topology allocator | OPEN. A multi-node testnet still needs a boot-time Register initiator (nothing in production populates a role registry from peers), pre-generated keystores feeding a centrally computed peer/port matrix, and a topology respecting RNS's point-to-point interfaces. Corrects two false ceilings: rns-net 0.7.0 has no max_peers or interface_count. | 6 |
+| `task-testnet-launcher` | Testnet launcher: key/genesis generator, sparse-topology allocator | PARTIAL. The peering initiator landed 10/02/2026 — nodes now register with each other over UDP. Remaining: pre-generated keystores feeding a centrally computed peer/port matrix, and a topology respecting RNS's point-to-point interfaces for the 20-40 node target. Corrects two false ceilings: rns-net 0.7.0 has no max_peers or interface_count. | 6 |
 | `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | COMPLETED 09/23/2026: all seven steps landed (cache dedup, 4 crate splits, 4 root-lib splits, core authenticate_envelope C1 helper, executor tests move). Workspace 828/32/0. | 5 |
 | `task-data-provider-wire-tests` | RESOLVED 10/01/2026: DefaultDataProvider wire-format tests (data.rs) — all five test-gap items closed | CLOSED: wire_format_tests (9) in data.rs plus siblings — server.rs async poison (2), epoch stubs (3), config load/parse (10 via path-injected seams); send_to_all already covered by Phase 6.2 fanout.rs. Suite 997 → 1021/37/0. | 3 |
 | `task-e2e-pipeline-integration-test` | DONE: e2e pipeline integration test (sentinel → executor → finalizer → committer) | CLOSED 07/26/2026: full-pipeline test at tests/pipeline_integration.rs — SUB→SENT→EXEC→FIN→COMM over RNS (5 nodes, 9 identities, 2/role); closes the audit's Done-when. Findings: Resource path needs a direct link; rns-net 0.7.0 port-wiring rule. | 4 |
@@ -107,7 +107,7 @@ Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data servi
 | `task-s5-4-real-pool-swap` | S5.4 — Composite node-server: real Arc<ShieldedPool> wiring | DONE 2026-09-22: composite role views are the shared Arc<ShieldedPool> itself (no composed view); fast action-gate discriminator + live e2e (4 dispatch hops) + live conflict lockstep-rollback tests; 847 passed / 16 ignored. | 7 |
 | `task-s6-shielded-completion` | S6 — Shielded Tier-1 completion: attacks, concurrency, cross-crate pipeline, proving UX | CLOSED 2026-09-25: attack suite + nullifier/Merkle concurrency + cross-crate 4-hop pipeline with wire-byte privacy assertion + prove/verify timing; 834/37/0; Tier-1 feature-complete. | 5 |
 
-## event (7)
+## event (8)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -138,10 +138,14 @@ Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data servi
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (19)
+## fact (25)
 
 | id | title | summary | edges |
 |---|---|---|---|
+| `fact-control-plane-peering` | Peering initiator: the control plane now has a client half | 10/02/2026: `peering.rs` sends Register / directory Request / Heartbeat on a 10 s retry loop from both binaries. Nodes advertise `declared_roles`, and a control frame's ~5.9 KB size means peering can only start after the peer's announce makes its route live. | 6 |
+| `fact-control-plane-silent-drop-paths` | Four control-plane paths that dropped packets without an error | RESOLVED 10/02/2026: a bare NodeRequest outside a NetworkPacket decodes as an empty packet and vanishes; ~5.9 KB replies went out on the 481 B direct path; a directory response echoed a Request (infinite peer-to-peer reply loop); and the directory answered any caller. | 4 |
+| `fact-register-ack-bucket-placement-defect` | RegisterAck filed the responder under the requester's role | RESOLVED 10/02/2026: handle_register_ack installed the peer under the ack's node_type — the type the *requester* was registered under — so a finalizer filed its committer peer into its own Finalizer bucket. Now files under the responder's own declared set. | 3 |
+| `fact-test-suite-peering` | Test baseline 2026-10-02 (peering): 1064 passed / 37 ignored / 0 failed | 10/02/2026 baseline after the peering initiator: 1064/37/0 (+17) — 16 control-plane unit tests and the first two-node-over-UDP peering end-to-end test; supersedes fact-test-suite-testnet. | 2 |
 | `fact-data-service` | Data service ships in-repo (data-service crate) | The required data service now ships as the data-service crate / pneumatic_data_service binary: framed MsgPack store speaking DataOp, byte-opaque by design, plus a genesis seeder writing through the client API so envelope fingerprints cannot drift. | 5 |
 | `fact-data-user-trait-default-defect` | DefaultDataProvider ignored its configured source for user lookups | RESOLVED 10/02/2026: get_user/save_user were private inherent methods, so the trait impl inherited the default that builds a FRESH provider with the DEFAULT local source — every Arc<dyn DataProvider> caller silently ignored PNEUMATIC_DATA_ADDR for user reads. | 5 |
 | `fact-test-suite-testnet` | Test baseline 2026-10-02 (data service): 1047 passed / 37 ignored / 0 failed | 10/02/2026 baseline after the data-service crate and the get_user fix: 1047/37/0 (+18) — 14 wire tests, 3 committer boot-gate tests, 1 genesis-example guard; supersedes fact-test-suite-audit7x. | 3 |
@@ -208,4 +212,4 @@ Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data servi
 
 ## Totals
 
-123 nodes. Logs (append-only, never indexed): see logs/.
+128 nodes. Logs (append-only, never indexed): see logs/.

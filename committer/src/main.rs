@@ -5,17 +5,15 @@ use dashmap::DashMap;
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::BasicHashProvider;
 use pneumatic_core::data::{DataProvider, DefaultDataProvider};
-use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
+use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::epoch::{BlockProposer, CandidateRegistry, Epoch, EpochBoundaryDetector};
 use pneumatic_core::gossiper::Gossiper;
 use pneumatic_core::logging::Logger;
 use pneumatic_core::node::registry::NodeRegistry;
 use pneumatic_core::node::stake_index::StakeIndex;
-use pneumatic_core::node::{NetworkPacket, NodeRequest, NodeRegistryResponse, NodeRegistryType};
-use pneumatic_core::node::NodeRequestType;
+use pneumatic_core::node::{NetworkPacket, NodeRegistryResponse, NodeRegistryType};
 use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::config_builder::RnsNodeConfigBuilder;
-use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::rns::wrapper::{AnnouncedIdentity, RnsNetwork};
 use pneumatic_core::telemetry::{
     init_tracing, spawn_health_server, wait_for_shutdown_signal, HealthState, Metrics,
@@ -181,7 +179,6 @@ async fn main() {
     //    to the node registry, data packets to the gossiper.
     if let Some(network_ref) = &network {
         let network = network_ref.clone();
-        let send_net = network.clone();
         let registry = node_registry.clone();
         let gossip = gossiper.clone();
         network.on_packet(Arc::new(move |raw: Vec<u8>| {
@@ -208,32 +205,29 @@ async fn main() {
             }
         }));
 
-        // 6. Discovery: when RNS announces a new peer, request its directory.
-        let dir_cfg = config.clone();
+        // 6. Peering. This binary serves one role, so declare only that one:
+        //    a peer admits us under every type we declare that clears its stake
+        //    gate, and declaring all four would put a committer into every
+        //    peer's Finalizer/Executor/Sentinel buckets.
+        node_registry.set_declared_roles(vec![NodeRegistryType::Committer]);
+        let registry_for_peering = node_registry.clone();
+        registry_for_peering.start_peering();
+
+        // 7. Discovery: when RNS announces a peer, register with it and ask it
+        //    for its directories. Both go through the registry's control-plane
+        //    senders rather than being assembled here, because the frame shape
+        //    and the declared role set are what the peer verifies — an ad-hoc
+        //    `NodeRequest` on the wire (what this handler used to send) decodes
+        //    as an empty `NetworkPacket` and is dropped without a word.
+        let peer_registry = node_registry.clone();
         network.on_announce(Arc::new(move |announced: AnnouncedIdentity| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let rhash = announced.identity_hash.0;
-            // A failed binding signature must surface as an error, not silently
-            // degrade into an empty binding_signature that every peer rejects.
-            let signature = NodeIdentity::sign_binding(
-                &dir_cfg.identity,
-                &rhash,
-                &NodeRegistryType::Committer,
-                &dir_cfg.node_registry_types,
-            ).map_err(|e| format!("directory request sign_binding failed: {}", e))?;
-            let payload = serialize_to_bytes_rmp(&NodeRequest {
-                requester_key: dir_cfg.public_key.clone(),
-                requester_rhash: dir_cfg.rhash,
-                request_type: NodeRequestType::Request,
-                requester_types: dir_cfg.node_registry_types.clone(),
-                requested_type: NodeRegistryType::Committer,
-                binding_signature: signature,
-            })?;
-            if payload.is_empty() {
-                return Err("directory request serialized to an empty payload".into());
-            }
-            send_net
-                .send_to(rhash, &payload)
-                .map_err(|e| format!("directory request to {:02x?} failed: {}", rhash, e))?;
+            // An announce means the route is live, which is when a control
+            // frame of this size can actually be delivered.
+            peer_registry
+                .register_with_peer(rhash)
+                .map_err(|e| format!("register with {:02x?} failed: {}", rhash, e))?;
+            peer_registry.request_directories_from_peer(rhash);
             Ok(())
         }));
     }

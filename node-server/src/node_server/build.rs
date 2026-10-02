@@ -41,7 +41,14 @@ pub fn build_runtime(
     // --- transport (RNS) — boot tolerated if it will not start --------------
     // Mirrors the committer boot recipe: the node still boots if the transport
     // cannot come up; it just cannot register or gossip.
-    let mut builder = RnsNodeConfigBuilder::new().with_transport_enabled(config.transport_enabled);
+    // Honoring `rns_port` is what lets more than one composite run on a host:
+    // without it every node binds the default 4242, the second one's interfaces
+    // fail to come up, and — because `panic_on_interface_error` is false and a
+    // transport failure is tolerated here — it boots "without transport" having
+    // registered nothing.
+    let mut builder = RnsNodeConfigBuilder::new()
+        .with_udp_port(config.rns_port)
+        .with_transport_enabled(config.transport_enabled);
     for peer in &config.bootstrap_peers {
         builder = builder.add_peer(&peer.ip, peer.port);
     }
@@ -209,6 +216,14 @@ pub fn build_runtime(
         installed.iter().map(|h| h.role()).collect();
     let role_dispatcher = Arc::new(TokioMutex::new(RoleDispatcher::new(installed)));
 
+    // Tell the registry what this node actually serves. Its config declares
+    // `node_registry_types` from `is_full_node` — all four for a full node —
+    // but a composite only *runs* the roles its stake qualified for, and a peer
+    // admits it under every type it declares. Without this, a node with only
+    // sentinel+executor plugins would appear in peers' finalizer buckets and
+    // receive `Sign` traffic it cannot serve.
+    node_registry.set_declared_roles(installed_roles.clone());
+
     // Wire the RNS transport to the in-process role dispatcher: control-plane
     // packets go to the node registry, data-plane packets route to the installed
     // role that owns the message's action (the `route_data_plane` unit, Phase 7).
@@ -225,6 +240,22 @@ pub fn build_runtime(
                         }
                     }
                     if let Some(data) = packet.data {
+                        // A data frame is either a directory response (control
+                        // plane's second half: a peer answering our `Request`)
+                        // or a pipeline `Message`. The committer has always
+                        // tried the directory first; without this branch a
+                        // composite silently discarded every directory
+                        // response, so it could never learn a peer it had not
+                        // bootstrapped with.
+                        if let Ok(response) = pneumatic_core::encoding::deserialize_rmp_to::<
+                            pneumatic_core::node::NodeRegistryResponse,
+                        >(&data)
+                        {
+                            if let Err(e) = registry.handle_directory_response(&response) {
+                                eprintln!("[pneumatic] directory response error: {}", e);
+                            }
+                            return;
+                        }
                         let d = dispatcher.clone();
                         tokio::spawn(async move {
                             route_data_plane(data, d).await
@@ -235,6 +266,31 @@ pub fn build_runtime(
                     eprintln!("[pneumatic] dropping undecodable transport packet: {}", e);
                 }
             }
+        }));
+
+        // Peering: this node announces itself to its bootstrap peers and asks
+        // them for role directories, then keeps both warm. A composite had no
+        // peering path at all before this — its registry only ever answered
+        // control traffic, and never sent any.
+        let peering_registry = node_registry.clone();
+        if !peering_registry.start_peering() {
+            eprintln!(
+                "[pneumatic] peering not started: {} role(s) installed — this node will \
+                 not appear in its peers' role directories",
+                installed_roles.len()
+            );
+        }
+
+        // And when a new peer announces, reach out to it immediately rather
+        // than waiting for the next peering tick.
+        let announce_registry = node_registry.clone();
+        network.on_announce(Arc::new(move |announced: pneumatic_core::rns::wrapper::AnnouncedIdentity| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let rhash = announced.identity_hash.0;
+            announce_registry
+                .register_with_peer(rhash)
+                .map_err(|e| format!("register with {:02x?} failed: {}", rhash, e))?;
+            announce_registry.request_directories_from_peer(rhash);
+            Ok(())
         }));
     }
 

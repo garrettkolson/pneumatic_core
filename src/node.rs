@@ -25,7 +25,13 @@ pub struct NodeTypeConfig {
 }
 
 /// Control-plane request types carried in `NodeRequest`.
-#[derive(Serialize, Deserialize)]
+///
+/// `Clone` is additive on purpose: the peering initiator signs a request once
+/// and sends the same signed bytes to every bootstrap peer (the binding covers
+/// only the sender's own triple, nothing about the receiver), which needs a
+/// cloneable request rather than one signature per peer. It has no effect on
+/// the wire form.
+#[derive(Serialize, Deserialize, Clone)]
 pub enum NodeRequestType {
     Register,
     Request,
@@ -158,7 +164,7 @@ pub enum NodeRegistryType {
 /// `(requester_rhash, requested_type, requester_types)`. Forging the claim
 /// requires the victim's Ed25519 private key, and actually receiving data
 /// addressed to the claimed rhash requires the victim's RNS private key.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NodeRequest {
     pub requester_key: Vec<u8>,
     /// Claimed transport address (rhash) of the sender; covered by the

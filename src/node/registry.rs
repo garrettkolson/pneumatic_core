@@ -53,6 +53,25 @@ pub struct NodeRegistry {
     /// the non-blocking map `len()` + `insert()` hold this; the blocking stake
     /// gate and connection setup in `handle_register` run outside it.
     admission_lock: Arc<std::sync::Mutex<()>>,
+    /// The boot-peering loop's handle ([`peering::NodeRegistry::start_peering`]).
+    /// Held so `Drop` can join it; the thread itself only keeps a `Weak<Self>`,
+    /// so it can never keep the registry alive.
+    peering: Mutex<Option<JoinHandle<()>>>,
+    /// The role set this node *actually serves*, as advertised in every
+    /// outbound control message (`Register`, `RegisterAck`, `Heartbeat`).
+    ///
+    /// Seeded from `config.node_registry_types`, which for a full node is all
+    /// four types — but a node's real roles are narrower and change: a
+    /// composite installs the role plugins its stake qualifies for, and a
+    /// committer-only binary serves exactly one. Declaring more than we serve
+    /// is not cosmetic: a receiver admits us under every declared type that
+    /// clears its stake gate (`handle_register`), so over-declaring puts us in
+    /// buckets whose traffic we cannot serve.
+    ///
+    /// Interior mutability rather than a rebuild: `Config` is shared as an
+    /// `Arc` and roles are re-evaluated per epoch, so the registry is told at
+    /// install time and every outbound message picks the new set up.
+    declared_roles: std::sync::RwLock<Vec<NodeRegistryType>>,
 }
 
 /// Canonical bytes for a directory response's envelope signature: the full
@@ -152,6 +171,8 @@ pub fn init(
     network: Option<Arc<RnsNetwork>>,
     stake_check: StakeCheck,
 ) -> Self {
+    // Read before `config` is moved into the struct below.
+    let declared_roles = std::sync::RwLock::new(config.node_registry_types.clone());
     let registry = NodeRegistry {
         committers: Arc::new(DashMap::new()),
         sentinels: Arc::new(DashMap::new()),
@@ -167,6 +188,8 @@ pub fn init(
         delivery_failures: Arc::new(DashMap::new()),
         send_timeout: SEND_TIMEOUT,
         admission_lock: Arc::new(std::sync::Mutex::new(())),
+        peering: Mutex::new(None),
+        declared_roles,
     };
     let mut registry = registry;
     if network.is_some() {
@@ -282,7 +305,10 @@ impl Connection for NullConnection {
 /// leak.
 impl Drop for NodeRegistry {
     fn drop(&mut self) {
+        // `stop_eviction` sets the shared shutdown flag both loops poll, so it
+        // must run first: `stop_peering` only joins.
         self.stop_eviction();
+        self.stop_peering();
     }
 }
 
@@ -302,6 +328,7 @@ fn evict_expired(notes: &[Arc<DashMap<Vec<u8>, NodeRegistryNode>>]) {
 }
 pub mod fanout;
 pub mod heartbeat;
+pub mod peering;
 pub mod registration;
 
 // ---------------------------------------------------------------------------
@@ -314,5 +341,6 @@ mod tests {
     mod fanout;
     mod heartbeat;
     mod lifecycle;
+    mod peering;
     mod registration;
 }
