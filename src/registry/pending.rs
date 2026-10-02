@@ -21,6 +21,19 @@ impl PendingTransactionRegistry {
         self.transactions.contains_key(id)
     }
 
+    /// Number of in-flight (standard-lifecycle) transactions tracked.
+    /// Read-only depth gauge for operator metrics (Phase 8); touches nothing
+    /// but the DashMap's own length.
+    pub fn in_flight_count(&self) -> usize {
+        self.transactions.len()
+    }
+
+    /// Number of admitted shielded transactions (the never-evicted parallel
+    /// map). Read-only depth gauge for operator metrics (Phase 8).
+    pub fn shielded_count(&self) -> usize {
+        self.shielded_transactions.len()
+    }
+
     /// Add a new pending transaction to the registry.
     pub fn add_transaction(&self, id: String, transaction: PendingTransaction) -> Result<(), PneumaticError> {
         // `insert` is atomic: it returns the old value if the key was present.

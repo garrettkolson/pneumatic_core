@@ -26,6 +26,14 @@ const KNOWN_DESTINATIONS_TTL: Duration = Duration::from_secs(48 * 60 * 60);
 /// Default own-listen UDP port for the RNS transport.
 pub const DEFAULT_UDP_PORT: u16 = 4242;
 
+/// Builder for rns-net 0.7.0's `NodeConfig`.
+///
+/// Deliberately exposes only the four knobs pneumatic actually varies (listen
+/// IP, base UDP port, peer list, transport flag); everything else `build`
+/// produces is a fixed, reviewed constant. New options must be added here —
+/// call sites must not assemble `NodeConfig` themselves — so the whole
+/// ~45-field literal stays in one file and a rns-net bump is a single-file
+/// migration (see module docs and `rns/mod.rs`).
 pub struct RnsNodeConfigBuilder {
     listen_ip: String,
     udp_port: u16,
@@ -40,6 +48,10 @@ impl Default for RnsNodeConfigBuilder {
 }
 
 impl RnsNodeConfigBuilder {
+    /// New builder with the leaf-node defaults: listen on `127.0.0.1`, base UDP
+    /// port [`DEFAULT_UDP_PORT`] (4242), no peers, `transport_enabled: false`
+    /// (a leaf learns paths but does not route for others). The
+    /// `Default` impl forwards here, so both entry points stay in sync.
     pub fn new() -> Self {
         RnsNodeConfigBuilder {
             listen_ip: "127.0.0.1".to_string(),
@@ -49,16 +61,28 @@ impl RnsNodeConfigBuilder {
         }
     }
 
+    /// Bind address for every generated UDP interface. Default
+    /// `127.0.0.1` (single-host mesh); multi-host deployments set the
+    /// externally reachable address.
     pub fn with_listen_ip(mut self, ip: impl Into<String>) -> Self {
         self.listen_ip = ip.into();
         self
     }
 
+    /// Base UDP listen port. Because each rns-net UDP interface needs its own
+    /// unique port, a node with N peers occupies N consecutive ports starting
+    /// here (`udp_port + i` for interface `i`; a peerless node uses just
+    /// `udp_port`). Choose a base that leaves that span clear — and clear of
+    /// the pneumatic TCP port table in `conns.rs`.
     pub fn with_udp_port(mut self, port: u16) -> Self {
         self.udp_port = port;
         self
     }
 
+    /// Add a bootstrap peer, addressed by its *own* listen `ip:port` (the
+    /// base port on their side, not a derived `+i` value — the `+i` rule
+    /// applies to *this* node's listen sockets only). Interfaces are assigned
+    /// in insertion order: peer `i` is the forward target of interface `i`.
     pub fn add_peer(mut self, ip: impl Into<String>, port: u16) -> Self {
         self.peers.push((ip.into(), port));
         self
@@ -73,6 +97,19 @@ impl RnsNodeConfigBuilder {
     }
 
     /// Build the full `NodeConfig` for `identity`.
+    ///
+    /// Interface generation follows the point-to-point rule from the module
+    /// docs: one interface per peer (listen `udp_port + i`, forward to peer
+    /// `i`), or a single listener-only interface when there are no peers.
+    /// Interfaces are named `pneumatic-udp-{i}` with 1-based `InterfaceId`s.
+    /// No TCP interfaces are emitted (v1 decision). Notable fixed choices
+    /// baked into the literal: `transport_enabled` comes from the builder
+    /// (default false = leaf), `known_destinations_ttl` is 48 h, ingress
+    /// control is enabled everywhere, `max_paths_per_destination: 1` (no
+    /// multipath in v1), and the identity is rebuilt from `identity`'s private
+    /// key so the config holds its own instance rather than aliasing the
+    /// caller's — `panic_on_interface_error`
+    /// is false so a bad interface cannot take the node down.
     pub fn build(self, identity: &Identity) -> NodeConfig {
         let ifaces: Vec<(u16, Option<(String, u16)>)> = if self.peers.is_empty() {
             vec![(self.udp_port, None)]

@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/01/2026 (auto-generated from files on disk).
+Last rebuilt: 10/01/2026 (manual update for the Phase 8 close: +5 nodes).
 
 ## pillar (2)
 
@@ -37,7 +37,7 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | `decision-upgrade-governance` | ADR-017: Upgrade governance (owner registry + M-of-N multisig + 1-epoch timelock) | An UpgradeContract tx swaps a contract's bytecode + owner set, gated by an M-of-N owner quorum over a canonical Ed25519 digest and a 1-epoch apply-time timelock; the executor re-validates + emits a re-derivable ReplaceAssetDelta the committer applies under the timelock. **Landed 09/29/2026 (P8)**; applies to Wasm modules. | 6 |
 | `decision-wasm-engine-tier2` | ADR-018: Tier-2 WasmEngine (wasmi) behind the ContractEngine trait | WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-metered, sandboxed, frozen ABI) so SmartContract.bytecode can be a WASM module for rich logic; opt-in, tiers W1 compute → W2 read → W3 storage → W4 cross-contract. **Core (W1+W2) landed 09/29/2026 (P5)**; **W3 storage (P7) landed 09/29/2026**; **W4 cross-contract (P9) landed 09/30/2026** (env.call host import, ADR-016). | 5 |
 
-## concept (35)
+## concept (36)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -76,14 +76,16 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | `concept-transaction-lifecycle` | Shielded transaction lifecycle & validation gates | ShieldedTransaction (transactions.rs:362) validation = 4 fail-closed gates: structural, nullifier membership, merkle-root freshness, proof verify. Id = SHA-256 of rmp canonical bytes. | 4 |
 | `concept-transaction-state-machine` | Transaction state machine — explicit TransactionState pipeline | Transactions move Pending → Preloaded → Validated → Executing → Finalizing → Committed (Failed reachable from any stage) via the explicit TransactionState enum; PendingTransaction holds an atomic lock count against premature collection. | 5 |
 | `concept-validation-specs` | Validation spec framework: traits, registries, fail-closed lookup | TransactionValidationSpec/BlockValidatorSpec traits with name-keyed registries; SelfSigned vs Executed specs; unregistered specs and unknown shielded actions fail closed. | 4 |
+| `concept-telemetry-health-metrics` | Telemetry layer: tracing + Prometheus-text metrics + HTTP health, with graceful-shutdown ordering | src/telemetry.rs is the ops surface: init_tracing, atomic Metrics (Prometheus text), HealthState (200→503 draining), minimal HTTP over tokio, wait_for_shutdown_signal; fixed binary drain order; no consensus hot path instrumented. | 3 |
 
-## question (3)
+## question (4)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `question-constrained-proving-ux` | Client-side proving performance on constrained devices (wallet UX) | Open: S6.4 will measure client proving time to decide if client-side Halo2 proving is acceptable on the intended wallet hardware class; seconds-scale proving may be too slow. | 4 |
 | `question-external-audit-before-real-value` | External audit of the Action circuit before real value | Open: before shielded transfers touch real value, the Action circuit needs external review/audit — a silently-accepting invalid proof is a zk constraint bug, a different risk class from a Rust bug. | 5 |
 | `question-viewing-keys-compliance` | Viewing keys / compliance: open product decision | Unresolved: should recipients (merchants, auditors, compliance) receive viewing keys that can decrypt note ciphertexts? Roadmark flags this as a product decision, not an engineering one. | 3 |
+| `question-conns-review-flags` | Conns-layer review flags from the Phase 8 rustdoc pass | Dead ConnError variants (CouldNotEstablishStream, ConnectionRejectedByRemote), HEARTBEAT_PORT declared but bound nowhere, sync/async read_exact return-type asymmetry — each needs wire/delete/document. | 3 |
 
 ## playbook (0)
 
@@ -103,7 +105,7 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | `task-s5-4-real-pool-swap` | S5.4 — Composite node-server: real Arc<ShieldedPool> wiring | DONE 2026-09-22: composite role views are the shared Arc<ShieldedPool> itself (no composed view); fast action-gate discriminator + live e2e (4 dispatch hops) + live conflict lockstep-rollback tests; 847 passed / 16 ignored. | 7 |
 | `task-s6-shielded-completion` | S6 — Shielded Tier-1 completion: attacks, concurrency, cross-crate pipeline, proving UX | CLOSED 2026-09-25: attack suite + nullifier/Merkle concurrency + cross-crate 4-hop pipeline with wire-byte privacy assertion + prove/verify timing; 834/37/0; Tier-1 feature-complete. | 5 |
 
-## event (6)
+## event (7)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -113,6 +115,7 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | `event-rns-e2e` | RNS end-to-end transport tests landed | Commit 451a00d: end-to-end tests over the Reticulum (RNS) transport layer — messages sent/received through the full rns-net stack with the exact pinned versions. | 2 |
 | `event-s5-2-finalizer-wiring` | S5.2: finalizer wiring for shielded transactions | Commit 1b7e4f0 (09/20/2026): 'feat: finalizer wiring for zk-shielded transactions' — the shielded validation spec is now on the finalizer's block path. | 3 |
 | `event-s6-shielded-completion` | S6: shielded Tier-1 feature-complete | 2026-09-25: S6 closes the shielded plan — attack suite, concurrency, cross-crate 4-hop pipeline with wire-byte privacy assertion, prove/verify timing. Workspace 834/37/0; Tier-1 feature-complete. | 4 |
+| `event-phase8-production-readiness` | Phase 8: production readiness landed (telemetry, graceful shutdown, Docker, runbook) — 10/01/2026 | Phase 8 closes the last planned roadmap phase: pneumatic_core::telemetry, SIGINT/SIGTERM drain in both binaries, the real node-server binary, Docker+compose with guard-tested examples, the runbook, rustdoc; 997/0/37; image builds + container smoke test green. | 4 |
 
 ## pattern (7)
 
@@ -130,9 +133,9 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 
 | id | title | summary | edges |
 |---|---|---|---|
-| `hyp-readme-postmvp-phase-8-outstanding` | Hypothesis: Phase 8 production-readiness work is planned, not done | Phase 8 production readiness (rustdoc, ADR docs, operator runbook; LOW, Post-MVP) is documented as planned in TASKS.md; the other roadmap phases verify as done, so Phase 8 items are likely still outstanding. | 4 |
+| `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (15)
+## fact (16)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -146,11 +149,12 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | `fact-rns-pinning` | RNS transport: rns-net =0.7.0, rns-crypto =0.1.9, rns-core =0.1.16 (exact pins) | Reticulum (RNS) transport pinned to exact versions in workspace Cargo.toml; NodeConfig (~45 fields, no Default) built via RnsNodeConfigBuilder; e2e tests over RNS exist. | 3 |
 | `fact-shielded-stack` | Shielded ZK stack: module map (S1–S6 landed) | src/shielded/ = poseidon, note, tree, circuit, verify, roots, pool_view + circuit_test; plus ShieldedTransaction, ShieldedValidationSpec, NullifierRegistry, MerkleRootState, ShieldedPool, prover build/assemble, S6 test layer. S1–S6 complete — Tier-1 feature-complete. | 4 |
 | `fact-test-suite` | Test baseline 2026-10-01: 988 passed / 37 ignored / 0 failed | 10/01/2026 workspace test baseline: 988 passed / 37 ignored / 0 failed — core 654 lib (+11 integration), committer 118 (109 lib + 9 integration), executor 33, finalizer 61, node-server 39, prover 15, sentinel 57. | 2 |
+| `fact-test-suite-phase8` | Test baseline 2026-10-01 (post-Phase-8): 997 passed / 37 ignored / 0 failed | Post-Phase-8 baseline: 997/37/0 (+9: 7 telemetry unit + 2 deploy-example guard); core lib 661, integration 22; Docker image pneumatic:phase8 builds green. | 2 |
 | `fact-test-suite-s6` | Test baseline 2026-07-26: 835 passed / 37 ignored / 0 failed | 07/26/2026 workspace baseline after the e2e pipeline test + finalizer/executor test-module compile fixes: 835 passed / 37 ignored / 0 failed — core 553/19, committer 101/7, prover 15/2, rest unchanged. Use `cargo test --workspace` (plain `cargo test` runs only the root crate). | 2 |
 | `fact-wasmparser-read-var-i32-bug` | wasmparser 0.239.0 read_var_i32 corrupts single-byte 0x40..0x7F immediates | wasmparser 0.239.0's read_var_i32 single-byte fast path mis-decodes i32.const immediates of 0x40..0x7F (yields byte-128); hand-assembled Wasm fixtures must encode every i32.const as 2-byte SLEB128 (sleb_force2). Also: the validator rejects popping a value at a control frame's baseline, and fixtures must omit the data section (section-id swap 11/12). | 2 |
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
 | `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/26/2026 (cargo test --workspace) | Verified per-crate 09/26/2026: core 548 + 19 ignored, committer 92 lib + 9 integration (+7 ignored), executor 10, finalizer 61, node-server 32 + 2 ignored, prover 15 + 2 ignored, sentinel 57 + 1 ignored — 0 failed in every crate. | 2 |
-| `fact-workspace-layout` | Workspace layout: 7 crates, 27 root modules | Rust workspace: root pneumatic_core lib (27 modules in lib.rs incl. rns, shielded) + sentinel, executor, finalizer, committer, node-server, prover crates. | 3 |
+| `fact-workspace-layout` | Workspace layout: 7 crates, 25 root modules | Rust workspace: root pneumatic_core lib (25 pub-mod modules incl. rns, shielded, telemetry) + sentinel, executor, finalizer, committer, node-server, prover; the two binaries are pneumatic_committer and node-server. | 4 |
 
 ## source (7)
 
@@ -169,13 +173,14 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 | id | title | summary | edges |
 |---|---|---|---|
 
-## note (4)
+## note (5)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `note-roadmap-status-2026-09-20` | Roadmap status 09/20/2026: S1.1–S5.2 landed; S5.3/S5.4/S6 remain | SUPERSEDED by note-roadmap-status-2026-09-26: Tier-1 shielded work was at S5.2 (HEAD 1b7e4f0); S5.3/S5.4/S6 have since all landed. | 9 |
 | `note-roadmap-status-2026-09-26` | Roadmap status 09/26/2026: shielded Tier-1 feature-complete; production readiness next | SUPERSEDED by note-roadmap-status-2026-10-01: S1.1–S6 all landed (S5.3 pool append, S5.4 real-pool swap 09/22, S6 close 09/25); shielded Tier-1 feature-complete. Remaining then: Phase 8, the executor contract stub (now done), and the TASKS.md test-gap tail. | 7 |
-| `note-roadmap-status-2026-10-01` | Roadmap status 10/01/2026: executor contract execution complete (Phases 1-10); production readiness next | The executor contract-execution plan is fully landed (Phases 1-10, 09/28→10/01): real Transfer/Spec/Wasm engines, W3 storage, deploy, upgrade governance, Model X cross-contract calls, plus P10 e2e + determinism. The rmp wire format moved to named maps (deploy fix). Remaining: Phase 8 production readiness + the TASKS.md test-gap tail. | 6 |
+| `note-roadmap-status-2026-10-01` | SUPERSEDED by note-roadmap-status-2026-10-01-phase8: Phase 8 landed the same day | SUPERSEDED by note-roadmap-status-2026-10-01-phase8: this snapshot listed Phase 8 production readiness as the open front; Phase 8 landed the same day (997/0/37 baseline). Kept as the historical record. | 6 |
+| `note-roadmap-status-2026-10-01-phase8` | Roadmap status 10/01/2026 (late): Phase 8 production readiness landed; only test-gap tail + open questions remain | Phase 8 (the last planned roadmap phase) complete the same day as P10: telemetry/health/metrics, graceful shutdown both binaries, real composite node-server binary, Docker+compose deploy with guard-tested examples, runbook, rustdoc. Remaining: TASKS.md test-gap tail + open questions. | 4 |
 | `note-threadpool-hybrid-pool` | ThreadPool: hybrid sync+async worker pool | ThreadPool (server.rs:10) pairs each worker with one std thread (sync closures) and one tokio task (async futures) draining two mpsc channels; new() asserts size > 0. | 2 |
 
 ## contact (0)
@@ -195,4 +200,4 @@ Last rebuilt: 10/01/2026 (auto-generated from files on disk).
 
 ## Totals
 
-110 nodes. Logs (append-only, never indexed): see logs/.
+115 nodes. Logs (append-only, never indexed): see logs/.

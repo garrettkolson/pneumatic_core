@@ -1176,6 +1176,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1225,6 +1226,8 @@ dependencies = [
  "tokio",
  "tokio-macros",
  "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
  "wasmi",
  "wasmparser",
  "x25519-dalek 3.0.0",
@@ -1280,6 +1283,7 @@ dependencies = [
  "strum",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

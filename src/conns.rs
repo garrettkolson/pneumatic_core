@@ -1,3 +1,22 @@
+//! Network connectivity: the port table, wire framing, connection targets,
+//! and the async [`Connection`] abstraction layered on the sync/async stream
+//! types in [`streams`].
+//!
+//! Framing is the load-bearing contract of this module: every message on the
+//! wire is a 4-byte big-endian payload length followed by that many bytes of
+//! MsgPack, read in two exact-read steps by [`get_data`] (sync) or
+//! [`get_data_async`] (Tokio). [`MAX_FRAME_SIZE`] caps the claimed length
+//! before allocation, and both readers treat any read failure — including a
+//! clean peer close (`UnexpectedEof`) — as terminal, which the
+//! `TcpConnection` read loop relies on to exit instead of busy-spinning
+//! (Phase 6.4).
+//!
+//! Submodules split the transport stack by role: [`streams`] (byte-level
+//! sync/async I/O), [`factories`] (transport construction from a
+//! [`ConnTarget`]), [`senders`] (blocking request/response clients),
+//! [`listeners`] (inbound accept loops), and [`uds`] (runtime-dir socket-path
+//! and HMAC helpers shared by the data-service channel).
+
 pub mod streams;
 pub mod factories;
 pub mod senders;
@@ -14,6 +33,13 @@ use crate::conns::senders::Sender;
 use crate::conns::streams::{Stream, StreamReader, StreamWriter};
 use crate::node::NodeRegistryType;
 
+/// Internal (50000-range) listen port for a registry node type.
+///
+/// The port table gives every registry type its own (internal, external) pair
+/// so one host can co-locate types without collision; the pair-distinctness is
+/// asserted by `conns_tests::every_type_has_distinct_port_pair`. The Archiver
+/// arm exists purely for table correctness — archiver networking has no
+/// callers yet (Phase 6.8 config hygiene).
 pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
     match node_type {
         NodeRegistryType::Committer => COMMITTER_PORT_INTERNAL,
@@ -26,6 +52,13 @@ pub fn get_internal_port(node_type: &NodeRegistryType) -> u16 {
     }
 }
 
+/// External (42000-range) port a registry type advertises for inbound
+/// connections from other nodes.
+///
+/// Paired with [`get_internal_port`]; the external port is the address other
+/// nodes dial, while the internal port is the worker's own listener. See
+/// [`get_internal_port`] for the pair-distinctness invariant and the Archiver
+/// no-callers note.
 pub fn get_external_port(node_type: &NodeRegistryType) -> u16 {
     match node_type {
         NodeRegistryType::Committer => COMMITTER_PORT,
@@ -38,6 +71,21 @@ pub fn get_external_port(node_type: &NodeRegistryType) -> u16 {
     }
 }
 
+/// Read one length-prefixed frame from a sync [`Stream`] (blocking).
+///
+/// Framing contract: a 4-byte big-endian payload length, then exactly that
+/// many bytes of MsgPack payload — two `read_exact` steps, no reassembly
+/// buffer needed because `read_exact` loops over partial reads itself. The
+/// claimed length is checked against [`MAX_FRAME_SIZE`] *before* the payload
+/// buffer is allocated, so an attacker sending a huge header cannot force a
+/// large allocation (SA_08; the test sends only the 4-byte header and the
+/// read must fail before touching the body).
+///
+/// Errors: header claiming an oversized frame -> `MalformedData`; any read
+/// failure on either step — including a peer close before header or payload
+/// completes (`UnexpectedEof`) -> `ReadError`. A zero-length frame is valid
+/// and yields an empty `Vec`. Callers such as the `TcpConnection` read loop
+/// treat every error as terminal (its `Err(_) => break` arm).
 pub fn get_data(reader: &mut Box<dyn Stream>) -> Result<Vec<u8>, ConnError> {
     let mut header = [0u8; 4];
     if let Err(err) = reader.read_exact(&mut header) {
@@ -57,6 +105,11 @@ pub fn get_data(reader: &mut Box<dyn Stream>) -> Result<Vec<u8>, ConnError> {
     }
 }
 
+/// Async counterpart of [`get_data`]: same two-step framing contract, same
+/// [`MAX_FRAME_SIZE`] pre-allocation guard, same terminal-error semantics —
+/// but the two exact reads await on a Tokio [`StreamReader`] instead of
+/// blocking a thread. This is the read path of every long-lived
+/// `TcpConnection` loop.
 pub async fn get_data_async(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8>, ConnError> {
     let mut header = [0u8; 4];
     if let Err(err) = reader.read_exact(&mut header).await {
@@ -76,8 +129,24 @@ pub async fn get_data_async(reader: &mut Box<dyn StreamReader>) -> Result<Vec<u8
     }
 }
 
+/// Outbound half of a live connection: deliver one message payload.
+///
+/// Implementations own transport-specific framing: the crate-internal
+/// `TcpConnection` prepends the 4-byte big-endian length so each `send`
+/// emits exactly one [`get_data`] frame, while `RnsConnection`
+/// (`crate::rns::conn`) wraps the payload in its `NetworkPacket` envelope
+/// instead. `Send + Sync` so connections can live in shared structures
+/// (`NodeRegistryNode` holds a `Box<dyn Connection>` per peer, node.rs) and
+/// be written from concurrent tasks; framed-stream implementations must
+/// serialize concurrent sends themselves so a frame's header+payload pair is
+/// never interleaved with another sender's (`TcpConnection` guards its writer
+/// with a `tokio::Mutex` held across both writes).
 #[async_trait]
 pub trait Connection : Send + Sync {
+    /// Hand `data` to the transport as one logical message. Errors surface as
+    /// writer-side [`ConnError`] variants (e.g. `WriteError`); there is no
+    /// retry or partial send — a failure means delivery failed from this
+    /// sender's perspective.
     async fn send(&self, data: &Vec<u8>) -> Result<(), ConnError>;
 }
 
@@ -144,6 +213,15 @@ impl Drop for TcpConnection {
     }
 }
 
+/// Destination of an outbound connection: same-host or remote.
+///
+/// The two-level shape encodes transport selection: `Remote` is always TCP
+/// (a routable `SocketAddr`), while `Local` may be a Unix socket path or a
+/// TCP address — letting `ConnFactory` pick the transport from the type
+/// alone, so callers (e.g. `data.rs`, which prefers UDS on Unix) never
+/// hard-code it. `Clone` is implemented by hand (structurally identical to
+/// what `#[derive(Clone)]` would produce; the nested match is written out
+/// explicitly).
 pub enum ConnTarget {
     Local(LocalTarget),
     Remote(SocketAddr)
@@ -163,17 +241,36 @@ impl Clone for ConnTarget {
     }
 }
 
+/// Same-host address space: a Unix domain socket path or a loopback TCP
+/// address. The `Unix` variant is how `data.rs` reaches the local data
+/// service; `Tcp` covers non-Unix platforms and tests that want loopback TCP.
 pub enum LocalTarget {
     Unix(String),
     Tcp(SocketAddr)
 }
 
+/// Network-layer error type, kept separate from `PneumaticError` because
+/// connection failures are handled at the transport/registry layer (drop the
+/// peer, terminate the read loop) rather than surfacing through consensus
+/// logic.
 pub enum ConnError {
+    /// Transport setup / socket failure (bind, connect, non-blocking flip,
+    /// `from_std` registration).
     IO(String),
+    /// A peer sent a frame the framing contract forbids — in practice a
+    /// length header exceeding [`MAX_FRAME_SIZE`] (the SA_08 DoS guard).
     MalformedData(String),
+    /// A connection was attempted but no usable stream resulted.
     CouldNotEstablishStream,
+    /// A framed write failed partway; the stream is no longer trusted to be
+    /// in sync with the peer's frame parser.
     WriteError(Option<String>),
+    /// A framed read failed — including EOF before a header or payload
+    /// completed, i.e. the peer disconnected (the terminal signal the
+    /// `TcpConnection` read loop breaks on).
     ReadError(Option<String>),
+    /// The remote side refused the connection at the protocol level, as
+    /// opposed to an I/O failure.
     ConnectionRejectedByRemote,
     /// Cryptographic decryption failure on a network-reachable path
     DecryptError(String),
@@ -223,13 +320,27 @@ impl Display for ConnError {
 /// Prevents memory-exhaustion DoS from attacker-controlled `data_length`.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Heartbeat/liveness channel port (42000). Reserved in the table; the
+/// current heartbeat protocol runs over the registry connections
+/// (`node/registry/heartbeat.rs`) and does not bind this port — see the
+/// Phase 8 review note.
 pub const HEARTBEAT_PORT: u16 = 42000;
+/// External (peer-facing) port for the Committer. See [`get_external_port`]
+/// for the port-pair table and its distinctness invariant.
 pub const COMMITTER_PORT: u16 = 42001;
+/// External (peer-facing) port for the Sentinel.
 pub const SENTINEL_PORT: u16 = 42002;
+/// External (peer-facing) port for the Executor.
 pub const EXECUTOR_PORT: u16 = 42003;
+/// External (peer-facing) port for the Finalizer.
 pub const FINALIZER_PORT: u16 = 42004;
+/// External (peer-facing) port for the Archiver (distinct from the
+/// Committer's pair since Phase 6.8).
 pub const ARCHIVER_PORT: u16 = 42005;
 
+// Internal (worker-listener) ports: the 50000-range counterpart of the
+// external table, same type order. Paired distinctness is enforced by
+// `conns_tests::every_type_has_distinct_port_pair`.
 const COMMITTER_PORT_INTERNAL: u16 = 50000;
 const SENTINEL_PORT_INTERNAL: u16 = 50001;
 const EXECUTOR_PORT_INTERNAL: u16 = 50002;

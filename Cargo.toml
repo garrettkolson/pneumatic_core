@@ -102,6 +102,13 @@ pqcrypto-traits = "0.3"
 hmac = "0.12"
 # getuid() for per-UID runtime-dir resolution (src/conns/uds.rs).
 libc = "0.2"
+# Phase 8 (production readiness) — observability primitives in
+# `src/telemetry.rs`: structured tracing for the binaries, plus a
+# Prometheus-text metrics registry and an HTTP health endpoint served with
+# plain tokio (no HTTP crate). Not consensus code, so not `=`-pinned like the
+# transport/crypto stack.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Reticulum Network Stack (rns-rs). Pinned exactly: NodeConfig has ~45 fields
 # and no Default, so any version bump is an API-migration event.
 rns-net = "=0.7.0"

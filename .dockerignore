@@ -1,0 +1,9 @@
+# Build-context hygiene for the Phase 8 image (see Dockerfile).
+target/
+infinite-brain/
+.git/
+deploy/
+docs/
+plans/
+*.md
+.env

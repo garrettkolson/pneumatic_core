@@ -17,6 +17,9 @@ use pneumatic_core::registry::PendingTransactionRegistry;
 use pneumatic_core::rns::config_builder::RnsNodeConfigBuilder;
 use pneumatic_core::rns::identity::NodeIdentity;
 use pneumatic_core::rns::wrapper::{AnnouncedIdentity, RnsNetwork};
+use pneumatic_core::telemetry::{
+    init_tracing, spawn_health_server, wait_for_shutdown_signal, HealthState, Metrics,
+};
 
 use pneumatic_committer::block_services::BlockServices;
 use pneumatic_committer::committer::Committer;
@@ -56,6 +59,24 @@ async fn main() {
         }
     };
 
+    // 1.5. Operator-facing telemetry (Phase 8). Structured tracing goes to
+    // stdout (RUST_LOG-filtered, default info); the health/metrics HTTP
+    // endpoint answers /health (200 → 503 when draining) and /metrics
+    // (Prometheus text). Bind failure is logged and tolerated — health is an
+    // ops affordance, not a consensus dependency (same tolerance as the RNS
+    // boot path). PNEUMATIC_HEALTH_ADDR overrides the bind address
+    // (e.g. "0.0.0.0:9500" in containers).
+    init_tracing("committer");
+    let health = std::sync::Arc::new(HealthState::new("committer"));
+    let metrics = std::sync::Arc::new(Metrics::new());
+    let health_addr: std::net::SocketAddr = env::var("PNEUMATIC_HEALTH_ADDR")
+        .ok()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1:9500".parse().expect("static addr"));
+    if let Err(e) = spawn_health_server(health_addr, health.clone(), metrics.clone()).await {
+        tracing::warn!(error = %e, "health server unavailable; continuing without it");
+    }
+
     // 2. Start the RNS transport. The node still boots if the transport can't
     //    come up (e.g. port conflict) — it just can't register or gossip.
     let mut builder = RnsNodeConfigBuilder::new()
@@ -82,14 +103,36 @@ async fn main() {
     //    Authenticate the data channel with the shared secret from the
     //    PNEUMATIC_DATA_SECRET env var when present; the framing + timeout
     //    hardening applies whether or not a secret is configured.
+    //    PNEUMATIC_DATA_ADDR (host:port) points the channel at a remote data
+    //    service — the container topology, where the default UDS-first local
+    //    channel cannot reach a sibling container. An unparsable value warns
+    //    and falls back to the local channel rather than refusing to boot.
+    let data_addr: Option<std::net::SocketAddr> = match env::var("PNEUMATIC_DATA_ADDR") {
+        Ok(raw) => match raw.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                tracing::warn!(
+                    value = %raw, error = %e,
+                    "PNEUMATIC_DATA_ADDR is not a valid host:port; using the local data channel"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let mut data_provider = DefaultDataProvider::new();
+    if let Some(addr) = data_addr {
+        tracing::info!(%addr, "data service channel: remote TCP");
+        data_provider = data_provider.with_source(pneumatic_core::conns::ConnTarget::Remote(addr));
+    }
     let data_provider = match env::var("PNEUMATIC_DATA_SECRET") {
-        Ok(secret) => Arc::new(DefaultDataProvider::new().with_secret(secret.into_bytes())),
+        Ok(secret) => Arc::new(data_provider.with_secret(secret.into_bytes())),
         Err(_) => {
             eprintln!(
                 "PNEUMATIC_DATA_SECRET not set: the data service channel runs with the \
                  unauthenticated (legacy/test) framing. Set it in production."
             );
-            Arc::new(DefaultDataProvider::new())
+            Arc::new(data_provider)
         }
     };
     // 3.5. Build the registration stake gate OFF the RNS worker pool (AUDIT
@@ -253,6 +296,12 @@ async fn main() {
 
     // 9. Create PendingTransactionRegistry
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
+    // Metrics poller handle (cloned before the registry moves into the
+    // Committer): read-only depth gauges for /metrics.
+    let pending_for_metrics = pending_registry.clone();
+    // Transport liveness gauge: the RNS network is built once at boot and
+    // either exists or doesn't for the process lifetime.
+    let transport_up = network.is_some() as u64;
 
     // 9.5. Create epoch tracking components
     let now = std::time::SystemTime::now()
@@ -283,6 +332,9 @@ async fn main() {
     ));
 
     // 11. Create Committer
+    // Metrics poller handle (cloned before the registry moves into the
+    // Committer): peer-count gauge for /metrics.
+    let registry_for_metrics = node_registry.clone();
     let committer = Arc::new(Committer::new(
         env_data.clone(),
         config.public_key.clone(),
@@ -319,7 +371,10 @@ async fn main() {
         });
     });
 
-    // 13. Start background epoch loop — polls for block proposals periodically
+    // 13. Start background epoch loop — polls for block proposals periodically,
+    // stopping promptly when the shutdown channel flips (Phase 8: graceful
+    // shutdown; the loop no longer runs to process exit).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let epoch_committer = committer.clone();
     // Advance the registration stake cache to the current epoch as it is
     // selected, so the off-thread gate consults the stake set frozen when each
@@ -327,6 +382,8 @@ async fn main() {
     // current_epoch_number). The refresher's own std::thread continues polling
     // the data service on its own cadence for the target epoch.
     let epoch_stake_index = stake_index.clone();
+    let mut epoch_shutdown = shutdown_rx.clone();
+    let epoch_interval = committer.proposal_interval_ms();
     tokio::spawn(async move {
         loop {
             if let Err(e) = epoch_committer.run_epoch_loop().await {
@@ -335,19 +392,82 @@ async fn main() {
                     .log(format!("Epoch loop error: {:?}", e));
             }
             epoch_stake_index.set_epoch(epoch_committer.current_epoch_number());
-            tokio::time::sleep(std::time::Duration::from_millis(
-                epoch_committer.proposal_interval_ms(),
-            ))
-            .await;
+            // Sleep out the proposal interval, waking immediately if the
+            // shutdown flag flips (a value change, not just a timer).
+            tokio::select! {
+                biased;
+                changed = epoch_shutdown.changed() => {
+                    if changed.is_err() || *epoch_shutdown.borrow_and_update() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(epoch_interval)) => {}
+            }
+        }
+        epoch_committer
+            .logger()
+            .log("Epoch loop stopped for shutdown".to_string());
+    });
+
+    // 13.5. Metrics poller (Phase 8): publishes cheap read-only depths and the
+    // epoch number as gauges every 10s. Read-only — it holds no locks across
+    // awaits and never mutates consensus state.
+    let metrics_epoch = committer.clone();
+    let metrics_registry = registry_for_metrics;
+    let metrics_pending = pending_for_metrics;
+    let mut metrics_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            metrics.set_gauge("pneumatic_epoch_current", metrics_epoch.current_epoch_number());
+            metrics.set_gauge("pneumatic_transport_up", transport_up);
+            let mut peers = 0u64;
+            for node_type in [
+                NodeRegistryType::Committer,
+                NodeRegistryType::Sentinel,
+                NodeRegistryType::Executor,
+                NodeRegistryType::Finalizer,
+                NodeRegistryType::Archiver,
+            ] {
+                if let Some(nodes) = metrics_registry.get_nodes(&node_type) {
+                    peers += nodes.len() as u64;
+                }
+            }
+            metrics.set_gauge("pneumatic_node_peers", peers);
+            metrics.set_gauge(
+                "pneumatic_pending_transactions",
+                metrics_pending.in_flight_count() as u64,
+            );
+            metrics.set_gauge(
+                "pneumatic_shielded_transactions",
+                metrics_pending.shielded_count() as u64,
+            );
+            metrics.set_gauge("pneumatic_up", 1);
+            if metrics_shutdown.changed().await.is_err() {
+                break; // sender dropped: process is unwinding
+            }
         }
     });
 
-    // 14. Log startup and block on shutdown
+    // 14. Log startup and block on the shutdown signal (Phase 8: graceful
+    // shutdown). Ordering matters:
+    //   1. mark_stopping() → /health answers 503, so health-checking
+    //      balancers/orchestrators stop sending work before anything drains;
+    //   2. flip the watch channel → the epoch loop exits at its next check
+    //      (immediately, not after the full proposal interval);
+    //   3. stop the off-thread stake refresher;
+    //   4. grace window for already-spawned message tasks, then exit —
+    //      well inside docker stop's default 10s SIGKILL grace.
     shared_logger.log("Committer node started".to_string());
+    tracing::info!(health_addr = %health_addr, "committer node started");
 
-    // Block the main thread indefinitely (node runs until killed)
-    // In production, this would listen for a shutdown signal
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
+    wait_for_shutdown_signal().await;
+    shared_logger.log("Shutdown signal received".to_string());
+    tracing::info!("shutdown signal received; draining");
+    health.mark_stopping();
+    let _ = shutdown_tx.send(true);
+    stake_index.stop();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    shared_logger.log("Committer node stopped cleanly".to_string());
+    tracing::info!("committer node stopped cleanly");
 }

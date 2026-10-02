@@ -1,0 +1,9 @@
+{
+  "is_full_node": true,
+  "rest_api_version": 1,
+  "environments": [],
+  "main_env_id": "env",
+  "reconciliation_partition_id": "default",
+  "transport_enabled": false,
+  "bootstrap_peers": []
+}

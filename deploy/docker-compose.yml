@@ -1,0 +1,60 @@
+# Pneumatic two-node topology (Phase 8 deployment infra).
+#
+#   committer  — dedicated committer role (`pneumatic_committer`)
+#   full-node  — composite runtime (`node-server`): hosts every role-plugin
+#                this node's stake qualifies for (sentinel/executor/
+#                finalizer/committer) selected per epoch.
+#
+# Prerequisites before `docker compose up`:
+# 1. A DATA SERVICE is REQUIRED. DefaultDataProvider talks to it (framed
+#    MsgPack); the committer fails at boot if it is unreachable (the boot
+#    stake-snapshot load is deliberately fail-closed). Set
+#    PNEUMATIC_DATA_ADDR=<host:port> in the environment, or run the data
+#    service on this host network and leave the default local channel.
+# 2. Fill PNEUMATIC_DATA_SECRET (HMAC-SHA256 shared secret, production).
+# 3. Each service's config lives under ./config/<service>/config.json; the
+#    shared /env specs under ./config/env. Keystores are created inside the
+#    per-service volumes on first boot — persist them; losing a keystore
+#    orphans the node's stake.
+# 4. To interlink the two nodes over RNS, fill each side's bootstrap_peers
+#    with the other's hex RNS public key (printed by the boot log line
+#    `[pneumatic] node identity rhash=... rns_public_key=...`).
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: pneumatic:phase8
+  restart: unless-stopped
+  volumes:
+    - ./config/env:/env:ro
+
+services:
+  committer:
+    <<: *node
+    command: ["pneumatic_committer"]
+    volumes:
+      - ./config/env:/env:ro
+      - ./config/committer:/pneumatic
+    environment:
+      PNEUMATIC_DATA_ADDR: ${PNEUMATIC_DATA_ADDR:-}
+      PNEUMATIC_DATA_SECRET: ${PNEUMATIC_DATA_SECRET:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "127.0.0.1:9501:9500"   # /health + /metrics
+      - "4242:4242/udp"         # RNS transport
+
+  full-node:
+    <<: *node
+    command: ["node-server"]
+    volumes:
+      - ./config/env:/env:ro
+      - ./config/full-node:/pneumatic
+    environment:
+      PNEUMATIC_DATA_ADDR: ${PNEUMATIC_DATA_ADDR:-}
+      PNEUMATIC_DATA_SECRET: ${PNEUMATIC_DATA_SECRET:-}
+      RUST_LOG: ${RUST_LOG:-info}
+      PNEUMATIC_EPOCH_INTERVAL_MS: "5000"
+    ports:
+      - "127.0.0.1:9502:9500"   # /health + /metrics
+      - "4243:4242/udp"         # RNS transport (host port offset)

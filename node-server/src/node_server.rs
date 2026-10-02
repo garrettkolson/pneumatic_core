@@ -117,6 +117,16 @@ pub async fn dispatch(&self, message: Message) -> Result<(), RoleError> {
     guard.dispatch(message).await
 }
 
+/// Fan shutdown to every installed role-plugin (Phase 8: graceful
+/// shutdown). Delegates to `RoleDispatcher::initiate_all_shutdown`, which
+/// visits each host's shutdown hook; the binary calls this once, after the
+/// health state has been marked draining and the coordinator loop has been
+/// stopped, so no new epoch work starts while the roles wind down.
+pub async fn shutdown(&self) {
+    let mut guard = self.role_dispatcher.lock().await;
+    guard.initiate_all_shutdown().await;
+}
+
 /// The full qualifying role set this node selected by stake on the last
 /// `select()`, in `NodeRegistryType` order.
 pub fn selected_roles(&self) -> Vec<pneumatic_core::node::NodeRegistryType> {

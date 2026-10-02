@@ -1,16 +1,16 @@
 ---
 id: note-roadmap-status-2026-10-01
-title: "Roadmap status 10/01/2026: executor contract execution complete (Phases 1-10); production readiness next"
+title: "SUPERSEDED by note-roadmap-status-2026-10-01-phase8: Phase 8 landed the same day"
 type: note
 namespace: pneumatic
 visibility: namespace
-summary: "The executor contract-execution plan is fully landed (Phases 1-10, 09/28→10/01): real Transfer/Spec/Wasm engines, W3 storage, deploy, upgrade governance, Model X cross-contract calls, plus P10 e2e + determinism. The rmp wire format moved to named maps (deploy fix). Remaining: Phase 8 production readiness + the TASKS.md test-gap tail."
+summary: "SUPERSEDED by note-roadmap-status-2026-10-01-phase8: this snapshot listed Phase 8 production readiness as the open front; Phase 8 landed the same day (997/0/37 baseline). Kept as the historical record."
 auto_inject: false
-applicable_when: "Answering 'where are we on the roadmap' after the contract-execution plan completion"
+applicable_when: "Historical: the roadmap state immediately before Phase 8 landed"
 confidence: 0.95
 verified_at: "10/01/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Stale when the next post-contract-execution work item lands — supersede with a dated status note"
+staleness_signal: "Superseded 10/01/2026 by note-roadmap-status-2026-10-01-phase8 (Phase 8 completion)"
 tags: [note, roadmap, status, executor, contract-execution, production-readiness]
 edges:
   - target: note-roadmap-status-2026-09-26

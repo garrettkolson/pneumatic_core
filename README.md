@@ -229,18 +229,18 @@ A single process — `pneumatic_node_server` (binary `node-server`) — *is* the
 
 ```bash
 cargo test --workspace --lib
-# 968 lib tests: 654 core + 109 committer + 33 executor + 61 finalizer + 39 node-server + 15 prover + 57 sentinel
+# 975 lib tests: 661 core + 109 committer + 33 executor + 61 finalizer + 39 node-server + 15 prover + 57 sentinel
 cargo test --workspace
-# 988 passed / 37 ignored: lib + integration (pipeline, transport, shielded) + doc tests
+# 997 passed / 37 ignored: lib + integration (pipeline, transport, shielded, deploy examples) + doc tests
 ```
 
 ## Roadmap
 
 The phase-by-phase checklist (Phases 0–10: foundation, the four worker pipelines, optimistic finality, deterministic routing, sharding, quorum gossip, RNS transport, production readiness, security audit remediation) is tracked in [TASKS.md](TASKS.md); dated status snapshots live in the vault (`infinite-brain/notes/`).
 
-**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete), and **complete executor contract execution** (pluggable `ContractEngine` registry — `Transfer`/`Spec`/`Wasm` engines, per-transaction gas + wall-clock backstop, panic isolation, on-chain deploy, W3 Wasm storage, upgrade governance, ADR-016 Model X cross-contract calls) — verified end-to-end (7 composite pipeline tests + 2 cross-executor determinism tests; 988-test workspace suite green).
+**Landed:** all foundation + worker phases, RNS transport (Phase 10), security-audit fixes SA_01–SA_08, hybrid PQ crypto (Phase 7), composite node-server runtime (Phases 1–7), shielded Tier-1 (S1.1–S6 — private value transfer with halo2 proofs, feature-complete), **complete executor contract execution** (pluggable `ContractEngine` registry — `Transfer`/`Spec`/`Wasm` engines, per-transaction gas + wall-clock backstop, panic isolation, on-chain deploy, W3 Wasm storage, upgrade governance, ADR-016 Model X cross-contract calls; verified end-to-end: 7 composite pipeline tests + 2 cross-executor determinism tests), and **production readiness (Phase 8)** — `pneumatic_core::telemetry` (tracing, Prometheus-text `/metrics`, HTTP `/health`), graceful SIGTERM/Ctrl-C shutdown in both binaries, the composite `node-server` binary, Docker + compose deployment (`Dockerfile`, `deploy/`), [operator runbook](docs/OPERATOR_RUNBOOK.md), and rustdoc.
 
-**Outstanding:** production readiness (rustdoc, operator runbook, observability, deployment infra — Phase 8) and the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests).
+**Outstanding:** only the remaining test-gap tail in TASKS.md (e.g. `DefaultDataProvider` wire-format tests) and the open question nodes (external circuit audit before real value, S6.4 proving-UX measurement, viewing-key compliance).
 
 ## Project Memory: Infinite Brain
 
