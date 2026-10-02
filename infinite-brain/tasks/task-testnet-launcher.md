@@ -94,6 +94,18 @@ forwarding are transport-gated in rns-core), so today every Message-carrying edg
 must be a direct link — which is precisely what makes full-mesh density expensive.
 Relay (`transport_enabled: true`) is untested in this repo.
 
+**3. (PARTLY DONE 10/02/2026 — was: the integration tests could not see the
+wiring they depend on.)** `tests/peered_topology_e2e.rs` now builds a 4-node mesh
+whose directories are *derived* by peering — nothing calls `register_peer` — and
+routes the pipeline's real hops over them. Mutation-verified against the ack
+defect. See `fact-integration-test-fixture-blind-spot`. Still open: the three
+older multi-node tests (`pipeline_integration`, `shielded_pipeline`,
+`transport_integration`) keep seeding with `register_peer(key, rhash, node_type,
+conn)`, a test-only API with no production caller, at 6 sites. They stay blind to
+registration, ack handling and control framing. Converting them is easier once a
+launcher computes the peer/port matrix, since a derived topology has to be
+expressible before it can be asserted.
+
 **Smaller verified launch blockers:** `/env` and `config.json` are hardcoded
 consts (`config.rs:63-64`) — fine for a shared env spec, but the env spec's
 single absolute `log_file` interleaves across same-host nodes;

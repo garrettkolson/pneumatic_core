@@ -7973,3 +7973,10 @@
 2026-10-02 21:10:50.459952 UTC: Epoch leader selected: d7
 2026-10-02 21:10:50.462023 UTC: Committed block to token [01] (chain length: 2, seq: 1)
 2026-10-02 21:10:50.464414 UTC: Attempted to distribute block to archivers (hash: )
+2026-10-02 21:44:13.607435 UTC: REJECT EPOCH ADVANCE: epoch 4 would not exceed stored 1000 (detector epoch 3)
+2026-10-02 21:44:13.610444 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-02 21:44:13.610779 UTC: SNAPSHOT PERSIST FAILED: epoch=2 kind=stake err=StoreNotFound
+2026-10-02 21:44:13.612025 UTC: Epoch leader selected: 6b
+2026-10-02 21:44:13.613706 UTC: Epoch leader selected: d7
+2026-10-02 21:44:13.616286 UTC: Committed block to token [01] (chain length: 2, seq: 1)
+2026-10-02 21:44:13.617951 UTC: Attempted to distribute block to archivers (hash: )

@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/02/2026 (control-plane peering: +4 facts — the peering initiator, four silent control-plane drop paths, the RegisterAck bucket-placement defect, the 1064 baseline; task-testnet-launcher downgraded to PARTIAL; section headers/totals reconciled against files on disk — the fact, question and event headers were each under-counting).
+Last rebuilt: 10/02/2026 (test-adequacy follow-up to the peering work: +2 facts — the fixture blind spot (multi-node tests seeded their own topology through a test-only API) and the 1065 baseline; task-testnet-launcher item 3 partly done).
 
 ## pillar (2)
 
@@ -138,10 +138,12 @@ Last rebuilt: 10/02/2026 (control-plane peering: +4 facts — the peering initia
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (25)
+## fact (27)
 
 | id | title | summary | edges |
 |---|---|---|---|
+| `fact-integration-test-fixture-blind-spot` | Integration tests seeded their own topology, so they could not see the wiring | RESOLVED 10/02/2026: the three multi-node tests seed directories with register_peer — a test-only API with no production caller — so nothing could observe registration, acks or control framing. tests/peered_topology_e2e.rs derives a 4-node mesh by peering; mutation-verified. | 5 |
+| `fact-test-suite-peer-derived-topology` | Test baseline 2026-10-02 (peer-derived topology): 1065 passed / 37 ignored / 0 failed | 10/02/2026 baseline: 1065/37/0 (+1 over fact-test-suite-peering) — one test, the suite's only multi-node test whose directories are derived rather than seeded. | 2 |
 | `fact-control-plane-peering` | Peering initiator: the control plane now has a client half | 10/02/2026: `peering.rs` sends Register / directory Request / Heartbeat on a 10 s retry loop from both binaries. Nodes advertise `declared_roles`, and a control frame's ~5.9 KB size means peering can only start after the peer's announce makes its route live. | 6 |
 | `fact-control-plane-silent-drop-paths` | Four control-plane paths that dropped packets without an error | RESOLVED 10/02/2026: a bare NodeRequest outside a NetworkPacket decodes as an empty packet and vanishes; ~5.9 KB replies went out on the 481 B direct path; a directory response echoed a Request (infinite peer-to-peer reply loop); and the directory answered any caller. | 4 |
 | `fact-register-ack-bucket-placement-defect` | RegisterAck filed the responder under the requester's role | RESOLVED 10/02/2026: handle_register_ack installed the peer under the ack's node_type — the type the *requester* was registered under — so a finalizer filed its committer peer into its own Finalizer bucket. Now files under the responder's own declared set. | 3 |
@@ -212,4 +214,4 @@ Last rebuilt: 10/02/2026 (control-plane peering: +4 facts — the peering initia
 
 ## Totals
 
-128 nodes. Logs (append-only, never indexed): see logs/.
+130 nodes. Logs (append-only, never indexed): see logs/.

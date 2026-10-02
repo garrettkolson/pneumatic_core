@@ -47,9 +47,20 @@ So a finalizer that registered with a committer stored *the committer* in its
 serve it, and still found nobody in the buckets it actually needed — while every
 directory looked populated and every ack verified.
 
-**Why it survived:** `handle_register_ack` had no production caller. Its unit
-tests used a single role on both sides, where requester type == responder type
-and the bug is invisible.
+**Why it survived: the handler had zero test coverage.** Verified with
+`git grep RegisterAck HEAD` — the only test in the tree that mentioned the variant
+was `node_request_register_ack_round_trip` (`src/node.rs:277`), which serializes a
+`RegisterAck` and reads the fields back. A wire-format test. **Nothing ever passed
+a `RegisterAck` to `handle_register_ack`.** No integration test reaches it either:
+`tests/pipeline_integration.rs`, `tests/shielded_pipeline.rs` and
+`tests/transport_integration.rs` build their cluster topology by calling
+`register_peer(key, rhash, node_type, conn)` directly, choosing each peer's bucket
+by hand — and `register_peer` has **no non-test caller** (every reference in the
+worker crates sits inside a `#[test]`). Those tests hand-build the exact directory
+that production is supposed to *derive* from a signed exchange, so the derivation
+layer is invisible to them. Worth naming as a general trap: an integration test
+whose fixture replaces the wiring under test can pass indefinitely while the
+wiring is broken.
 
 **Fix.** File the responder under the role set **it declared for itself** in the
 ack (`request.requester_types`) — the same field its binding signature covers, so
@@ -60,7 +71,11 @@ stored, so an ack-learned peer is *vouchable*: `handle_request` lists only nodes
 with a non-empty `directory_signature`, and without this a cluster could never
 grow past the peers it bootstrapped with.
 
-**Pinned** by `an_ack_files_the_responder_under_the_roles_it_declared` (unit) and
+**Pinned** by `an_ack_files_the_responder_under_the_roles_it_declared` (unit),
 `two_nodes_peer_over_udp_and_land_in_each_others_role_directories`
-(`tests/peering_e2e.rs`), which gives the two nodes *different* roles precisely
-so the old behavior cannot pass.
+(`tests/peering_e2e.rs`), and
+`a_cluster_derived_by_peering_routes_the_pipelines_real_hops`
+(`tests/peered_topology_e2e.rs`), which gives the two nodes *different* roles
+precisely so the old behavior cannot pass. The last one is mutation-verified:
+reinstating this defect makes it fail with the sentinel holding two entries in
+its own Sentinel bucket (`fact-integration-test-fixture-blind-spot`).
