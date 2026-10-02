@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/01/2026 (manual update for the audit Phase 7 close: +1 fact, +1 event; earlier same day: +1 question anonymity-bootstrap, +1 fact test-gap-tail).
+Last rebuilt: 10/02/2026 (data-service landing: +3 facts, +1 task — data service, the get_user trait-default defect, the 1047 baseline, and the open testnet-launcher task).
 
 ## pillar (2)
 
@@ -93,10 +93,11 @@ Last rebuilt: 10/01/2026 (manual update for the audit Phase 7 close: +1 fact, +1
 | id | title | summary | edges |
 |---|---|---|---|
 
-## task (8)
+## task (9)
 
 | id | title | summary | edges |
 |---|---|---|---|
+| `task-testnet-launcher` | Testnet launcher: peering initiator, key/genesis generator, sparse-topology allocator | OPEN. A multi-node testnet still needs a boot-time Register initiator (nothing in production populates a role registry from peers), pre-generated keystores feeding a centrally computed peer/port matrix, and a topology respecting RNS's point-to-point interfaces. Corrects two false ceilings: rns-net 0.7.0 has no max_peers or interface_count. | 6 |
 | `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | COMPLETED 09/23/2026: all seven steps landed (cache dedup, 4 crate splits, 4 root-lib splits, core authenticate_envelope C1 helper, executor tests move). Workspace 828/32/0. | 5 |
 | `task-data-provider-wire-tests` | RESOLVED 10/01/2026: DefaultDataProvider wire-format tests (data.rs) — all five test-gap items closed | CLOSED: wire_format_tests (9) in data.rs plus siblings — server.rs async poison (2), epoch stubs (3), config load/parse (10 via path-injected seams); send_to_all already covered by Phase 6.2 fanout.rs. Suite 997 → 1021/37/0. | 3 |
 | `task-e2e-pipeline-integration-test` | DONE: e2e pipeline integration test (sentinel → executor → finalizer → committer) | CLOSED 07/26/2026: full-pipeline test at tests/pipeline_integration.rs — SUB→SENT→EXEC→FIN→COMM over RNS (5 nodes, 9 identities, 2/role); closes the audit's Done-when. Findings: Resource path needs a direct link; rns-net 0.7.0 port-wiring rule. | 4 |
@@ -137,10 +138,13 @@ Last rebuilt: 10/01/2026 (manual update for the audit Phase 7 close: +1 fact, +1
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (16)
+## fact (19)
 
 | id | title | summary | edges |
 |---|---|---|---|
+| `fact-data-service` | Data service ships in-repo (data-service crate) | The required data service now ships as the data-service crate / pneumatic_data_service binary: framed MsgPack store speaking DataOp, byte-opaque by design, plus a genesis seeder writing through the client API so envelope fingerprints cannot drift. | 5 |
+| `fact-data-user-trait-default-defect` | DefaultDataProvider ignored its configured source for user lookups | RESOLVED 10/02/2026: get_user/save_user were private inherent methods, so the trait impl inherited the default that builds a FRESH provider with the DEFAULT local source — every Arc<dyn DataProvider> caller silently ignored PNEUMATIC_DATA_ADDR for user reads. | 5 |
+| `fact-test-suite-testnet` | Test baseline 2026-10-02 (data service): 1047 passed / 37 ignored / 0 failed | 10/02/2026 baseline after the data-service crate and the get_user fix: 1047/37/0 (+18) — 14 wire tests, 3 committer boot-gate tests, 1 genesis-example guard; supersedes fact-test-suite-audit7x. | 3 |
 | `fact-executor-backpressure-slot-leak` | Executor backpressure slots are never freed in production | RESOLVED (Phase 3, 09/28/2026): backpressure slots were never freed in production (only preload_cleanup removed them); slots now live in a separate active_tasks set and are freed by the spawned task on settle. | 1 |
 | `fact-executor-partition-key-defect` | Executor passes env_id where the token partition id belongs | RESOLVED (Phase 3, 09/28/2026): the executor fetched contract/user data under env_id instead of the token partition id; it now threads token_partition_id (executor `partition_id` field) into get_token/get_user. | 2 |
 | `fact-hybrid-pq-crypto` | Hybrid PQ crypto: (Ed25519·ML-DSA-44) sign, (X25519·ML-KEM-768) KEM | AsymCryptoProvider is fully hybrid (N = N+1): signatures = Ed25519 + ML-DSA-44 concatenated; key exchange = X25519 + ML-KEM-768. Phase 7. | 3 |
@@ -204,4 +208,4 @@ Last rebuilt: 10/01/2026 (manual update for the audit Phase 7 close: +1 fact, +1
 
 ## Totals
 
-119 nodes. Logs (append-only, never indexed): see logs/.
+123 nodes. Logs (append-only, never indexed): see logs/.

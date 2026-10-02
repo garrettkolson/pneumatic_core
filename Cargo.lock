@@ -1203,6 +1203,7 @@ dependencies = [
  "once_cell",
  "pasta_curves",
  "pneumatic_committer",
+ "pneumatic_data_service",
  "pneumatic_executor",
  "pneumatic_finalizer",
  "pneumatic_prover",
@@ -1231,6 +1232,17 @@ dependencies = [
  "wasmi",
  "wasmparser",
  "x25519-dalek 3.0.0",
+]
+
+[[package]]
+name = "pneumatic_data_service"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pneumatic_core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

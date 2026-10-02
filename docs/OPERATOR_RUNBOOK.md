@@ -13,20 +13,33 @@ covers only *running the thing*.
 |---|---|
 | `pneumatic_committer` | Dedicated committer node: commit pipeline, conflict resolution, epoch loop, shielded pool authority. |
 | `node-server` | Composite runtime: one process hosting *all four* role-plugins (sentinel / executor / finalizer / committer) that this node's stake qualifies for, re-evaluated each epoch. |
+| `pneumatic_data_service` | The **data service** every node reads chain state through (`data-service/`). Framed MsgPack store plus genesis seeder. |
 
-Both are built from this workspace; inter-node traffic runs over **RNS**
+All three are built from this workspace; inter-node traffic runs over **RNS**
 (Reticulum Network Stack, UDP) with destination-encrypted packets.
 
-**The node requires an external DATA SERVICE** — a process answering framed
-MsgPack requests (`get_user`, `get_token`, stake snapshots, shielded-pool
-state) over the local UDS/TCP channel. It is not part of this repo. **Both
-binaries fail closed at boot when it is unreachable**, by design: the
-committer at the stake-snapshot load, and the composite node-server at the
-shielded-pool load (a missing pool state is indistinguishable from corrupt —
+**Every node requires a reachable DATA SERVICE.** `pneumatic_core`'s
+`DefaultDataProvider` is the client half of that channel; `pneumatic_data_service`
+(crates `data-service/`) is the server half. It answers framed MsgPack requests
+(`get_user`, `get_token`, `get_data`, stake snapshots, executor sets, shielded-pool
+state). **Both node binaries fail closed at boot when it is unreachable**, by
+design: the committer at the stake-snapshot load, and the composite node-server at
+the shielded-pool load (a missing pool state is indistinguishable from corrupt —
 re-seeding would forget prior spends). A container that exits immediately with
 `load shielded pool at boot: … refusing to re-seed` in its log has no
 reachable data service; fix the data channel (`PNEUMATIC_DATA_ADDR`,
 reachability, secret), do not restart-loop.
+
+Run it before the nodes, and seed genesis in the same step (an empty store is a
+*fail-closed* store, not a bootable one — see §5.1):
+
+```bash
+cargo build --release -p pneumatic_data_service --bin pneumatic_data_service
+PNEUMATIC_DATA_ADDR=127.0.0.1:55555 \
+PNEUMATIC_GENESIS=path/to/genesis.json \
+PNEUMATIC_DATA_STATE=./state/data.json \
+./target/release/pneumatic_data_service
+```
 
 ## 2. Configuration
 
@@ -100,6 +113,38 @@ mkdir -p /env && cp deploy/config/env/env.json /env/
 cp deploy/config/committer/config.json ./config.json
 RUST_LOG=info PNEUMATIC_DATA_SECRET=*** ./target/release/pneumatic_committer
 ```
+
+## 5.1 Genesis seeding
+
+An empty data service is not a bootable cluster — it is an unreachable one. Seed
+the records the nodes read at boot, with `PNEUMATIC_GENESIS` pointing at a JSON
+spec (template: `deploy/config/testnet/genesis.example.json`, guarded by
+`cargo test --test deploy_examples`). Four records matter, and each is read by a
+different component:
+
+| Record | Read by | Symptom if missing |
+|---|---|---|
+| `User { stake, fuel_balance }` per node | role selection (`RoleSelector` vs the env spec's `per_type_min_stake` floors) | node boots, logs `installed_roles: []`, does nothing |
+| `StakeSet` snapshot at **epoch 1** | the registration stake gate (`StakeIndex`) | every peer registration rejected |
+| `StakeSet` snapshot at **epoch 0** | quorum checks on the standard pipeline path | first transaction never finalizes |
+| `ShieldedPoolState` | composite/committer boot load (fail-closed) | `refusing to re-seed`, process exits |
+| token keyed by `environment_id` | `latest_block_hash` (the sentinel's chain-tip lookup) | routing errors on the first transaction |
+
+Two traps that cost hours if undocumented:
+
+1. **The key is the node's Ed25519 public key**, not its RNS public key. It is
+   the `ed25519=` field of the `[pneumatic] node identity rhash=… ed25519=…
+   rns_public_key=…` boot line (or the `ed25519` key inside
+   `node_identity.json`). Listing the RNS key yields a node that boots cleanly
+   and then has every registration rejected.
+2. **Stakes must not all be equal** if you intend to exercise conflict
+   resolution: equal stakes tie, and the loser is discarded rather than slashed
+   (ADR-008).
+
+Genesis is written *through the client API* (`DefaultDataProvider`), so the
+SHA-256 stake-snapshot and pool envelope fingerprints come from
+`pneumatic_core`'s own save path — the seeder cannot drift from what a running
+committer would persist.
 
 ## 6. Observability
 

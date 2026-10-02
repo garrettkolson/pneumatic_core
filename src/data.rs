@@ -211,37 +211,6 @@ impl DefaultDataProvider {
 
         Err(DataError::StoreNotFound)
     }
-
-    fn get_user(&self, key: &Vec<u8>, partition: &str) -> Result<User, DataError> {
-        let source = self.get_source();
-        if let Ok(sender) = self.conn_factory.get_sender(source) {
-            let data = self.serialize_request(key, DataOp::Get(GetOp::User), partition)?;
-            let response = match sender.get_response(&data) {
-                Ok(data) => data,
-                Err(err) => return Err(conn_error_to_data_error(err))
-            };
-
-            return match deserialize_rmp_to::<User>(&response) {
-                Ok(user) => Ok(user),
-                Err(err) => Err(DataError::DeserializationError(err))
-            }
-        }
-
-        Err(DataError::StoreNotFound)
-    }
-
-    fn save_user(&self, key: &Vec<u8>, user: User, partition: &str) -> Result<(), DataError> {
-        let source = self.get_source();
-        if let Ok(sender) = self.conn_factory.get_sender(source) {
-            let data = self.serialize_request(key, DataOp::Save(SaveOp::User(user)), partition)?;
-            return match sender.get_response(&data) {
-                Ok(_) => Ok(()),
-                Err(err) => Err(conn_error_to_data_error(err))
-            };
-        }
-
-        Err(DataError::StoreNotFound)
-    }
 }
 
 impl DataProvider for DefaultDataProvider {
@@ -260,6 +229,29 @@ impl DataProvider for DefaultDataProvider {
 
     fn save_data(&self, key: &Vec<u8>, data: Vec<u8>, partition_id: &str) -> Result<(), DataError> {
         self.save_data_internal::<Vec<u8>>(key, DataOp::Save(SaveOp::Data(data)), partition_id)
+    }
+
+    // `get_user` / `save_user` are implemented HERE on purpose.
+    //
+    // They used to live as private *inherent* methods on this type, which meant
+    // this trait impl silently inherited the trait's default — and that default
+    // builds a brand-new `DefaultDataProvider::new()` with the DEFAULT local
+    // source. Every production caller holds `Arc<dyn DataProvider>` (both node
+    // binaries, `ActionRouter`, `StakeIndex`, `DataStakeProvider`), so trait
+    // dispatch won and the freshly built provider discarded `with_source` *and*
+    // `with_secret`. With `PNEUMATIC_DATA_ADDR` pointing at a remote data
+    // service — the container topology the operator runbook documents — user
+    // lookups silently went to the local UDS path instead, found nothing, and
+    // resolved stake 0: role selection installed no roles and the registration
+    // gate rejected every peer. An in-crate test could not catch it, because
+    // `src/data.rs` tests can see the private inherent method; callers outside
+    // the module cannot.
+    fn get_user(&self, key: &Vec<u8>, partition_id: &str) -> Result<User, DataError> {
+        self.get_data_internal::<User>(key, DataOp::Get(GetOp::User), partition_id)
+    }
+
+    fn save_user(&self, key: &Vec<u8>, user: User, partition_id: &str) -> Result<(), DataError> {
+        self.save_data_internal::<User>(key, DataOp::Save(SaveOp::User(user)), partition_id)
     }
 
     fn get_stake_snapshot(&self, epoch: u64, partition_id: &str) -> Result<StakeSet, DataError> {
@@ -585,6 +577,28 @@ impl DataRequest {
             op,
             partition_id: partition.to_string()
         }
+    }
+
+    // Read accessors for the RECEIVING side of the data channel. The fields
+    // stay private — the wire shape is consensus surface, so these three
+    // accessors are the only public read seam — but a data service cannot
+    // dispatch a request it cannot read. Additive: no wire change, no
+    // behavior change on the client path.
+    /// The storage key the client computed for this op. For stake/executor
+    /// snapshots this is the big-endian epoch; for the shielded pool,
+    /// `b"shielded_pool"`; for token/user/data lookups the entity key.
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// The operation to perform.
+    pub fn op(&self) -> &DataOp {
+        &self.op
+    }
+
+    /// The partition the request is scoped to.
+    pub fn partition_id(&self) -> &str {
+        &self.partition_id
     }
 }
 

@@ -1,0 +1,39 @@
+{
+  "_comment": "GENESIS TEMPLATE — not directly bootable. Replace every public_key_hex with a REAL node key before use. The key a node is judged by is its Ed25519 public key (the `ed25519=` field of the `[pneumatic] node identity rhash=… ed25519=… rns_public_key=…` boot line, or the `ed25519` key inside that node's node_identity.json) — NOT its RNS public key. A genesis that lists the wrong key boots the node but installs no roles and rejects its registrations, because both the role floors and the registration stake gate look up this key.",
+
+  "environment_id": "env",
+  "token_partition_id": "token",
+
+  "_comment_epochs": "A committer reads epoch 1 at boot; the standard pipeline path also reads epoch 0 for quorum checks. Seeding only one of the two produces a cluster that boots and then fails on the first transaction.",
+  "stake_snapshot_epochs": [0, 1],
+
+  "_comment_recency": "Must equal the env spec's shielded_root_recency (deploy/config/env/env.json) or a booting node rebuilds the pool with a different window.",
+  "shielded_root_recency": 10,
+
+  "_comment_stake": "10 is the registration floor (Config::default_min_stake). Role floors live in the env spec's cost_model.per_type_min_stake; unset floors default to 10, so 1000 clears everything with headroom. Stakes must not all be equal if you intend to exercise conflict resolution — equal stakes tie and the loser is discarded rather than slashed.",
+  "nodes": [
+    {
+      "public_key_hex": "REPLACE_WITH_NODE_1_ED25519_PUBLIC_KEY_HEX",
+      "stake": 1000,
+      "fuel_balance": 1000000
+    },
+    {
+      "public_key_hex": "REPLACE_WITH_NODE_2_ED25519_PUBLIC_KEY_HEX",
+      "stake": 1000,
+      "fuel_balance": 1000000
+    }
+  ],
+
+  "_comment_accounts": "Non-validator wallets (a load driver's senders). stake 0 keeps them out of the stake set, so funding a test wallet never silently grants it voting weight.",
+  "accounts": [
+    {
+      "public_key_hex": "REPLACE_WITH_SENDER_ED25519_PUBLIC_KEY_HEX",
+      "fuel_balance": 10000000,
+      "stake": 0
+    }
+  ],
+
+  "_comment_seeds": "Both are required for a composite/committer to boot: the pool read is fail-closed at boot (an unreadable pool is treated as corrupt, never absent), and the sentinel's chain-tip lookup resolves as get_token(environment_id, environment_id).",
+  "seed_shielded_pool": true,
+  "seed_partition_token": true
+}

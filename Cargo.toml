@@ -10,6 +10,11 @@ members = [
     # pasta_curves below are pinned to the exact versions pneumatic_core already
     # resolves (S1.1/S1.2), so this adds zero new packages to Cargo.lock.
     "prover",
+    # The data service both node binaries read chain state through
+    # (`DefaultDataProvider` is the client half; this crate is the server half).
+    # Hard requirement for any multi-node run: both binaries fail closed at boot
+    # without it, so this is the gate on spinning up a testnet.
+    "data-service",
 ]
 resolver = "2"
 
@@ -124,3 +129,6 @@ pneumatic_executor = { path = "executor" }
 pneumatic_finalizer = { path = "finalizer" }
 pneumatic_committer = { path = "committer" }
 pneumatic_prover = { path = "prover" }
+# Root-level boot test: the committer's real fail-closed boot load driven
+# against the real data service (tests/data_service_boot.rs).
+pneumatic_data_service = { path = "data-service" }

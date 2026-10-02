@@ -1,0 +1,26 @@
+[package]
+name = "pneumatic_data_service"
+version = "0.1.0"
+edition = "2021"
+
+# The data service both nodes talk to at boot. `pneumatic_core`'s
+# `DefaultDataProvider` is the CLIENT half of this channel; this crate is the
+# server half, which the repo has never shipped (the operator runbook documents
+# it as "not part of this repo" and both binaries fail closed without it).
+#
+# Deliberately light on dependencies: the wire types (`DataRequest`, `DataOp`,
+# the SHA-256 envelopes) all come from `pneumatic_core`, so the service can
+# never drift from the client's codec. No HTTP framework, no database.
+[dependencies]
+pneumatic_core = { path = ".." }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+hex = "0.4"
+
+[[bin]]
+name = "pneumatic_data_service"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Same version already resolved in the workspace lockfile (root crate).
+tempfile = "3.20.0"

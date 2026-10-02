@@ -55,3 +55,44 @@ fn deploy_env_example_parses_validates_and_loads() {
         .expect("env.json must load into EnvironmentMetadata");
     assert_eq!(env.environment_id, "env");
 }
+
+#[test]
+fn deploy_genesis_example_parses_and_agrees_with_the_env_example() {
+    // The genesis template is the input to `pneumatic_data_service --genesis`,
+    // so it must keep parsing as `GenesisSpec` — and it must AGREE with
+    // `deploy/config/env/env.json`, because a genesis whose `environment_id` or
+    // recency window disagrees with the env spec produces a cluster that boots
+    // and then fails on its first transaction rather than at startup.
+    let raw = fs::read(repo_root().join("deploy/config/testnet/genesis.example.json"))
+        .expect("read deploy/config/testnet/genesis.example.json");
+    let spec: pneumatic_data_service::GenesisSpec =
+        serde_json::from_slice(&raw).expect("genesis.example.json must parse as GenesisSpec");
+
+    // The shipped template is a template: placeholder keys, by design.
+    assert_eq!(spec.nodes.len(), 2, "the template documents a two-node cluster");
+    assert!(
+        spec.nodes.iter().all(|n| n.public_key_hex.starts_with("REPLACE")),
+        "the template must ship placeholders, never a key that could boot a real node"
+    );
+
+    // Cross-file agreement with the env example.
+    let env_raw = fs::read(repo_root().join("deploy/config/env/env.json")).expect("read env.json");
+    let env_value: serde_json::Value = serde_json::from_slice(&env_raw).expect("env.json parses");
+    assert_eq!(
+        spec.environment_id,
+        env_value["environment_id"].as_str().expect("env id is a string"),
+        "genesis environment_id must equal the env spec's environment_id"
+    );
+    assert_eq!(
+        spec.shielded_root_recency, 10,
+        "the template's recency window must match the value the pool is built with"
+    );
+
+    // Both boot-critical seeds on, and both epochs the nodes read are covered.
+    assert!(spec.seed_shielded_pool, "a composite cannot boot without a seeded pool");
+    assert!(spec.seed_partition_token, "the sentinel's chain-tip lookup needs the partition token");
+    assert!(
+        spec.stake_snapshot_epochs.contains(&0) && spec.stake_snapshot_epochs.contains(&1),
+        "epoch 1 is the boot read and epoch 0 is the pipeline-path read"
+    );
+}
