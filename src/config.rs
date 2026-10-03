@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::Error;
 use std::net::{IpAddr, Ipv6Addr};
@@ -145,7 +146,46 @@ impl Config {
     }
 
     fn load_spec() -> Result<ConfigSpec, Error> {
-        Config::load_spec_from(Path::new(Self::CONFIG_FILE_LOCATION))
+        Config::load_spec_from(Path::new(&Config::config_file_location()))
+    }
+
+    /// Resolve the two hardcoded config paths, honoring per-process overrides.
+    ///
+    /// `CONFIG_FILE_LOCATION` is CWD-relative and `ENV_FILE_LOCATION` is the
+    /// absolute `/env`, which is exactly right inside a container (compose
+    /// bind-mounts `./config/env:/env:ro`) and unusable for N nodes on one host:
+    /// every process would read the same spec and the same keystore, and `/env`
+    /// needs filesystem-root write access on a plain machine. A testnet launcher
+    /// gives each node its own directory instead, so both paths become
+    /// per-process:
+    ///
+    /// | Variable | Unset (unchanged behavior) |
+    /// |---|---|
+    /// | `PNEUMATIC_CONFIG_FILE` | `config.json` in the CWD |
+    /// | `PNEUMATIC_ENV_DIR` | `/env` |
+    ///
+    /// Overrides are pass-through, not validation: a path that does not exist
+    /// fails at the same point with the same error as the default path would
+    /// (`fs::read` / `fs::read_dir`), so pointing an override at garbage is
+    /// loud-at-boot rather than silently defaulted. An empty value is treated as
+    /// unset, because `VAR=` in a shell or a compose file is far more likely a
+    /// mistake than an intent to read a file named `""`.
+    fn config_file_location() -> String {
+        Self::resolve_location(env::var("PNEUMATIC_CONFIG_FILE").ok(), Self::CONFIG_FILE_LOCATION)
+    }
+
+    fn env_file_location() -> String {
+        Self::resolve_location(env::var("PNEUMATIC_ENV_DIR").ok(), Self::ENV_FILE_LOCATION)
+    }
+
+    /// Pure half of the two `*_location` resolvers, so the override rules are
+    /// testable without mutating process-global environment variables (which
+    /// would race with every other test in the binary).
+    fn resolve_location(override_value: Option<String>, default: &'static str) -> String {
+        match override_value {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => default.to_string(),
+        }
     }
 
     /// Filesystem half of `load_spec`, with the path injected so the load/parse
@@ -161,7 +201,7 @@ impl Config {
     }
 
     fn get_environment_metadata() -> Result<Arc<DashMap<String, EnvironmentMetadata>>, Error> {
-        Config::get_environment_metadata_from(Path::new(Self::ENV_FILE_LOCATION))
+        Config::get_environment_metadata_from(Path::new(&Config::env_file_location()))
     }
 
     /// Directory-scoped half of `get_environment_metadata` with the directory
@@ -525,6 +565,44 @@ mod config_tests {
             Config::load_spec_from(&path).is_err(),
             "a spec missing a required field must not build"
         );
+    }
+
+    /// Without the override set, both paths resolve exactly as they always did —
+    /// containers keep mounting `/env` and binaries keep reading `config.json`
+    /// from the CWD.
+    #[test]
+    fn config_path_override_defaults_are_unchanged() {
+        assert_eq!(
+            Config::resolve_location(None, Config::CONFIG_FILE_LOCATION),
+            "config.json"
+        );
+        assert_eq!(
+            Config::resolve_location(None, Config::ENV_FILE_LOCATION),
+            "/env"
+        );
+        assert_eq!(
+            Config::resolve_location(Some("/tmp/node-3/config.json".into()), Config::CONFIG_FILE_LOCATION),
+            "/tmp/node-3/config.json",
+            "a per-node override must win, which is what lets N nodes share a host"
+        );
+        assert_eq!(
+            Config::resolve_location(Some("/tmp/node-3/env".into()), Config::ENV_FILE_LOCATION),
+            "/tmp/node-3/env"
+        );
+    }
+
+    /// `VAR=` in a shell or compose file is a mistake, not an instruction to read
+    /// a file named `""`. Treating blank as unset keeps the failure mode at the
+    /// default path instead of producing a confusing `No such file or directory`.
+    #[test]
+    fn blank_path_override_is_treated_as_unset() {
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                Config::resolve_location(Some(blank.into()), Config::ENV_FILE_LOCATION),
+                "/env",
+                "blank override {blank:?} must fall back to the default"
+            );
+        }
     }
 
     #[test]

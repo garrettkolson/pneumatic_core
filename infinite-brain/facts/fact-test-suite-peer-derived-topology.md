@@ -10,7 +10,7 @@ applicable_when: "Comparing a test count after a change, or checking the regress
 confidence: 1.0
 verified_at: "10/02/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Any change that adds/removes tests; superseded by the next recorded baseline"
+staleness_signal: "SUPERSEDED 10/02/2026 by fact-test-suite-generator (1084/37/0). Otherwise: any change that adds/removes tests."
 tags: [fact, tests, baseline, peering, integration-tests]
 edges:
   - target: fact-test-suite-peering

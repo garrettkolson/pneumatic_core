@@ -15,6 +15,11 @@ members = [
     # Hard requirement for any multi-node run: both binaries fail closed at boot
     # without it, so this is the gate on spinning up a testnet.
     "data-service",
+    # Generates the artifacts a multi-node run needs and nothing else: keys,
+    # per-node config + env dirs, and genesis. Its tests validate the output
+    # against the real loaders, so emitted configs cannot drift from what the
+    # binaries parse.
+    "testnet-gen",
 ]
 resolver = "2"
 

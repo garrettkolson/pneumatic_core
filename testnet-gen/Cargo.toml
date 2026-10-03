@@ -1,0 +1,40 @@
+[package]
+name = "pneumatic_testnet_gen"
+version = "0.1.0"
+edition = "2021"
+
+# Generates a bootable multi-node testnet: pre-generated keystores, one
+# `config.json` per node with both-sided `bootstrap_peers`, a per-node env dir,
+# and a `genesis.json` whose keys are the *Ed25519* keys the nodes are judged by.
+#
+# Two things make this a Rust crate rather than a script:
+#
+# 1. **Keystores.** `bootstrap_peers` carries each peer's hex RNS public key at
+#    seed time, so every identity must exist before the first boot. The only
+#    correct way to produce one is the loader's own writer
+#    (`NodeIdentity::load_or_create`), which persists the hybrid PQC keypair set
+#    (Ed25519 seed + ML-DSA + ML-KEM) at mode 0600. Reimplementing that format in
+#    another language guarantees drift — and a silently wrong keystore oracles as
+#    a node that boots, installs no roles, and rejects registrations.
+#
+# 2. **The peer/port matrix.** RNS UDP interfaces are point-to-point: interface
+#    `k` on a node listens on `base + k` and must forward to
+#    `peer_base + j`, where `j` is *this* node's index in *that peer's* peer list.
+#    No single node can derive `j` locally — it depends on another node's
+#    configuration. A central generator is the only place that knows both sides.
+#
+# The emitted shapes are validated against the real parsers (`Config::
+# load_spec_from`, `EnvironmentMetadata`) in `tests/generation.rs`, so drift
+# fails the build instead of the boot.
+[dependencies]
+pneumatic_core = { path = ".." }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+hex = "0.4"
+
+[[bin]]
+name = "pneumatic_testnet_gen"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.20.0"

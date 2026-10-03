@@ -4,7 +4,7 @@ title: "Testnet launcher: key/genesis generator, sparse-topology allocator"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "PARTIAL. The peering initiator landed 10/02/2026 (see fact-control-plane-peering) — nodes now register with each other over UDP. Two pieces remain: pre-generated keystores feeding a centrally computed peer/port matrix, and a topology that respects RNS's point-to-point interface model for the 20-40 node target."
+summary: "PARTIAL. Peering and generation both landed 10/02/2026: nodes register with each other over UDP (fact-control-plane-peering), and testnet-gen emits the keys, configs, env dirs, genesis and peer/port matrix (fact-testnet-generator). Density is answered — pruning topology never lowers the worst node (fact-fanout-graph-density). Remaining: the up/down/status launcher and converting the older seeded tests."
 auto_inject: false
 applicable_when: "Building or extending local testnet tooling, or debugging why a multi-node cluster does not route"
 confidence: 0.85
@@ -69,7 +69,12 @@ existed and looked sound with line-number citations, while
 function was reported to exist at registry.rs:131 during this investigation —
 **it does not exist anywhere in the repo** (verified case-insensitively).
 
-**2. Identities must be pre-generated, and the peer/port matrix centrally computed.**
+**2. (DONE 10/02/2026 — was: identities had to be pre-generated and the
+peer/port matrix centrally computed.)** `testnet-gen/` emits keystores
+(through the loader's own writer), per-node `config.json` with both-sided
+`bootstrap_peers`, per-node env dirs, and `genesis.json` keyed by Ed25519.
+See `fact-testnet-generator`. Historical record of the constraint, because
+it is what forced a generator rather than a script:
 `identity_path` is a config field (`src/config.rs:105`) and
 `NodeIdentity::generate_in_memory()` needs no file I/O, so keystores can be
 written before first boot — which is required, because `bootstrap_peers` carries
@@ -79,7 +84,12 @@ for peer P must forward to `base_P + (D's index in P's peer list)` — the **j-r
 (`tests/pipeline_integration.rs:413-426`). An independent process cannot derive
 that locally; the launcher must emit it.
 
-**3. Density is the open question, and two assumed ceilings are false.**
+**3. Density: answered 10/02/2026, and the answer is not topology.
+Two assumed ceilings remain false and must not be designed around.**
+`fact-fanout-graph-density` measures it: the send graph is a full mesh minus
+executor↔executor, so pruning saves 5.8% at equal role counts and 50% when
+executors dominate, but **never lowers the worst node**, which is the binding
+constraint. What is still unknown is empirical, not structural:
 The repo's own e2e test documents that a dense 9-node mesh left "a stable subset
 of directed routes never … live", which is why it rides a 5-node chain with ≤3
 interfaces (`tests/pipeline_integration.rs:13-26`). **Two constraints claimed by
@@ -94,7 +104,7 @@ forwarding are transport-gated in rns-core), so today every Message-carrying edg
 must be a direct link — which is precisely what makes full-mesh density expensive.
 Relay (`transport_enabled: true`) is untested in this repo.
 
-**3. (PARTLY DONE 10/02/2026 — was: the integration tests could not see the
+**4. (PARTLY DONE 10/02/2026 — was: the integration tests could not see the
 wiring they depend on.)** `tests/peered_topology_e2e.rs` now builds a 4-node mesh
 whose directories are *derived* by peering — nothing calls `register_peer` — and
 routes the pipeline's real hops over them. Mutation-verified against the ack
@@ -105,6 +115,16 @@ conn)`, a test-only API with no production caller, at 6 sites. They stay blind t
 registration, ack handling and control framing. Converting them is easier once a
 launcher computes the peer/port matrix, since a derived topology has to be
 expressible before it can be asserted.
+
+**5. The launcher (`up` / `down` / `status`) is the remaining piece.** Everything it
+needs to read already exists in `manifest.json` — every node's directory, base
+port, interface count, peer names, and all three public-key forms. What it must
+do: start the data service first with `PNEUMATIC_GENESIS` pointed at the generated
+`genesis.json` (nodes fail closed without a listener), wipe stale RNS state before
+each boot (`known_destinations_ttl` is 48 h, so yesterday's routes poison today's
+run), start each node with `PNEUMATIC_CONFIG_FILE`, `PNEUMATIC_ENV_DIR` and
+`PNEUMATIC_DATA_ADDR`, then poll until every directory is populated — observable
+now, rather than something to eyeball in logs.
 
 **Smaller verified launch blockers:** `/env` and `config.json` are hardcoded
 consts (`config.rs:63-64`) — fine for a shared env spec, but the env spec's

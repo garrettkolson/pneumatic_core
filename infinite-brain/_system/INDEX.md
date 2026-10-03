@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/02/2026 (test-adequacy follow-up to the peering work: +2 facts — the fixture blind spot (multi-node tests seeded their own topology through a test-only API) and the 1065 baseline; task-testnet-launcher item 3 partly done).
+Last rebuilt: 10/02/2026 (testnet generator: +3 facts — testnet-gen itself, the measured role fan-out density graph, and the 1084 baseline; task-testnet-launcher items 2 and 3 closed, launcher added as item 5; concept-env-driven-config covers the new path overrides).
 
 ## pillar (2)
 
@@ -97,7 +97,7 @@ Last rebuilt: 10/02/2026 (test-adequacy follow-up to the peering work: +2 facts 
 
 | id | title | summary | edges |
 |---|---|---|---|
-| `task-testnet-launcher` | Testnet launcher: key/genesis generator, sparse-topology allocator | PARTIAL. The peering initiator landed 10/02/2026 — nodes now register with each other over UDP. Remaining: pre-generated keystores feeding a centrally computed peer/port matrix, and a topology respecting RNS's point-to-point interfaces for the 20-40 node target. Corrects two false ceilings: rns-net 0.7.0 has no max_peers or interface_count. | 6 |
+| `task-testnet-launcher` | Testnet launcher: up/down/status over generated artifacts | PARTIAL. Peering and generation both landed 10/02/2026: nodes register over UDP, and testnet-gen emits keys, configs, env dirs, genesis and the peer/port matrix. Density is answered — pruning topology never lowers the worst node. Remaining: the launcher itself and converting the older seeded tests. | 6 |
 | `task-monolith-modularization` | Refactor: apply committer modularization to remaining monoliths | COMPLETED 09/23/2026: all seven steps landed (cache dedup, 4 crate splits, 4 root-lib splits, core authenticate_envelope C1 helper, executor tests move). Workspace 828/32/0. | 5 |
 | `task-data-provider-wire-tests` | RESOLVED 10/01/2026: DefaultDataProvider wire-format tests (data.rs) — all five test-gap items closed | CLOSED: wire_format_tests (9) in data.rs plus siblings — server.rs async poison (2), epoch stubs (3), config load/parse (10 via path-injected seams); send_to_all already covered by Phase 6.2 fanout.rs. Suite 997 → 1021/37/0. | 3 |
 | `task-e2e-pipeline-integration-test` | DONE: e2e pipeline integration test (sentinel → executor → finalizer → committer) | CLOSED 07/26/2026: full-pipeline test at tests/pipeline_integration.rs — SUB→SENT→EXEC→FIN→COMM over RNS (5 nodes, 9 identities, 2/role); closes the audit's Done-when. Findings: Resource path needs a direct link; rns-net 0.7.0 port-wiring rule. | 4 |
@@ -138,12 +138,15 @@ Last rebuilt: 10/02/2026 (test-adequacy follow-up to the peering work: +2 facts 
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (27)
+## fact (30)
 
 | id | title | summary | edges |
 |---|---|---|---|
 | `fact-integration-test-fixture-blind-spot` | Integration tests seeded their own topology, so they could not see the wiring | RESOLVED 10/02/2026: the three multi-node tests seed directories with register_peer — a test-only API with no production caller — so nothing could observe registration, acks or control framing. tests/peered_topology_e2e.rs derives a 4-node mesh by peering; mutation-verified. | 5 |
 | `fact-test-suite-peer-derived-topology` | Test baseline 2026-10-02 (peer-derived topology): 1065 passed / 37 ignored / 0 failed | 10/02/2026 baseline: 1065/37/0 (+1 over fact-test-suite-peering) — one test, the suite's only multi-node test whose directories are derived rather than seeded. | 2 |
+| `fact-testnet-generator` | testnet-gen: generated keystores, configs, and the two-sided port matrix | 10/02/2026: `testnet-gen/` emits keystores via the loader's own writer, per-node config.json with both-sided bootstrap_peers, per-node env dirs, Ed25519-keyed genesis and a manifest. New PNEUMATIC_CONFIG_FILE / PNEUMATIC_ENV_DIR overrides let N nodes share a host. | 5 |
+| `fact-fanout-graph-density` | The role fan-out graph is a full mesh minus executor-executor | 10/02/2026, read off the send_to_all sites and measured: only the executor↔executor pair class is absent, so pruning saves 5.8% at equal role counts and 50% when executors dominate — and never lowers the worst node, which is the binding constraint on one host. | 4 |
+| `fact-test-suite-generator` | Test baseline 2026-10-02 (testnet generator): 1084 passed / 37 ignored / 0 failed | 10/02/2026 baseline after testnet-gen and the config-path overrides: 1084/37/0 (+19) — 17 in the new crate, 2 for the path-override rules. | 2 |
 | `fact-control-plane-peering` | Peering initiator: the control plane now has a client half | 10/02/2026: `peering.rs` sends Register / directory Request / Heartbeat on a 10 s retry loop from both binaries. Nodes advertise `declared_roles`, and a control frame's ~5.9 KB size means peering can only start after the peer's announce makes its route live. | 6 |
 | `fact-control-plane-silent-drop-paths` | Four control-plane paths that dropped packets without an error | RESOLVED 10/02/2026: a bare NodeRequest outside a NetworkPacket decodes as an empty packet and vanishes; ~5.9 KB replies went out on the 481 B direct path; a directory response echoed a Request (infinite peer-to-peer reply loop); and the directory answered any caller. | 4 |
 | `fact-register-ack-bucket-placement-defect` | RegisterAck filed the responder under the requester's role | RESOLVED 10/02/2026: handle_register_ack installed the peer under the ack's node_type — the type the *requester* was registered under — so a finalizer filed its committer peer into its own Finalizer bucket. Now files under the responder's own declared set. | 3 |
@@ -214,4 +217,4 @@ Last rebuilt: 10/02/2026 (test-adequacy follow-up to the peering work: +2 facts 
 
 ## Totals
 
-130 nodes. Logs (append-only, never indexed): see logs/.
+133 nodes. Logs (append-only, never indexed): see logs/.

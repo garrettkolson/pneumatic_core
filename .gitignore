@@ -12,3 +12,9 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Generated testnet artifacts (`pneumatic_testnet_gen`). These directories hold
+# node keystores — `node_identity.json` contains Ed25519 seeds and ML-DSA/ML-KEM
+# secret keys — so they must never be committed, even though the testnet they
+# describe is throwaway.
+deploy/generated/

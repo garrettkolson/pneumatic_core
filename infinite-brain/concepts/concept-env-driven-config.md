@@ -8,11 +8,15 @@ summary: "Config::build loads config.json plus every JSON spec in /env/ into per
 auto_inject: false
 applicable_when: "Changing node boot, environment specs, cost model, quorum/shard parameters, or validation spec registration"
 confidence: 1.0
-verified_at: "09/20/2026"
+verified_at: "10/02/2026"
 verified_by: "dsh-agent"
-staleness_signal: "If config.json//env file layout, EnvironmentMetadata fields, or spec validation-on-load changes"
+staleness_signal: "If config.json//env file layout, EnvironmentMetadata fields, spec validation-on-load, or the PNEUMATIC_CONFIG_FILE/PNEUMATIC_ENV_DIR overrides change"
 tags: [config, environment, cost-model, quorum]
 edges:
+  - target: fact-testnet-generator
+    type: related_to
+    weight: 0.85
+    note: "The generator emits config.json + a per-node env dir; the path overrides are what make per-node dirs reachable"
   - target: fact-workspace-layout
     type: related_to
     weight: 0.6
@@ -36,6 +40,8 @@ source_url: "Empty"
 # Environment-driven configuration: config.json + /env/ specs
 
 `Config::build` (`src/config.rs:66`) is two-phase: `load_spec` reads `config.json` (lines 63, 148) for node identity, `node_type` (Full/Light), and transport settings; `get_environment_metadata` (lines 156-211) reads **every file in `/env/`** (line 64), parses each as an `EnvironmentMetadataSpec`, runs `env_spec.validate()` (line 186) and `load_from_spec` (line 197), and indexes results by `environment_id` in a DashMap. A spec whose quorum/risk/tax/gas/shard values are out of range fails node boot, instead of silently neutering the risk gate or finalization quorum.
+
+**Both paths are overridable since 10/02/2026.** `PNEUMATIC_CONFIG_FILE` and `PNEUMATIC_ENV_DIR` replace the two constants per process; unset or blank behaves exactly as before, and a bad override fails at the same `fs::read`/`read_dir` with the same error instead of quietly defaulting. This exists because `config.json` is CWD-relative while `/env` is absolute — right inside a container (compose mounts `./config/env:/env:ro`), unusable for N nodes on one host, where every process would read the same spec and the same keystore, and where `/env` needs filesystem-root write access. `testnet-gen` gives each node its own directory, and the overrides are what make those directories reachable. See [[fact-testnet-generator]].
 
 `Config` (config.rs:32) is identity-authoritative: `public_key` always comes from the persistent identity (`identity.ed25519`), and any `public_key` in `config.json` is deliberately ignored (lines 35-40). It also carries per-type `NodeTypeConfig` (min/max connections + minimum stake, lines 213-225, 265-279) and the Full/Light registry-type split (line 246-257: light nodes skip Archiver).
 
