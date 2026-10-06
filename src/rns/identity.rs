@@ -256,6 +256,21 @@ impl NodeIdentity {
         }
     }
 
+    /// Verify a detached hybrid signature over an arbitrary `message`, given the
+    /// signer's Ed25519 key.
+    ///
+    /// Mirrors [`verify_binding`]'s policy — a throwaway provider, both halves of
+    /// the `(Ed25519 · ML-DSA-44)` signature must verify — for artifacts outside
+    /// the control plane. Currently mesh fragments: attestations a node makes
+    /// about itself offline, which a log pipeline ships and `mesh-probe` checks
+    /// without any ability to ask the node again.
+    pub fn verify_message(ed25519_public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        // A throwaway provider: check_signature only uses the supplied public key.
+        Ed25519Provider::generate()
+            .check_signature(signature, ed25519_public_key, message)
+            .unwrap_or(false)
+    }
+
     /// Load an existing keystore. A missing or corrupt file is a hard error
     /// — we NEVER silently regenerate, because a new identity would orphan
     /// any stake registered under the old one.

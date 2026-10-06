@@ -45,6 +45,11 @@ pub enum PneumaticError {
     /// `halo2_proofs::plonk::verify_proof` on its own greppable variant rather
     /// than being swallowed into a generic crypto error.
     Shielded(String),
+    /// Filesystem failure on an observability path (mesh fragments). Separate
+    /// from `Network`/`Registry` so an operator grepping for "Io(" finds exactly
+    /// the writes that failed, and so a failed fragment never masquerades as a
+    /// protocol error in the logs.
+    Io(String),
 }
 
 impl std::fmt::Display for PneumaticError {
@@ -52,6 +57,7 @@ impl std::fmt::Display for PneumaticError {
         match self {
             PneumaticError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
             PneumaticError::Encoding(msg) => write!(f, "Encoding({})", msg),
+            PneumaticError::Io(msg) => write!(f, "Io({})", msg),
             PneumaticError::Data(e) => write!(f, "Data({})", e),
             PneumaticError::Network(msg) => write!(f, "Network({})", msg),
             PneumaticError::Resource(msg) => write!(f, "Resource({})", msg),

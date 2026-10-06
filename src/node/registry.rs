@@ -247,6 +247,18 @@ pub fn get_network(&self) -> Option<Arc<RnsNetwork>> {
     self.network.as_ref().map(Arc::clone)
 }
 
+/// Snapshot of the per-peer fan-out failure counters, for mesh fragments
+/// (`fragment.rs`).
+///
+/// Returned as an owned Vec rather than an iterator or handle: the caller is an
+/// observability thread that must not hold shard guards into the send path.
+pub fn delivery_failures_snapshot(&self) -> Vec<([u8; 16], NodeRegistryType, u64)> {
+    self.delivery_failures
+        .iter()
+        .map(|entry| (entry.key().0, entry.key().1.clone(), *entry.value()))
+        .collect()
+}
+
 pub fn get_nodes(&self, node_type: &NodeRegistryType) -> Option<Nodes> {
     match node_type {
         NodeRegistryType::Committer => Some(Arc::clone(&self.committers)),
@@ -326,6 +338,7 @@ fn evict_expired(notes: &[Arc<DashMap<Vec<u8>, NodeRegistryNode>>]) {
         }
     }
 }
+pub mod fragment;
 pub mod fanout;
 pub mod heartbeat;
 pub mod peering;
@@ -339,6 +352,7 @@ pub mod registration;
 mod tests {
     pub mod helpers;
     mod fanout;
+    mod fragment;
     mod heartbeat;
     mod lifecycle;
     mod peering;

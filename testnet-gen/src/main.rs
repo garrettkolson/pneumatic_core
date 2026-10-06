@@ -26,14 +26,16 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use pneumatic_testnet_gen::cli::{flag, parsed};
 use pneumatic_testnet_gen::emit::{GenSpec, Report};
-use pneumatic_testnet_gen::topology::{Role, TopologyMode};
+use pneumatic_testnet_gen::topology::{Placement, Role, TopologyMode};
 
 const USAGE: &str = "\
 pneumatic_testnet_gen — generate a bootable multi-node testnet
 
   --out <dir>              output directory (default: deploy/generated/testnet)
-  --validators <n>         n nodes per role (shorthand for the four flags below)
+  --validators <n>         total nodes, split across the four roles (leftover
+                           roles come first). Individual role flags override it.
   --sentinels <n>          sentinel nodes
   --executors <n>          executor nodes
   --finalizers <n>         finalizer nodes
@@ -46,34 +48,26 @@ pneumatic_testnet_gen — generate a bootable multi-node testnet
   --fuel <n>              validator fuel balance (default: 1000000)
   --data-addr <host:port>  where the data service will listen (default: 127.0.0.1:55555)
   --env-template <path>    env spec to clone per node (default: deploy/config/env/env.json)
+  --addresses <a,b,c,...>  one address per node, in report order. Supplying these
+                           means one node per machine: peers dial these addresses
+                           and every host shares ONE port range.
+  --addresses-file <path>  same, one address per line; blank lines and #-comments
+                           ignored. Feed a provisioner's output straight in.
+  --bind-ip <ip>           address each node binds. Default: every interface.
+                           Set on a multi-homed host, where binding every
+                           interface would answer on the wrong network.
   --force-keys             replace existing keystores (orphans their genesis stake)
   --help                   this text
+
+One node per machine (a cloud testnet), where a provisioner has already produced
+addresses. Note the two-pass order: keystores first, because a node's config
+lists its peers' public keys, so identities must exist before configs can be
+written — then addresses, which only exist after provisioning.
+
+  pneumatic_testnet_gen --out /tmp/keys --validators 4
+  # ...provision 16 machines, collect their addresses into addresses.txt...
+  pneumatic_testnet_gen --out /tmp/keys --validators 4 --addresses-file addresses.txt
 ";
-
-/// One CLI flag value (`--flag value` or `--flag=value`), same convention as the
-/// data service binary.
-fn flag(args: &[String], name: &str) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(rest) = arg.strip_prefix(&format!("--{name}=")) {
-            return Some(rest.to_string());
-        }
-        if arg == &format!("--{name}") {
-            return iter.next().map(|value| value.to_string());
-        }
-    }
-    None
-}
-
-fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, String> {
-    match flag(args, name) {
-        None => Ok(None),
-        Some(raw) => raw
-            .parse::<T>()
-            .map(Some)
-            .map_err(|_| format!("--{name} expected a number, got {raw:?}")),
-    }
-}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -117,6 +111,34 @@ fn run(args: &[String]) -> Result<Report, String> {
     if let Some(template) = flag(args, "env-template") {
         spec.env_template = PathBuf::from(template);
     }
+    // Where the nodes run. Supplying addresses *is* the declaration that this is
+    // not a single-host cluster, so there is no separate `--per-host` flag that
+    // could contradict the address list.
+    let addresses = match (flag(args, "addresses"), flag(args, "addresses-file")) {
+        (Some(_), Some(_)) => {
+            return Err("--addresses and --addresses-file are mutually exclusive".to_string())
+        }
+        (Some(list), None) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect(),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|e| format!("--addresses-file {path}: {e}"))?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect(),
+        (None, None) => Vec::new(),
+    };
+    if !addresses.is_empty() {
+        spec.placement = Placement::PerHost { addresses };
+    }
+    if let Some(bind) = flag(args, "bind-ip") {
+        spec.bind_address = Some(bind);
+    }
     spec.force_keys = args.iter().any(|a| a == "--force-keys");
 
     match flag(args, "topology").as_deref() {
@@ -130,12 +152,18 @@ fn run(args: &[String]) -> Result<Report, String> {
         }
     }
 
-    // Counts: `--validators n` is n per role; individual flags override it, so
-    // `--validators 40 --sentinels 6` means 6 sentinels and 10 of everything else.
+    // Counts. `--validators n` is n nodes *total* split across the four roles;
+    // individual role flags override it, so `--validators 40 --sentinels 6` means
+    // 6 sentinels and 10 of everything else.
     let mut counts = spec.counts;
     if let Some(n) = parsed::<usize>(args, "validators")? {
-        for (_, count) in counts.iter_mut() {
-            *count = n / 4;
+        // The remainder is handed out in role order rather than truncated. The
+        // old `n / 4` made `--validators 10` silently build 8 nodes, and made
+        // `--validators 1..3` fail as "every role count is zero" — both are the
+        // sort of quiet surprise this generator exists to remove. A count below
+        // 4 now means what it says: a cluster that lacks some roles.
+        for (i, (_, count)) in counts.iter_mut().enumerate() {
+            *count = n / 4 + usize::from(i < n % 4);
         }
     }
     for (role, flag_name) in [
@@ -172,17 +200,36 @@ fn print_report(report: &Report) {
         report.keystore_created,
         report.keystore_reused
     );
-    println!();
+    // The split, because `--validators 10` is 3/3/2/2 and an operator should see
+    // that rather than infer it from the table — role counts change the mesh.
+    let split: Vec<String> = [
+        (Role::Sentinel, "sentinel"),
+        (Role::Executor, "executor"),
+        (Role::Finalizer, "finalizer"),
+        (Role::Committer, "committer"),
+    ]
+    .iter()
+    .map(|(role, label)| {
+        let n = report
+            .nodes
+            .iter()
+            .filter(|n| &n.role == role)
+            .count();
+        format!("{label} {n}")
+    })
+    .collect();
+    println!("  role split: {}\n", split.join(" · "));
     println!(
-        "  {:<14} {:<10} {:>6} {:>5} {:>8}  peers",
-        "node", "role", "port", "links", "threads"
+        "  {:<14} {:<10} {:<15} {:>6} {:>5} {:>8}  peers",
+        "node", "role", "peer dials", "port", "links", "threads"
     );
-    println!("  {}", "-".repeat(76));
+    println!("  {}", "-".repeat(92));
     for node in &report.nodes {
         println!(
-            "  {:<14} {:<10} {:>6} {:>5} {:>8}  {}",
+            "  {:<14} {:<10} {:<15} {:>6} {:>5} {:>8}  {}",
             node.name,
             format!("{:?}", node.role).to_lowercase(),
+            node.address,
             node.rns_port,
             node.interfaces,
             thread_estimate(node.interfaces),
@@ -190,16 +237,32 @@ fn print_report(report: &Report) {
         );
     }
     println!();
-    println!("  cost on one host:");
+    println!("  cost ({} placement):", report.placement);
     println!(
         "    max UDP interfaces per node: {} (≈{} threads/process)",
         report.max_interfaces,
         thread_estimate(report.max_interfaces)
     );
     println!(
+        "    UDP ports per machine:       {}{}",
+        report.ports_per_host,
+        if report.placement == "per-host" {
+            "  (one range reused on every host)"
+        } else {
+            ""
+        }
+    );
+    println!(
         "    total UDP sockets:           {}",
         report.total_interfaces
     );
+    if report.placement == "per-host" {
+        let lo = report.base_port;
+        let hi = report.base_port + report.ports_per_host - 1;
+        println!(
+            "    firewall: open UDP {lo}-{hi} between cluster members only. Leaves cannot\n    route through other leaves, so this range must be reachable peer-to-peer: a\n    load balancer or NAT gateway cannot stand in for it."
+        );
+    }
     if report.max_interfaces > 12 {
         println!(
             "    NOTE: {} interfaces/node is past anything this repo has run. The \

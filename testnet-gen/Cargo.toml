@@ -36,5 +36,13 @@ hex = "0.4"
 name = "pneumatic_testnet_gen"
 path = "src/main.rs"
 
+# Judged a *running* cluster against its manifest. Separate binary because it
+# answers a different question than the generator: not "what should this cluster
+# look like" but "did it actually form". Its sibling in the codebase is the
+# collector that will fill the snapshot it consumes.
+[[bin]]
+name = "mesh-probe"
+path = "src/bin/mesh_probe.rs"
+
 [dev-dependencies]
 tempfile = "3.20.0"

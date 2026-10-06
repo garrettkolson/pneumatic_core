@@ -422,6 +422,9 @@ pub fn make_test_committer_with_slash(
     let config = Config {
         public_key: vec![1],
         ip_address: "127.0.0.1".parse().unwrap(),
+        // Fixture nodes do not report: a unit test writing fragments would drop
+        // files into the working tree, and none of these assertions read them.
+        mesh_fragment_path: None,
         rest_api_version: 1,
         node_type: pneumatic_core::node::NodeType::Full,
         node_registry_types: vec![NodeRegistryType::Committer],
@@ -459,6 +462,9 @@ pub fn make_test_committer_with_slash(
         Config {
             public_key: vec![2],
             ip_address: "127.0.0.1".parse().unwrap(),
+            // Fixture nodes do not report: a unit test writing fragments would drop
+            // files into the working tree, and none of these assertions read them.
+            mesh_fragment_path: None,
             rest_api_version: 1,
             node_type: pneumatic_core::node::NodeType::Full,
             node_registry_types: vec![NodeRegistryType::Committer],
@@ -665,6 +671,9 @@ pub fn build_committer_for_leader_test(
     let config = Config {
         public_key: committer_key.clone(),
         ip_address: "127.0.0.1".parse().unwrap(),
+        // Fixture nodes do not report: a unit test writing fragments would drop
+        // files into the working tree, and none of these assertions read them.
+        mesh_fragment_path: None,
         rest_api_version: 1,
         node_type: pneumatic_core::node::NodeType::Full,
         node_registry_types: vec![NodeRegistryType::Committer],
@@ -691,6 +700,9 @@ pub fn build_committer_for_leader_test(
         Config {
             public_key: vec![2],
             ip_address: "127.0.0.1".parse().unwrap(),
+            // Fixture nodes do not report: a unit test writing fragments would drop
+            // files into the working tree, and none of these assertions read them.
+            mesh_fragment_path: None,
             rest_api_version: 1,
             node_type: pneumatic_core::node::NodeType::Full,
             node_registry_types: vec![NodeRegistryType::Committer],

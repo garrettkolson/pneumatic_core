@@ -46,7 +46,14 @@ pub fn build_runtime(
     // fail to come up, and — because `panic_on_interface_error` is false and a
     // transport failure is tolerated here — it boots "without transport" having
     // registered nothing.
+    // `with_listen_ip` was missing here, so the composite inherited
+    // `RnsNodeConfigBuilder::new()`'s `127.0.0.1` default: it booted, announced,
+    // and logged nothing worse than "no live route", while being unreachable
+    // from every other host. Loopback binds are invisible on a single-host mesh,
+    // which is how long this survived. The rule is `Config::rns_listen_ip` in
+    // core — shared with the committer so the two cannot drift again.
     let mut builder = RnsNodeConfigBuilder::new()
+        .with_listen_ip(config.rns_listen_ip())
         .with_udp_port(config.rns_port)
         .with_transport_enabled(config.transport_enabled);
     for peer in &config.bootstrap_peers {
@@ -280,6 +287,13 @@ pub fn build_runtime(
                 installed_roles.len()
             );
         }
+
+        // Mesh fragments: this node's own signed directory report, so health
+        // checking needs no collector node and no stake. Unconfigured ⇒ off.
+        pneumatic_core::node::registry::fragment::start_if_configured(
+            &config,
+            node_registry.clone(),
+        );
 
         // And when a new peer announces, reach out to it immediately rather
         // than waiting for the next peering tick.

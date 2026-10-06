@@ -63,6 +63,24 @@ repointed per node (one absolute path shared by N nodes interleaves into mush);
 `shielded_root_recency` is **copied from the env template into genesis**, so the
 coupling the runbook warns about is enforced rather than remembered.
 
+**Multi-host placement (10/02/2026).** `Placement::SingleHost` (default: peers dial
+loopback, port windows disjoint) versus `Placement::PerHost { addresses }`: one
+node per machine, peers dial real addresses, and **every host shares one port
+range** — the address disambiguates, so a 40-node fleet needs one UDP range per
+instance, not one per node. `--addresses a,b,c` or `--addresses-file` (one per
+line, `#` comments allowed, so a provisioner's output feeds straight in). Supplying
+addresses *is* the declaration of per-host placement; there is no separate flag
+that could contradict the list. A count mismatch fails the build rather than
+padding with loopback. `--bind-ip` emits the new `ip_address` key (omitted when
+unset, so "bind every interface" stays the absence of a decision rather than an
+invented value).
+
+The two-pass split that cloud provisioning needs — identities first, then configs
+listing peers' public keys — was already there for ordering reasons. Also fixed:
+`--validators n` divided by four and dropped the remainder, so `--validators 10`
+silently built 8 nodes and `--validators 1..3` failed as "every role count is
+zero". It now distributes the remainder in role order and prints the split.
+
 **Two failure classes it exists to make unreachable.** Genesis is keyed by each
 node's **Ed25519** key while `bootstrap_peers` carries its **RNS** key — both
 64-byte hex in the same manifest, and swapping them yields a node that boots,
@@ -82,7 +100,13 @@ same error rather than silently defaulting.
 
 **Verification.** `tests/boot_config.rs` takes a generated node through the real
 `Config::build()` — config, env dir, keystore — and asserts the loaded identity is
-the one genesis was written for. Plus 8 artifact tests against `ConfigSpec`,
-`EnvironmentMetadata::load_from_spec`, and `NodeIdentity::load_or_create`.
-**1084 passed / 37 ignored / 0 failed** workspace-wide after this (see
-`fact-test-suite-generator`). Generated trees are gitignored: they hold private keys.
+the one genesis was written for. Plus 11 artifact tests against `ConfigSpec`,
+`EnvironmentMetadata::load_from_spec`, and `NodeIdentity::load_or_create`, 12
+topology/placement unit tests, and 4 tests that invoke the **binary** (flag
+semantics live in `main.rs`, unreachable from the library). **1101 passed /
+37 ignored / 0 failed** workspace-wide after this (see `fact-test-suite-cloud`).
+Two mutation-verified: reverting the j-rule direction fails
+`bootstrap_peer_ports_are_the_targets_listen_ports`, and replacing the peer's
+address with a shared constant fails `per_host_placement_writes_each_peers_own_address`
+— the test that exists because a single-host cluster cannot distinguish "correct"
+from "everyone dials 127.0.0.1". Generated trees are gitignored: they hold private keys.

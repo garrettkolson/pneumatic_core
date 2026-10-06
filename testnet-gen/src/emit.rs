@@ -14,7 +14,7 @@ use pneumatic_core::crypto::AsymCryptoProvider;
 use pneumatic_core::rns::identity::NodeIdentity;
 use serde::Serialize;
 
-use crate::topology::{Mesh, NodePlan, Role, TopologyMode};
+use crate::topology::{Mesh, NodePlan, Placement, Role, TopologyMode};
 
 /// Everything the generator needs. Defaults are chosen so that
 /// `pneumatic_testnet_gen --out /tmp/testnet` produces something bootable.
@@ -36,7 +36,14 @@ pub struct GenSpec {
     /// and the operator see the same value. Not part of `config.json` — the
     /// nodes take it from `PNEUMATIC_DATA_ADDR`.
     pub data_addr: String,
-    pub ip: String,
+    /// Where the nodes run: one host (loopback peers, disjoint port windows) or
+    /// one node per machine (real addresses, one shared port range).
+    pub placement: Placement,
+    /// Address each node binds its transport to. `None` binds every interface,
+    /// which is what the committer already does and the right default. Set it on
+    /// a multi-homed instance, where binding "any" answers on the wrong network
+    /// and every peer just records a delivery failure.
+    pub bind_address: Option<String>,
     /// Regenerate keystores that already exist. Off by default: replacing a
     /// keystore orphans the stake that genesis put under the old key, so a
     /// re-run must be explicit.
@@ -66,7 +73,8 @@ impl GenSpec {
             environment_id: "env".to_string(),
             token_partition_id: "token".to_string(),
             data_addr: "127.0.0.1:55555".to_string(),
-            ip: "127.0.0.1".to_string(),
+            placement: Placement::SingleHost,
+            bind_address: None,
             force_keys: false,
         }
     }
@@ -89,6 +97,9 @@ pub struct NodeReport {
     pub name: String,
     pub role: Role,
     pub dir: String,
+    /// Where peers dial this node. A launcher reads this to place the node on
+    /// the right machine and to open the right firewall range.
+    pub address: String,
     pub rns_port: u16,
     pub interfaces: usize,
     pub peers: Vec<String>,
@@ -105,6 +116,14 @@ pub struct Report {
     pub genesis: String,
     pub max_interfaces: usize,
     pub total_interfaces: usize,
+    /// UDP ports one machine must expose. Differs from `total_interfaces`
+    /// because a per-host placement reuses one range on every machine.
+    pub ports_per_host: u16,
+    /// First UDP port of every node's range. With per-host placement this is the
+    /// same on every machine, so `base_port .. base_port + ports_per_host - 1`
+    /// is literally the firewall range.
+    pub base_port: u16,
+    pub placement: String,
     pub keystore_reused: usize,
     pub keystore_created: usize,
     pub shielded_root_recency: usize,
@@ -132,7 +151,7 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
     fs::create_dir_all(&out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
 
     let mode = spec.resolve_mode();
-    let mesh = Mesh::build(spec.counts, spec.base_port, mode)?;
+    let mesh = Mesh::build(spec.counts, spec.base_port, mode, spec.placement.clone())?;
 
     let template = read_env_template(&spec.env_template)?;
 
@@ -170,6 +189,7 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
             name: plan.node.name.clone(),
             role: plan.node.role,
             dir: dir.display().to_string(),
+            address: plan.address.clone(),
             rns_port: plan.base_port,
             interfaces: mesh.interfaces(plan.node.index),
             peers: plan.peers.iter().map(|&p| mesh.plan[p].node.name.clone()).collect(),
@@ -195,7 +215,9 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
                    and safe to rewrite; node_identity.json is a keystore — deleting it orphans \
                    the stake genesis put under its key.",
         "mode": mode,
+        "placement": spec.placement.label(),
         "base_port": spec.base_port,
+        "ports_per_host": mesh.ports_per_host(),
         "data_addr": spec.data_addr,
         "environment_id": spec.environment_id,
         "token_partition_id": spec.token_partition_id,
@@ -210,6 +232,9 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
         mode,
         max_interfaces: mesh.max_interfaces(),
         total_interfaces,
+        ports_per_host: mesh.ports_per_host(),
+        base_port: spec.base_port,
+        placement: spec.placement.label().to_string(),
         keystore_reused: reused_keys,
         keystore_created: identities.len() - reused_keys,
         nodes,
@@ -296,11 +321,15 @@ fn build_config_json(
         let port = peer.listen_port_for(plan.node.index)?;
         peers.push(serde_json::json!({
             "public_key": identities[peer_index].rns_hex,
-            "ip": spec.ip,
+            // The PEER's address, not ours and not a shared constant. On one
+            // host every address is loopback so a single value looked fine;
+            // across machines this is the difference between a mesh and N
+            // isolated nodes.
+            "ip": peer.address,
             "port": port,
         }));
     }
-    Ok(serde_json::json!({
+    let mut config = serde_json::json!({
         "is_full_node": true,
         "rest_api_version": 1,
         // Required by ConfigSpec and intentionally unused by the loader. It must
@@ -309,12 +338,26 @@ fn build_config_json(
         "main_env_id": spec.environment_id,
         "reconciliation_partition_id": "reconciliation",
         "identity_path": dir.join("node_identity.json").display().to_string(),
+        // Where this node writes its signed mesh fragment, which is how
+        // `mesh-probe --fragments` sees it. Absolute like `identity_path` — so a
+        // generated tree is only portable to the machine it was generated on
+        // until the operator rewrites both keys (or mounts the same paths).
+        // Ship this directory with whatever the log/metrics agent already tails.
+        "mesh_fragment_path": dir.join("mesh_fragment.json").display().to_string(),
         "rns_port": plan.base_port,
         // Leaves only. `transport_enabled: true` makes a node a relay, which is
         // the untested lever for mesh density — the repo has never exercised it.
         "transport_enabled": false,
         "bootstrap_peers": peers,
-    }))
+    });
+    // Omitted when unset so that existing behavior (bind every interface) is
+    // the literal absence of a key rather than a value we invented.
+    if let Some(bind) = spec.bind_address.as_deref().map(str::trim) {
+        if !bind.is_empty() {
+            config["ip_address"] = serde_json::json!(bind);
+        }
+    }
+    Ok(config)
 }
 
 /// Genesis, keyed by **Ed25519** public keys.

@@ -337,3 +337,232 @@ fn node_role(manifest: &Value, node: &pneumatic_testnet_gen::emit::NodeReport) -
         .find(|n| n["name"].as_str() == Some(node.name.as_str()))
         .and_then(|n| n["role"].as_str().map(|r| r.to_string()))
 }
+
+/// Per-machine placement: every bootstrap entry must carry **its own peer's**
+/// address.
+///
+/// On one host every address is `127.0.0.1`, so an emitter that wrote a single
+/// shared constant passes every single-host test — and produces a cluster where
+/// all eight nodes dial themselves. Distinct addresses are the whole point of
+/// this test; without them the bug is invisible.
+#[test]
+fn per_host_placement_writes_each_peers_own_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spec = spec_for(dir.path());
+    let addresses: Vec<String> = (1..=8).map(|i| format!("10.20.{}{}", i / 2, i)).collect();
+    spec.placement = pneumatic_testnet_gen::topology::Placement::PerHost {
+        addresses: addresses.clone(),
+    };
+    generate(&spec).expect("generate");
+
+    let manifest = manifest(dir.path());
+    let nodes = manifest["nodes"].as_array().expect("nodes");
+    assert_eq!(manifest["placement"].as_str(), Some("per-host"));
+
+    let by_rns: std::collections::HashMap<String, &Value> = nodes
+        .iter()
+        .map(|n| (n["rns_public_key_hex"].as_str().unwrap().to_string(), n))
+        .collect();
+
+    let mut checked = 0;
+    for node in nodes {
+        let name = node["name"].as_str().unwrap();
+        let my_address = node["address"].as_str().expect("node address in manifest");
+        assert!(
+            addresses.iter().any(|a| a == my_address),
+            "{name}: manifest address {my_address} is not from the supplied list"
+        );
+
+        let path = Path::new(node["dir"].as_str().unwrap()).join("config.json");
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("config.json")).expect("parse");
+
+        for peer in config["bootstrap_peers"].as_array().expect("bootstrap_peers") {
+            let key = peer["public_key"].as_str().unwrap();
+            let dialed = peer["ip"].as_str().expect("peer ip");
+            let target = *by_rns
+                .get(key)
+                .unwrap_or_else(|| panic!("{name}: bootstrap peer is not a generated node"));
+            let target_name = target["name"].as_str().unwrap();
+
+            assert_eq!(
+                dialed,
+                target["address"].as_str().unwrap(),
+                "{name} must dial {target_name} at its own address"
+            );
+            assert_ne!(
+                dialed, my_address,
+                "{name} is dialing its own address {dialed} — the emitter wrote a \
+                 shared value instead of the peer's"
+            );
+            assert_ne!(
+                dialed, "127.0.0.1",
+                "{name} → {target_name} still dials loopback; per-host placement \
+                 must have replaced it"
+            );
+            checked += 1;
+        }
+    }
+    // 8 nodes × 7 peers in a full mesh. If this is 0 the assertion loop above
+    // never ran, which is how a vacuous test looks.
+    assert_eq!(checked, 56, "every directed edge must have been checked");
+}
+
+/// With one machine per node the address distinguishes peers, so every host can
+/// run the same port range — and the j-rule must still hold on top of it.
+#[test]
+fn per_host_placement_reuses_one_range_and_keeps_the_j_rule() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spec = spec_for(dir.path());
+    spec.placement = pneumatic_testnet_gen::topology::Placement::PerHost {
+        addresses: (1..=8).map(|i| format!("10.30.0.{i}")).collect(),
+    };
+    let report = generate(&spec).expect("generate");
+
+    let bases: std::collections::HashSet<u16> =
+        report.nodes.iter().map(|n| n.rns_port).collect();
+    assert_eq!(
+        bases.len(),
+        1,
+        "per-host placement must reuse one base port; got {bases:?}"
+    );
+    // Read back from the artifacts, not the mesh: every port any node forwards
+    // to must live in the single shared window. One window per node would show
+    // up here as a spread far wider than `ports_per_host`.
+    let mut forward_ports: Vec<u64> = Vec::new();
+    for node in std::fs::read_dir(dir.path().join("nodes")).expect("nodes") {
+        let path = node.expect("entry").path().join("config.json");
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("parse");
+        for peer in config["bootstrap_peers"].as_array().unwrap() {
+            forward_ports.push(peer["port"].as_u64().unwrap());
+        }
+    }
+    let spread = forward_ports.iter().max().unwrap() - forward_ports.iter().min().unwrap();
+    assert!(
+        spread < report.ports_per_host as u64,
+        "forwarded ports span {spread} but the per-host window is only {}; the          generator allocated one range per node under per-host placement",
+        report.ports_per_host
+    );
+
+    // And the forwarded port is still the target's base + our index in its list.
+    let manifest = manifest(dir.path());
+    let nodes = manifest["nodes"].as_array().expect("nodes");
+
+    for node in nodes {
+        let name = node["name"].as_str().unwrap();
+        let read = |v: &Value| -> Value {
+            let path = Path::new(v["dir"].as_str().unwrap()).join("config.json");
+            serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("parse")
+        };
+        let my_config = read(node);
+        for peer in my_config["bootstrap_peers"].as_array().unwrap() {
+            let port = peer["port"].as_u64().unwrap();
+            let key = peer["public_key"].as_str().unwrap();
+            let target = nodes
+                .iter()
+                .find(|n| n["rns_public_key_hex"].as_str() == Some(key))
+                .expect("peer is a generated node");
+            let target_config = read(target);
+            let target_base = target_config["rns_port"].as_u64().unwrap();
+            let j = target_config["bootstrap_peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|p| p["public_key"].as_str() == Some(
+                    node["rns_public_key_hex"].as_str().unwrap(),
+                ))
+                .unwrap_or_else(|| panic!("{name} is not a peer of its own peer"));
+            assert_eq!(
+                port,
+                target_base + j as u64,
+                "{name} → {} must forward to base {target_base} + j {j}",
+                target["name"].as_str().unwrap()
+            );
+        }
+    }
+}
+
+/// The bind address is operator intent, so it is emitted only when given.
+/// Absent means "bind every interface", which is what the transport already
+/// does; writing our own default would silently narrow a multi-homed host.
+#[test]
+fn bind_address_is_emitted_only_when_configured() {
+    let plain = tempfile::tempdir().expect("tempdir");
+    generate(&spec_for(plain.path())).expect("generate");
+    for node_dir in node_dirs(plain.path()) {
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(node_dir.join("config.json")).expect("config"))
+                .expect("parse");
+        assert!(
+            config.get("ip_address").is_none(),
+            "{}: an unconfigured bind address must be absent, not invented",
+            node_dir.display()
+        );
+    }
+
+    let bound = tempfile::tempdir().expect("tempdir");
+    let mut spec = spec_for(bound.path());
+    spec.bind_address = Some("10.40.0.7".to_string());
+    generate(&spec).expect("generate");
+    for node_dir in node_dirs(bound.path()) {
+        let raw = std::fs::read(node_dir.join("config.json")).expect("config");
+        let config: Value = serde_json::from_slice(&raw).expect("parse");
+        assert_eq!(config["ip_address"].as_str(), Some("10.40.0.7"));
+        // And it survives the real parser, not just JSON shape.
+        serde_json::from_slice::<ConfigSpec>(&raw)
+            .expect("a config carrying ip_address must still parse as ConfigSpec");
+    }
+}
+
+/// A probe must judge a running cluster against the topology it was *actually*
+/// built from, so `manifest.json` has to rebuild the mesh exactly. A reader that
+/// quietly dropped a peer would make the probe under-report — reporting a healthy
+/// mesh for a cluster with a dead link.
+#[test]
+fn the_manifest_rebuilds_the_exact_topology_that_was_emitted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spec = spec_for(dir.path());
+    spec.placement = pneumatic_testnet_gen::topology::Placement::PerHost {
+        addresses: (1..=8).map(|i| format!("10.50.0.{i}")).collect(),
+    };
+    generate(&spec).expect("generate");
+    let manifest = manifest(dir.path());
+
+    let rebuilt = pneumatic_testnet_gen::topology::Mesh::from_manifest(&manifest)
+        .expect("the manifest we just wrote must reload");
+    let nodes = manifest["nodes"].as_array().expect("nodes");
+    assert_eq!(rebuilt.plan.len(), nodes.len());
+
+    for (i, node) in nodes.iter().enumerate() {
+        let plan = &rebuilt.plan[i];
+        assert_eq!(plan.node.name, node["name"].as_str().unwrap(), "name at index {i}");
+        assert_eq!(plan.base_port, node["rns_port"].as_u64().unwrap() as u16);
+        assert_eq!(plan.address, node["address"].as_str().unwrap());
+        let peer_names: Vec<&str> = plan.peers.iter().map(|&p| rebuilt.plan[p].node.name.as_str()).collect();
+        let manifest_peers: Vec<&str> = node["peers"]
+            .as_array()
+            .expect("peers")
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(peer_names, manifest_peers, "{}: peer set must round-trip", plan.node.name);
+        // Interface count is what the operator sized the machine for.
+        assert_eq!(plan.peers.len(), node["interfaces"].as_u64().unwrap() as usize);
+    }
+}
+
+/// A truncated or hand-edited manifest must fail the reload, not silently lose
+/// edges: a probe that reads fewer edges than exist reports green on a broken
+/// cluster.
+#[test]
+fn a_manifest_naming_an_unknown_peer_fails_the_reload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    generate(&spec_for(dir.path())).expect("generate");
+    let mut manifest = manifest(dir.path());
+    manifest["nodes"][0]["peers"][0] = Value::from("ghost-node");
+
+    let err = pneumatic_testnet_gen::topology::Mesh::from_manifest(&manifest)
+        .expect_err("an unknown peer name must not reload silently");
+    assert!(err.contains("ghost-node"), "must name the offender, got: {err}");
+}

@@ -45,4 +45,25 @@ source_url: "Empty"
 
 `Config` (config.rs:32) is identity-authoritative: `public_key` always comes from the persistent identity (`identity.ed25519`), and any `public_key` in `config.json` is deliberately ignored (lines 35-40). It also carries per-type `NodeTypeConfig` (min/max connections + minimum stake, lines 213-225, 265-279) and the Full/Light registry-type split (line 246-257: light nodes skip Archiver).
 
+## Keys added in October 2026, and the cost of a `Config` field
+
+Two additive `ConfigSpec` keys, both `#[serde(default)]` so existing `config.json`
+files load unchanged:
+
+- **`ip_address`** — the address the RNS transport binds. Unset binds the
+  unspecified address; `Config::rns_listen_ip()` turns that into `0.0.0.0`. Exists
+  for multi-homed cloud hosts, and **a value that fails to parse stops the boot**
+  rather than falling back: the fallback is a node that looks healthy and peers with
+  nobody (`fact-transport-loopback-bind-default`).
+- **`mesh_fragment_path`** — where the node writes its signed mesh fragment for
+  `mesh-probe`. Absent means reporting is off, which is what every test fixture
+  wants. Atomic write (temp + rename), so a log shipper can never pick up a
+  half-written file (`fact-mesh-verification-probe`).
+
+**Adding a field to `Config` breaks every exhaustive `Config { … }` literal.**
+`mesh_fragment_path` took 18 fixes across 12 files in five crates, all test
+fixtures. `cargo check -p <crate>` does not find them; a workspace-wide build does.
+The upside is real — a fixture cannot silently boot a node that writes into the
+working tree — but budget the sweep.
+
 `EnvironmentMetadata` (`src/environment.rs:127`) is the per-environment policy object: partition ids (token/contract/proxy-auth/slush), `quorum_percentage`/`override_quorum_percentage`/`shard_quorum_percentage`, `max_risk`, the `CostModel`, an `AsymCryptoProvider`, both validation-spec registries, allowed token types, logger, and shard count. `CostModel` (line 15) prices actions via fixed-point gas (`gas = base_cost + amount × multiplier`, integer scale 10 000, lines 56-93) and holds staking policy: `global_min_stake`, per-type stake overrides, admin tax, and `slash_fraction`.

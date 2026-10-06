@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Error;
 use std::net::{IpAddr, Ipv6Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,9 @@ pub struct Config {
     /// public key has no matching key and must not be honored.
     pub public_key: Vec<u8>,
     pub ip_address: IpAddr,
+    /// Where this node writes its signed mesh fragment, or `None` to report
+    /// nothing. See `node::registry::fragment`.
+    pub mesh_fragment_path: Option<PathBuf>,
     pub rest_api_version: usize,
     pub node_type: NodeType,
     pub node_registry_types: Vec<NodeRegistryType>,
@@ -127,9 +130,19 @@ impl Config {
         );
 
         let rhash = identity.rhash;
+        let ip_address = Self::resolve_bind_address(spec.ip_address.as_deref())?;
+        // Empty string is "explicitly off", distinct from absent only in that the
+        // operator typed it; both disable reporting.
+        let mesh_fragment_path = spec
+            .mesh_fragment_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(PathBuf::from);
         Ok(Config {
             public_key,
-            ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            ip_address,
+            mesh_fragment_path,
             rest_api_version: spec.rest_api_version,
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
             node_registry_types,
@@ -185,6 +198,48 @@ impl Config {
         match override_value {
             Some(value) if !value.trim().is_empty() => value,
             _ => default.to_string(),
+        }
+    }
+
+    /// Which address to bind the transport to. The pure half of the `ip_address`
+    /// handling, so the fail-closed rule is testable without a keystore on disk.
+    ///
+    /// Unset binds the unspecified address. A configured value is parsed
+    /// strictly: a malformed address stops boot instead of falling back to
+    /// "any", because the fallback produces a node that reports itself healthy
+    /// while every peer records a delivery failure against it. Whitespace is
+    /// trimmed — these files are hand-edited, and a trailing space is a
+    /// formatting slip rather than an intent to bind a different host.
+    fn resolve_bind_address(configured: Option<&str>) -> Result<IpAddr, NodeBootstrapError> {
+        match configured {
+            None => Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some(raw) if raw.trim().is_empty() => Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some(raw) => raw.trim().parse::<IpAddr>().map_err(|e| NodeBootstrapError {
+                message: format!("config ip_address {raw:?} is not a valid IP address: {e}"),
+            }),
+        }
+    }
+
+    /// Address the RNS transport should bind, as a string for
+    /// `RnsNodeConfigBuilder::with_listen_ip`.
+    ///
+    /// Single source of truth for every binary that starts a transport, and it
+    /// exists because there wasn't one: the committer carried this rule locally
+    /// and `node-server` applied none, so the composite silently inherited
+    /// `RnsNodeConfigBuilder::new()`'s `127.0.0.1` default and could not be
+    /// reached from any other host. Binding loopback is invisible on a
+    /// single-host mesh, which is why nothing caught it (10/02/2026).
+    ///
+    /// An unspecified address binds every interface. A configured one binds
+    /// only that interface, which is what a multi-homed instance needs.
+    /// Unspecified IPv6 resolves to `0.0.0.0`: the transport's own addresses are
+    /// IPv4 in this codebase, so widening to `::` here would change wire
+    /// behavior rather than just the bind.
+    pub fn rns_listen_ip(&self) -> String {
+        if self.ip_address.is_unspecified() {
+            "0.0.0.0".to_string()
+        } else {
+            self.ip_address.to_string()
         }
     }
 
@@ -349,6 +404,9 @@ impl Config {
         Config {
             public_key,
             ip_address: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            // Tests do not report: a unit test writing fragments would land files
+            // in the repository working tree.
+            mesh_fragment_path: None,
             rest_api_version: 1,
             node_type: NodeType::Full,
             node_registry_types: vec![],
@@ -404,6 +462,30 @@ pub struct ConfigSpec {
     /// Own listen UDP port (default 4242).
     #[serde(default)]
     rns_port: Option<u16>,
+    /// Address to bind the RNS transport to. Unset binds the unspecified
+    /// address, which `Config::rns_listen_ip` turns into `0.0.0.0`.
+    ///
+    /// This exists for multi-homed hosts: a cloud instance with a second
+    /// interface (an admin NIC on a different network) must bind the interface
+    /// its peers can actually reach, because a source bound to the wrong
+    /// address is unreachable and every peer just records a delivery failure.
+    /// A value that does not parse stops boot rather than falling back — the
+    /// fallback failure mode is a node that looks healthy and peers with nobody.
+    #[serde(default)]
+    ip_address: Option<String>,
+    /// Path to write this node's signed mesh fragment (its own role directories,
+    /// for `mesh-probe` to aggregate). Unset disables reporting.
+    ///
+    /// Self-reporting rather than a collector node: a collector would have to hold
+    /// stake to register at all (`registration.rs` stake gate), and the same stake
+    /// feeds the quorum denominator — so monitoring would be paid for in fault
+    /// tolerance. It would also only ever see nodes it links to directly.
+    ///
+    /// Point this at a directory your log/metrics agent already ships. Writes are
+    /// atomic (temp + rename), so a half-written fragment is not a thing the
+    /// shipper can pick up.
+    #[serde(default)]
+    mesh_fragment_path: Option<String>,
     /// Relay/gateway mode (default false = leaf).
     #[serde(default)]
     transport_enabled: bool
@@ -414,6 +496,8 @@ mod config_tests {
     use std::sync::Arc;
 
     use dashmap::DashMap;
+
+    use std::net::{IpAddr, Ipv6Addr};
 
     use crate::config::{Config, ConfigSpec};
     use crate::crypto::AsymCryptoProvider;
@@ -676,5 +760,91 @@ mod config_tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // --- bind address / transport listen IP ---------------------------------
+    // Before 10/02/2026 `ip_address` was not loadable at all (always
+    // unspecified) and only the committer translated it into a bind address;
+    // node-server passed none and so inherited the builder's 127.0.0.1. These
+    // pin the shared rule.
+
+    #[test]
+    fn bind_address_defaults_to_unspecified() {
+        let unset = Config::resolve_bind_address(None).expect("unset must bind unspecified");
+        assert!(unset.is_unspecified());
+        // Blank behaves like unset, matching the path-override rule above:
+        // a JSON `""` is an unfilled template field, not an address.
+        let blank = Config::resolve_bind_address(Some("   "))
+            .expect("blank must bind unspecified, not fail");
+        assert!(blank.is_unspecified());
+    }
+
+    #[test]
+    fn bind_address_honors_a_configured_interface() {
+        // Whitespace-tolerant: config.json files get hand-edited.
+        let addr = Config::resolve_bind_address(Some(" 10.0.0.5 "))
+            .expect("valid address must parse");
+        assert_eq!(addr.to_string(), "10.0.0.5");
+    }
+
+    /// The fail-closed half. Falling back to "any interface" here would boot a
+    /// node that looks healthy in every log while its peers record delivery
+    /// failures, which is the exact failure mode this whole area keeps producing.
+    #[test]
+    fn malformed_bind_address_stops_boot_and_names_the_value() {
+        let err = Config::resolve_bind_address(Some("10.0.0.256"))
+            .expect_err("a malformed ip_address must not be ignored");
+        assert!(
+            err.message.contains("10.0.0.256"),
+            "the error must quote the offending value, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn rns_listen_ip_binds_every_interface_when_unspecified() {
+        let mut config = Config::new_for_testing(
+            "env".to_string(),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        );
+        config.ip_address = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        // This is what makes a composite reachable from another host. Asserting
+        // the literal, because "0.0.0.0" vs "127.0.0.1" is the entire bug.
+        assert_eq!(config.rns_listen_ip(), "0.0.0.0");
+    }
+
+    #[test]
+    fn rns_listen_ip_uses_the_configured_interface_verbatim() {
+        let mut config = Config::new_for_testing(
+            "env".to_string(),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        );
+        config.ip_address = "10.0.0.5".parse().expect("static addr");
+        assert_eq!(config.rns_listen_ip(), "10.0.0.5");
+    }
+
+    /// An `ip_address` in config.json reaches the spec, and its absence does
+    /// not change existing files' behavior.
+    #[test]
+    fn config_spec_ip_address_is_optional_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let plain = dir.path().join("config.json");
+        std::fs::write(&plain, base_spec().to_string()).unwrap();
+        assert!(
+            Config::load_spec_from(&plain).expect("parse").ip_address.is_none(),
+            "existing config.json files must keep binding as before"
+        );
+
+        let mut with_ip = base_spec();
+        with_ip["ip_address"] = serde_json::json!("10.0.0.5");
+        let bound = dir.path().join("config-bound.json");
+        std::fs::write(&bound, with_ip.to_string()).unwrap();
+        assert_eq!(
+            Config::load_spec_from(&bound).expect("parse").ip_address.as_deref(),
+            Some("10.0.0.5")
+        );
     }
 }

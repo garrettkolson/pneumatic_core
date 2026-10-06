@@ -13,6 +13,10 @@ verified_by: "dsh-agent"
 staleness_signal: "If a launcher/generator exists that writes keystores and emits the peer+port matrix, or if relay (`transport_enabled: true`) is exercised in this repo"
 tags: [task, testnet, peering, rns, topology, launcher, transport]
 edges:
+  - target: task-multihost-testnet-rollout
+    type: related_to
+    weight: 0.85
+    note: "The launcher starts the fleet; the rollout roadmap says what has to be true before that fleet is worth launching"
   - target: fact-data-service
     type: preceded_by
     weight: 0.9
@@ -118,7 +122,8 @@ expressible before it can be asserted.
 
 **5. The launcher (`up` / `down` / `status`) is the remaining piece.** Everything it
 needs to read already exists in `manifest.json` — every node's directory, base
-port, interface count, peer names, and all three public-key forms. What it must
+port, interface count, peer names, all three public-key forms, and since the
+multi-host work each node's `address`, the `placement` and `ports_per_host`. What it must
 do: start the data service first with `PNEUMATIC_GENESIS` pointed at the generated
 `genesis.json` (nodes fail closed without a listener), wipe stale RNS state before
 each boot (`known_destinations_ttl` is 48 h, so yesterday's routes poison today's
@@ -126,9 +131,29 @@ run), start each node with `PNEUMATIC_CONFIG_FILE`, `PNEUMATIC_ENV_DIR` and
 `PNEUMATIC_DATA_ADDR`, then poll until every directory is populated — observable
 now, rather than something to eyeball in logs.
 
-**Smaller verified launch blockers:** `/env` and `config.json` are hardcoded
-consts (`config.rs:63-64`) — fine for a shared env spec, but the env spec's
-single absolute `log_file` interleaves across same-host nodes;
+**6. Multi-host / cloud deployment (started 10/02/2026).** The hard blocker is
+gone: the composite used to bind `127.0.0.1` (the builder's default, never
+overridden — `fact-transport-loopback-bind-default`) and so could not be reached
+across hosts at all. `testnet-gen` now has per-host placement: peers dial real
+addresses (`--addresses` / `--addresses-file`) and every machine shares one UDP
+range, which is the firewall consequence of the address doing the disambiguating.
+What remains is the deployment plumbing itself, and the constraints that shape it:
+leaves cannot route through other leaves, so the mesh needs flat, directly
+routable L3 — a NAT gateway or load balancer cannot stand in; peer addresses live
+in `bootstrap_peers`, so ephemeral instance IPs invalidate configs fleet-wide and
+need statically assigned addresses; and dense mesh has **never been exercised off
+loopback** (the suite's own dense test documents dead routes on loopback, where
+there is no loss or jitter), so the first milestone is 4 nodes on 4 instances
+proving mesh formation, not 40. Kubernetes is a poor fit for the same reason the
+port model is rigid. Not yet built: the `ip_address`-based bind is loadable but
+the launcher must decide per host; key custody is still "the operator holds every
+validator key", acceptable for a testnet and worth keeping deliberate.
+
+**Smaller verified launch blockers:** `/env` and `config.json` were hardcoded
+consts (`config.rs:63-64`; now overridable via `PNEUMATIC_ENV_DIR` /
+`PNEUMATIC_CONFIG_FILE` — see `fact-testnet-generator`) — fine for a shared env
+spec, but the env spec's single absolute `log_file` interleaves across same-host
+nodes (the generator rewrites it per node);
 `known_destinations_ttl` is 48 h, so a launcher must wipe stale RNS state between
 runs; **peering requires a live route in both directions** (a control frame is
 ~5.9 KB and cannot ride a direct packet), so a launcher that cannot get announces

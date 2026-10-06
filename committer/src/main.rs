@@ -26,15 +26,9 @@ use pneumatic_committer::epoch_manager::{
     EpochReconciler, LeaderSelector, StakeStore, StakingManager,
 };
 
-/// RNS listen IP: the configured node address, or all interfaces when the
-/// config leaves it unspecified.
-fn rns_listen_ip(config: &Config) -> String {
-    if config.ip_address.is_unspecified() {
-        "0.0.0.0".to_string()
-    } else {
-        config.ip_address.to_string()
-    }
-}
+// The listen-IP rule now lives on `Config::rns_listen_ip` (core), shared with
+// node-server. It used to be duplicated here and absent there, which is how the
+// composite ended up binding loopback.
 
 #[tokio::main]
 async fn main() {
@@ -78,7 +72,7 @@ async fn main() {
     // 2. Start the RNS transport. The node still boots if the transport can't
     //    come up (e.g. port conflict) — it just can't register or gossip.
     let mut builder = RnsNodeConfigBuilder::new()
-        .with_listen_ip(rns_listen_ip(&config))
+        .with_listen_ip(config.rns_listen_ip())
         .with_udp_port(config.rns_port)
         .with_transport_enabled(config.transport_enabled);
     for peer in &config.bootstrap_peers {
@@ -212,6 +206,15 @@ async fn main() {
         node_registry.set_declared_roles(vec![NodeRegistryType::Committer]);
         let registry_for_peering = node_registry.clone();
         registry_for_peering.start_peering();
+
+        // Mesh fragments: this node's own signed directory report. Self-reporting
+        // is what keeps health checking off the consensus path — a central
+        // collector would have needed stake to register, and stake here is quorum
+        // budget. Unconfigured ⇒ off; see `node::registry::fragment`.
+        pneumatic_core::node::registry::fragment::start_if_configured(
+            &config,
+            node_registry.clone(),
+        );
 
         // 7. Discovery: when RNS announces a peer, register with it and ask it
         //    for its directories. Both go through the registry's control-plane

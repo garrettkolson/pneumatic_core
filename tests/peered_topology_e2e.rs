@@ -110,6 +110,9 @@ fn registry_config(identity: &Arc<NodeIdentity>, bootstrap: Vec<BootstrapPeer>) 
     Config {
         public_key: identity.ed25519.public_key().expect("identity public key"),
         ip_address: "127.0.0.1".parse().expect("loopback"),
+        // Fixture nodes do not report: a unit test writing fragments would drop
+        // files into the working tree, and none of these assertions read them.
+        mesh_fragment_path: None,
         rest_api_version: 1,
         node_type: NodeType::Full,
         // Config declares all four; the registry is then narrowed to this node's

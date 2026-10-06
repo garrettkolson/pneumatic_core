@@ -8,5 +8,8 @@
 //!
 //! See `src/main.rs` for the CLI and its rationale.
 
+pub mod cli;
 pub mod emit;
+pub mod fragments;
+pub mod probe;
 pub mod topology;
