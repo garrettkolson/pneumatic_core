@@ -1324,6 +1324,7 @@ dependencies = [
  "parking_lot",
  "pasta_curves",
  "pneumatic_core",
+ "pneumatic_data_service",
  "pneumatic_prover",
  "serde",
  "serde_json",

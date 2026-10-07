@@ -20,6 +20,11 @@ serde = { version = "1", features = ["derive"] }
 # test fixtures. All pinned to versions the workspace already resolves (zero
 # new lockfile packages).
 pneumatic_prover = { path = "../prover" }
+# Phase 0 exit test: the selection salt read through the *production* provider —
+# a real `DefaultDataProvider` over a real socket to a real data service, because
+# every other salt test drives `StubDataProvider` and a stub cannot disagree with
+# the wire the way production can.
+pneumatic_data_service = { path = "../data-service" }
 pasta_curves = "=0.5.2"
 ff = "=0.13.1"
 group = "=0.13.0"

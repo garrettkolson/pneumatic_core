@@ -1029,3 +1029,121 @@ fn selection_tip_refuses_a_missing_token() {
         Err(other) => panic!("expected a Registry error, got a different variant"),
     }
 }
+
+/// The roadmap Phase 0 **exit test**: the selection salt observed through the
+/// provider production actually uses.
+///
+/// Every other salt test drives `StubDataProvider`, which answers from a map it
+/// built itself — so it can never disagree with its caller about what a miss, an
+/// empty chain, or a round-tripped blockchain looks like. This test boots a real
+/// data service on an ephemeral port and reads the salt through
+/// `DefaultDataProvider` over a real socket (`tests/data_service_boot.rs` uses the
+/// same construction as `bin/node-server.rs`). Three separate things can only be
+/// seen here:
+///
+/// 1. **The chain survives the wire.** The salt IS `token.blockchain`'s tip, so if
+///    MsgPack lost the chain across the request boundary the salt would come back
+///    empty on a production node while every stub test stayed green — and an empty
+///    salt looks exactly like genesis.
+/// 2. **The salt moves when the chain advances**, which is the whole reason ADR-019
+///    exists: the seed must not be knowable until the previous block is mined.
+/// 3. **A miss on the wire is an error, not an empty token.** The service answers a
+///    miss with an empty body (`handle_get` → `unwrap_or_default()`); the stub raises
+///    a proper error. Those two providers could behave differently, and if the
+///    production one quietly produced a default `Token`, selection would be salted by
+///    a constant forever and the failure would read as a healthy boot.
+#[test]
+fn selection_salt_through_the_production_data_provider() {
+    use pneumatic_core::blocks::{Block, BlockFactory};
+    use pneumatic_core::conns::ConnTarget;
+    use pneumatic_core::data::{DataProvider, DefaultDataProvider};
+
+    // --- a real service, and the production client, exactly as the node boots them
+    let store = Arc::new(pneumatic_data_service::DataStore::new());
+    let (bound, handle) = pneumatic_data_service::spawn(
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().expect("loopback:0"),
+        store.clone(),
+        None,
+    )
+    .expect("the data service binds an ephemeral port");
+    std::mem::forget(handle); // keep the accept loop alive for the test's scope
+
+    let provider: Arc<dyn DataProvider> = Arc::new(
+        DefaultDataProvider::new().with_source(ConnTarget::Remote(bound)),
+    );
+
+    let env_data = make_test_env_data();
+    let partition = env_data.token_partition_id.clone();
+    let (sentinel, _r) = make_sentinel_fixture_with_provider(
+        provider.clone(),
+        env_data,
+        Arc::new(SimpleShieldedPoolView::new(10)),
+    );
+
+    // --- 1. store a mined chain, then read the salt the way selection does
+    let genesis_block = token_with_one_block();
+    let first_tip = genesis_block.blockchain.get_current_chain_state().last_hash_in.clone();
+    assert!(!first_tip.is_empty(), "the fixture token is a mined chain");
+
+    provider
+        .save_token(&vec![1u8], genesis_block, &partition)
+        .expect("saving a token over the wire");
+
+    let salt = sentinel
+        .selection_tip(&[1])
+        .expect("a stored token must resolve through the production provider");
+    assert_eq!(
+        salt, first_tip,
+        "the salt must be the stored chain's tip — an empty or different value means the \
+         blockchain did not survive the MsgPack round trip"
+    );
+    assert!(!salt.is_empty(), "a mined chain supplies a non-empty salt");
+
+    // --- 2. mine a block and watch the salt move
+    let second = Block {
+        signed_trans: token_with_one_block().blockchain.get_block_at(0)
+            .expect("block 0").signed_trans.clone(),
+        token_metadata: std::collections::HashMap::new(),
+        previous_hash: first_tip.clone(),
+        timestamp: 1,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![],
+        epoch_number: 0,
+    };
+    let mut mined_twice = token_with_one_block();
+    let mut second = second;
+    second.current_hash = BlockFactory::create_hash(&second).expect("well-formed block hash");
+    mined_twice.blockchain.add_block(second);
+    let second_tip = mined_twice.blockchain.get_current_chain_state().last_hash_in.clone();
+    assert_ne!(second_tip, first_tip, "a longer chain has a different tip");
+
+    provider
+        .save_token(&vec![1u8], mined_twice, &partition)
+        .expect("saving the advanced token");
+
+    let salt_after = sentinel
+        .selection_tip(&[1])
+        .expect("the advanced token must resolve");
+    assert_eq!(
+        salt_after, second_tip,
+        "the salt must follow the chain — a salt that does not move is ADR-019's defect \
+         returning in a different costume"
+    );
+    assert_ne!(
+        salt_after, salt,
+        "selection must not be predictable from the previous block's seed"
+    );
+
+    // --- 3. a miss must be an error, not an empty token
+    match sentinel.selection_tip(&[9, 9, 9]) {
+        Ok(tip) => panic!(
+            "a token that was never stored produced a salt ({} bytes). The service answers \
+             a miss with an empty body, so a production-side default here would salt every \
+             selection with a constant forever while looking like genesis.",
+            tip.len()
+        ),
+        Err(SentinelError::Registry(_)) => {}
+        Err(other) => panic!("expected a Registry error, got a different variant: {:?}", other),
+    }
+}

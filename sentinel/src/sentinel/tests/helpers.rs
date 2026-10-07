@@ -153,6 +153,28 @@ pub fn make_sentinel_fixture_with_env_data_and_view(
     env_data: EnvironmentMetadata,
     pool_view: Arc<dyn ShieldedPoolView>,
 ) -> (Sentinel, Arc<PendingTransactionRegistry>) {
+    make_sentinel_fixture_with_provider(
+        Arc::new(data_provider) as Arc<dyn pneumatic_core::data::DataProvider>,
+        env_data,
+        pool_view,
+    )
+}
+
+
+/// The same fixture over **any** provider, including the production
+/// `DefaultDataProvider` pointed at a live data service.
+///
+/// The typed-stub variants above cannot express "read the salt the way
+/// production reads it": a stub answers from a map it built itself, so it can
+/// never disagree with the caller about what a miss, an empty chain, or a
+/// round-tripped blockchain looks like. This entry point exists for the test
+/// that closes roadmap Phase 0 — the salt observed through the provider nodes
+/// actually use.
+pub fn make_sentinel_fixture_with_provider(
+    data_provider: Arc<dyn pneumatic_core::data::DataProvider>,
+    env_data: EnvironmentMetadata,
+    pool_view: Arc<dyn ShieldedPoolView>,
+) -> (Sentinel, Arc<PendingTransactionRegistry>) {
     let registry = Arc::new(PendingTransactionRegistry::new());
     let node_registry = make_test_node_registry();
     let env_data = Arc::new(env_data);
@@ -168,7 +190,7 @@ pub fn make_sentinel_fixture_with_env_data_and_view(
         node_registry,
         registry.clone(),
         gossiper,
-        Arc::new(data_provider),
+        data_provider,
         pool_view,
     );
     (sentinel, registry)
