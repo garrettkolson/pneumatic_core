@@ -833,8 +833,8 @@ fn get_shard_executors_returns_executors() {
     );
 
     // Shard 0 and shard 1 should each return some executors
-    let shard0 = sentinel.get_shard_executors("tx-0", 1);
-    let shard1 = sentinel.get_shard_executors("tx-1", 1);
+    let shard0 = sentinel.get_shard_executors("tx-0", 1, b"tip");
+    let shard1 = sentinel.get_shard_executors("tx-1", 1, b"tip");
     assert!(shard0.is_ok() && shard1.is_ok());
     let s0 = shard0.unwrap();
     let s1 = shard1.unwrap();
@@ -876,12 +876,19 @@ fn get_shard_executors_changes_with_mined_tip() {
     let (s_block, _r) =
         make_sentinel_fixture_with_env_and_data_provider(one_block_tip, env_data);
 
+    // The salt is the caller's input now: genesis convention (empty chain) versus a
+    // mined tip. It used to be inferred by the provider from the environment id,
+    // which is precisely how it came to be pinned to a placeholder chain.
+    let salt_empty: Vec<u8> = Vec::new();
+    let salt_block = token_with_one_block().blockchain.get_current_chain_state().last_hash_in;
+    assert!(!salt_block.is_empty(), "fixture must carry a mined tip for this to discriminate");
+
     let mut shard_empty = Vec::new();
     let mut shard_block = Vec::new();
     for i in 0..50 {
         let tx_id = format!("tx_shard_tip_{i}");
-        shard_empty.push(s_empty.get_shard_executors(&tx_id, 1).unwrap());
-        shard_block.push(s_block.get_shard_executors(&tx_id, 1).unwrap());
+        shard_empty.push(s_empty.get_shard_executors(&tx_id, 1, &salt_empty).unwrap());
+        shard_block.push(s_block.get_shard_executors(&tx_id, 1, &salt_block).unwrap());
     }
 
     assert_ne!(
@@ -898,15 +905,24 @@ fn get_shard_executors_changes_with_mined_tip() {
 fn send_to_executor_for_preload_follows_current_epoch() {
     use pneumatic_core::epoch::ExecutorSet;
 
+    let env_data = make_test_env_data_sharded();
+    let partition = env_data.token_partition_id.clone();
+
     // Only epoch 1 has an executor set; epoch 2 is absent.
-    let data_provider = StubDataProvider::new().with_executor_set(
-        1,
-        ExecutorSet {
-            executors: [(vec![1], 100), (vec![2], 100)].into_iter().collect(),
-        },
-    );
+    let data_provider = StubDataProvider::new()
+        .with_executor_set(
+            1,
+            ExecutorSet {
+                executors: [(vec![1], 100), (vec![2], 100)].into_iter().collect(),
+            },
+        )
+        // ADR-019: the salt is the tip of the transaction's OWN chain, and reading it
+        // is fail-closed. This test's subject is epoch routing, so it supplies the
+        // token the fixture transaction names (token_id = [1]) rather than testing
+        // the missing-token path — that has its own test.
+        .with_token(vec![1], partition, token_with_one_block());
     let (sentinel, _registry) =
-        make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data_sharded());
+        make_sentinel_fixture_with_env_and_data_provider(data_provider, env_data);
 
     let tx = Transaction {
         payload: vec![], gas_limit: 0,
@@ -938,3 +954,65 @@ fn send_to_executor_for_preload_follows_current_epoch() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Selection salt (Phase 0 / Phase 5.3 H3)
+// ---------------------------------------------------------------------------
+
+/// The selection salt must come from the token the transaction extends.
+///
+/// The bug this pins out: the salt used to be fetched as
+/// `latest_block_hash(environment_id)`, and that accessor used its argument as BOTH a
+/// partition and a token id. Genesis obligingly seeded a placeholder token under the
+/// environment id so the lookup would succeed — and a placeholder chain never
+/// advances, so every selection in every epoch was salted by a constant. Two tokens in
+/// one environment now cannot share a salt, which is the smallest observable proof that
+/// the salt is per-chain.
+#[test]
+fn selection_tip_reads_the_transactions_own_token() {
+    use pneumatic_core::tokens::Token;
+
+    let partition = make_test_env_data().token_partition_id.clone();
+
+    let mined = token_with_one_block();
+    let mined_tip = mined.blockchain.get_current_chain_state().last_hash_in.clone();
+    let unmined = Token::new();
+
+    let data_provider = StubDataProvider::new()
+        .with_token(vec![1], partition.clone(), mined)
+        .with_token(vec![2], partition, unmined.clone());
+
+    let (sentinel, _r) =
+        make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data());
+
+    let tip_a = sentinel.selection_tip(&[1]).expect("token 1 must resolve");
+    let tip_b = sentinel.selection_tip(&[2]).expect("token 2 must resolve");
+
+    assert_eq!(tip_a, mined_tip, "the salt is the chain tip of THAT token");
+    assert!(!tip_a.is_empty(), "a mined chain supplies a non-empty salt");
+    assert!(tip_b.is_empty(), "an unmined chain is the genesis convention");
+    assert_ne!(
+        tip_a, tip_b,
+        "two tokens in one environment must not be salted identically"
+    );
+}
+
+/// Fail-closed: an unreadable token is an error, never an empty salt.
+///
+/// An empty salt is indistinguishable from genesis, so a swallowed lookup failure
+/// looks like a healthy boot and silently freezes the selection seed forever.
+#[test]
+fn selection_tip_refuses_a_missing_token() {
+    let (sentinel, _r) = make_sentinel_fixture_with_env_and_data_provider(
+        StubDataProvider::new(),
+        make_test_env_data(),
+    );
+
+    match sentinel.selection_tip(&[7, 7, 7]) {
+        Ok(tip) => panic!(
+            "a missing token must not produce a salt (got {} bytes — an empty salt is              indistinguishable from genesis)",
+            tip.len()
+        ),
+        Err(SentinelError::Registry(_)) => {}
+        Err(other) => panic!("expected a Registry error, got a different variant"),
+    }
+}

@@ -261,9 +261,6 @@ impl DataProvider for TestDataProvider {
     fn save_executor_set(&self, epoch: u64, set: ExecutorSet, partition_id: &str) -> Result<(), DataError> {
         self.inner.save_executor_set(epoch, set, partition_id)
     }
-    fn latest_block_hash(&self, partition_id: &str) -> Result<Option<Vec<u8>>, DataError> {
-        self.inner.latest_block_hash(partition_id)
-    }
 }
 
 // ---------------------------------------------------------------------------

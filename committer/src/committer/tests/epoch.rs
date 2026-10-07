@@ -376,3 +376,60 @@ async fn handle_epoch_reconcile_surfaces_snapshot_persist_failure() {
         result.err()
     );
 }
+
+/// `canonical_chain_tip` seeds epoch **leader** election, so its value must depend on
+/// the token set and nothing else.
+///
+/// The bug this pins out: the previous code took `.iter().map(…).next()` over the
+/// `DashMap`, i.e. whichever token hash-shard iteration happened to yield first. Two
+/// committers holding the same tokens could elect different leaders. The rule is now
+/// "the sorted-first token id", which is testable without a committer.
+#[test]
+fn canonical_chain_tip_is_independent_of_insertion_order() {
+    use pneumatic_core::tokens::Token;
+
+    // Token [0x00] carries a mined chain; token [0x01] is unmined. Sorted order puts
+    // [0x00] first, so the mined tip must win whichever order we insert in.
+    let mut mined = Token::new();
+    mined.id = vec![0x00];
+    let mut block = pneumatic_core::blocks::Block {
+        signed_trans: pneumatic_core::transactions::SignedTransaction::test_transaction(),
+        token_metadata: std::collections::HashMap::new(),
+        previous_hash: vec![], // genesis convention
+        timestamp: 0,
+        current_hash: vec![],
+        finality_status: pneumatic_core::blocks::FinalityStatus::Optimistic,
+        proposer_key: vec![],
+        epoch_number: 0,
+    };
+    block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+        .expect("well-formed test block hashes");
+    mined.blockchain.add_block(block);
+    let mined_tip = mined.blockchain.get_current_chain_state().last_hash_in.clone();
+    assert!(!mined_tip.is_empty(), "fixture must carry a mined tip to discriminate");
+
+    let mut unmined = Token::new();
+    unmined.id = vec![0x01];
+
+    let forward = dashmap::DashMap::new();
+    forward.insert(vec![0x00u8], mined.clone());
+    forward.insert(vec![0x01u8], unmined.clone());
+
+    let reverse = dashmap::DashMap::new();
+    reverse.insert(vec![0x01u8], unmined.clone());
+    reverse.insert(vec![0x00u8], mined.clone());
+
+    let a = epoching::canonical_chain_tip(&forward);
+    let b = epoching::canonical_chain_tip(&reverse);
+    assert_eq!(a, b, "iteration order must not change the leader seed");
+    assert_eq!(a, mined_tip, "the sorted-first token's tip is the canonical one");
+
+    // When the sorted-first token is itself unmined, the genesis convention applies —
+    // and it stays stable across orders.
+    let only_unmined = dashmap::DashMap::new();
+    only_unmined.insert(vec![0x01u8], unmined.clone());
+    assert!(epoching::canonical_chain_tip(&only_unmined).is_empty());
+
+    // No tokens yet (pre-genesis) is an explicit empty salt, not a swallowed error.
+    assert!(epoching::canonical_chain_tip(&dashmap::DashMap::new()).is_empty());
+}

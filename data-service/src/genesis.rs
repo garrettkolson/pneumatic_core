@@ -16,7 +16,7 @@
 //! | `User { stake, fuel_balance, nonce }` per node | role selection (`RoleSelector` vs the per-type floors) | `bin/node-server.rs` `DataStakeProvider` |
 //! | `StakeSet` snapshot per epoch | the registration stake gate and leader election | `StakeIndex` (epoch 1 at boot), finalizer quorum (epoch 0 on the standard path) |
 //! | `ShieldedPoolState` | composite/committer boot load, fail-closed | `ShieldedPool::load` |
-//! | a token keyed by the environment id | chain-tip resolution for routing | `DataProvider::latest_block_hash` → `get_token(env_id, env_id)`, called by the sentinel |
+//! | a token keyed by the environment id | *nothing now* — vestigial, still seeded for compatibility | was `DataProvider::latest_block_hash` → `get_token(env_id, env_id)`. Removed 10/07/2026: the sentinel's selection salt is now the tip of the transaction's OWN token, because a placeholder chain never advances and so pinned every selection in every epoch to a constant. |
 //!
 //! Both stake records must exist: seeding only the user rows installs roles but
 //! rejects registrations (the gate consults the snapshot and a cache miss is
@@ -96,8 +96,15 @@ pub struct GenesisSpec {
     /// boot against a real `DefaultDataProvider`, which never reports "absent".
     #[serde(default = "default_true")]
     pub seed_shielded_pool: bool,
-    /// Seed an empty-chain token under the environment id so
-    /// `latest_block_hash` resolves instead of erroring.
+    /// Seed an empty-chain token under the environment id.
+    ///
+    /// Vestigial as of 10/07/2026. It existed so `latest_block_hash(environment_id)`
+    /// would resolve — that accessor conflated a partition with a token id, and the
+    /// sentinel used its result as the deterministic-selection salt. A token whose
+    /// chain never advances cannot supply a varying salt, so the seed made the defect
+    /// permanent rather than fixing it. The accessor is gone and the salt now comes
+    /// from the transaction's own token; the record is still written because existing
+    /// `genesis.json` files and boot paths assume the field, and it is harmless.
     #[serde(default = "default_true")]
     pub seed_partition_token: bool,
 }
@@ -289,12 +296,13 @@ pub fn apply(
         report.pool_seeded = true;
     }
 
-    // --- partition token (sentinel chain-tip lookup) ----------------------
+    // --- partition token (vestigial; see GenesisSpec::seed_partition_token) ----
     if spec.seed_partition_token {
-        // `latest_block_hash(partition)` resolves as
-        // `get_token(partition_id, partition_id)`; the sentinel passes the
-        // *environment id*, so the record is keyed there. An empty chain yields
-        // `last_hash_in == []`, the genesis convention — not an error.
+        // Written for compatibility only. Nothing reads this for selection anymore:
+        // the sentinel salts deterministic selection with the tip of the transaction's
+        // own token, so a per-environment placeholder is not consulted — and could not
+        // work if it were, since its chain never advances. Left intact because
+        // existing genesis files set the field and boot reporting tracks it.
         let key = spec.environment_id.as_bytes().to_vec();
         provider
             .save_token(&key, Token::new(), &spec.environment_id)

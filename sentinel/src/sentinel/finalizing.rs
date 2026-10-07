@@ -72,9 +72,15 @@ impl Sentinel {
             )));
         }
 
-        // Assign a new finalizer deterministically using the current stake snapshot.
-        // Falls back to random candidate selection if the snapshot is unavailable.
-        let new_key = match self.assign_finalizer_deterministic_retry(&tx_id, *self.current_epoch.lock(), &rejected_key) {
+        // Assign a new finalizer deterministically against the current stake
+        // snapshot, salted by the tip of the chain this transaction extends.
+        //
+        // The salt read is deliberately INSIDE the fallible attempt: if it cannot be
+        // resolved, reassignment takes the same candidate-based fallback that a
+        // missing stake snapshot already takes. What it must never do is substitute an
+        // empty salt — that is indistinguishable from genesis and would freeze the
+        // selection seed forever (ADR-019). `selection_tip` is what enforces that.
+        let new_key = match self.reassign_finalizer_deterministically(&tx_id, &rejected_key) {
             Ok(key) => key,
             Err(_) => {
                 // Fallback: pick the first non-rejected candidate from the node registry.
@@ -139,18 +145,67 @@ impl Sentinel {
         Ok(())
     }
 
+    /// Resolve the salt for a transaction already in the registry and reassign its
+    /// finalizer deterministically.
+    ///
+    /// The registry entry is read inside a scope so the DashMap guard is dropped
+    /// before the provider call — a shard lock must never be held across socket I/O.
+    pub(crate) fn reassign_finalizer_deterministically(
+        &self,
+        tx_id: &str,
+        rejected_key: &[u8],
+    ) -> Result<Vec<u8>, SentinelError> {
+        let token_id = {
+            let entry = self
+                .registry
+                .get_transaction_mut(tx_id)
+                .map_err(|e| {
+                    SentinelError::Registry(format!(
+                        "Cannot read transaction {} for finalizer reassignment: {}",
+                        tx_id, e
+                    ))
+                })?;
+            match &entry.state {
+                TransactionState::Preloaded { transaction }
+                | TransactionState::Validated { transaction, .. }
+                | TransactionState::Executing { transaction, .. }
+                | TransactionState::Finalizing { transaction, .. } => transaction.token_id.clone(),
+                _ => {
+                    return Err(SentinelError::Registry(format!(
+                        "Cannot reassign finalizer for tx {}: no transaction in state",
+                        tx_id
+                    )));
+                }
+            }
+        };
+        let chain_tip = self.selection_tip(&token_id)?;
+        self.assign_finalizer_deterministic_retry(
+            tx_id,
+            *self.current_epoch.lock(),
+            rejected_key,
+            &chain_tip,
+        )
+    }
+
     /// Deterministically assign a finalizer for a transaction using the current
     /// stake snapshot. Returns the assigned finalizer's public key.
     ///
     /// Uses the sentinel's `EpochSnapshotCache<StakeSet>` to load the snapshot for the
     /// given epoch, then delegates to `pneumatic_core::deterministic_select`.
     ///
-    /// If the snapshot is not cached and the DataProvider call fails, returns
-    /// a `Routing` error.
+    /// If the snapshot is not cached, returns a `Routing` error.
+    ///
+    /// `chain_tip` is the selection salt: the tip of the chain the transaction
+    /// extends, resolved by the caller (`Sentinel::selection_tip` for a token id,
+    /// `Sentinel::chain_tip_of` when the token is already loaded). Passing it in —
+    /// rather than having this function guess which chain was meant — is what keeps
+    /// the salt per-token; see `fact-self-referential-quorum-denominator` for why a
+    /// predictable selection is not a benign property.
     pub fn assign_finalizer_deterministic(
         &self,
         tx_id: &str,
         epoch_number: u64,
+        chain_tip: &[u8],
     ) -> Result<Vec<u8>, SentinelError> {
         let snapshot = self.stake_snapshot_cache.get(epoch_number)
             .ok_or_else(|| SentinelError::Routing(format!("No snapshot for epoch {}", epoch_number)))?;
@@ -159,18 +214,12 @@ impl Sentinel {
             return Err(SentinelError::Routing("Stake set is empty".into()));
         }
 
-        let prev_block_hash = self
-            .data_provider
-            .latest_block_hash(&self.env_data.environment_id)
-            .unwrap_or_default() // unknown tip / I/O error → empty salt (genesis fails closed)
-            .unwrap_or_default();
-
         let finalizer_key = pneumatic_core::deterministic_select(
             &snapshot,
             FINALIZER_DOMAIN,
             tx_id.as_bytes(),
             epoch_number,
-            &prev_block_hash,
+            chain_tip,
         )
         .ok_or_else(|| SentinelError::Routing("Selection returned none for non-empty stake set".into()))?;
 
@@ -188,12 +237,15 @@ impl Sentinel {
         tx_id: &str,
         epoch_number: u64,
         rejected_key: &[u8],
+        chain_tip: &[u8],
     ) -> Result<Vec<u8>, SentinelError> {
-        let key = self.assign_finalizer_deterministic(tx_id, epoch_number)?;
+        let key = self.assign_finalizer_deterministic(tx_id, epoch_number, chain_tip)?;
         if key == rejected_key {
-            // Try with a "retry" suffix to shift the selection
+            // Try with a "retry" suffix to shift the selection. The salt is carried
+            // unchanged: only the tie-break input moves, so a retry stays bound to
+            // the same chain tip the original assignment used.
             let retry_tx_id = format!("{}_retry", tx_id);
-            return self.assign_finalizer_deterministic(&retry_tx_id, epoch_number);
+            return self.assign_finalizer_deterministic(&retry_tx_id, epoch_number, chain_tip);
         }
         Ok(key)
     }

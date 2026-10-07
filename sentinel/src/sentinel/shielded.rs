@@ -92,8 +92,15 @@ impl Sentinel {
 
         // 5. Deterministic finalizer assignment + the one outbound
         //    `SignShielded`.
-        let finalizer_key =
-            self.assign_finalizer_deterministic(&stx.id, *self.current_epoch.lock())?;
+        // Salted by the tip of the token this shielded transaction extends. The
+        // token is already loaded above for the opt-in checks, so take the tip from
+        // it rather than re-reading: the salt cannot then disagree with the token the
+        // transaction was validated against.
+        let finalizer_key = self.assign_finalizer_deterministic(
+            &stx.id,
+            *self.current_epoch.lock(),
+            &Self::chain_tip_of(&token),
+        )?;
         self.transaction_notifier
             .send_sign_shielded(&stx, &finalizer_key, &self.env_data)?;
 

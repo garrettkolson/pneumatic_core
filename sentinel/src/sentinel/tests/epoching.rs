@@ -76,20 +76,20 @@ fn advance_epoch_routes_follows_new_epoch() {
     sentinel.advance_epoch(1);
     assert_eq!(*sentinel.current_epoch.lock(), 1);
     let exec1 = sentinel
-        .get_shard_executors(&tx_id, *sentinel.current_epoch.lock())
+        .get_shard_executors(&tx_id, *sentinel.current_epoch.lock(), b"epoch-test-tip")
         .unwrap();
     let finalizer1 = sentinel
-        .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock())
+        .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock(), b"epoch-test-tip")
         .unwrap();
 
     // advance_epoch(2) moves routing to epoch 2.
     sentinel.advance_epoch(2);
     assert_eq!(*sentinel.current_epoch.lock(), 2);
     let exec2 = sentinel
-        .get_shard_executors(&tx_id, *sentinel.current_epoch.lock())
+        .get_shard_executors(&tx_id, *sentinel.current_epoch.lock(), b"epoch-test-tip")
         .unwrap();
     let finalizer2 = sentinel
-        .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock())
+        .assign_finalizer_deterministic(&tx_id, *sentinel.current_epoch.lock(), b"epoch-test-tip")
         .unwrap();
 
     // Per-epoch routing must select different targets. Under the literal-1 bug

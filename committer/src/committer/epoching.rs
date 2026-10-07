@@ -6,6 +6,34 @@
 
 use super::*;
 
+/// The chain tip that seeds epoch leader selection (Phase 5.3 / AUDIT H3).
+///
+/// **Canonical, not incidental.** `tokens` is a `DashMap`, whose iteration order
+/// follows hash-shard layout rather than insertion order. This previously did
+/// `.iter().map(…).next()`, so the leader seed was whichever token iteration happened
+/// to yield first: two committers holding the same token set could elect different
+/// leaders, and a single committer could change its mind as the map rehashed. Sorting
+/// token ids first applies the same deterministic-iteration rule the selection code
+/// itself follows (`C6` in `src/epoch/leader.rs`).
+///
+/// An empty cache yields an empty salt. That is the pre-genesis case — no tokens
+/// loaded yet — and it is stated here rather than produced by a swallowed error.
+///
+/// This is a free function rather than a method so the determinism property can be
+/// tested directly, without standing up a committer.
+pub(crate) fn canonical_chain_tip(
+    tokens: &dashmap::DashMap<Vec<u8>, pneumatic_core::tokens::Token>,
+) -> Vec<u8> {
+    // Keys are cloned out before sorting: DashMap's iterator holds a shard guard, and
+    // that guard must not be live across the sort or the lookup below.
+    let mut token_ids: Vec<Vec<u8>> = tokens.iter().map(|entry| entry.key().clone()).collect();
+    token_ids.sort();
+    match token_ids.first().and_then(|id| tokens.get(id)) {
+        Some(token) => token.blockchain.get_current_chain_state().last_hash_in,
+        None => Vec::new(),
+    }
+}
+
 impl Committer {
 
     /// Handle epoch reconciliation request.
@@ -82,12 +110,7 @@ impl Committer {
         // epoch's leader is only knowable once this tip is produced. Read the
         // current tip from the local token cache — the committer holds its chain
         // state there and does not persist it to the data service.
-        let prev_block_hash = self
-            .tokens
-            .iter()
-            .map(|entry| entry.value().blockchain.get_current_chain_state().last_hash_in)
-            .next()
-            .unwrap_or_default();
+        let prev_block_hash = canonical_chain_tip(&self.tokens);
 
         // The detector lock serializes the two writers: the internal path and the
         // wire path cannot both be mid-advance, and it is released before

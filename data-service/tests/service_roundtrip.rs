@@ -151,16 +151,25 @@ fn data_blob_round_trips_for_executor_get_data() {
 }
 
 #[test]
-fn token_round_trips_so_latest_block_hash_resolves() {
+fn the_env_placeholder_token_round_trips() {
     let (_store, provider, _addr) = boot(None);
-    // `latest_block_hash(partition)` is `get_token(partition, partition)`, and
-    // the sentinel calls it with the environment id.
+    // Genesis seeds a placeholder token under the environment id
+    // (`GenesisSpec::seed_partition_token`). It used to be read through
+    // `latest_block_hash(environment_id)`, which looked the token up BY the partition
+    // string — and the sentinel took its deterministic-selection salt from that, so
+    // the salt was pinned to a chain that never advances. That accessor is gone; the
+    // salt now comes from the transaction's own token. This test keeps the genesis
+    // artifact itself honest: it round-trips, and its chain is genuinely empty.
     let token = pneumatic_core::tokens::Token::new();
     let key = b"env".to_vec();
     provider.save_token(&key, token, "env").expect("save_token");
 
-    let tip = provider.latest_block_hash("env").expect("latest_block_hash must resolve");
-    assert_eq!(tip, Some(Vec::new()), "an empty chain reports the genesis convention");
+    let stored = provider.get_token(&key, "env").expect("placeholder token must resolve");
+    assert_eq!(
+        stored.blockchain.get_current_chain_state().last_hash_in,
+        Vec::<u8>::new(),
+        "the placeholder is seeded with an empty chain — which is exactly why it can          never supply a varying selection salt"
+    );
 }
 
 #[test]
@@ -337,8 +346,15 @@ fn genesis_writes_every_record_a_node_reads_at_boot() {
     let pool = provider.get_shielded_pool(PARTITION).expect("pool readable").expect("pool seeded");
     assert_eq!(pool.root, genesis_pool_state().root);
 
-    // The sentinel's chain-tip lookup resolves.
-    assert_eq!(provider.latest_block_hash("env").expect("tip resolves"), Some(Vec::new()));
+    // The genesis placeholder token resolves (vestigial for selection now, but
+    // existing genesis files still carry it and boot paths still seed it).
+    let placeholder = provider
+        .get_token(&b"env".to_vec(), "env")
+        .expect("genesis must seed the env-keyed placeholder token");
+    assert!(
+        placeholder.blockchain.get_current_chain_state().last_hash_in.is_empty(),
+        "seeded with an empty chain by design"
+    );
 }
 
 #[test]

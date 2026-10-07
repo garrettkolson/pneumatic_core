@@ -175,26 +175,30 @@ fn assign_finalizer_changes_with_mined_tip() {
         stakers: [(vec![10], 10), (vec![20], 30), (vec![30], 60)].into_iter().collect(),
     };
 
-    // Two sentinels: identical stake snapshot + epoch, differing only in the
-    // mined tip exposed by the data provider (empty chain vs. one block).
+    // Two sentinels: identical stake snapshot + epoch. The mined tip is now the
+    // caller's input (see below), so the providers are deliberately identical — if
+    // this test still discriminates, it is discriminating on the salt and not on
+    // whatever the provider happens to guess.
     let empty_tip = StubDataProvider::new().with_stake_snapshot(1, stake.clone());
-    let one_block_tip = StubDataProvider::new()
-        .with_stake_snapshot(1, stake)
-        .with_token(vec![1], "test".to_string(), token_with_one_block());
+    let one_block_tip = StubDataProvider::new().with_stake_snapshot(1, stake);
 
     let (s_empty, _r) =
         make_sentinel_fixture_with_env_and_data_provider(empty_tip, make_test_env_data());
     let (s_block, _r) =
         make_sentinel_fixture_with_env_and_data_provider(one_block_tip, make_test_env_data());
 
+    let salt_empty: Vec<u8> = Vec::new();
+    let salt_block = token_with_one_block().blockchain.get_current_chain_state().last_hash_in;
+    assert!(!salt_block.is_empty(), "fixture must carry a mined tip for this to discriminate");
+
     let mut finalizers_empty = Vec::new();
     let mut finalizers_block = Vec::new();
     for i in 0..50 {
         let tx_id = format!("tx_finalizer_tip_{i}");
         finalizers_empty
-            .push(s_empty.assign_finalizer_deterministic(&tx_id, 1).unwrap());
+            .push(s_empty.assign_finalizer_deterministic(&tx_id, 1, &salt_empty).unwrap());
         finalizers_block
-            .push(s_block.assign_finalizer_deterministic(&tx_id, 1).unwrap());
+            .push(s_block.assign_finalizer_deterministic(&tx_id, 1, &salt_block).unwrap());
     }
 
     assert_ne!(
@@ -224,6 +228,15 @@ fn handle_rejection_follows_current_epoch() {
             StakeSet {
                 stakers: [(vec![10], 100), (vec![20], 100), (vec![30], 100)].into_iter().collect(),
             },
+        )
+        // ADR-019: the reassignment salt comes from the tip of the transaction's own
+        // chain, and an unreadable token never yields a salt. This test asserts the
+        // reassignment lands on the epoch-2 DETERMINISTIC pick, so it has to supply
+        // the token the fixture entry names (token_id = [1]).
+        .with_token(
+            vec![1],
+            make_test_env_data().token_partition_id.clone(),
+            token_with_one_block(),
         );
     let (sentinel, registry) = make_sentinel_fixture_with_data_provider(data_provider);
 
@@ -247,11 +260,18 @@ fn handle_rejection_follows_current_epoch() {
 
     // The discriminators: the reassignment must land on the epoch-2 pick, not the
     // epoch-1 pick (which is what the literal-1 bug would produce).
+    //
+    // The salt here is the fixture token's chain tip — the same value the handler
+    // derives from the transaction's own token (ADR-019). Using it explicitly also
+    // makes this test discriminate on salt provenance: a handler that salted with
+    // anything else would miss the expected pick entirely.
+    let chain_tip = token_with_one_block().blockchain.get_current_chain_state().last_hash_in;
+    assert!(!chain_tip.is_empty(), "fixture must carry a mined tip");
     let epoch2_pick = sentinel
-        .assign_finalizer_deterministic_retry("tx_reject_epoch", 2, &rejected_key)
+        .assign_finalizer_deterministic_retry("tx_reject_epoch", 2, &rejected_key, &chain_tip)
         .unwrap();
     let epoch1_pick = sentinel
-        .assign_finalizer_deterministic_retry("tx_reject_epoch", 1, &rejected_key)
+        .assign_finalizer_deterministic_retry("tx_reject_epoch", 1, &rejected_key, &chain_tip)
         .unwrap();
     assert_ne!(epoch1_pick, epoch2_pick, "the two epochs must pick different finalizers for the test to be meaningful");
     assert!(

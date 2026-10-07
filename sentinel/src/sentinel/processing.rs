@@ -7,6 +7,42 @@
 use super::*;
 
 impl Sentinel {
+    /// The chain tip of the token a transaction extends — the deterministic
+    /// selection salt (Phase 5.3 / AUDIT H3).
+    ///
+    /// Deliberately **per-token**. A block-lattice has no environment-level tip: a
+    /// transaction extends exactly one token's chain, so the transaction's own token
+    /// is the only canonical choice, and honest nodes cannot disagree about which
+    /// chain the salt names. The previous implementation asked the data provider for
+    /// `latest_block_hash(environment_id)`, whose lookup key conflated a partition
+    /// with a token id; genesis even seeded a placeholder token under the environment
+    /// id (`GenesisSpec::seed_partition_token`) to make that lookup succeed. The
+    /// placeholder's chain never advances, so the salt was pinned to the genesis tip
+    /// forever — the opposite of "only knowable once the previous block is mined".
+    /// That ambiguous accessor is gone, so the conflation cannot be reintroduced.
+    ///
+    /// An empty salt is legitimate *only* for a genuinely empty chain (genesis). A
+    /// token that cannot be read is an error: a missing token must not silently
+    /// become a constant seed, because a constant seed makes every committee in
+    /// every epoch predictable forever.
+    pub(crate) fn selection_tip(&self, token_id: &[u8]) -> Result<Vec<u8>, SentinelError> {
+        let token = self
+            .data_provider
+            .get_token(&token_id.to_vec(), &self.env_data.token_partition_id)
+            .map_err(|e| SentinelError::Registry(format!(
+                "Cannot read token for selection salt: {}", e
+            )))?;
+        Ok(Self::chain_tip_of(&token))
+    }
+
+    /// The salt for a token already in hand — no provider round trip. Callers that
+    /// loaded the token for validation must use this rather than re-reading it, so
+    /// the salt cannot disagree with the token the transaction was validated
+    /// against.
+    pub(crate) fn chain_tip_of(token: &pneumatic_core::tokens::Token) -> Vec<u8> {
+        token.blockchain.get_current_chain_state().last_hash_in
+    }
+
     /// Handle a "Process" request — a new transaction entering the pipeline.
     ///
     /// Flow:
@@ -150,8 +186,10 @@ impl Sentinel {
     /// When sharding is enabled (shard_count > 1), routes only to the shard's executors.
     pub(crate) fn send_to_executor_for_preload(&self, tx: &Transaction) -> Result<(), SentinelError> {
         if self.env_data.shard_count > 1 {
-            // Shard-aware routing: only send to the selected shard's executors
-            let shard_executors = self.get_shard_executors(&tx.id, *self.current_epoch.lock())?;
+            // Shard-aware routing: only send to the selected shard's executors.
+            // The salt is the tip of the chain THIS transaction extends.
+            let chain_tip = self.selection_tip(&tx.token_id)?;
+            let shard_executors = self.get_shard_executors(&tx.id, *self.current_epoch.lock(), &chain_tip)?;
             self.transaction_notifier
                 .send_to_shard_executors_for_preload(tx, &shard_executors, &self.env_data)
                 .map_err(Into::into)
@@ -164,7 +202,19 @@ impl Sentinel {
     }
 
     /// Get the executor public keys for the transaction's shard.
-    pub(crate) fn get_shard_executors(&self, tx_id: &str, epoch_number: u64) -> Result<Vec<Vec<u8>>, SentinelError> {
+    ///
+    /// `chain_tip` is the selection salt — the tip of the chain the transaction
+    /// extends, resolved by the caller via [`Self::selection_tip`] or
+    /// [`Self::chain_tip_of`]. It is a parameter rather than fetched here so that
+    /// every caller is forced to say which chain it is selecting against, and so a
+    /// test can drive both branches without a provider that has to guess the same
+    /// thing the production provider guesses.
+    pub(crate) fn get_shard_executors(
+        &self,
+        tx_id: &str,
+        epoch_number: u64,
+        chain_tip: &[u8],
+    ) -> Result<Vec<Vec<u8>>, SentinelError> {
         let executors = self.executor_set_cache.get(epoch_number)
             .ok_or_else(|| SentinelError::Routing(format!("No executor set for epoch {}", epoch_number)))?;
 
@@ -172,18 +222,12 @@ impl Sentinel {
             return Err(SentinelError::Routing("Executor set is empty".into()));
         }
 
-        let prev_block_hash = self
-            .data_provider
-            .latest_block_hash(&self.env_data.environment_id)
-            .unwrap_or_default() // unknown tip / I/O error → empty salt (genesis fails closed)
-            .unwrap_or_default();
-
         let shard_executors = pneumatic_core::deterministic_select_shard(
             &executors,
             self.env_data.shard_count,
             tx_id,
             epoch_number,
-            &prev_block_hash,
+            chain_tip,
         )
         .ok_or_else(|| SentinelError::Routing("Selected shard has no executors".into()))?;
 
