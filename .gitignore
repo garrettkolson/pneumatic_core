@@ -18,3 +18,10 @@ Cargo.lock
 # secret keys — so they must never be committed, even though the testnet they
 # describe is throwaway.
 deploy/generated/
+
+# Local test-run output. These three files were tracked before anyone thought
+# about it, so every `cargo test` dirtied the working tree and buried real
+# changes in log churn. Unanchored on purpose: `test.log` also covers
+# `committer/test.log`, since a test binary writes one wherever it is invoked.
+test.log
+test_log.txt
