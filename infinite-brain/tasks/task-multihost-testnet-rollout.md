@@ -17,10 +17,14 @@ edges:
     type: depends_on
     weight: 0.9
     note: "Phase 2's verdict instrument: exit code over eyeballed logs, and why logs cannot answer it"
+  - target: fact-committer-confirmation-gate-did-not-gate
+    type: related_to
+    weight: 0.95
+    note: "What auditing the actually-live gate found instead of the dead function the roadmap named — three silent failures behind the only quorum an ordinary transaction passes"
   - target: fact-self-referential-quorum-denominator
     type: depends_on
     weight: 0.95
-    note: "Phase 0 item 3 and the reason Phase 7's denominator work is 'declare and verify', not 'divide by shard stake'"
+    note: "Phase 0 item 3 (done 10/07: the denominator is declared and a shortfall fails) and the reason Phase 7's denominator work is 'declare and verify', not 'divide by shard stake'"
   - target: fact-sharding-exists-unexercised
     type: depends_on
     weight: 0.95
@@ -198,7 +202,7 @@ in the direction that hides the fault. Phase 5 exists to prevent exactly this.
 > capacity-capped bucket can silently hold fewer peers than the code believes — the same
 > class, one level down. Worth folding into Phase 2's honest-measurement work.
 
-**3. The per-transaction quorum denominator is whoever showed up.**
+**3. ✅ DONE 10/07 — the quorum denominator is now a declared set.**
 `SignatureCollector::reconcile_signatures` (`finalizer/src/signature_collector.rs:161`)
 computes its denominator as the **sum of the stake of signatures that arrived**, and if the
 threshold is never reached it falls through to `candidates.first()` and proceeds. Nothing
@@ -218,12 +222,51 @@ block already records global `total_stake`/`total_voters` it never enforced
 (`finalizer/finalizing.rs:108-115`), so the declared set is already available to compare
 against.
 
+> **What landed.** `reconcile_signatures(tx_id, &ResponsibleSet)` — the denominator is the
+> set's total, each vote is priced by the set rather than by the `current_stake` stamped on
+> the vote, votes from unassigned keys are excluded **and counted**, and a shortfall is an
+> `Err` plus `quorum_shortfall_count()` instead of a fallthrough to `candidates.first()`.
+> `Finalizer::responsible_set()` resolves the set from the epoch stake snapshot and
+> **refuses** at `shard_count > 1`: a shard is chosen from the per-transaction selection
+> salt, which the finalizer is never given, so the global set there would fail every
+> sharded transaction while looking like a working check. Dead count-based machinery went
+> with it — `check_quorum` and the `total_voters` constructor parameter are deleted (7
+> call sites), the composite now passes `env_data.quorum_percentage` instead of a literal
+> `66.6`, and `shard_quorum_percentage` is removed from `EnvironmentMetadata`, the spec,
+> the deploy config and every fixture.
+>
+> **The roadmap pointed at a dead function.** `try_finalize` has no caller: the live
+> standard path is `try_finalize_optimistic`, which per ADR-005/ADR-010 waits for no
+> quorum and reconciles no signatures, so the self-referential denominator was live only on
+> the shielded path. Auditing the *actually live* gate instead turned up three worse
+> defects, now fixed — a committer obeyed a `BlockQuorumReached` claim without recomputing
+> it, from any registered role; a committer never counted its own vote, so three equal
+> committers could never reach 67% and nothing would ever become `Confirmed`; and votes
+> arriving before their stake set were discarded silently. See
+> `fact-committer-confirmation-gate-did-not-gate`.
+>
+> **Still open here:** the *assigned* set is only exact at `shard_count: 1`, where
+> selection returns every positive-stake executor. Carrying a selection record (epoch,
+> salt, committee hash) on the sentinel→finalizer message is Phase 7's job and is
+> deliberately not approximated here.
+
 **Exit test:** a test that stores a token observes a non-empty salt through the *production*
 provider, not only the stub; a send to a peer removed from a bucket increments a visible
 counter; and a transaction whose votes fall short of the assigned set produces a
 *distinguishable outcome* — a rejection or a counter — rather than a finalized block. All
 three are small. None is optional, because Phases 1–2 consist of measuring through code
 that currently reports success when it did not succeed, and finalizes on whoever answered.
+
+> **Status of the three exit tests.** (2) is satisfied — `register_peer` refuses an
+> over-capacity bucket and the refusal is observable, with the residual named above. (3) is
+> satisfied and then some: `one_vote_is_no_longer_a_quorum`,
+> `a_shortfall_refuses_instead_of_lowering_the_bar`, and the committer-side
+> `quorum_claim_is_refused_unless_this_node_computes_quorum_too` all assert a distinguishable
+> outcome, mutation-verified. **(1) is not satisfied**: the salt tests drive
+> `StubDataProvider`, so "the production provider returns a non-empty salt" is still an
+> assumption rather than an observed fact — which is precisely the class of gap Phase 0
+> exists to close. It needs a `DefaultDataProvider`-against-a-real-data-service test (or a
+> service-backed test fixture) before Phase 0 can be called complete.
 
 ## Phase 1 — Transaction ingress and a client
 
@@ -407,11 +450,14 @@ just never reduces links, and its tail is unsharded.
    everyone else sends `environment_id`). A wire change means a **lockstep upgrade**: rmp
    encodes structs positionally, so frames are not byte-compatible across it.
 2. **A real denominator, then a shard-scoped one.** Not "divide by the shard's stake" —
-   see Phase 0 item 3. The per-transaction denominator is currently the stake that arrived
-   (`fact-self-referential-quorum-denominator`), so there is nothing to scope yet. The block
+   see Phase 0 item 3. The denominator is now a **declared set**
+   (`fact-self-referential-quorum-denominator`), but at `shard_count: 1` only:
+   `Finalizer::responsible_set()` refuses above one shard because it cannot know the salt,
+   so the first Phase 7 deliverable is the selection record that tells it. The block
    must name the responsible set, the receiver must verify against it, and only then can
    "shard quorum" mean anything. The committer's block-confirmation gate
-   (`quoruming.rs:55-75`) *does* have a declared global denominator — that is the gate to
+   (`quoruming.rs`) *does* have a declared global denominator — and now verifies its own
+   numerator as well (`fact-committer-confirmation-gate-did-not-gate`) — that is the gate to
    learn the shape from, and the one that keeps fault-tolerance claims honest today.
 3. **Receiver-side validation.** Nothing on the receiving side asks "is this mine?" — a
    mis-routed message is processed normally. Without this, a shard is a routing hint, not

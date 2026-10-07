@@ -4,15 +4,23 @@ title: "Per-transaction finalization quorum divides by the stake that showed up,
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "10/07/2026: `SignatureCollector::reconcile_signatures` (`finalizer/src/signature_collector.rs:161`) computes its quorum denominator as `total_stake = candidates.iter().map(stake).sum()` — the stake of the signatures that actually arrived — and if that threshold is never reached it falls through to `candidates.first()` and proceeds anyway. Nothing anywhere compares the voters to the executors the sentinel assigned (grep for assigned/expected_executors/shard_executors in the collector and `finalizer/finalizing.rs`: no hits). Meanwhile `try_finalize` passes the *global* `(total_stake, total_voters)` from `resolve_stake_metrics()` (`finalizing.rs:48-52,108`) into the block. So each block records a global denominator that was never used for the decision. Benign at `shard_count: 1` only because selection returns every positive-stake executor and delivery is assumed complete."
+summary: "10/07/2026, RESOLVED same day: `SignatureCollector::reconcile_signatures` computed its quorum denominator as the stake of the signatures that actually arrived, and a shortfall fell through to `candidates.first()` and proceeded anyway. Now it takes a declared `ResponsibleSet`, prices each vote by that set rather than by the vote's own stamp, excludes and counts votes from unassigned keys, and returns `Err` on a shortfall. Two corrections to this node's original reading: `try_finalize` (the quorum-gated finalization path it described) **has no caller** — the live standard path is `try_finalize_optimistic`, which by ADR-005/ADR-010 waits for no quorum at all, so `reconcile_signatures` was live only on the shielded path; and the committer-side gate it credited with a real denominator turned out not to verify anything (`fact-committer-confirmation-gate-did-not-gate`)."
 auto_inject: true
 applicable_when: "Any work on quorum, sharding, finalization, committee assignment, fault-tolerance claims, or the security consequences of dropping a message"
-confidence: 1.0
+confidence: 0.9
 verified_at: "10/07/2026"
 verified_by: "dsh-agent"
-staleness_signal: "If the collector ever receives the assigned executor set, if `check_quorum` gains a production caller, if reconcile_signatures rejects a shortfall instead of falling through, or if blocks stop recording unenforced voter metrics"
+staleness_signal: "If `reconcile_signatures` is ever called with a set derived from the arriving signatures instead of a resolved epoch/committee set; if the shortfall `Err` is converted back into a fallthrough; if `try_finalize` gains a caller without being re-audited; or if blocks stop recording unenforced voter metrics"
 tags: [fact, quorum, finalizer, sharding, consensus, security, fault-tolerance]
 edges:
+  - target: fact-committer-confirmation-gate-did-not-gate
+    type: related_to
+    weight: 0.95
+    note: "The gate this node credited as real did not verify its own claims; that is where an ordinary transaction's quorum actually runs"
+  - target: decision-optimistic-finality
+    type: depends_on
+    weight: 0.9
+    note: "Why the finalizer-side quorum this node analysed is not on the standard path at all: standard tokens commit optimistically and reconcile nothing"
   - target: fact-sharding-exists-unexercised
     type: related_to
     weight: 0.95
@@ -34,6 +42,33 @@ source_url: "Empty"
 ---
 
 # Per-transaction finalization quorum divides by the stake that showed up
+
+> **Resolved 10/07/2026.** `reconcile_signatures` now takes a `ResponsibleSet` and its
+> total is the denominator; a shortfall is an `Err` and a counter, not a fallthrough;
+> votes from outside the set are excluded and counted; a vote's weight is the set's
+> declared stake for that key rather than the `current_stake` the vote carries.
+> `Finalizer::responsible_set()` resolves it from the epoch stake snapshot, and
+> **refuses** at `shard_count > 1` rather than substituting the global set — the shard
+> depends on the per-transaction selection salt, which the finalizer is never given, so
+> guessing there would fail every sharded transaction while looking like a working check.
+> Dead count-based machinery went with it: `check_quorum` and the `total_voters`
+> constructor parameter are deleted, and the composite now passes
+> `env_data.quorum_percentage` instead of a literal `66.6`. `shard_quorum_percentage` is
+> deleted outright — a knob that was validated at boot and read by nothing.
+>
+> Two things this node got wrong, both worth keeping visible:
+>
+> 1. **It analysed a dead function.** `try_finalize` has no caller anywhere in the
+>    workspace (verified by grep). The live standard path is `try_finalize_optimistic`,
+>    which per ADR-005/ADR-010 commits on the first authenticated executor vote and
+>    reconciles no signatures — so the self-referential denominator was live only on the
+>    **shielded** path, whose own `check_stake_quorum` gate was already using a declared
+>    total. Roadmap Phase 0's item 3 was written against the dead path and was right about
+>    the arithmetic for the wrong reason.
+> 2. **It credited the committer's gate with being real.** The denominator there was
+>    declared, yes — and the gate accepted a *claim* of quorum without recomputing it,
+>    never counted its own vote, and discarded votes that arrived early. See
+>    `fact-committer-confirmation-gate-did-not-gate`.
 
 Found 10/07/2026 while working out whether enabling `shard_count > 1` would break the
 pipeline. The expectation was that a global denominator would make sharding fail closed —
@@ -71,7 +106,8 @@ Three properties follow, all verified:
    set and the executors the sentinel selected. The assigned set is used to decide *who
    receives the preload*, and then never again.
 
-And the block itself carries the opposite numbers: `try_finalize` resolves
+*(See the resolution note above: the paragraph that follows describes `try_finalize`,
+which has no caller.)* And the block itself carries the opposite numbers: `try_finalize` resolves
 `(total_stake, total_voters)` from the **global** current-epoch stake set
 (`finalizer/finalizing.rs:48-52`) and passes them into `build_signed_transaction`
 (`:108-115`). So a block attests to voter metrics that governed nothing.
@@ -96,14 +132,15 @@ That makes it fragile in exactly the direction the rest of this vault has been c
   6.6) and it is the only place in this path where the denominator is chosen rather than
   inherited.
 
-## The contrast: the committer's gate is real
+## The contrast: the committer's gate had a declared denominator
 
 Block *confirmation* does have a declared denominator. `committer/quoruming.rs:55-75`
 takes `total_stake` from `stake_set_cache` for that block and compares
 `cumulative_stake * 100 >= total * quorum_pct`, with `quorum_percentage` read from
-`env_data`. So the protocol has one genuine global gate (committers confirming a block)
-and one that is decorative (finalizers assembling a transaction). Any claim about
-fault tolerance should name which one it means.
+`env_data`. So the denominator there was declared rather than derived — which is the half of the
+problem this node was about. The other half, found while fixing it, is that declaring a
+denominator is not the same as checking a numerator: see
+`fact-committer-confirmation-gate-did-not-gate`.
 
 ## Two config details, corrected
 
