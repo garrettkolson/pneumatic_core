@@ -152,6 +152,22 @@ pub enum NodeRegistryType {
     Archiver,
 }
 
+impl NodeRegistryType {
+    /// Does holding this role mean *participating* — producing, validating,
+    /// finalizing, or committing blocks?
+    ///
+    /// `Archiver` is the only variant that does not: it stores and serves history.
+    /// The distinction earns its keep on the trust path, where "I only watch" has to
+    /// be checkable rather than asserted. See
+    /// [`crate::node::registry::NodeRegistry::may_trust_unregistered_directory_responder`]:
+    /// a config key a validator could flip to make itself trusting would not be a
+    /// safety property, so the relaxation is refused to any node declaring a
+    /// consensus role, whatever its config says.
+    pub fn is_consensus_role(&self) -> bool {
+        !matches!(self, NodeRegistryType::Archiver)
+    }
+}
+
 /// A control-plane request.
 ///
 /// RNS is destination-encrypted: the transport guarantees the packet was
@@ -174,6 +190,18 @@ pub struct NodeRequest {
     pub requester_types: Vec<NodeRegistryType>,
     pub requested_type: NodeRegistryType,
     pub binding_signature: Vec<u8>,
+    /// Directory query only (`request_type == Request`): the responder's rhash, so
+    /// a captured query cannot be turned against another peer — a responder
+    /// refuses unless it is the named target. `None` marks a pre-freshness query,
+    /// honored only from an already-registered peer.
+    #[serde(default)]
+    pub query_target: Option<[u8; 16]>,
+    /// Directory query only. A one-shot number chosen by the requester: a repeat
+    /// of `(requester_rhash, query_nonce)` is refused. Without it the binding —
+    /// which covers no responder, nonce, or timestamp — is replayable forever by
+    /// anyone who observed one legitimate query.
+    #[serde(default)]
+    pub query_nonce: Option<[u8; 16]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,6 +290,8 @@ mod tests {
             requester_types: vec![NodeRegistryType::Committer, NodeRegistryType::Finalizer],
             requested_type: NodeRegistryType::Committer,
             binding_signature: vec![7, 8, 9],
+            query_target: None,
+            query_nonce: None,
         };
         let bytes = serialize_to_bytes_rmp(&req).unwrap();
         let back: NodeRequest = deserialize_rmp_to(&bytes).unwrap();
@@ -287,6 +317,8 @@ mod tests {
             requester_types: vec![NodeRegistryType::Finalizer],
             requested_type: NodeRegistryType::Finalizer,
             binding_signature: vec![6],
+            query_target: None,
+            query_nonce: None,
         };
         let bytes = serialize_to_bytes_rmp(&req).unwrap();
         let back: NodeRequest = deserialize_rmp_to(&bytes).unwrap();
@@ -391,6 +423,8 @@ mod tests {
             requester_types: vec![NodeRegistryType::Committer],
             requested_type: NodeRegistryType::Committer,
             binding_signature: vec![],
+            query_target: None,
+            query_nonce: None,
         };
         let req2 = NodeRequest {
             requester_key: vec![1],
@@ -399,6 +433,8 @@ mod tests {
             requester_types: vec![NodeRegistryType::Committer],
             requested_type: NodeRegistryType::Committer,
             binding_signature: vec![],
+            query_target: None,
+            query_nonce: None,
         };
         let bytes = serialize_to_bytes_rmp(&NetworkPacket { control: Some(req2), data: None }).unwrap();
         let back: NetworkPacket = deserialize_rmp_to(&bytes).unwrap();

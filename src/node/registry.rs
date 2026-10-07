@@ -43,6 +43,20 @@ pub struct NodeRegistry {
     /// `send_to_all` / `send_to_all_blocking` result is observable (Phase 6.2).
     /// Bounded by the number of registered nodes per type.
     delivery_failures: Arc<DashMap<([u8; 16], NodeRegistryType), u64>>,
+    /// Directory-query nonces we have already answered, `(requester_rhash, nonce)`
+    /// → when we saw it. The freshness window ([`QUERY_NONCE_WINDOW`]) prunes it,
+    /// so it stays small: it only ever holds queries from the last window.
+    ///
+    /// This is what makes a *fresh* query actually fresh. Without it, the nonce is
+    /// decoration: the requester picked it, and any observer of one legitimate
+    /// query could resend it until the requester's key rotated.
+    query_nonces: Arc<DashMap<([u8; 16], [u8; 16]), Instant>>,
+    /// Unit-test stand-in for the transport route table, used only when there is
+    /// no `RnsNetwork` to ask. Production has exactly one source of truth — the
+    /// transport's own destination table — and a registry with no transport
+    /// cannot receive a query, so the seam is not a second opinion.
+    #[cfg(test)]
+    test_routes: Arc<DashMap<[u8; 16], ()>>,
     /// Per-send bound for the fan-out methods. Production is `SEND_TIMEOUT`;
     /// `with_send_timeout` overrides it in tests so timeout-elapsed discriminators
     /// run at ~50 ms instead of the 5 s production bound.
@@ -98,6 +112,12 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// poll) instead of ~40 s, and a `Drop`-driven shutdown returns within one
 /// poll rather than up to 10 s.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a directory-query nonce stays remembered, and therefore how long a
+/// captured query is unreplayable. Well past any plausible round trip, short
+/// enough that the cache cannot grow without bound. Reuse inside the window is
+/// refused; a requester that retries must pick a new nonce (it does — it is
+/// generated per request).
+pub const QUERY_NONCE_WINDOW: Duration = Duration::from_secs(120);
 
 /// Record a failed fan-out delivery (Phase 6.2): bump the per-(rhash,
 /// node_type) counter and log it so every lost `send_to_all` /
@@ -186,6 +206,9 @@ pub fn init(
         shutdown: Arc::new(AtomicBool::new(false)),
         evict_interval: EVICTION_INTERVAL,
         delivery_failures: Arc::new(DashMap::new()),
+        query_nonces: Arc::new(DashMap::new()),
+        #[cfg(test)]
+        test_routes: Arc::new(DashMap::new()),
         send_timeout: SEND_TIMEOUT,
         admission_lock: Arc::new(std::sync::Mutex::new(())),
         peering: Mutex::new(None),

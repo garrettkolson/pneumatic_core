@@ -26,6 +26,8 @@ fn forged_heartbeat_does_not_refresh_last_seen() {
         requester_types: vec![NodeRegistryType::Finalizer],
         requested_type: NodeRegistryType::Finalizer,
         binding_signature: vec![0u8; 32],
+        query_target: None,
+        query_nonce: None,
     };
     reg.handle_heartbeat(&forged);
 
@@ -91,6 +93,8 @@ fn heartbeat_without_any_signature_does_not_refresh_last_seen() {
         requester_types: vec![NodeRegistryType::Finalizer],
         requested_type: NodeRegistryType::Finalizer,
         binding_signature: vec![], // literally no signature
+        query_target: None,
+        query_nonce: None,
     };
     reg.handle_heartbeat(&unsigned);
 

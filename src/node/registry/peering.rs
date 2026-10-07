@@ -111,15 +111,43 @@ impl NodeRegistry {
 
     /// Build a directory request for the `for_type` bucket. The declared roles
     /// describe *us* to the responder; the bucket asked about is `for_type`.
+    /// Ask one specific peer (`responder_rhash`) for `for_type`.
+    ///
+    /// Unlike `Register`/`Heartbeat`, this signs with [`NodeIdentity::sign_query`]
+    /// rather than `sign_binding`, and carries the responder's rhash plus a
+    /// one-shot nonce. Two reasons, both about replay:
+    ///
+    /// - the classic binding covers no responder, so one captured query could be
+    ///   sent to *every* peer we know;
+    /// - it covers no nonce or timestamp, so it could be sent *forever*.
+    ///
+    /// A query is repeatable and expensive — a 40-entry directory is ~156 KB of
+    /// hybrid signatures plus an ML-DSA sign to produce — so the difference
+    /// matters. Peers that already registered with us may still accept a legacy
+    /// query with these fields `None` (rolling upgrade); an unregistered observer
+    /// is only ever answered with them present.
     pub fn build_directory_request(
         &self,
         for_type: &NodeRegistryType,
+        responder_rhash: [u8; 16],
     ) -> Result<NodeRequest, PneumaticError> {
-        self.build_request(
-            NodeRequestType::Request,
-            for_type.clone(),
-            &self.declared_roles(),
-        )
+        let declared = self.declared_roles();
+        let mut nonce = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let binding_signature =
+            self.config
+                .identity
+                .sign_query(&responder_rhash, &nonce, for_type, &declared)?;
+        Ok(NodeRequest {
+            requester_key: self.config.public_key.clone(),
+            requester_rhash: self.config.rhash,
+            request_type: NodeRequestType::Request,
+            requester_types: declared,
+            requested_type: for_type.clone(),
+            binding_signature,
+            query_target: Some(responder_rhash),
+            query_nonce: Some(nonce),
+        })
     }
 
     /// Build a `Heartbeat`: an authenticated `last_seen` refresh. This is the
@@ -158,6 +186,12 @@ impl NodeRegistry {
             requester_types: declared.to_vec(),
             requested_type,
             binding_signature,
+            // `Register` and `Heartbeat` are not queries. They keep the classic
+            // binding — one registration happens once per peer, so the absence of
+            // a nonce costs little; a directory query happens forever, which is
+            // why only that path binds a responder and a nonce.
+            query_target: None,
+            query_nonce: None,
         })
     }
 
@@ -229,7 +263,7 @@ impl NodeRegistry {
     pub fn request_directories_from_peer(&self, peer_rhash: [u8; 16]) -> usize {
         let mut sent = 0;
         for for_type in Self::routed_role_types() {
-            let request = match self.build_directory_request(&for_type) {
+            let request = match self.build_directory_request(&for_type, peer_rhash) {
                 Ok(request) => request,
                 Err(e) => {
                     eprintln!(

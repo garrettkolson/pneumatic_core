@@ -113,6 +113,8 @@ mod tests {
             requester_types: types,
             requested_type: requested_type,
             binding_signature: binding,
+            query_target: None,
+            query_nonce: None,
         });
         key
     }

@@ -43,6 +43,25 @@ pub struct Config {
     /// Where this node writes its signed mesh fragment, or `None` to report
     /// nothing. See `node::registry::fragment`.
     pub mesh_fragment_path: Option<PathBuf>,
+    /// This node watches the network instead of participating in it.
+    ///
+    /// What it changes, and nothing else: the node may *apply* a directory response
+    /// from a peer it has never registered with, provided the envelope and every
+    /// entry still verify and the peer is reachable. A monitor, explorer, or indexer
+    /// holds no stake, so it cannot register, so without this it is answered by
+    /// peers and then discards every answer.
+    ///
+    /// It does **not** relax who this node answers (that path is gated by freshness
+    /// and reachability, not by this key), and a participant cannot use it: the
+    /// relaxation is refused to any node declaring a consensus role, so turning this
+    /// on while running Sentinel/Executor/Finalizer/Committer buys nothing. A
+    /// validator accepting directory entries from arbitrary reachable peers would
+    /// install attacker-chosen keys into its role buckets, and `send_to_all` fans
+    /// real pipeline traffic to whatever a bucket holds.
+    ///
+    /// No serde attribute: `Config` is built by `Config::build` from `ConfigSpec`,
+    /// which is the serde surface.
+    pub directory_observer: bool,
     pub rest_api_version: usize,
     pub node_type: NodeType,
     pub node_registry_types: Vec<NodeRegistryType>,
@@ -143,6 +162,7 @@ impl Config {
             public_key,
             ip_address,
             mesh_fragment_path,
+            directory_observer: spec.directory_observer,
             rest_api_version: spec.rest_api_version,
             node_type: if spec.is_full_node { NodeType::Full } else { NodeType::Light },
             node_registry_types,
@@ -407,6 +427,7 @@ impl Config {
             // Tests do not report: a unit test writing fragments would land files
             // in the repository working tree.
             mesh_fragment_path: None,
+            directory_observer: false,
             rest_api_version: 1,
             node_type: NodeType::Full,
             node_registry_types: vec![],
@@ -486,6 +507,9 @@ pub struct ConfigSpec {
     /// shipper can pick up.
     #[serde(default)]
     mesh_fragment_path: Option<String>,
+    /// Absent ⇒ not an observer. See [`Config::directory_observer`].
+    #[serde(default)]
+    directory_observer: bool,
     /// Relay/gateway mode (default false = leaf).
     #[serde(default)]
     transport_enabled: bool

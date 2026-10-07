@@ -242,16 +242,200 @@ fn handle_request(&self, request: &NodeRequest) {
     }
 }
 
+/// Decide whether to answer a directory query, burning the nonce when we do.
+///
+/// Two shapes of query, deliberately of different strength.
+///
+/// **Fresh** — `query_target` and `query_nonce` present, which is what this build
+/// always sends. The signature covers *us* and a one-shot number, so it is proof
+/// of this exact request rather than a captured one, and such a requester needs no
+/// prior registration. That is the point: a directory answer is how a node learns
+/// who to talk to, so requiring a stake-funded registration to ask the question
+/// pushed every monitor, explorer, and load generator into the validator set and
+/// the quorum denominator. What an unregistered asker still must show is that it
+/// is **in contact with us** — the query has to name us as its target, and it must
+/// already have a route (it announced to us, or we seeded it). A stranger firing
+/// one cold packet at a validator is still refused, which was the original reason
+/// for the gate.
+///
+/// **Legacy** — fields absent, i.e. a peer on an older build. The classic binding,
+/// which covers neither responder nor nonce and so is replayable indefinitely, plus
+/// registration. Strictly weaker; honored only so a rolling upgrade is not a hard
+/// failure. Nothing in this build sends one.
+///
+/// Fail-closed throughout: every path that does not clearly satisfy one shape
+/// returns `false`.
+fn admit_directory_query(&self, request: &NodeRequest) -> bool {
+    // Verify before looking anything up, so a forged request never reaches the
+    // registry (same order as `handle_heartbeat`).
+    let (target, nonce) = match (request.query_target, request.query_nonce) {
+        (Some(target), Some(nonce)) => (target, nonce),
+        _ => {
+            if !NodeIdentity::verify_binding(
+                &request.requester_key,
+                &request.requester_rhash,
+                &request.requested_type,
+                &request.requester_types,
+                &request.binding_signature,
+            ) {
+                eprintln!(
+                    "[pneumatic] directory request from {:02x?} failed binding verification; not answering",
+                    request.requester_rhash
+                );
+                return false;
+            }
+            if self
+                .find_node_type_by_public_key(&request.requester_key)
+                .is_none()
+            {
+                eprintln!(
+                    "[pneumatic] directory request from unregistered node {:02x?}; not answering",
+                    request.requester_rhash
+                );
+                return false;
+            }
+            return true;
+        }
+    };
+
+    // A query signed for a different responder is a replay of someone else's
+    // capture, or an attempt to use one peer as a stamp for another.
+    if target != self.config.rhash {
+        eprintln!(
+            "[pneumatic] directory query from {:02x?} addressed to {target:02x?}, not to us; not answering",
+            request.requester_rhash
+        );
+        return false;
+    }
+    if !NodeIdentity::verify_query(
+        &request.requester_key,
+        &request.requester_rhash,
+        &target,
+        &nonce,
+        &request.requested_type,
+        &request.requester_types,
+        &request.binding_signature,
+    ) {
+        eprintln!(
+            "[pneumatic] directory query from {:02x?} failed query-signature verification; not answering",
+            request.requester_rhash
+        );
+        return false;
+    }
+
+    // An unknown requester must at least be reachable, which means it announced to
+    // us: the directory is not a service open to any packet.
+    if self
+        .find_node_type_by_public_key(&request.requester_key)
+        .is_none()
+        && !self.peer_is_reachable(&request.requester_rhash)
+    {
+        eprintln!(
+            "[pneumatic] directory query from {:02x?} is unregistered and unreachable; not answering",
+            request.requester_rhash
+        );
+        return false;
+    }
+
+    // Prune, then test-and-set — last, so the nonce is burned exactly when we
+    // answer. A query refused for another reason (a peer we cannot yet reach, say)
+    // must not consume the nonce and turn a transient "not yet" into a permanent
+    // "no". Held to a bounded window so the cache cannot grow with traffic; the
+    // requester generates a fresh nonce per request, so legitimate retries are
+    // unaffected.
+    let now = Instant::now();
+    self.query_nonces
+        .retain(|_, seen| now.duration_since(*seen) < QUERY_NONCE_WINDOW);
+    if self
+        .query_nonces
+        .insert((request.requester_rhash, nonce), now)
+        .is_some()
+    {
+        eprintln!(
+            "[pneumatic] directory query from {:02x?} reused a nonce; not answering (replay?)",
+            request.requester_rhash
+        );
+        return false;
+    }
+    true
+}
+
+/// May this node apply a directory response from a peer it never registered with?
+///
+/// Three conditions, all required, each with a different job:
+///
+/// 1. **`directory_observer` is set.** Someone has to decide that watching is what
+///    this node does. That is an operator decision about a deployment, not something
+///    to infer from traffic.
+/// 2. **This node declares no consensus role.** Config alone must not be able to make
+///    a participant trusting. If a validator accepted directory entries from
+///    arbitrary reachable peers it would install attacker-chosen keys into its role
+///    buckets — and `send_to_all` fans real pipeline traffic to whatever a bucket
+///    holds, which is a data-plane delivery oracle for an attacker who never
+///    registers and never stakes a coin. So the check reads the roles actually
+///    declared to the registry, which is what the binaries set from what they
+///    actually installed, and the config key buys a participant nothing.
+/// 3. **The responder is reachable.** Not for authority — the envelope signature and
+///    the per-entry bindings are the authority, and both are still verified below, so
+///    a response signed by an arbitrary key cannot forge a real validator's rhash.
+///    This is the same floor the query path applies to us when we are the asker.
+///
+/// Reachability and signatures do different jobs here, and both are needed: RNS is
+/// destination-encrypted but exposes no sender identity, so a responder rhash is
+/// *claimed* in the payload. The envelope signature binds that claim to a key; the
+/// route check makes the claimed address one we can actually talk to. Neither alone
+/// proves anything.
+///
+/// What is *not* relaxed by any of this: envelope verification, per-entry binding
+/// verification, and the rule that a directory response can never redirect an
+/// already-registered peer.
+fn may_trust_unregistered_directory_responder(
+    &self,
+    response: &NodeRegistryResponse,
+) -> bool {
+    if !self.config.directory_observer {
+        return false;
+    }
+    if self
+        .declared_roles()
+        .iter()
+        .any(NodeRegistryType::is_consensus_role)
+    {
+        eprintln!(
+            "[pneumatic] directory_observer is set but this node declares a consensus role;              ignoring the observer relaxation"
+        );
+        return false;
+    }
+    self.peer_is_reachable(&response.responder_rhash)
+}
+
+/// Can we reply to this peer? Production asks the transport, whose destination
+/// table is the only authority on reachability — seeded from bootstrap config and
+/// filled by announces. A registry with no transport has no route to anything:
+/// it cannot receive a query in the first place, so refusing is the honest answer
+/// rather than a permissive default. (Unit tests seed [`test_routes`] to stand
+/// in for the announce path they do not run.)
+fn peer_is_reachable(&self, rhash: &[u8; 16]) -> bool {
+    match &self.network {
+        Some(network) => network.has_route(rhash),
+        #[cfg(test)]
+        None => self.test_routes.contains_key(rhash),
+        #[cfg(not(test))]
+        None => false,
+    }
+}
+
+/// Seed the reachability answer for a registry with no transport. Test-only:
+/// production reachability comes from the transport and cannot be set here.
+#[cfg(test)]
+pub(crate) fn seed_route_for_test(&self, rhash: [u8; 16]) {
+    self.test_routes.insert(rhash, ());
+}
+
 /// Build our answer to a directory request, or `None` when we must not answer.
 ///
-/// Two gates, both fail-closed. **The requester must be a node we registered,
-/// and must prove it with its own binding.** Nothing sent directory requests
-/// before the peering initiator existed, so this handler had never been
-/// exercised on a live path and answered *anyone* — an open enumeration of the
-/// validator set to whichever UDP peer asked, and the reply loop described in
-/// [`NodeRegistry::handle_request`]. A node now registers first (the peering
-/// loop does exactly that) and can then ask; a request that arrives before its
-/// own `Register` is simply unanswered and retried on the next tick.
+/// Admission is [`NodeRegistry::admit_directory_query`]; this function only
+/// assembles the answer once admission says yes.
 ///
 /// **Only nodes we hold a binding for are listed** — a node learned from a
 /// directory response carries no binding of its own here, so we cannot
@@ -262,29 +446,7 @@ pub(crate) fn build_directory_response(
 ) -> Option<NodeRegistryResponse> {
     let requested_type = request.requested_type.clone();
 
-    // Verify before looking anything up, so a forged request never reaches the
-    // registry (same order as `handle_heartbeat`).
-    if !NodeIdentity::verify_binding(
-        &request.requester_key,
-        &request.requester_rhash,
-        &request.requested_type,
-        &request.requester_types,
-        &request.binding_signature,
-    ) {
-        eprintln!(
-            "[pneumatic] directory request from {:02x?} failed binding verification; not answering",
-            request.requester_rhash
-        );
-        return None;
-    }
-    if self
-        .find_node_type_by_public_key(&request.requester_key)
-        .is_none()
-    {
-        eprintln!(
-            "[pneumatic] directory request from unregistered node {:02x?}; not answering",
-            request.requester_rhash
-        );
+    if !self.admit_directory_query(request) {
         return None;
     }
 
@@ -603,6 +765,8 @@ pub(crate) fn build_register_ack(
         requester_types: declared,
         requested_type: node_type,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     })
 }
 
@@ -651,10 +815,16 @@ pub fn handle_directory_response(
     &self,
     response: &NodeRegistryResponse,
 ) -> Result<(), PneumaticError> {
-    // The responder must be a registered node. Without this an attacker
+    // The responder must be a node we registered. Without this an attacker
     // fabricates a response signed by an arbitrary key and injects
-    // arbitrary (key, rhash) mappings.
-    if self.find_node_type_by_public_key(&response.responder_key).is_none() {
+    // arbitrary (key, rhash) mappings. The one exception is gated entirely in
+    // `may_trust_unregistered_directory_responder`, so the reasoning lives in one
+    // place and the refusal stays the default.
+    if self
+        .find_node_type_by_public_key(&response.responder_key)
+        .is_none()
+        && !self.may_trust_unregistered_directory_responder(response)
+    {
         return Err(PneumaticError::Registry(
             "directory response from unregistered node".to_string(),
         ));

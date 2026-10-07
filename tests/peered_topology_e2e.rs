@@ -113,6 +113,7 @@ fn registry_config(identity: &Arc<NodeIdentity>, bootstrap: Vec<BootstrapPeer>) 
         // Fixture nodes do not report: a unit test writing fragments would drop
         // files into the working tree, and none of these assertions read them.
         mesh_fragment_path: None,
+        directory_observer: false,
         rest_api_version: 1,
         node_type: NodeType::Full,
         // Config declares all four; the registry is then narrowed to this node's

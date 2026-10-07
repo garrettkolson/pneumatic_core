@@ -66,7 +66,7 @@ use super::NodeRegistry;
 /// How often a node rewrites its fragment.
 ///
 /// Ten seconds: fast enough that a stale cluster is detected within one eviction
-/// window (`REGISTRY_MAX_AGE`), slow enough that the signature cost — a hybrid
+/// window (the 30 s eviction cutoff, `registry.rs:328`), slow enough that the signature cost — a hybrid
 /// Ed25519 + ML-DSA signature per write — is invisible next to block work.
 pub const DEFAULT_FRAGMENT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -88,7 +88,7 @@ pub struct FragmentPeer {
     /// Seconds since the last packet seen from this peer, at dump time.
     ///
     /// This is the field that separates a learned-but-dying entry from a live
-    /// one: eviction drops a peer at `REGISTRY_MAX_AGE`, so a large age here
+    /// one: eviction drops a peer not seen for 30 s (`registry.rs:328`), so a large age here
     /// means the directory entry is already a fiction. A bucket count alone
     /// cannot tell those two clusters apart.
     pub last_seen_age_secs: u64,

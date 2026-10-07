@@ -396,6 +396,15 @@ impl RnsNetwork {
     /// re-traverses the established links, which is what upgrades a synthetic
     /// bootstrap route to a usable one. The RNS identity is reconstructed from the
     /// stored private key.
+    /// Do we know how to reach `rhash`? True once we have seen an announce from it
+    /// (which also seeds the destination table) or seeded it from bootstrap
+    /// config. A reply we cannot deliver is worth nothing, and requiring this of a
+    /// peer that has never registered is what keeps a directory answer from being
+    /// a service open to any packet: an asker has to be in contact with us first.
+    pub fn has_route(&self, rhash: &[u8; 16]) -> bool {
+        self.destinations.contains_key(rhash)
+    }
+
     pub fn announce(&self) {
         let identity = Identity::from_private_key(&self.private_key);
         if let Err(_) = self.node.announce(&self.dest, &identity, None) {

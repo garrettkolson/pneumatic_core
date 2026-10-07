@@ -263,6 +263,8 @@ fn concurrent_admission_never_exceeds_capacity() {
                     requester_types: types,
                     requested_type: NodeRegistryType::Sentinel,
                     binding_signature: binding,
+                    query_target: None,
+                    query_nonce: None,
                 };
                 reg.handle_register(req);
             })
@@ -527,4 +529,143 @@ fn directory_response_rejects_tampered_registry_type() {
         signature,
     };
     assert!(reg.handle_directory_response(&response).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Directory observers: consuming answers without stake
+// ---------------------------------------------------------------------------
+
+const OBSERVER_TYPES: &[(NodeRegistryType, usize)] = &[
+    (NodeRegistryType::Committer, 5),
+    (NodeRegistryType::Sentinel, 5),
+    (NodeRegistryType::Executor, 5),
+    (NodeRegistryType::Finalizer, 5),
+    (NodeRegistryType::Archiver, 5),
+];
+
+/// The last step of the observer path. An unstaked monitor can now be *answered*
+/// by peers (see the fresh-query admission in `peering.rs` tests), but the
+/// receiving rule — "the responder must be a node we registered" — meant it
+/// discarded every answer it received. `directory_observer` is the operator saying
+/// "this node watches".
+#[test]
+fn a_directory_observer_applies_a_response_from_a_peer_it_never_registered() {
+    let responder = NodeIdentity::generate_in_memory();
+    let listed = NodeIdentity::generate_in_memory();
+    let observer = observer_registry_with_capacity(OBSERVER_TYPES, &[NodeRegistryType::Archiver]);
+    // In contact with the responder — the announce path, which these tests seed.
+    observer.seed_route_for_test(responder.rhash);
+
+    let response =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    assert!(
+        bucket_len(&observer, &NodeRegistryType::Committer) == 0,
+        "nothing is installed by the response's mere existence"
+    );
+    observer
+        .handle_directory_response(&response)
+        .expect("an observer applies the answer it was given");
+    assert_eq!(bucket_len(&observer, &NodeRegistryType::Committer), 1);
+}
+
+/// The rule this relaxes is the default, not an accident of the fixture: the same
+/// response from the same responder, to a node that did not opt in, is refused.
+#[test]
+fn a_participant_still_refuses_an_unregistered_directory_responder() {
+    let responder = NodeIdentity::generate_in_memory();
+    let listed = NodeIdentity::generate_in_memory();
+    let reg = registry_with_capacity(OBSERVER_TYPES);
+    // Seed reachability deliberately. Without it this test passes for the wrong
+    // reason: the reachability floor alone refuses the response, and the opt-in
+    // check goes untested. Refusing here must be about the posture and nothing
+    // else — the first version of this test survived deleting the `directory_observer`
+    // check entirely, which is exactly what a mutation run is for.
+    reg.seed_route_for_test(responder.rhash);
+
+    let response =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    assert!(
+        reg.handle_directory_response(&response).is_err(),
+        "a node that did not opt in must not accept an answer from a stranger"
+    );
+    assert_eq!(bucket_len(&reg, &NodeRegistryType::Committer), 0);
+}
+
+/// The guardrail that keeps the config key from being a footgun. A validator that
+/// trusted directory entries from arbitrary reachable peers would install
+/// attacker-chosen keys into its role buckets, and `send_to_all` fans real pipeline
+/// traffic to whatever a bucket holds. So the posture is only available to a node
+/// that isn't running consensus roles — whatever its config file claims.
+#[test]
+fn observer_config_buys_a_node_running_consensus_roles_nothing() {
+    let responder = NodeIdentity::generate_in_memory();
+    let listed = NodeIdentity::generate_in_memory();
+    let pretending =
+        observer_registry_with_capacity(OBSERVER_TYPES, &[NodeRegistryType::Committer]);
+    pretending.seed_route_for_test(responder.rhash);
+
+    let response =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    assert!(
+        pretending.handle_directory_response(&response).is_err(),
+        "a node declaring Committer may not use the observer relaxation"
+    );
+    assert_eq!(bucket_len(&pretending, &NodeRegistryType::Committer), 0);
+}
+
+/// Reachability is the spam floor, not decoration: an observer that has never been
+/// in contact with the responder gets nothing from it.
+#[test]
+fn an_observer_still_refuses_a_responder_it_cannot_reach() {
+    let responder = NodeIdentity::generate_in_memory();
+    let listed = NodeIdentity::generate_in_memory();
+    let observer = observer_registry_with_capacity(OBSERVER_TYPES, &[NodeRegistryType::Archiver]);
+    // Deliberately no seed_route_for_test.
+
+    let response =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    assert!(
+        observer.handle_directory_response(&response).is_err(),
+        "unreachable and unknown is not a peer an observer should believe"
+    );
+    assert_eq!(bucket_len(&observer, &NodeRegistryType::Committer), 0);
+}
+
+/// What the relaxation must *not* touch, stated as a test because the whole value
+/// of the trust model is that the entries are self-authenticating. A tampered entry
+/// and a tampered envelope are both refused even by a fully opted-in, fully
+/// reachable observer.
+#[test]
+fn the_observer_path_still_verifies_the_envelope_and_every_entry() {
+    let responder = NodeIdentity::generate_in_memory();
+    let listed = NodeIdentity::generate_in_memory();
+    let attacker = NodeIdentity::generate_in_memory();
+
+    // (a) A valid envelope over a *forged entry*: attacker rhash under a real key.
+    let observer = observer_registry_with_capacity(OBSERVER_TYPES, &[NodeRegistryType::Archiver]);
+    observer.seed_route_for_test(responder.rhash);
+    let mut forged =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    forged.entries[0].node_rhash = attacker.rhash;
+    forged.signature = envelope_signature(
+        &responder,
+        &forged.entries,
+        &NodeRegistryType::Committer,
+        responder.rhash,
+    );
+    assert!(
+        observer.handle_directory_response(&forged).is_err(),
+        "re-signing the envelope cannot launder a forged entry binding"
+    );
+    assert_eq!(bucket_len(&observer, &NodeRegistryType::Committer), 0);
+
+    // (b) Valid entries, broken envelope.
+    let mut bad_env =
+        unregistered_responder_response(&responder, &listed, &NodeRegistryType::Committer);
+    bad_env.signature = vec![7; bad_env.signature.len()];
+    assert!(
+        observer.handle_directory_response(&bad_env).is_err(),
+        "the observer relaxation is not a signature exemption"
+    );
+    assert_eq!(bucket_len(&observer, &NodeRegistryType::Committer), 0);
 }

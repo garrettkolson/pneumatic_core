@@ -9,6 +9,13 @@
 //! which are decided before any socket is touched — and the framing that does
 //! need the transport is pinned separately, both by size against the
 //! direct-packet cap and by the two frame-shape tests below.
+//!
+//! Directory admission also asks whether a responder can *reach* the asker, which
+//! is transport state. With `network = None` there is no route table to consult,
+//! so the reachability answer is seeded via `seed_route_for_test` — which fails
+//! closed by default, so these tests start from "cannot reach" exactly as an
+//! unseeded production registry would, and the live transport tests in
+//! `tests/peered_topology_e2e.rs` cover the announce path that fills it.
 use super::helpers::*;
 use super::super::*;
 use crate::config::BootstrapPeer;
@@ -183,6 +190,8 @@ fn an_ack_declaring_nothing_falls_back_to_the_acked_type() {
         requester_types: vec![],
         requested_type: node_type,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     };
 
     alice_reg
@@ -326,6 +335,8 @@ fn known_peers_are_deduplicated_across_buckets() {
         ],
         requested_type: NodeRegistryType::Finalizer,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     };
     alice_reg.handle_control(ack).expect("ack handled");
 
@@ -425,7 +436,7 @@ fn control_frames_exceed_the_direct_cap_so_peering_must_wait_for_a_route() {
         for node_type in NodeRegistry::routed_role_types() {
             out.push((
                 "Request",
-                reg.build_directory_request(&node_type)
+                reg.build_directory_request(&node_type, bob.rhash)
                     .expect("directory request"),
             ));
         }
@@ -570,16 +581,19 @@ fn a_directory_request_from_a_stranger_is_not_answered() {
     let stranger = test_identity();
     let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
 
-    // A perfectly well-formed request from a node that never registered here.
+    // A well-formed request from a node that never registered here and has never
+    // been in contact with us. It carries a valid signature and a fresh nonce, so
+    // nothing about it is malformed — it is refused because a stranger firing one
+    // cold packet has not earned the validator-set listing.
     let request = {
         let stranger_reg = registry_for(&stranger, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
         stranger_reg
-            .build_directory_request(&NodeRegistryType::Committer)
+            .build_directory_request(&NodeRegistryType::Committer, alice.rhash)
             .expect("build request")
     };
     assert!(
         alice_reg.build_directory_response(&request).is_none(),
-        "an unregistered requester must not receive the directory"
+        "an unregistered, unreachable requester must not receive the directory"
     );
 
     // And the specific shape of the old directory *response*, which carried a
@@ -592,6 +606,8 @@ fn a_directory_request_from_a_stranger_is_not_answered() {
         requester_types: vec![],
         requested_type: NodeRegistryType::Committer,
         binding_signature: vec![],
+        query_target: None,
+        query_nonce: None,
     };
     assert!(alice_reg.build_directory_response(&echo).is_none());
 }
@@ -625,7 +641,7 @@ fn a_registered_peer_is_answered_with_the_peers_it_can_vouch_for() {
     );
 
     let request = bob_reg
-        .build_directory_request(&NodeRegistryType::Committer)
+        .build_directory_request(&NodeRegistryType::Committer, alice.rhash)
         .expect("build request");
     let response = alice_reg
         .build_directory_response(&request)
@@ -651,5 +667,238 @@ fn a_registered_peer_is_answered_with_the_peers_it_can_vouch_for() {
             &response.entries[0].signature,
         ),
         "a directory entry must verify against the listed node's own key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Directory admission: freshness, replay, and the unregistered observer
+// ---------------------------------------------------------------------------
+
+/// Build a fresh query from `asker` to `responder`, asking for `for_type`.
+fn query_from(
+    asker: &NodeRegistry,
+    for_type: &NodeRegistryType,
+    responder_rhash: [u8; 16],
+) -> NodeRequest {
+    asker
+        .build_directory_request(for_type, responder_rhash)
+        .expect("build directory query")
+}
+
+/// The reason the directory gate stopped being a stake gate. A monitor, explorer,
+/// or load generator that holds no stake is not in the validator set and does not
+/// inflate the quorum denominator — but it still needs to learn who the validators
+/// are. It can, by proving it is in contact with us and signing a query addressed
+/// to us alone. No registration, no stake, no slot in the denominator.
+#[test]
+fn an_observer_that_never_registered_is_answered_once_it_is_in_contact() {
+    let alice = test_identity();
+    let listed = test_identity();
+    let observer = test_identity();
+
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    // Someone Alice registered, so the answer has real content to withhold.
+    let listed_reg = registry_for(
+        &listed,
+        ALL_TYPES,
+        &[NodeRegistryType::Committer],
+        vec![],
+    );
+    alice_reg
+        .handle_control(listed_reg.build_register_request().expect("register"))
+        .expect("register handled");
+
+    let observer_reg = registry_for(
+        &observer,
+        ALL_TYPES,
+        &[NodeRegistryType::Archiver],
+        vec![],
+    );
+
+    // Cold: perfectly well-formed, correctly signed, never been in contact.
+    let cold = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    assert!(
+        alice_reg.build_directory_response(&cold).is_none(),
+        "a query from a peer we cannot reach must not be answered"
+    );
+
+    // In contact — the announce path, which these tests stand in for by seeding.
+    alice_reg.seed_route_for_test(observer.rhash);
+    let warm = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    let answer = alice_reg
+        .build_directory_response(&warm)
+        .expect("an observer in contact is answered");
+    assert_eq!(answer.entries.len(), 1);
+    assert_eq!(answer.entries[0].node_key, key_of(&listed));
+
+    // And the answer is Alice's own envelope over exactly (entries, type, her
+    // rhash) — the observer verifies it without trusting anyone else.
+    assert!(NodeIdentity::verify_message(
+        &key_of(&alice),
+        &directory_response_signature_payload(
+            &answer.entries,
+            &answer.registry_type,
+            &alice.rhash
+        )
+        .expect("payload"),
+        &answer.signature
+    ));
+}
+
+/// The nonce is the whole difference between a query and a captured query. The
+/// classic binding covers no responder and no freshness, so one observation of a
+/// legitimate query was, until now, a subscription to the validator set.
+#[test]
+fn a_replayed_directory_query_is_refused() {
+    let alice = test_identity();
+    let observer = test_identity();
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    alice_reg.seed_route_for_test(observer.rhash);
+    let observer_reg = registry_for(&observer, ALL_TYPES, &[NodeRegistryType::Archiver], vec![]);
+
+    let query = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    assert!(alice_reg.build_directory_response(&query).is_some());
+    assert!(
+        alice_reg.build_directory_response(&query).is_none(),
+        "the same query resent must not be answered twice"
+    );
+    // A retry with a *new* nonce is unaffected — this is replay protection, not a
+    // rate limit that punishes honest retries.
+    let retry = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    assert!(alice_reg.build_directory_response(&retry).is_some());
+}
+
+/// A captured query names its responder. Pointing the same signature at a
+/// different validator fails, so one peer cannot be used as a stamp to query
+/// everyone a requester's key is known to.
+#[test]
+fn a_query_addressed_to_another_responder_is_refused() {
+    let alice = test_identity();
+    let carol = test_identity();
+    let observer = test_identity();
+
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    alice_reg.seed_route_for_test(observer.rhash);
+    let observer_reg = registry_for(&observer, ALL_TYPES, &[NodeRegistryType::Archiver], vec![]);
+
+    let for_carol = query_from(&observer_reg, &NodeRegistryType::Committer, carol.rhash);
+    assert!(
+        alice_reg.build_directory_response(&for_carol).is_none(),
+        "a query addressed to someone else is not ours to answer"
+    );
+
+    // Same key, same role set, addressed to us: answered. The refusal above was
+    // about the target and nothing else.
+    let for_alice = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    assert!(alice_reg.build_directory_response(&for_alice).is_some());
+}
+
+/// The signature covers the requested type and the declared role set, so editing
+/// either after signing breaks it — a requester cannot ask for one bucket with a
+/// signature obtained for another.
+#[test]
+fn a_query_tampered_after_signing_is_refused() {
+    let alice = test_identity();
+    let observer = test_identity();
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    alice_reg.seed_route_for_test(observer.rhash);
+    let observer_reg = registry_for(&observer, ALL_TYPES, &[NodeRegistryType::Archiver], vec![]);
+
+    let mut inflated = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    inflated.requester_types = vec![
+        NodeRegistryType::Archiver,
+        NodeRegistryType::Committer,
+        NodeRegistryType::Finalizer,
+    ];
+    assert!(
+        alice_reg.build_directory_response(&inflated).is_none(),
+        "claiming extra roles after signing must invalidate the query"
+    );
+
+    let mut retargeted = query_from(&observer_reg, &NodeRegistryType::Committer, alice.rhash);
+    retargeted.requested_type = NodeRegistryType::Executor;
+    assert!(
+        alice_reg.build_directory_response(&retargeted).is_none(),
+        "asking for a different bucket than was signed must fail"
+    );
+}
+
+/// Domain separation, both directions. Adding a query signature to the control
+/// plane is only safe if it cannot be spent as a registration binding — that
+/// would hand the stake gate an override — and a registration binding must not be
+/// spendable as a query.
+#[test]
+fn a_query_signature_cannot_register_and_a_registration_binding_cannot_query() {
+    let alice = test_identity();
+    let attacker = test_identity();
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    let attacker_reg = registry_for(
+        &attacker,
+        ALL_TYPES,
+        &[NodeRegistryType::Committer],
+        vec![],
+    );
+
+    // Query signature → Register. The attacker holds no stake; if this were
+    // admitted, the fresh-query path would be a door around the stake gate.
+    let query = query_from(&attacker_reg, &NodeRegistryType::Committer, alice.rhash);
+    let smuggled = NodeRequest {
+        request_type: NodeRequestType::Register,
+        binding_signature: query.binding_signature.clone(),
+        query_target: None,
+        query_nonce: None,
+        ..query.clone()
+    };
+    alice_reg
+        .handle_control(smuggled)
+        .expect("register handled");
+    assert_eq!(
+        bucket_len(&alice_reg, &NodeRegistryType::Committer),
+        0,
+        "a query signature must not register anyone"
+    );
+
+    // Register binding → query. The attacker's classic binding, replayed as a
+    // legacy query, still needs to be registered here — which it is not.
+    let register = attacker_reg.build_register_request().expect("register");
+    let as_query = NodeRequest {
+        request_type: NodeRequestType::Request,
+        requested_type: NodeRegistryType::Committer,
+        query_target: None,
+        query_nonce: None,
+        ..register.clone()
+    };
+    assert!(
+        alice_reg.build_directory_response(&as_query).is_none(),
+        "a registration binding is not a query, and its owner is not registered"
+    );
+}
+
+/// The compatibility path: a peer on a build that predates fresh queries is still
+/// answered if it registered. Weaker — its binding covers neither responder nor
+/// nonce — and honored only for that reason.
+#[test]
+fn a_legacy_query_from_a_registered_peer_is_still_answered() {
+    let alice = test_identity();
+    let bob = test_identity();
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Sentinel], vec![]);
+    let bob_reg = registry_for(&bob, ALL_TYPES, &[NodeRegistryType::Committer], vec![]);
+    alice_reg
+        .handle_control(bob_reg.build_register_request().expect("register"))
+        .expect("register handled");
+
+    // A pre-freshness query: classic binding, no target, no nonce. (A heartbeat
+    // already carries exactly that shape, so relabel one rather than hand-roll a
+    // binding the client no longer produces.)
+    let legacy = NodeRequest {
+        request_type: NodeRequestType::Request,
+        requested_type: NodeRegistryType::Committer,
+        query_target: None,
+        query_nonce: None,
+        ..bob_reg.build_heartbeat_request().expect("heartbeat")
+    };
+    assert!(
+        alice_reg.build_directory_response(&legacy).is_some(),
+        "a registered peer on an older build must not be cut off mid-upgrade"
     );
 }

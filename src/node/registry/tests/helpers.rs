@@ -30,6 +30,8 @@ pub fn register_request(types: Vec<NodeRegistryType>) -> NodeRequest {
         requester_types: types,
         requested_type: NodeRegistryType::Committer,
         binding_signature: vec![],
+        query_target: None,
+        query_nonce: None,
     }
 }
 
@@ -54,6 +56,8 @@ pub fn register_node(
         requester_types: types,
         requested_type,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     };
     reg.handle_register(req);
     reg.find_node_type_by_public_key(&identity.ed25519.public_key().unwrap())
@@ -118,6 +122,8 @@ pub fn register_multi_bucket(
         requester_types: types,
         requested_type,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     };
     reg.handle_register(req);
     key
@@ -141,6 +147,8 @@ pub fn signed_heartbeat(
         requester_types: types,
         requested_type,
         binding_signature: binding,
+        query_target: None,
+        query_nonce: None,
     }
 }
 
@@ -246,4 +254,52 @@ pub fn bucket_len(reg: &NodeRegistry, node_type: &NodeRegistryType) -> usize {
     reg.get_nodes(node_type)
         .expect("type configured in this fixture")
         .len()
+}
+
+/// A registry configured as a **directory observer** — the posture of a monitor,
+/// explorer, or indexer, which holds no stake, can never register, and so would
+/// otherwise be answered by peers and then discard every answer.
+///
+/// `declared` matters: the relaxation is refused to anything declaring a consensus
+/// role, and that is the property under test in some of these cases, so it is a
+/// parameter rather than a fixture default.
+pub fn observer_registry_with_capacity(
+    types: &[(NodeRegistryType, usize)],
+    declared: &[NodeRegistryType],
+) -> NodeRegistry {
+    let mut type_configs = DashMap::new();
+    for (t, max) in types {
+        type_configs.insert(
+            t.clone(),
+            NodeTypeConfig { min: 0, max: *max, min_stake: 0 },
+        );
+    }
+    let mut config = Config::new_for_testing(
+        "test_env".to_string(),
+        Arc::new(DashMap::new()),
+        Arc::new(type_configs),
+    );
+    config.directory_observer = true;
+    // `declared_roles` is seeded from this at init, which is exactly how the
+    // binaries populate it — from the roles actually running.
+    config.node_registry_types = declared.to_vec();
+    NodeRegistry::init(Arc::new(config), None, Arc::new(|_, _| true))
+}
+
+/// A response from an identity that never registered with the receiver, listing
+/// `listed`, built the way a real responder builds one.
+pub fn unregistered_responder_response(
+    responder: &NodeIdentity,
+    listed: &NodeIdentity,
+    node_type: &NodeRegistryType,
+) -> NodeRegistryResponse {
+    let entries = vec![valid_entry(listed, node_type.clone())];
+    let signature = envelope_signature(responder, &entries, node_type, responder.rhash);
+    NodeRegistryResponse {
+        responder_key: responder.ed25519.public_key().unwrap(),
+        responder_rhash: responder.rhash,
+        registry_type: node_type.clone(),
+        entries,
+        signature,
+    }
 }

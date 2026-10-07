@@ -271,6 +271,54 @@ impl NodeIdentity {
             .unwrap_or(false)
     }
 
+    /// Sign a directory query.
+    ///
+    /// A separate payload from [`sign_binding`], deliberately. The classic
+    /// binding covers `(rhash, requested_type, requester_types)` and nothing
+    /// else — no responder, no nonce, no timestamp — so the *same* signature is
+    /// valid against every peer forever. That is fine for a one-time `Register`
+    /// and for the entry attestations we store, but for a repeatable, expensive
+    /// query it means anyone who observed a single legitimate query can replay it
+    /// indefinitely. Binding the responder and a one-shot nonce is what makes a
+    /// query a query.
+    ///
+    /// `sign_binding` is left untouched on purpose: it is shared by `Register`,
+    /// `Heartbeat`, and the directory-entry attestations nodes store and re-verify
+    /// later, so changing its bytes would invalidate stored bindings and every
+    /// peer on an older build.
+    pub fn sign_query(
+        &self,
+        responder_rhash: &[u8; 16],
+        nonce: &[u8; 16],
+        requested_type: &NodeRegistryType,
+        requester_types: &[NodeRegistryType],
+    ) -> Result<Vec<u8>, PneumaticError> {
+        let payload = query_payload(&self.rhash, responder_rhash, nonce, requested_type, requester_types)?;
+        self.ed25519.sign_data(&payload)
+    }
+
+    /// Verify a directory query against the requester's Ed25519 key.
+    ///
+    /// Every argument is part of what was signed, so a query addressed to another
+    /// responder, replayed with a reused nonce, or re-targeted at a different
+    /// role set fails here rather than at some later "looks close enough" check.
+    pub fn verify_query(
+        requester_ed25519: &[u8],
+        requester_rhash: &[u8; 16],
+        responder_rhash: &[u8; 16],
+        nonce: &[u8; 16],
+        requested_type: &NodeRegistryType,
+        requester_types: &[NodeRegistryType],
+        signature: &[u8],
+    ) -> bool {
+        match query_payload(requester_rhash, responder_rhash, nonce, requested_type, requester_types) {
+            Ok(payload) => Ed25519Provider::generate()
+                .check_signature(signature, requester_ed25519, &payload)
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Load an existing keystore. A missing or corrupt file is a hard error
     /// — we NEVER silently regenerate, because a new identity would orphan
     /// any stake registered under the old one.
@@ -507,6 +555,20 @@ impl NodeIdentity {
 
 /// The exact bytes the binding signature covers. Both the signing and
 /// verifying sides go through here so they can never drift.
+/// The bytes a directory query signs. Distinct field order from
+/// [`binding_payload`] so a query signature can never be mistaken for a
+/// registration binding (see the domain-separation test).
+fn query_payload(
+    rhash: &[u8; 16],
+    responder_rhash: &[u8; 16],
+    nonce: &[u8; 16],
+    requested_type: &NodeRegistryType,
+    requester_types: &[NodeRegistryType],
+) -> Result<Vec<u8>, PneumaticError> {
+    serialize_to_bytes_rmp(&(rhash, responder_rhash, nonce, requested_type, requester_types))
+        .map_err(|e| PneumaticError::Encoding(e.to_string()))
+}
+
 fn binding_payload(
     rhash: &[u8; 16],
     requested_type: &NodeRegistryType,
