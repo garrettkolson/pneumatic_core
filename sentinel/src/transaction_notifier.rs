@@ -59,27 +59,34 @@ impl TransactionNotifier {
         )?;
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
-        let registry = Arc::clone(&self.node_registry);
-        let payload_clone = payload.clone();
+        // Targeted send, with the SAME delivery-failure accounting as the
+        // broadcast path (Phase 0 / item 2). The loop this replaces spawned one
+        // OS thread and one fresh runtime per key, discarded every send result,
+        // and returned Ok even when no member of the shard was in the bucket —
+        // so fragments (which report `delivery_failures`) showed a sharded
+        // cluster as healthier than a dense one while it dropped preloads.
+        let undelivered = self.node_registry.send_to_peers_blocking(
+            executor_keys,
+            &NodeRegistryType::Executor,
+            &payload,
+        );
 
-        // Send to each executor key in the shard
-        for key in executor_keys {
-            let key_clone = key.clone();
-            let payload_inner = payload_clone.clone();
-            let reg = Arc::clone(&registry);
-            let _ = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("could not build mini runtime for shard preload send");
-                rt.block_on(async {
-                    let Some(nodes) = reg.get_nodes(&NodeRegistryType::Executor) else { return };
-                    if let Some(entry) = nodes.get(&key_clone) {
-                        let _ = entry.value().conn.send(&payload_inner).await;
-                    };
-                });
-            });
+        if !undelivered.is_empty() {
+            env.logger.log(format!(
+                "shard preload for tx {} reached {} of {} executors; undelivered: {:?}",
+                tx.id,
+                executor_keys.len() - undelivered.len(),
+                executor_keys.len(),
+                undelivered
+            ));
         }
+
+        if !executor_keys.is_empty() && undelivered.len() == executor_keys.len() {
+            // Not one member of the shard received it. Returning Ok would leave
+            // the transaction waiting on a preload that can never arrive.
+            return Err(NotifyError::NoTarget(NodeRegistryType::Executor));
+        }
+
         Ok(())
     }
 
@@ -204,21 +211,25 @@ impl TransactionNotifier {
         )?;
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
-        let registry = Arc::clone(&self.node_registry);
-        let payload_clone = payload.clone();
-        let finalizer_key_clone = finalizer_key.clone();
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("could not build mini runtime for request_single_finalizer");
-            rt.block_on(async {
-                let Some(nodes) = registry.get_nodes(&NodeRegistryType::Finalizer) else { return };
-                if let Some(entry) = nodes.get(&finalizer_key_clone) {
-                    let _ = entry.value().conn.send(&payload_clone).await;
-                };
-            });
-        });
+
+        // Exactly one intended recipient, so a send that does not land is a
+        // failure and not something to discard: no other finalizer will pick
+        // this up. The previous version spawned a thread and a fresh runtime,
+        // ignored the result, and returned Ok even when the assigned finalizer
+        // was not in the bucket at all.
+        let undelivered = self.node_registry.send_to_peers_blocking(
+            std::slice::from_ref(&finalizer_key),
+            &NodeRegistryType::Finalizer,
+            &payload,
+        );
+        if !undelivered.is_empty() {
+            env.logger.log(format!(
+                "FinalizerRequest for tx {} did not reach the assigned finalizer",
+                tx.id
+            ));
+            return Err(NotifyError::NoTarget(NodeRegistryType::Finalizer));
+        }
+
         Ok(())
     }
 

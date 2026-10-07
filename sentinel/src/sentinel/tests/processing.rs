@@ -940,6 +940,19 @@ fn send_to_executor_for_preload_follows_current_epoch() {
     
     result_data: vec![],};
 
+    // Both shard candidates must be registered. The fire-and-forget send this
+    // replaced tolerated an empty registry; now that delivery is accounted for,
+    // sending to a peer that is not in the bucket is a delivery failure — which
+    // is the behaviour under test elsewhere, not here.
+    for i in 1u8..=2 {
+        sentinel.node_registry.register_peer(
+            vec![i],
+            [i; 16],
+            &NodeRegistryType::Executor,
+            Box::new(pneumatic_core::node::registry::NullConnection),
+        );
+    }
+
     // advance_epoch(1) is a no-op at boot; routing stays on epoch 1 → valid set.
     sentinel.advance_epoch(1);
     assert!(sentinel.send_to_executor_for_preload(&tx).is_ok());

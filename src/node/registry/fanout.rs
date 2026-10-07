@@ -146,10 +146,17 @@ pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) 
         let nodes_for_send = Arc::clone(&nodes);
         let send_data = data.clone();
         let result = runtime.block_on(async move {
-            if let Some(entry) = nodes_for_send.get(&key) {
-                tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
-            } else {
-                Ok(Ok(()))
+            match nodes_for_send.get(&key) {
+                Some(entry) => {
+                    tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
+                }
+                // Evicted between collection and send. Reporting `Ok(Ok(()))`
+                // here counted a delivery that never happened — the same
+                // silence-as-emptiness the Phase 6.2 counters exist to remove.
+                // Wrapped as `Ok(Err(..))` to match `timeout`'s inner result.
+                None => Ok(Err(ConnError::IO(
+                    "peer removed from the bucket before the send".to_string(),
+                ))),
             }
         });
         match result {
@@ -161,6 +168,120 @@ pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) 
             ),
         }
     }
+}
+
+/// Targeted fan-out to a specific set of peers, with the SAME delivery-failure
+/// accounting as [`Self::send_to_all`].
+///
+/// This exists because the per-key sends it replaces bypassed the counters
+/// completely: they spawned an OS thread and a fresh `current_thread` runtime
+/// per key per transaction, discarded every send result, and returned success
+/// even when the target was not in the bucket at all. Mesh fragments report
+/// `delivery_failures`, so a shard preload or a single-finalizer request that
+/// reached nobody made the cluster look *healthier* than a dense one while
+/// silently dropping work — silence read as emptiness, in the direction that
+/// hides the fault.
+///
+/// Cost scales with the call rather than with the number of targets: one thread
+/// and one runtime serve the whole batch.
+///
+/// Returns the targets that did NOT receive the payload. Send failures are also
+/// recorded in the counter, because a registered peer has an rhash to attribute
+/// them to; a target that is not in the bucket has no known rhash, so it can
+/// only be reported here — which is why returning the list is part of the API
+/// rather than just logging.
+pub fn send_to_peers_blocking(
+    &self,
+    keys: &[Vec<u8>],
+    node_type: &NodeRegistryType,
+    data: &[u8],
+) -> Vec<Vec<u8>> {
+    let Some(nodes) = self.get_nodes(node_type) else {
+        // The bucket itself is missing: nobody can be reached, so every
+        // target counts as undelivered rather than the call quietly succeeding.
+        return keys.to_vec();
+    };
+
+    // Resolve targets up front so no DashMap guard is live while a send runs
+    // (same discipline as send_to_all). `None` rhash = not in the bucket.
+    let targets: Vec<(Vec<u8>, Option<[u8; 16]>)> = keys
+        .iter()
+        .map(|key| {
+            let rhash = nodes.get(key).map(|entry| entry.value().rhash);
+            (key.clone(), rhash)
+        })
+        .collect();
+
+    let failures = Arc::clone(&self.delivery_failures);
+    let mut undelivered: Vec<Vec<u8>> = Vec::new();
+
+    if let Some(network) = &self.network {
+        for (key, rhash) in targets {
+            let Some(rhash) = rhash else {
+                undelivered.push(key);
+                continue;
+            };
+            let network = Arc::clone(network);
+            let send_data = data.to_vec();
+            match bounded_send(self.send_timeout, move || {
+                let _ = RnsSender::new(network, rhash).get_response(&send_data);
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    record_delivery_failure(&failures, rhash, node_type, e);
+                    undelivered.push(key);
+                }
+            }
+        }
+        return undelivered;
+    }
+
+    // Direct branch: one self-contained runtime for the whole batch. A
+    // `current_thread` runtime is reused across `block_on` calls, so this is
+    // one thread per send *site* rather than one per key.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build local runtime for targeted send");
+
+    for (key, rhash) in targets {
+        let Some(rhash) = rhash else {
+            undelivered.push(key);
+            continue;
+        };
+        let nodes_for_send = Arc::clone(&nodes);
+        let send_key = key.clone();
+        let send_data = data.to_vec();
+        let result = runtime.block_on(async move {
+            match nodes_for_send.get(&send_key) {
+                Some(entry) => {
+                    tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
+                }
+                // Evicted between resolution and send: a failure, not a no-op.
+                // `Ok(Err(..))` to match `timeout`'s inner result type.
+                None => Ok(Err(ConnError::IO(
+                    "peer removed from the bucket before the send".to_string(),
+                ))),
+            }
+        });
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                record_delivery_failure(&failures, rhash, node_type, e);
+                undelivered.push(key);
+            }
+            Err(_) => {
+                record_delivery_failure(
+                    &failures,
+                    rhash,
+                    node_type,
+                    ConnError::Timeout(format!("direct send exceeded {:?}", self.send_timeout)),
+                );
+                undelivered.push(key);
+            }
+        }
+    }
+    undelivered
 }
 
 /// Count of failed fan-out deliveries for a specific (rhash, node_type).

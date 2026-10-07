@@ -112,35 +112,75 @@ impl Sentinel {
             }
         };
 
-        // Transition to Finalizing with the new finalizer key.
-        if let Ok(mut entry) = self.registry.get_transaction_mut(&tx_id) {
-            let old_state = std::mem::replace(
-                &mut entry.state,
-                TransactionState::Pending,
-            );
-            if let TransactionState::Finalizing { transaction, .. } = old_state {
-                entry.transition_to_finalizing(transaction, new_key.clone());
-            } else {
-                entry.state = old_state;
+        // Transition to Finalizing with the new finalizer key, keeping a copy of
+        // the transaction to hand to the new finalizer.
+        //
+        // The copy must come from THIS scope. The follow-up `get_transaction` this
+        // replaces could never succeed: that accessor only serves entries in the
+        // Validated state (`src/registry/pending.rs:246-257`), and this handler has
+        // just moved the entry into Finalizing. So the lookup failed on EVERY
+        // rejection — a state precondition, not a race. Wrapped in `if let Ok(tx)`
+        // the error was invisible and the reassignment send never ran: the
+        // transaction was reassigned in local state and delivered to nobody, with
+        // nothing logged and `Ok(())` returned. Nothing recovers it either — the
+        // new finalizer never learns the transaction exists, so no confirmation and
+        // no rejection ever comes back. The recovery path stranded the transaction
+        // it was meant to rescue.
+        let reassigned_tx = match self.registry.get_transaction_mut(&tx_id) {
+            Ok(mut entry) => {
+                let old_state = std::mem::replace(&mut entry.state, TransactionState::Pending);
+                if let TransactionState::Finalizing { transaction, .. } = old_state {
+                    let for_send = transaction.clone();
+                    entry.transition_to_finalizing(transaction, new_key.clone());
+                    Some(for_send)
+                } else {
+                    entry.state = old_state;
+                    let _ = self.registry.release_transaction(&tx_id);
+                    return Err(SentinelError::Registry(format!(
+                        "Transaction {} not in Finalizing state for rejection handling", tx_id
+                    )));
+                }
+            }
+            Err(e) => {
+                // Previously this fell through to the (always-skipped) send and
+                // the handler reported Ok(()). Nothing can be reassigned without
+                // reading the entry, so say so.
                 let _ = self.registry.release_transaction(&tx_id);
                 return Err(SentinelError::Registry(format!(
-                    "Transaction {} not in Finalizing state for rejection handling", tx_id
+                    "Cannot read transaction {} to reassign its finalizer: {}", tx_id, e
                 )));
             }
-        }
+        };
 
-        // Send the transaction to the new finalizer.
-        if let Ok(tx) = self.registry.get_transaction(&tx_id) {
-            let _ = self.transaction_notifier.request_single_finalizer(
-                &tx, new_key.clone(), &self.env_data
-            );
-        }
+        // Send the transaction to the new finalizer. The result was discarded
+        // here before, which is how a dropped send became a silently stuck
+        // transaction: the new finalizer never receives it, so no rejection ever
+        // comes back and nothing else retries it.
+        let send_result = match reassigned_tx {
+            Some(tx) => self
+                .transaction_notifier
+                .request_single_finalizer(&tx, new_key.clone(), &self.env_data)
+                .map_err(Into::into),
+            None => Err(SentinelError::Registry(format!(
+                "Cannot send reassignment for tx {}: no transaction to send", tx_id
+            ))),
+        };
 
         // Notify all sentinels that this transaction is being reassigned.
         let _ = self.transaction_notifier.notify_delete(&tx_id, &self.env_data);
 
         // Release lock — transaction remains in Finalizing for new finalizer.
+        // Released BEFORE surfacing the send failure so the entry is not left
+        // write-locked behind the error path.
         let _ = self.registry.release_transaction(&tx_id);
+
+        if let Err(e) = send_result {
+            self.env_data.logger.log(format!(
+                "finalizer reassignment for tx {} to {:02x?} did not reach its target: {:?}",
+                tx_id, new_key, e
+            ));
+            return Err(e);
+        }
 
         Ok(())
     }

@@ -267,3 +267,95 @@ fn record_delivery_failure_counts_by_rhash_and_type() {
         "total must be the sum across keys"
     );
 }
+
+// --- Phase 0 item 2: targeted sends must carry the same accounting as fan-out ---
+
+/// `send_to_shard_executors_for_preload` and `request_single_finalizer` used to
+/// call `conn.send()` directly, discard the result, and return `Ok(())` — so a
+/// sharded cluster could drop every preload while its fragments reported zero
+/// delivery failures. A targeted send names its recipients, so each target that
+/// does not receive the payload must be counted where attributable AND reported.
+#[test]
+fn targeted_send_records_failures_and_reports_undelivered() {
+    let reg = registry_with_capacity(&[(NodeRegistryType::Executor, 5)]);
+    for (i, rhash) in [(1u8, [1u8; 16]), (2, [2u8; 16])] {
+        reg.register_peer(
+            vec![i],
+            rhash,
+            &NodeRegistryType::Executor,
+            Box::new(FailingConnection),
+        );
+    }
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    reg.register_peer(
+        vec![3],
+        [3u8; 16],
+        &NodeRegistryType::Executor,
+        Box::new(RecordingConnection { tx }),
+    );
+
+    // Two failing peers, one healthy, one that was never registered.
+    let keys: Vec<Vec<u8>> = vec![vec![1], vec![2], vec![3], vec![9]];
+    let undelivered = reg.send_to_peers_blocking(&keys, &NodeRegistryType::Executor, &[7u8]);
+
+    assert_eq!(
+        undelivered,
+        vec![vec![1u8], vec![2u8], vec![9u8]],
+        "failing and unregistered targets must be reported; the healthy one must not"
+    );
+    assert_eq!(
+        reg.total_delivery_failures(),
+        2,
+        "only peers with a known rhash can be attributed to the counter"
+    );
+    assert_eq!(
+        reg.failure_count([3u8; 16], &NodeRegistryType::Executor),
+        0,
+        "a delivered send must not be counted as a failure"
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(vec![7u8]),
+        "the healthy peer must actually receive the payload, not just be skipped"
+    );
+}
+
+/// The unregistered target above has no rhash the registry knows, so the
+/// counter cannot hold it. That is exactly why this API returns the undelivered
+/// list instead of only counting: an absent peer must never be silent.
+#[test]
+fn targeted_send_reports_every_target_when_the_bucket_is_unavailable() {
+    let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 2)]);
+    let keys = vec![vec![1u8], vec![2u8]];
+    let undelivered = reg.send_to_peers_blocking(&keys, &NodeRegistryType::Executor, &[1u8]);
+    assert_eq!(
+        undelivered, keys,
+        "no usable Executor bucket, so every target counts as undelivered"
+    );
+}
+
+/// Positive control: when every target is registered the call is clean, so the
+/// failure arms above cannot be passing on a setup that always fails.
+#[test]
+fn targeted_send_delivers_to_every_registered_peer() {
+    let reg = registry_with_capacity(&[(NodeRegistryType::Executor, 3)]);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    for i in 1u8..=3 {
+        reg.register_peer(
+            vec![i],
+            [i; 16],
+            &NodeRegistryType::Executor,
+            Box::new(RecordingConnection { tx: tx.clone() }),
+        );
+    }
+    let keys: Vec<Vec<u8>> = (1u8..=3).map(|i| vec![i]).collect();
+    let undelivered = reg.send_to_peers_blocking(&keys, &NodeRegistryType::Executor, &[5u8]);
+
+    assert!(undelivered.is_empty(), "every target was registered: {:?}", undelivered);
+    assert_eq!(reg.total_delivery_failures(), 0);
+    let mut received = 0;
+    while rx.try_recv().is_ok() {
+        received += 1;
+    }
+    assert_eq!(received, 3, "one send per target, all landing");
+}
