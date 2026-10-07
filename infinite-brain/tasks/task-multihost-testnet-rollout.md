@@ -4,19 +4,23 @@ title: "Multi-host testnet rollout: from a working local cluster to production"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "OPEN — phased. A correctly configured cluster can boot and peer on one host; it cannot be driven from outside and forgets its validator set on restart. Seven phases with testable exits: (0) three correctness defects already on the live path, (1) transaction ingress, (2) transport viability off loopback, (3) durable stake, (4) enforcement and key custody, (5) operability, (6) public testnet and review, (7) shard boundaries — post-launch and capacity-gated. Phase 2 is the riskiest unknown and must not be deferred; Phase 0 is small and comes first because everything downstream measures through it."
+summary: "PHASED, IN PROGRESS. **Phase 0 closed 10/07/2026** (per-token selection salt + production-provider exit test, per-key send accounting, quorum measured against a declared set with the committer gate fixed). A correctly configured cluster can boot and peer on one host; it cannot be driven from outside. **Read the Live scorecard and Pickup cards near the top of this node before anything else** — they carry current status per phase, what is already in place, the first thing to do, and the trap each phase has. Remaining: (1) transaction ingress — nothing exists, do this next; (2) transport off loopback — instrumented but never run, no code needed to start; (3) durable staking ops; (4) rate limiting and key custody; (5) operability metrics; (6) public testnet; (7) shard boundaries, capacity-gated and deliberately refused in code. Phase 2 is the riskiest unknown and must not be deferred."
 auto_inject: true
 applicable_when: "Planning or executing multi-host / cloud testnet deployment, deciding what to build next, or sizing a validator fleet"
 confidence: 0.9
 verified_at: "10/07/2026"
 verified_by: "dsh-agent"
-staleness_signal: "Any phase exit being met — especially an ingress surface existing, stake becoming durable, or the transport being exercised across real hosts. Re-verify the Missing/Partial scorecard before planning from this node."
+staleness_signal: "If any Pickup card states a status the tree contradicts; if a phase is started out of order; if a line anchor in this node no longer points at what it cites; if Phase 0's mutation-verified tests are edited without re-running the mutations" "Any phase exit being met — especially an ingress surface existing, stake becoming durable, or the transport being exercised across real hosts. Re-verify the Missing/Partial scorecard before planning from this node."
 tags: [task, testnet, deployment, multi-host, cloud, transport, ingress, staking, roadmap]
 edges:
   - target: fact-mesh-verification-probe
     type: depends_on
     weight: 0.9
     note: "Phase 2's verdict instrument: exit code over eyeballed logs, and why logs cannot answer it"
+  - target: playbook-picking-up-a-roadmap-phase
+    type: depends_on
+    weight: 0.9
+    note: "The procedure and repo-specific traps for starting any phase cold — read it before the pickup cards"
   - target: fact-committer-confirmation-gate-did-not-gate
     type: related_to
     weight: 0.95
@@ -98,7 +102,137 @@ prover — while proof *verification* is genuinely on the validation path
 other, and run the pipeline. It cannot be pointed at by an outside user, and it
 forgets its validator set when it restarts.
 
-## Phase 0 — Three things already on the live path *(small; do first)*
+---
+
+## Live scorecard — start here *(updated 10/07/2026, supersedes the table above)*
+
+Every row was checked against the working tree today rather than remembered. Where it
+contradicts the rollout-start table, the contradiction is named so that table stays
+useful for its reasoning and stop being used for its state.
+
+| Phase | Status | Already in place | First thing to do |
+|---|---|---|---|
+| **0 — live-path defects** | **✅ closed 10/07** | ADR-019 per-token salt; per-key send accounting; declared `ResponsibleSet`; committer confirmation gate verified | Nothing. If you touch quorum, finality or selection, re-run the mutation checks in `playbook-picking-up-a-roadmap-phase` first |
+| **1 — ingress** | **○ not started** | No *transaction* ingress: no client binary, no RPC, `rest_api_version` vestigial. Note there *is* one HTTP responder in the tree — the health/metrics server in `src/telemetry.rs`, raw tokio, no HTTP crate — which is the shape a first ingress endpoint would reuse | Decide the ingress surface (see the pickup card) *before* writing a handler; then one transaction from a client to a committed block, observable in the data service |
+| **2 — transport off loopback** | **◐ instrumented, unrun** | Loopback-bind fix, `Placement::PerHost`, signed mesh fragments, `mesh-probe --fragments`, `directory_observer` posture (probe needs no stake), send accounting so failures reach the probe | Book four instances and run it. No code first |
+| **3 — persistence & restart** | **◐ partial** | Chain state + stake/executor snapshots persist: `advance_epoch_to` writes both (`committer/src/committer/epoching.rs:156-171`) and boot loads one fail-closed | `StubStakingManager` is still a stub: decide what staking ops must survive a restart, then make one of them survive one |
+| **4 — enforcement, admission, custody** | **◐ partly landed** | Slashing **is** enforced: two sites — an invalid chain's tip proposer and double-sign resolution (`committer/src/epoch_manager.rs:205-227`, `:262-275`) — applied through a real `StakingManager` (`:111-124`) and persisted with the epoch snapshot. Config hygiene items done | Rate limiting at the sentinel — nothing exists in `src/` and it gates any gateway |
+| **5 — operability** | **◐ plumbing exists** | `src/telemetry.rs`: Prometheus text-format metrics on lock-free atomics, health endpoint over raw tokio, tracing init. Mesh fragments | Decide what "directories populated" looks like as a metric and alert on it — the plumbing is not the gap |
+| **6 — public testnet** | **○ blocked on 1 & 2** | `testnet-gen` (keys, configs, env, genesis, topology, fragments); no `up/down/status` launcher (`task-testnet-launcher`) | Do not start here. Phase 1 first |
+| **7 — shard boundaries** | **⛔ gated, deliberately** | Sharding exists and is unit-tested; `Finalizer::responsible_set()` refuses `shard_count > 1` rather than guessing | Nothing, until a measured capacity number fails |
+
+**Four corrections to the rollout-start table**, so nobody re-derives them:
+- *Selection seeds "Defective"* — fixed 10/07 by ADR-019; the empty-salt path is gone at
+  the type level (`latest_block_hash` deleted) and the behaviour is pinned through the
+  **production** provider (`selection_salt_through_the_production_data_provider`).
+- *Validator-stake persistence "Missing… nothing writes it"* — **too strong**. Epoch
+  stake and executor snapshots are written on epoch advance and a failure aborts the
+  advance rather than swallowing it. What is genuinely missing is staking-operation
+  persistence (`StubStakingManager`) and identity/peer rejoin.
+- *Slashing enforcement "Missing… no application site"* — **wrong**, and it would have
+  sent someone to build what already exists. `slash_fraction` has two application sites:
+  an invalid chain's tip proposer (`committer/src/epoch_manager.rs:205-227`, where the
+  audit-driven fix gave `misshapen_tokens` an economic effect instead of leaving it a dead
+  accumulator) and double-sign resolution (`:262-275`). Ops are applied exactly once per
+  op by a real `StakingManager::apply_ops` (`:111-124`, which also records that an earlier
+  version deducted twice), and the result rides the epoch snapshot into the data service.
+  What Phase 4 actually lacks is the **network** half: a byzantine validator run as a second
+  committer process, slashed, with the reduced stake visible in the persisted snapshot.
+- *Observability "under-reports"* — the per-key send path now carries the same
+  `delivery_failures` accounting as `send_to_all`, so a dropped finalizer request is
+  counted. Residual: `register_peer` still signals capacity refusal as a bare `bool`.
+
+## Pickup cards
+
+One per open phase: what to read, what the first commit looks like, and the trap that
+specific phase has. Phases 1 and 2 are the only two worth starting today; the rest are
+recorded so they are not started out of order.
+
+### Phase 1 — ingress
+- **Read first:** this section, `fact-control-plane-silent-drop-paths` (what "it looked
+  healthy" means here), `task-testnet-launcher` (the generator side is done; the runbook
+  half is not).
+- **First commit:** the *decision*, not the server — which surface (raw tokio HTTP like
+  `telemetry.rs`, or a framed MsgPack endpoint on the same length-prefixed protocol the
+  nodes already speak), and whether the ingress node is a sentinel or a new role. The
+  wire already has no client-facing message type; inventing one is a wire change, and
+  rmp encodes positionally, so it is lockstep with everything.
+- **Then:** one transaction, one client, one 4-node cluster, assert the committed block
+  is readable through the data service — the same shape as
+  `selection_salt_through_the_production_data_provider`: assert the *effect* through the
+  production path, never through a stub.
+- **Trap:** the gateway question is a Phase 2 topology question wearing an ingress hat.
+  Gateways consume leaf links; if they are not in `testnet-gen`'s plan they silently
+  change the mesh.
+
+### Phase 2 — transport
+- **Read first:** `fact-mesh-verification-probe`, `fact-fanout-graph-density`,
+  `fact-transport-loopback-bind-default`.
+- **First commit:** none. Book four instances, run
+  `testnet-gen --validators 4 --addresses-file …`, one `data-service` sidecar per host
+  from the same `genesis.json`, open the shared UDP range between members only, and let
+  `mesh-probe --manifest … --fragments <dir>` be the verdict.
+- **Trap #1:** a green probe means **control-plane formation only**. Send traffic.
+- **Trap #2:** the exit test requires four *numbers* per node at target size
+  (verifications/s, threads, RSS, sockets). Without them the gateway-vs-shard decision is
+  a preference. A dense round is plausibly O(N²) signature verifications before it is
+  socket-bound, and gateways do nothing about that.
+- **Trap #3:** CI cannot detect a loopback-only bind in either direction, because binding
+  "any" is a superset of binding loopback. A single-host CI passes forever.
+
+### Phase 3 — persistence
+- **Read first:** `tests/data_service_boot.rs` (the two boot reads that gate a node),
+  `committer/src/committer/epoching.rs:156-171`.
+- **First commit:** kill a node mid-epoch and restart it, and write down what actually
+  differs afterwards — before changing anything. The roadmap's claim is "it comes back
+  wrong"; nobody has recorded *how*.
+- **Trap:** `register_peer` is capacity-capped (`get_max_node_number`) and reports refusal
+  only as a `bool`. A restarted node that "rejoined" may have a directory that is quietly
+  short. Count it before trusting the rejoin.
+
+### Phase 4 — enforcement
+- **First commit:** rate limiting at the sentinel, because it gates the gateway and every
+  later network shape. Admission control already has per-type bounds and a stake floor in
+  `NodeTypeConfig`; the missing half is per-source rate.
+- **Trap:** slashing exists in-process, so it *looks* done. The exit test is "a byzantine
+  validator is actually slashed" **across a network** — a conflicting block produced by a
+  second committer process, not a unit fixture.
+
+### Phase 5 — operability
+- **First commit:** one metric + one alert for directories populated, then delete the
+  habit of reading logs to answer a mesh question.
+- **Trap:** failures are keyed `(rhash, NodeRegistryType)` and fragments bucket by role.
+  Add the shard dimension when Phase 7 needs it, but stop hardening the keying before
+  then — otherwise "shard 3 is down" becomes permanently indistinguishable from "the mesh
+  is fine".
+
+### Phase 7 — shards
+- **Entry gate is three conditions, all required** (measured capacity, the fleet is at
+  the point where it fails, and a written committee-shape choice). "The code is nearly
+  there" is not one of them; the existing path thins one send and validates nothing on
+  receipt.
+- **First commit:** the selection record (epoch, salt, committee hash) on the
+  sentinel→finalizer message — `Finalizer::responsible_set()` already refuses
+  `shard_count > 1`, so the phase opens with a compile-time-shaped hole rather than a
+  silent wrong answer. That refusal is the seam to work from.
+- **Trap:** the envelope has no shard identity, and `chain_id` is write-only — the
+  sentinel sends the constant `"token"` while every other role sends
+  `environment_id`. Any of this is a lockstep wire change.
+
+## If you are picking this roadmap up cold
+
+Read `playbook-picking-up-a-roadmap-phase` first. It is the procedure and the set of
+repo-specific traps (the test suite exceeds the default command timeout; absence-grep
+findings that miss multi-line call sites; the mutation-verify standard every "was
+rejected" test here is held to). Line numbers in this node **drift** — the anchors were
+true on 10/07/2026; verify each before acting on it.
+
+## Phase 0 — Three things already on the live path ✅ **CLOSED 10/07/2026**
+
+> Kept in full because the reasoning is the point: two of the three were found by
+> auditing a *sharding* question and both ran at `shard_count: 1`. Read the item
+> write-ups before changing selection, send accounting, or quorum — each has a
+> mutation-verified test that the change will break.
 
 Found while scoping sharding on 10/07, and **neither is a sharding item** — both run in
 the current `shard_count: 1` configuration, which is why they precede everything below.
@@ -346,21 +480,26 @@ epoch position intact, no manual steps, same validator set.
 
 ## Phase 4 — Enforcement, admission, and key custody
 
-- **Enforce slashing.** A parameter with no enforcement site is not a security model.
+- **✅ Mostly done 10/07 — slashing does have enforcement sites.** The roadmap claimed
+  otherwise; it does not (see the correction above: invalid-chain proposer and double-sign,
+  applied through a real `StakingManager` and persisted on epoch advance). **Remaining:** the
+  exit test's version of the claim — slash a byzantine validator running as a *separate*
+  committer process and see the reduced stake in the snapshot the other roles read. In-process
+  fixtures prove the arithmetic, not the protocol.
 - **Admission control and rate limiting** at the sentinel. `NodeTypeConfig` gives
   per-type connection bounds and a minimum stake; nothing stands between a client and a
   transaction flood. **This is also the precondition for any gateway**: there is no rate
   limiting anywhere in `src/` today, and an unmetered forwarder is an amplifier.
-- **Delete `shard_quorum_percentage` or make it mean something.** It is parsed, defaulted
-  to 67.0, range-validated, and **read by nobody**, while its own doc comment claims the
-  signature collector uses it (`environment.rs:161-163`). A knob that silently does nothing
-  is worse than a missing one: an operator who sets it believes shards have their own
-  quorum. The composite is a near cousin — it passes literal `66.6` and `4` into
-  `Finalizer::new` while holding `env_data` in the same call
-  (`node_server/plugins.rs:126-127`). Checked rather than assumed: the `66.6` **is** used,
-  so `env_data.quorum_percentage` really is ignored on the finalize path; the `4` feeds
-  `total_voters`, whose only consumer `check_quorum` has no production caller, so it is
-  inert rather than dangerous. Fix both, but they are not the same severity.
+- **✅ DONE 10/07 — config knobs that lied.** `shard_quorum_percentage` is **deleted**
+  (struct field, spec, boot validation, deploy `env.json`, every fixture) rather than wired:
+  it was parsed, defaulted to 67.0, range-validated, read by nobody, and its doc comment
+  claimed the signature collector used it. A knob that silently does nothing is worse than a
+  missing one — an operator who sets it believes shards have their own quorum. Restore it in
+  Phase 7 *only if* shard-level quorum is implemented. The composite's literals went the same
+  way: it passed `66.6` and `4` into `Finalizer::new` while holding `env_data`; it now passes
+  `env_data.quorum_percentage`, and `total_voters` is gone with the dead `check_quorum` that
+  was its only consumer. The severity difference between those two literals was established
+  by reading, not assuming — `66.6` was live, `4` was inert.
 - **Key custody.** Currently the operator holds every validator key as plaintext
   JSON generated locally. Acceptable for a testnet if deliberate; unacceptable for
   anything securing value. The alternative (per-node generation) needs a
@@ -494,10 +633,14 @@ range opened between cluster members only, and
 **Simpler than this node claimed on 10/05.** The collector it told you to build is no
 longer required. Nodes sign and dump their own fragments (`mesh_fragment_path`, emitted
 by the generator), the operator log shipper moves the files, and the probe aggregates.
-Nothing needs stake and nothing needs a link to every node. So the remaining piece is
-genuinely the run itself — plus, in parallel because it is small, the Phase 0 salt and
-counter fixes, since every number this run produces otherwise comes from code that
-reports success when it did not succeed.
+Nothing needs stake and nothing needs a link to every node.
+
+**So the remaining piece is genuinely the run itself.** The caveat this section carried —
+"run it in parallel with the Phase 0 fixes, because every number comes from code that
+reports success when it did not succeed" — is **gone as of 10/07/2026**: all three Phase 0
+items are closed, the salt is read through the production provider in a test, per-key sends
+are accounted, and the quorum gate verifies its own arithmetic. A 4-node run's numbers can
+be trusted now. Nothing stands between this action and booking four instances.
 
 A green probe still means **control-plane formation only**. Traffic has to be sent; that
 is Phase 1, and it is why ingress precedes every capacity claim.

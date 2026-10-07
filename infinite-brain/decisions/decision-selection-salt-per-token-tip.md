@@ -41,7 +41,7 @@ edges:
     type: related_to
     weight: 0.8
     note: "Roadmap Phase 0 item 1 — implemented 10/07/2026; the 'record the salt used' half remains open with item 3"
-related: ["[[Transaction sharding is already implemented and unit-tested — but has never run with shard_count > 1 across a network]]", "[[Per-transaction finalization quorum divides by the stake that showed up, not the set that was assigned]]"]
+related: ["[[Transaction sharding is already implemented and unit-tested — but has never run with shard_count > 1 across a network]]", "[[Per-transaction finalization quorum divides by the stake that showed up, not by the set that was assigned]]"]
 source_url: "Empty"
 ---
 
