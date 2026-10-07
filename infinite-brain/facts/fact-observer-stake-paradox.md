@@ -10,13 +10,21 @@ applicable_when: "Designing any monitoring, discovery, diagnostics, bootstrappin
 confidence: 1.0
 verified_at: "10/05/2026"
 verified_by: "dsh-agent"
-staleness_signal: "If the directory query stops requiring registration, if the stake gate becomes role-specific or is bypassed for read-only queries, if the quorum denominator moves from the stake snapshot to the live registered set, or if a non-voting observer role is introduced"
+staleness_signal: "PARTLY RESOLVED 10/05/2026 — the directory query no longer requires registration. Still live for anything else that registers (see the Resolution section): re-check if the stake gate becomes role-specific, if the quorum denominator moves from the stake snapshot to the live registered set, or if a non-voting observer role is introduced"
 tags: [fact, staking, quorum, observability, protocol-design, monitoring, consensus]
 edges:
   - target: fact-control-plane-peering
     type: depends_on
     weight: 0.9
     note: "The stake gate sits on the registration path every observer would have to take"
+  - target: fact-config-trust-relaxations
+    type: supports
+    weight: 0.85
+    note: "The receiving-half fix: an observer posture that a participant cannot switch on"
+  - target: fact-static-binding-replay
+    type: depends_on
+    weight: 0.85
+    note: "Removing registration from the query path only helps if the query itself cannot be replayed; that is a separate property"
   - target: fact-mesh-verification-probe
     type: supports
     weight: 0.9
@@ -89,3 +97,53 @@ tests. Each of those either pays stake (and changes the security parameters it i
 measuring) or is locked out — and a load generator that inflates the quorum
 denominator is a self-inflicted halt, which is how test infrastructure takes down a
 testnet.
+
+## Resolution (same day): the gate was membership, not stake
+
+Chasing "why would a query need stake?" through the code produced a correction to
+this node's own framing. **The directory query never checked stake.**
+`build_directory_response` checked two things: a valid binding signature, and that
+the requester was in *our* registry. Stake entered one hop earlier, at
+`handle_register`. So the paradox was real in effect — an observer could only
+become answerable by registering, and registering needed stake — but the mechanism
+was inherited, not designed, and that made it removable without touching validator
+admission at all.
+
+What the query gate was actually for, and what survives:
+
+- **Enumeration** of the live validator set to any UDP peer. Legitimate; kept.
+- **A reply loop** between peers. Fixed properly by making responses data-only.
+- **Cost.** Real and large: a hybrid signature is 3796 B (`crypto.rs:74-75`), so a
+  40-entry directory is ~156 KB plus an ML-DSA signature to produce, and every one
+  of those bytes rides the Resource-transfer path because the direct-packet cap is
+  481 B (`wrapper.rs:79`). A ~200-byte request buys all of it.
+
+The fix that keeps all three: a directory query now signs `query_payload` —
+requester rhash, **responder rhash**, **one-shot nonce**, requested type, declared
+roles — and an unregistered requester is answered only if the query names us, the
+nonce is unseen within `QUERY_NONCE_WINDOW`, and we already have a route to it.
+Registration is no longer required to ask who the validators are; contact is.
+Validator admission and the transaction-action floor are untouched — note they
+share one constant (`global_min_stake`, `config.rs:437` and `action_router.rs:183`),
+so lowering it to admit observers would also drop the floor for actions. That is
+why "make the per-type minimum zero" does not work either: the global floor still
+applies to every type.
+
+**The other half, same day.** `handle_directory_response` refused a response whose
+responder was not in *our* registry, so an observer got answered and then discarded
+the answer. Making that symmetric is unsafe by default: a validator accepting
+directory entries from arbitrary reachable peers installs attacker-chosen keys into
+its role buckets, and `send_to_all` fans real pipeline traffic to whatever a bucket
+holds. Entries cannot be *misattributed* to real validators — each is bound by its
+own key — so the exposure was fake peers and poisoned directories, not impersonation.
+
+The fix that keeps the asymmetry honest is `directory_observer` in config, refused to
+any node declaring a consensus role, with the roles read from what the node actually
+runs. So an observer consumes answers; a participant cannot turn the protection off.
+See `fact-config-trust-relaxations` for why the posture is derived rather than
+asserted, and for the test that passed for the wrong reason until a mutation run
+exposed it.
+
+**Net effect:** a node with no stake can now learn the validator set — query it,
+receive it, and install it — without appearing in the quorum denominator. What
+observation costs is now a route and a signature.

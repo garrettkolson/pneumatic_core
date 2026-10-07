@@ -8,7 +8,7 @@ summary: "10/02/2026: `src/node/registry/peering.rs` sends the control plane (Re
 auto_inject: true
 applicable_when: "Any multi-node run, launcher/peering work, or debugging a cluster where nodes boot but no traffic flows between roles"
 confidence: 1.0
-verified_at: "10/02/2026"
+verified_at: "10/05/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If peering.rs changes shape, if the binding signature size changes (moving control frames under the direct-packet cap), or if a binary stops calling start_peering"
 tags: [fact, peering, control-plane, node-registry, rns, testnet, boot]
@@ -21,6 +21,10 @@ edges:
     type: depends_on
     weight: 0.9
     note: "Control frames exceed the direct-packet cap, so peering rides the Resource path and needs a live route"
+  - target: fact-static-binding-replay
+    type: relates_to
+    weight: 0.85
+    note: "The directory Request is the one of the three control messages that repeats, so it alone carries a responder and a nonce"
   - target: fact-control-plane-silent-drop-paths
     type: related_to
     weight: 0.85
@@ -92,3 +96,22 @@ asserts each node lands in the other's *correct* role bucket (asymmetric roles,
 so the ack-placement defect would fail it). Passes in 0.8 s, stable across
 repeated runs. 16 unit tests cover the builders, the bucket math, the frame
 shapes, and the directory gates.
+
+## Update 10/05/2026 — the directory `Request` is no longer shaped like the others
+
+`Register` and `Heartbeat` still sign the classic three-tuple binding. `Request`
+does not: it now carries `query_target` (the responder's rhash) and `query_nonce`,
+and signs the five-tuple `query_payload` instead. The reason is that of the three
+messages it is the only one a peer sends **repeatedly** and whose answer is
+**expensive** — see `fact-static-binding-replay`.
+
+Callers of `build_directory_request` must now pass the responder's rhash; it is not
+derivable from the requester's state. The fields on `NodeRequest` are
+`#[serde(default)]`-ed `Option`s, so a peer on an older build is still understood —
+with one caveat worth knowing before a rolling upgrade: rmp serializes structs
+positionally, so the *frame* is not byte-compatible across the change even though
+the semantics are backward-honored. Everything on a network has to move together.
+
+`request_directories_from_peer(peer_rhash)` threads the peer's rhash straight
+through, so the production peering loop needed no logic change — a query is always
+addressed to the peer it is being sent to.

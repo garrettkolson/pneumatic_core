@@ -88,7 +88,7 @@ withholding impossible; it should make it impossible to mistake for health.
 |---|---|
 | `buckets` → peers with `rhash_hex` | The directory contents, which is the primary question |
 | `vouched` | "I registered this node myself" vs "someone told me about it". A full bucket of unvouched peers is a cluster that learned names and has no direct links — which does not route |
-| `last_seen_age_secs` | Eviction drops a peer at `REGISTRY_MAX_AGE`, so a large age means the entry is already fiction. A bucket count cannot tell a live cluster from a dying one |
+| `last_seen_age_secs` | Eviction drops a peer not seen for 30 s (`registry.rs:328`, 1 s passes), so a large age means the entry is already fiction. A bucket count cannot tell a live cluster from a dying one |
 | `delivery_failures` | Failed fan-outs per peer, already tracked by the registry for fan-out observability. This is the only reachability evidence available: **listed and unreachable** is otherwise indistinguishable from peered |
 | `written_at_unix` | **Inside the signature**, so age is provable and a re-dated fragment fails verification. Otherwise the freshness bound is decorative |
 
