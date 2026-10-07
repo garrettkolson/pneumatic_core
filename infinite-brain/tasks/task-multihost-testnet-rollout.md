@@ -111,12 +111,57 @@ exists: selection should be knowable only *"once the previous block is actually 
 in force for finalizer assignment — or for shard selection, once it is enabled.
 
 This is not pure plumbing. With **per-token chains there is no single env-level tip**,
-which is almost certainly why the conflation happened in the first place. So the fix is a
-decision: salt per token (`chain_id`-shaped, which is what the lattice suggests) or per
-epoch from committer state. It also needs a test that **stores a token**, because
+which is almost certainly why the conflation happened in the first place.
+
+Checked how each side of the protocol would source it, because they are different
+processes with different access to chain state:
+
+- **The sentinel already has the answer in hand.** `processing.rs:87-90` loads
+  `get_token(&tx.token_id, token_partition_id)` for validation roughly 85 lines before the
+  same function fetches the selection salt at `:175-179`. The tip of the chain the
+  transaction actually extends is available with no new I/O, and it is canonically
+  determined by the transaction itself — one token, so no tie-break rule to invent.
+- **The committer already does this, and does it nondeterministically.**
+  `epoching.rs:85-90` takes
+  `self.tokens.iter().map(…last_hash_in).next().unwrap_or_default()` over
+  `Arc<DashMap<Vec<u8>, Token>>` (`committer.rs:112`) — the tip of **whichever token
+  DashMap iteration happens to yield first**. With more than one token cached, nothing pins
+  the choice, and this is the seed for epoch **leader** election. Deterministic iteration is
+  an explicit house rule elsewhere (the `C6` sort-before-select comments in
+  `src/epoch/leader.rs`); this site predates it or missed it. Fix it under either option.
+- The committer's chain state is deliberately **not persisted**
+  (`epoching.rs:81-84`), so a sentinel that wanted an epoch-scoped salt would need new
+  persisted state and a new read path, not just a new argument.
+
+So the decision is per-token-tip versus epoch-state, with the recommendation being
+per-token + **record the salt that was used**, so other nodes verify rather than recompute.
+Both options re-key: per-token re-keys per block per token, epoch-state re-keys per epoch,
+and the security difference is that re-key frequency rather than secrecy. Whichever wins,
+the `.unwrap_or_default().unwrap_or_default()` pair goes — a genuinely missing tip is the
+genesis case and must be explicit, not a collapsed error.
+
+The Phase 0 exit test also got sharper: the salt must be non-empty **and identical across
+nodes given the same fixture**, which is the property the leader site currently cannot
+guarantee. It also needs a test that **stores a token**, because
 `StubDataProvider` (`src/data.rs:838`) reads the same argument as a partition key and its
 comment claims it mirrors `DefaultDataProvider` while implementing the other reading —
 so the first well-intentioned test will pass while production keeps returning empty.
+
+> **✅ Implemented 10/07/2026.** `latest_block_hash` is **deleted** from `DataProvider`
+> rather than renamed — the single-string parameter that doubled as partition and token id
+> was the root cause, and with the accessor gone the conflation is not expressible. The salt
+> is now the tip of the token the transaction extends (`Sentinel::selection_tip`, and
+> `chain_tip_of` where the token is already loaded), an unreadable token is an **error**
+> rather than an empty salt, and the committer's leader seed goes through
+> `canonical_chain_tip` (sorted-first token id) instead of DashMap iteration order.
+> Genesis's placeholder token is still written, documented as vestigial. Decision recorded
+> in `decision-selection-salt-per-token-tip`. Tests:
+> `selection_tip_reads_the_transactions_own_token`,
+> `selection_tip_refuses_a_missing_token`,
+> `canonical_chain_tip_is_independent_of_insertion_order`; the two pre-existing
+> tip-sensitivity tests now pass the salt explicitly, so they can only discriminate on it.
+> **Still open:** recording the salt actually used, so a past committee can be re-derived —
+> that is the same job as item 3 and touches the block/transaction surface.
 
 **2. Per-key sends are not counted.** `request_single_finalizer`
 (`sentinel/src/transaction_notifier.rs:214`, called from `finalizing.rs:128`) — like the

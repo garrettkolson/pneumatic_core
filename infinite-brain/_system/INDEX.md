@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/07/2026. +1 fact — the per-transaction quorum denominator is whoever arrived, not the assigned set (`fact-self-referential-quorum-denominator`); the rollout roadmap's Phase 0 now carries three live-path items and Phase 7 carries the two committee-shape options. Earlier the same day: the roadmap was restructured to seven phases, and the shard-routing audit landed (`fact-sharding-exists-unexercised`, full audit in `raw/`). Earlier still: mesh fragments replacing the staked collector, freshness-bound directory queries, and the `directory_observer` posture (`fact-observer-stake-paradox` resolved, `fact-static-binding-replay`, `fact-config-trust-relaxations`). Earlier this week: testnet generator and role fan-out density facts, launcher items, and the 1101→1118→1132→1138→1143 baselines. (Prior rebuild notes were collapsed here on 10/07 because the running list had outgrown its usefulness.)
+Last rebuilt: 10/07/2026. +1 decision — **ADR-019**: deterministic selection is salted with the transaction's own chain tip, `DataProvider::latest_block_hash` deleted rather than renamed, missing token = error not empty salt, committer leader seed made canonical (roadmap Phase 0 item 1 now implemented). Earlier the same day: the roadmap was restructured to seven phases after the shard-routing audit (`fact-sharding-exists-unexercised`, audit in `raw/`), and the per-transaction quorum denominator was found to be self-referential (`fact-self-referential-quorum-denominator`). Earlier still: mesh fragments replacing the staked collector, freshness-bound directory queries, and the `directory_observer` posture (`fact-observer-stake-paradox` resolved, `fact-static-binding-replay`, `fact-config-trust-relaxations`). Earlier this week: testnet generator and role fan-out density facts, launcher items, and the 1101→1118→1132→1138→1143 baselines. (Prior rebuild notes were collapsed on 10/07 because the running list had outgrown its usefulness.)
 
 ## pillar (2)
 
@@ -10,7 +10,7 @@ Last rebuilt: 10/07/2026. +1 fact — the per-transaction quorum denominator is 
 | `pillar-block-lattice` | Block-lattice PoS consensus | Per-token block lattice (Nano-style) with a 4-role worker pipeline: executor proposes, finalizer optimistically finalizes, committer commits, sentinel monitors. | 4 |
 | `pillar-shielded-value-transfer` | Shielded value transfer (Tier-1 deliverable) | Tier-1 roadmap goal: private token value transfer via note commitments, nullifiers, and halo2 zk-proofs verified on-chain; phases S1.1–S5.2 landed, S5.3+ pending. | 4 |
 
-## decision (22)
+## decision (23)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -36,6 +36,7 @@ Last rebuilt: 10/07/2026. +1 fact — the per-transaction quorum denominator is 
 | `decision-tx-calldata-payload` | ADR-012: Additive payload: Vec<u8> on Transaction as contract calldata | Additive payload: Vec<u8> on Transaction carries contract calldata (skip-if-empty keeps legacy wire byte-identical); it joins CanonicalTransaction so the sender signs it, with a sentinel-enforced size cap. | 4 |
 | `decision-upgrade-governance` | ADR-017: Upgrade governance (owner registry + M-of-N multisig + 1-epoch timelock) | An UpgradeContract tx swaps a contract's bytecode + owner set, gated by an M-of-N owner quorum over a canonical Ed25519 digest and a 1-epoch apply-time timelock; the executor re-validates + emits a re-derivable ReplaceAssetDelta the committer applies under the timelock. **Landed 09/29/2026 (P8)**; applies to Wasm modules. | 6 |
 | `decision-wasm-engine-tier2` | ADR-018: Tier-2 WasmEngine (wasmi) behind the ContractEngine trait | WasmEngine is a Tier-2 ContractEngine impl (wasmi interpreter, fuel-metered, sandboxed, frozen ABI) so SmartContract.bytecode can be a WASM module for rich logic; opt-in, tiers W1 compute → W2 read → W3 storage → W4 cross-contract. **Core (W1+W2) landed 09/29/2026 (P5)**; **W3 storage (P7) landed 09/29/2026**; **W4 cross-contract (P9) landed 09/30/2026** (env.call host import, ADR-016). | 5 |
+| `decision-selection-salt-per-token-tip` | ADR-019: Salt deterministic selection with the transaction's own chain tip, and remove the ambiguous accessor | Deterministic selection (shard, finalizer, epoch leader) is salted by the chain the transaction actually extends — never an environment-level value. `latest_block_hash(partition_id)` is deleted, not renamed; a missing token is an error, never an empty salt; the committer's leader seed takes the sorted-first token id. | 7 |
 
 ## concept (36)
 
@@ -228,4 +229,4 @@ Last rebuilt: 10/07/2026. +1 fact — the per-transaction quorum denominator is 
 
 ## Totals
 
-144 nodes. Logs (append-only, never indexed): see logs/.
+145 nodes. Logs (append-only, never indexed): see logs/.
