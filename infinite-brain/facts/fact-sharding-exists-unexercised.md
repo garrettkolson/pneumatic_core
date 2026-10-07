@@ -14,7 +14,7 @@ staleness_signal: "If any e2e or deploy config sets shard_count > 1, if downstre
 tags: [fact, sharding, capacity, topology, epoch, routing, fanout]
 edges:
   - target: fact-fanout-graph-density
-    type: relates_to
+    type: related_to
     weight: 0.95
     note: "That fact's closing prediction — subsets thin the graph by themselves — is exactly what this code already does for one hop"
   - target: concept-executor-sharding
@@ -22,11 +22,11 @@ edges:
     weight: 0.9
     note: "The concept node describes the Shuffler abstractly and cites a file that no longer exists; this is the concrete call-site-level state"
   - target: concept-per-token-chains
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Per-token chains make tokens the natural shard axis, but the envelope does NOT carry a token id — chain_id is write-only (see the Wire section)"
   - target: fact-observer-stake-paradox
-    type: relates_to
+    type: related_to
     weight: 0.75
     note: "A shard-scoped quorum needs a shard-scoped denominator; the same arithmetic that made observers expensive governs this"
 related: ["[[The role fan-out graph is a full mesh minus executor↔executor]]", "[[Executor sharding per epoch (Shuffler)]]"]

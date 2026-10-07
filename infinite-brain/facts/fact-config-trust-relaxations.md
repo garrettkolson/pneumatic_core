@@ -18,11 +18,11 @@ edges:
     weight: 0.9
     note: "The observer posture exists because observation used to require joining — this is the receiving-half fix for that"
   - target: fact-static-binding-replay
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "The sending half of the same path; both halves needed a floor that is not stake"
   - target: fact-control-plane-peering
-    type: relates_to
+    type: related_to
     weight: 0.75
     note: "declared_roles is what the guardrail reads, and the binaries populate it from what they install"
 related: ["[[Paying for observation in stake: the gate that makes monitors cost fault tolerance]]"]

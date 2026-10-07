@@ -14,19 +14,19 @@ staleness_signal: "If the collector ever receives the assigned executor set, if 
 tags: [fact, quorum, finalizer, sharding, consensus, security, fault-tolerance]
 edges:
   - target: fact-sharding-exists-unexercised
-    type: relates_to
+    type: related_to
     weight: 0.95
     note: "Why enabling shard_count > 1 does NOT fail closed on a global denominator — the per-tx denominator quietly becomes the shard's own stake"
   - target: fact-observer-stake-paradox
-    type: relates_to
+    type: related_to
     weight: 0.85
     note: "Same lesson one layer down: a quorum is only as strong as the set its denominator names, and here the denominator names whoever arrived"
   - target: fact-mesh-verification-probe
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Composes with uncounted per-key sends: a send nobody counts shrinks a denominator nobody declared"
   - target: task-multihost-testnet-rollout
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Phase 0's third item and Phase 7's real subject: make the denominator a declared, verifiable set before scoping it to anything"
 related: ["[[Transaction sharding is already implemented and unit-tested — but has never run with shard_count > 1 across a network]]"]

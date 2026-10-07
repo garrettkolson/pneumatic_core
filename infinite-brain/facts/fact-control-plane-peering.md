@@ -22,7 +22,7 @@ edges:
     weight: 0.9
     note: "Control frames exceed the direct-packet cap, so peering rides the Resource path and needs a live route"
   - target: fact-static-binding-replay
-    type: relates_to
+    type: related_to
     weight: 0.85
     note: "The directory Request is the one of the three control messages that repeats, so it alone carries a responder and a nonce"
   - target: fact-control-plane-silent-drop-paths

@@ -26,19 +26,19 @@ edges:
     weight: 0.85
     note: "The snapshot path stays the source of the responsible set; the chain tip comes from the token record, not a snapshot"
   - target: decision-executor-sharding
-    type: relates_to
+    type: related_to
     weight: 0.85
     note: "Shard membership selection is the other consumer of this salt; per-token salting applies whether shard_count is 1 or more"
   - target: fact-self-referential-quorum-denominator
-    type: relates_to
+    type: related_to
     weight: 0.9
     note: "The reason predictability is not benign: an attacker-chosen tx id plus a known salt names the responsible set in advance"
   - target: fact-sharding-exists-unexercised
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Where the defect surfaced; that node records the permanent-placeholder mechanism this decision removes"
   - target: task-multihost-testnet-rollout
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Roadmap Phase 0 item 1 — implemented 10/07/2026; the 'record the salt used' half remains open with item 3"
 related: ["[[Transaction sharding is already implemented and unit-tested — but has never run with shard_count > 1 across a network]]", "[[Per-transaction finalization quorum divides by the stake that showed up, not the set that was assigned]]"]

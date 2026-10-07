@@ -14,11 +14,11 @@ staleness_signal: "If `binding_payload` gains a nonce, timestamp, or counterpart
 tags: [fact, security, cryptography, control-plane, replay, authentication, protocol-design]
 edges:
   - target: fact-observer-stake-paradox
-    type: relates_to
+    type: related_to
     weight: 0.9
     note: "The reason the query path could not simply be opened up: without freshness, removing the gate removes the only thing the gate was enforcing"
   - target: fact-control-plane-peering
-    type: relates_to
+    type: related_to
     weight: 0.8
     note: "Register, RegisterAck and Heartbeat all ride the same static binding"
   - target: fact-mesh-verification-probe

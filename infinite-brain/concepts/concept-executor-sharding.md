@@ -18,7 +18,7 @@ edges:
     weight: 0.95
     note: "The concrete state of this concept at the call sites, and the fact that it has never been exercised"
   - target: fact-fanout-graph-density
-    type: relates_to
+    type: related_to
     weight: 0.85
     note: "Shard subsets are what would thin the fan-out graph; today only the sentinel→executor hop is thinned"
   - target: concept-optimistic-finality
