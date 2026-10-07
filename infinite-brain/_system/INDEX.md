@@ -1,7 +1,7 @@
 # Infinite Brain — Node Index
 
 Master index of all nodes in this vault. One row per node; log nodes are excluded by design.
-Last rebuilt: 10/07/2026. +1 decision — **ADR-019**: deterministic selection is salted with the transaction's own chain tip, `DataProvider::latest_block_hash` deleted rather than renamed, missing token = error not empty salt, committer leader seed made canonical (roadmap Phase 0 item 1 now implemented). Earlier the same day: the roadmap was restructured to seven phases after the shard-routing audit (`fact-sharding-exists-unexercised`, audit in `raw/`), and the per-transaction quorum denominator was found to be self-referential (`fact-self-referential-quorum-denominator`). Earlier still: mesh fragments replacing the staked collector, freshness-bound directory queries, and the `directory_observer` posture (`fact-observer-stake-paradox` resolved, `fact-static-binding-replay`, `fact-config-trust-relaxations`). Earlier this week: testnet generator and role fan-out density facts, launcher items, and the 1101→1118→1132→1138→1143 baselines. (Prior rebuild notes were collapsed on 10/07 because the running list had outgrown its usefulness.)
+Last rebuilt: 10/07/2026. +1 fact — **finalizer reassignment never delivered the transaction** (`fact-finalizer-reassignment-never-delivered`): the reassignment re-read a Finalizing entry through a Validated-only accessor, the error was swallowed, and the send had been dead for its entire history. Roadmap Phase 0 item 2 (uncounted per-key sends) implemented the same day, plus ADR-019 closing item 1 (`decision-selection-salt-per-token-tip`). Edge types normalized to the `EDGE-TYPES.md` vocabulary (`relates_to` → `related_to`, 17 sites); `refines`, `supersedes`, `refined_by` and `precedes` remain in use but are not in the canonical list. Earlier: the seven-phase roadmap restructure, the shard-routing audit, and the self-referential quorum denominator. (Prior rebuild notes were collapsed on 10/07 because the running list had outgrown its usefulness.)
 
 ## pillar (2)
 
@@ -140,7 +140,7 @@ Last rebuilt: 10/07/2026. +1 decision — **ADR-019**: deterministic selection i
 |---|---|---|---|
 | `hyp-readme-postmvp-phase-8-outstanding` | RESOLVED 10/01/2026: Phase 8 production-readiness work landed | RESOLVED: Phase 8 was outstanding, and landed 10/01/2026 (telemetry/health/metrics, graceful shutdown, real node-server binary, Docker+compose, runbook, rustdoc). See event-phase8-production-readiness. | 3 |
 
-## fact (40)
+## fact (41)
 
 | id | title | summary | edges |
 |---|---|---|---|
@@ -184,6 +184,7 @@ Last rebuilt: 10/07/2026. +1 decision — **ADR-019**: deterministic selection i
 | `fact-wire-protocol` | Wire protocol: 4-byte BE length + MsgPack, 16 MB frame cap | Inter-service frames = 4-byte big-endian length header + MsgPack (rmp-serde) payload; MAX_FRAME_SIZE = 16 MB enforced by senders. | 3 |
 | `fact-worker-crate-tests` | Per-worker-crate test counts verified 09/26/2026 (cargo test --workspace) | Verified per-crate 09/26/2026: core 548 + 19 ignored, committer 92 lib + 9 integration (+7 ignored), executor 10, finalizer 61, node-server 32 + 2 ignored, prover 15 + 2 ignored, sentinel 57 + 1 ignored — 0 failed in every crate. | 2 |
 | `fact-workspace-layout` | Workspace layout: 7 crates, 25 root modules | Rust workspace: root pneumatic_core lib (25 pub-mod modules incl. rns, shielded, telemetry) + sentinel, executor, finalizer, committer, node-server, prover; the two binaries are pneumatic_committer and node-server. | 4 |
+| `fact-finalizer-reassignment-never-delivered` | Finalizer reassignment never delivered the transaction: the re-read could not succeed, and its failure was swallowed | RESOLVED 10/07/2026. `handle_rejection` re-read the entry with `get_transaction`, which only serves the Validated state, on an entry it had just moved to Finalizing — so it failed on every rejection, `if let Ok(tx)` swallowed it, and the send never ran. No timeout, TTL, or second sender exists, so the transaction stayed in Finalizing for the process lifetime. | 6 |
 
 ## source (7)
 
@@ -229,4 +230,4 @@ Last rebuilt: 10/07/2026. +1 decision — **ADR-019**: deterministic selection i
 
 ## Totals
 
-145 nodes. Logs (append-only, never indexed): see logs/.
+146 nodes. Logs (append-only, never indexed): see logs/.

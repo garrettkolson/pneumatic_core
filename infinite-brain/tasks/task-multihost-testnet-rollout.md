@@ -172,6 +172,32 @@ counter `send_to_all` maintains. Fragments report `delivery_failures`, so **a fa
 finalizer request makes the mesh look healthier than it is** — silence read as emptiness,
 in the direction that hides the fault. Phase 5 exists to prevent exactly this.
 
+> **✅ Implemented 10/07/2026 — and it was hiding something worse than bad telemetry.**
+> Both sites now go through a new `NodeRegistry::send_to_peers_blocking`, which applies the
+> same `(rhash, node_type)` counter as `send_to_all` and **returns the targets that did not
+> receive the payload** (a peer that is not in the bucket has no known rhash, so the counter
+> cannot hold it — that is why the list is part of the API). One thread and one runtime now
+> serve a whole batch instead of one per key per transaction. A shard preload that reaches
+> nobody returns `NoTarget`; a single-finalizer request does the same, and
+> `handle_rejection` no longer discards that result.
+>
+> Making the send report failure exposed a **live liveness defect**: the handler had been
+> re-reading the transaction with `get_transaction`, which only serves the `Validated`
+> state (`src/registry/pending.rs:246-257`), on an entry it had just moved to `Finalizing`.
+> That lookup failed on **every** rejection, `if let Ok(tx)` swallowed it, and the send
+> never ran — so a rejected transaction was reassigned in local state and delivered to
+> nobody. Full account in `fact-finalizer-reassignment-never-delivered`. The transaction is
+> now cloned from the lock scope that already holds it, and
+> `handle_rejection_delivers_the_transaction_to_the_new_finalizer` asserts the recipient
+> *receives bytes* (mutation-verified: skipping the send while returning `Ok(())` fails it).
+> Two sibling silences fixed in the same pass: `send_to_all_blocking` scored a peer evicted
+> mid-fan-out as a **successful** delivery, and a test fixture learned to assert
+> `register_peer`'s return value instead of assuming capacity.
+>
+> **Still open here:** `register_peer` still reports refusal only as a `bool`, so a
+> capacity-capped bucket can silently hold fewer peers than the code believes — the same
+> class, one level down. Worth folding into Phase 2's honest-measurement work.
+
 **3. The per-transaction quorum denominator is whoever showed up.**
 `SignatureCollector::reconcile_signatures` (`finalizer/src/signature_collector.rs:161`)
 computes its denominator as the **sum of the stake of signatures that arrived**, and if the
