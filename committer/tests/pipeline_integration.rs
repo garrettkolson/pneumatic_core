@@ -127,8 +127,7 @@ fn make_test_env_data(logger: Arc<FileLogger>) -> Arc<EnvironmentMetadata> {
         "trans_validation_specs": [],
         "block_validation_specs": [],
         "log_file": "/tmp/test.log",
-        "shard_count": 1,
-        "shard_quorum_percentage": 67.0
+        "shard_count": 1
     }
     "#;
 

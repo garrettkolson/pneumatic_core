@@ -71,7 +71,20 @@ fn allowed_senders_for(action: &str) -> AllowedSenders {
     match action {
         "Commit" | "BlockFinalized" => AllowedSenders::Exact(NodeRegistryType::Finalizer),
         "DistributeToken" | "DistributeBlock" => AllowedSenders::Exact(NodeRegistryType::Committer),
-        "BlockConfirmed" | "BlockQuorumReached" => AllowedSenders::AnyRegistered,
+        // `BlockConfirmed` is a VOTE, and every role sends it: any node that
+        // receives and validates a `BlockFinalized` broadcasts one (see
+        // `MessageDispatcher::send_block_confirmed_vote`). A vote from a node
+        // outside the stake set resolves to zero stake, so breadth here cannot
+        // inflate a quorum.
+        "BlockConfirmed" => AllowedSenders::AnyRegistered,
+        // `BlockQuorumReached` is different: it is a *conclusion*, and the only
+        // producer is `Committer::broadcast_quorum_reached`, which sends it after
+        // checking its own accumulation against the declared stake set. It used to
+        // be `AnyRegistered`, which let any registered node of any role — an
+        // executor included — flip every committer's copy of a block to
+        // `Confirmed`, bypassing the one stake-weighted gate an ordinary
+        // transaction has (ADR-005/010 make the committer quorum that gate).
+        "BlockQuorumReached" => AllowedSenders::Exact(NodeRegistryType::Committer),
         "EpochReconcile" => AllowedSenders::SelfOnly,
         // Any unrecognized action falls back to Committer-only so it is still
         // rejected at the dispatch stage as UnknownAction.
@@ -146,6 +159,22 @@ pub struct Committer {
     /// Cache of stake sets received via BlockFinalized messages, keyed by block hash.
     /// Used to look up sender stakes when processing BlockConfirmed votes.
     stake_set_cache: Mutex<HashMap<Vec<u8>, StakeSet>>,
+    /// Confirmation votes that arrived before their block's stake set, keyed by
+    /// block hash. These used to be dropped with `return Ok(())` and no trace —
+    /// and because a peer gossips its vote as soon as it validates a block,
+    /// "early" is the common case rather than the rare one. A committer whose
+    /// votes all arrived early never accumulated stake, never reached quorum,
+    /// and left the block `Optimistic` forever with no counter and no log line
+    /// (Phase 0 item 3). Buffered here, replayed when the stake set lands.
+    pending_confirmation_votes: Mutex<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
+    /// Count of `BlockQuorumReached` claims that did not match this committer's
+    /// own stake arithmetic, and so did not flip the block to `Confirmed`. A peer
+    /// claiming quorum is a hint to re-check, not authorization.
+    rejected_quorum_claims: Arc<AtomicU64>,
+    /// Monotonic count of votes buffered because their stake set had not arrived.
+    /// Non-zero is normal; a value that only ever grows means blocks are
+    /// confirming without their votes ever being counted.
+    buffered_confirmation_votes: Arc<AtomicU64>,
     /// Bounded, per-token orphan buffer for finalized blocks received out of order (AUDIT Phase
     /// 3.4 / H15). A BlockFinalized whose block does not chain onto the current tip is buffered
     /// here and replayed as the tip advances, so out-of-order delivery is never silently dropped.
@@ -224,6 +253,9 @@ impl Committer {
             shielded_pool,
             confirmation_votes: Mutex::new(HashMap::new()),
             stake_set_cache: Mutex::new(HashMap::new()),
+            pending_confirmation_votes: Mutex::new(HashMap::new()),
+            rejected_quorum_claims: Arc::new(AtomicU64::new(0)),
+            buffered_confirmation_votes: Arc::new(AtomicU64::new(0)),
             orphan_blocks: Mutex::new(OrphanBuffer::new(1024, 256, Duration::from_secs(30))),
             rmw_locks: Mutex::new(HashMap::new()),
         }

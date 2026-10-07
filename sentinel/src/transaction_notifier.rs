@@ -408,7 +408,6 @@ mod tests {
             sym_crypto_provider: "aes256-gcm".to_string(),
             serialization_provider: "rmp-serde".to_string(),
             shard_count: 1,
-            shard_quorum_percentage: 67.0,
             shielded_root_recency: 10,
             contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
         }

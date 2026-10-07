@@ -129,7 +129,6 @@ fn make_test_config() -> Config {
         sym_crypto_provider: "aes256-gcm".to_string(),
         serialization_provider: "rmp-serde".to_string(),
         shard_count: 1,
-        shard_quorum_percentage: 67.0,
         shielded_root_recency: 10,
         contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
     };
@@ -198,7 +197,6 @@ fn make_config_with_env() -> Config {
         sym_crypto_provider: "aes256-gcm".to_string(),
         serialization_provider: "rmp-serde".to_string(),
         shard_count: 1,
-        shard_quorum_percentage: 67.0,
         shielded_root_recency: 10,
         contract_engines: Arc::new(pneumatic_core::contracts::ContractEngineRegistry::new()),
     };

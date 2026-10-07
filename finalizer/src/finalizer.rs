@@ -107,7 +107,6 @@ impl Finalizer {
 /// Create a new Finalizer with all required components.
 ///
 /// `quorum_percentage` is the threshold for quorum (e.g., 67.0 for 2/3).
-/// `total_voters` is the total number of voting nodes.
 /// `signing_key` is the Ed25519 private key for signing blocks.
 /// `verifying_key` is derived from the signing key.
 /// `leader_address/stake/hash` are from the environment's leader.
@@ -124,7 +123,6 @@ pub fn new(
     pending_registry: Arc<PendingTransactionRegistry>,
     signature_registry: Arc<TransactionSignatureRegistry>,
     quorum_percentage: f32,
-    total_voters: u32,
     signing_key: Arc<NodeIdentity>,
     verifying_key: VerifyingKey,
     hash_provider: Arc<dyn HashProvider>,
@@ -140,7 +138,6 @@ pub fn new(
     let signature_collector = SignatureCollector::new(
         signature_registry.clone(),
         quorum_percentage,
-        total_voters,
     );
 
     let finalizer_addr = verifying_key.to_bytes().to_vec();

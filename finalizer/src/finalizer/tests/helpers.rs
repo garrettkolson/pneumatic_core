@@ -359,7 +359,6 @@ pub fn make_finalizer_with_shielded_identity(
         pending_registry,
         signature_registry,
         67.0,   // quorum
-        3,      // total voters
         identity,
         verifying_key,
         hash_provider,

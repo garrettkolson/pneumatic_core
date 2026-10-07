@@ -503,7 +503,6 @@ const CONTRACT_SPEC: &str = r#"{
     "block_validation_specs": [],
     "log_file": "/tmp/test.log",
     "shard_count": 1,
-    "shard_quorum_percentage": 67.0,
     "contract_engines": ["Transfer", "Spec"]
 }"#;
 

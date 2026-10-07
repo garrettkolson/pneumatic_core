@@ -44,10 +44,15 @@ impl Committer {
         let block_hash = block.current_hash.clone();
         let token_id = &block.signed_trans.transaction.token_id;
 
-        // Cache the stake set for later vote processing
+        // Cache the stake set for later vote processing, then replay any votes
+        // that raced ahead of it. Without the replay those votes were lost for
+        // good, and a committer that lost them all never reached quorum.
         if let Some(ref stake_set) = message.stake_set {
-            let mut cache = self.stake_set_cache.lock().await;
-            cache.insert(block_hash.clone(), stake_set.clone());
+            {
+                let mut cache = self.stake_set_cache.lock().await;
+                cache.insert(block_hash.clone(), stake_set.clone());
+            }
+            self.replay_pending_votes(&block_hash).await;
         }
 
         // Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5): reject a block whose
@@ -128,8 +133,24 @@ impl Committer {
             // Distribute to archivars (propagate gossip)
             let _ = self.block_services.distribute_to_archivers(committed_block).await;
 
+            // Cast our own confirmation vote — we have received and validated this
+            // block — and only then broadcast it and re-check quorum.
+            //
+            // Recording it locally is the half that was missing. The vote handler
+            // skipped `self.public_key` on the belief that "we already voted via
+            // handle_block_finalized", but this path only broadcast; nothing was
+            // ever recorded. So this node's stake sat in the denominator while its
+            // own vote could never enter the numerator. At equal stake that makes a
+            // 3-committer cluster permanently unable to reach 67%: each sees 2 of 3
+            // (66.7%), and `200 >= 201` is false — no block would ever be
+            // `Confirmed`, with no counter and no log line.
+            self.cast_confirmation_vote(&committed_block.current_hash, self.public_key.clone())
+                .await;
+
             // Broadcast our own vote: we've received and validated this block
             self.broadcast_vote(&committed_block.current_hash).await;
+
+            self.announce_quorum_if_reached(&committed_block.current_hash).await;
         }
 
         Ok(())

@@ -123,8 +123,10 @@ pub(crate) fn build_role_plugin(
                 node_registry,
                 pending_registry,
                 signature_registry,
-                66.6,
-                4,
+                // The environment's own quorum, not a literal: the composite held
+                // env_data two lines away and passed 66.6 anyway, so every
+                // environment silently ran a threshold nobody configured.
+                env_data.quorum_percentage,
                 config.identity.clone(),
                 verifying_key,
                 hash_provider,

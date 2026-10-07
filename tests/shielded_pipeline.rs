@@ -469,7 +469,6 @@ fn build_pipeline(real_shielded: bool, pre_spent: Option<[u8; 32]>) -> Pipeline 
         registry.clone(),
         Arc::new(TransactionSignatureRegistry::new()),
         67.0, // stake quorum
-        1,   // total voters (100/100 stake — one vote is quorum)
         sf_identity.clone(),
         verifying_key,
         Arc::new(BasicHashProvider::new()),
@@ -1139,7 +1138,6 @@ fn build_pipeline_with_pool(
         registry.clone(),
         Arc::new(TransactionSignatureRegistry::new()),
         67.0,
-        1,
         sf_identity.clone(),
         verifying_key,
         Arc::new(BasicHashProvider::new()),

@@ -157,9 +157,6 @@ pub struct EnvironmentMetadata {
     pub logger: Arc<dyn Logger>,
     /// Number of executor shards. Default 1 = no sharding.
     pub shard_count: u32,
-    /// Quorum percentage within a shard (e.g. 67.0 = 2/3).
-    /// Used by the signature collector when accumulating stake.
-    pub shard_quorum_percentage: f32,
     /// Number of shielded pool state snapshots (Merkle roots) retained for
     /// the root-freshness check: a note's `merkle_root` must be one of the
     /// most recent `K` committed pool states, older roots are stale.
@@ -304,7 +301,6 @@ impl EnvironmentMetadata {
             serialization_provider,
             logger,
             shard_count: spec.shard_count,
-            shard_quorum_percentage: spec.shard_quorum_percentage,
             shielded_root_recency: spec.shielded_root_recency,
             contract_engines,
         })
@@ -331,9 +327,6 @@ pub struct EnvironmentMetadataSpec {
     /// Number of executor shards. Default 1 = no sharding.
     #[serde(default = "default_shard_count")]
     pub shard_count: u32,
-    /// Quorum percentage within a shard. Default 67.0 (2/3).
-    #[serde(default = "default_shard_quorum_percentage")]
-    pub shard_quorum_percentage: f32,
     /// Number of shielded pool state snapshots (Merkle roots) retained for
     /// the root-freshness check. Default 10.
     #[serde(default = "default_shielded_root_recency")]
@@ -345,7 +338,6 @@ pub struct EnvironmentMetadataSpec {
 }
 
 fn default_shard_count() -> u32 { 1 }
-fn default_shard_quorum_percentage() -> f32 { 67.0 }
 fn default_shielded_root_recency() -> usize { 10 }
 fn default_contract_engines() -> Vec<String> {
     vec!["Transfer".to_string(), "Spec".to_string()]
@@ -358,7 +350,7 @@ impl EnvironmentMetadataSpec {
     ///
     /// Ranges enforced (this is the fail-closed config gate for audit Phase
     /// 5.7 / H6):
-    /// - `quorum_percentage`, `shard_quorum_percentage` ∈ (0, 100]: a 0%
+    /// - `quorum_percentage` ∈ (0, 100]: a 0%
     ///   finalizer quorum would be satisfied by zero signatures; anything
     ///   above 100% is unsatisfiable and deadlocks finalization.
     /// - `override_quorum_percentage` ∈ [0, 100]: 0 is the documented
@@ -384,12 +376,6 @@ impl EnvironmentMetadataSpec {
             violations.push(format!(
                 "quorum_percentage {} is outside (0, 100]",
                 self.quorum_percentage
-            ));
-        }
-        if !ok_quorum(self.shard_quorum_percentage) {
-            violations.push(format!(
-                "shard_quorum_percentage {} is outside (0, 100]",
-                self.shard_quorum_percentage
             ));
         }
         if !ok_percent(self.override_quorum_percentage) {
@@ -489,8 +475,7 @@ mod tests {
         "trans_validation_specs":[],
         "block_validation_specs":[],
         "log_file":"test.log",
-        "shard_count":1,
-        "shard_quorum_percentage":67.0
+        "shard_count":1
     }"#;
 
     fn parse(value: serde_json::Value) -> EnvironmentMetadataSpec {
@@ -511,7 +496,6 @@ mod tests {
     fn spec_validate_accepts_quorum_exactly_100() {
         let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
         value["quorum_percentage"] = json!(100.0);
-        value["shard_quorum_percentage"] = json!(100.0);
         value["override_quorum_percentage"] = json!(100.0);
         assert!(parse(value).validate().is_ok(), "100.0 is inside the inclusive bound");
         // And its mirror: just over the bound still fails.
@@ -554,12 +538,6 @@ mod tests {
         assert!(parse(value).validate().is_err());
     }
 
-    #[test]
-    fn spec_validate_rejects_shard_quorum_percentage_zero() {
-        let mut value: serde_json::Value = serde_json::from_str(VALID_BASE).unwrap();
-        value["shard_quorum_percentage"] = json!(0.0);
-        assert!(parse(value).validate().is_err());
-    }
 
     #[test]
     fn spec_validate_rejects_override_quorum_over_100() {

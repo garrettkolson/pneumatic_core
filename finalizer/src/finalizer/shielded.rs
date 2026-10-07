@@ -230,8 +230,11 @@ pub async fn handle_shielded_vote(&self, message: &Message) -> Result<Vec<u8>, P
 ///    commit-ack path, S5.3).
 /// 6. Clean up the recorded bytes + signature registry entry.
 async fn try_finalize_shielded(&self, tx_id: &str) -> Result<Vec<u8>, PneumaticError> {
-    // 1. Reconcile the collected votes.
-    let reconciled = self.signature_collector.reconcile_signatures(tx_id)?;
+    // 1. Reconcile the collected votes against the responsible set. The gate above
+    // already used a declared total; reconciliation must use the same set, or the
+    // gate and the result are measured against different denominators.
+    let responsible = self.responsible_set()?;
+    let reconciled = self.signature_collector.reconcile_signatures(tx_id, &responsible)?;
 
     // 2. Rebuild the recorded shielded tx from its canonical bytes.
     let stx_bytes = self

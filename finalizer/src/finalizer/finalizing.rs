@@ -52,7 +52,53 @@ pub(crate) fn resolve_stake_metrics(&self) -> (u64, u32) {
     }
 }
 
+/// The set whose votes may finalize a transaction in this epoch.
+///
+/// At `shard_count == 1` the sentinel assigns **every** positive-stake executor
+/// (`src/epoch/leader.rs:181-194`), so the epoch stake set *is* the assigned set
+/// and this is exact rather than an approximation.
+///
+/// `shard_count > 1` is **refused, not guessed**. A shard is chosen from the
+/// per-transaction selection salt, which the finalizer is never told, so the only
+/// set available here is the global one. Demanding the global set's stake from a
+/// node that was asked to vote as part of a shard would fail every sharded
+/// transaction — while looking exactly like a working quorum check, which is worse
+/// than an honest error, because it would hide the real prerequisite: carrying a
+/// selection record (epoch, salt, committee) to the nodes that must verify it.
+/// That is Phase 7's "declare and verify the responsible set".
+pub(crate) fn responsible_set(&self) -> Result<crate::signature_collector::ResponsibleSet, PneumaticError> {
+    if self.env_data.shard_count > 1 {
+        return Err(PneumaticError::Epoch(format!(
+            "Cannot determine the responsible set for shard_count {}: per-shard finalization \
+             requires the sentinel's selection record (epoch, salt, committee). Run with \
+             shard_count 1, or implement the selection record first.",
+            self.env_data.shard_count
+        )));
+    }
+    let stake_set = self.get_stake_set_for_epoch().ok_or_else(|| {
+        PneumaticError::Epoch(
+            "No stake snapshot available for the current epoch. Without a declared responsible \
+             set, a quorum would be measured against whoever happened to vote — which is the \
+             failure this replaces."
+                .to_string(),
+        )
+    })?;
+    Ok(crate::signature_collector::ResponsibleSet::from_stake_set(&stake_set))
+}
+
 /// Attempt to finalize a transaction after quorum is reached.
+///
+/// **This function has no caller in the workspace** (verified by grep, 10/07/2026). The
+/// live standard-token path is `try_finalize_optimistic` above, which per ADR-005/ADR-010
+/// commits on the first authenticated executor vote and waits for no quorum — so this
+/// quorum-gated path is not what governs an ordinary transaction, and a defect audit that
+/// stops here will miss the committer-side gate that does
+/// (`fact-committer-confirmation-gate-did-not-gate`).
+///
+/// It is kept rather than deleted because ADR-005 retains the quorum machinery as the
+/// *conflict-resolution* path, and this is its only implementation. Wiring it to the
+/// conflict case, or removing it along with the machinery beneath it, is a deliberate
+/// Phase 7 decision — not a cleanup to perform as a side effect.
 ///
 /// This is the core pipeline step:
 /// 1. Reconcile executor signatures
@@ -62,8 +108,11 @@ pub(crate) fn resolve_stake_metrics(&self) -> (u64, u32) {
 /// 5. Send to Committers
 /// 6. Clear Sentinels
 async fn try_finalize(&self, tx_id: &str) -> Result<Vec<u8>, PneumaticError> {
-    // Step 1: Reconcile collected signatures
-    let reconciled = self.signature_collector.reconcile_signatures(tx_id)?;
+    // Step 1: Reconcile collected signatures against the set that was responsible
+    // for this transaction. Naming that set is what makes the quorum mean
+    // something: measured against the votes that arrived, one vote was always 100%.
+    let responsible = self.responsible_set()?;
+    let reconciled = self.signature_collector.reconcile_signatures(tx_id, &responsible)?;
 
     // Step 2: Load the transaction from pending registry
     let entry = self.pending_registry.get_transaction_mut(tx_id)?;
