@@ -20,6 +20,10 @@ members = [
     # against the real loaders, so emitted configs cannot drift from what the
     # binaries parse.
     "testnet-gen",
+    # Roadmap Phase 1 (ADR-020): the submitting side. Library + `pneumatic-tx`
+    # CLI that signs transactions as a real sender and POSTs them through a
+    # node's transaction ingress — same wire types, no client protocol.
+    "client",
 ]
 resolver = "2"
 

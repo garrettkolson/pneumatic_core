@@ -174,6 +174,7 @@ pub(crate) use self::transport::route_data_plane;
 
 pub mod build;
 pub mod epoch_coord;
+pub mod ingress_sink;
 pub mod plugins;
 pub mod role_adapters;
 pub mod transport;

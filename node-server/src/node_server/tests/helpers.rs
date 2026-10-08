@@ -248,6 +248,17 @@ impl DataProvider for E2eDataProvider {
     fn get_token(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Token, DataError> {
         Ok(self.token.clone())
     }
+    /// Phase 1: `BlockServices::commit_block` now persists the advanced token
+    /// after every chain append. This fixture drives the SHIELDED dimension
+    /// (pool/chain lockstep) and asserts chain state through the composite's
+    /// token cache, never through this provider's token store — so the write
+    /// is accepted and discarded. A no-op still beats the trait default, which
+    /// would dial a real `DefaultDataProvider` at the ambient local data
+    /// service. Committed-chain persistence is asserted against a REAL service
+    /// in `tests/ingress.rs`.
+    fn save_token(&self, _key: &Vec<u8>, _token: Token, _partition_id: &str) -> Result<(), DataError> {
+        Ok(())
+    }
     fn get_data(&self, _key: &Vec<u8>, _partition_id: &str) -> Result<Vec<u8>, DataError> {
         Err(DataError::DataNotFound)
     }

@@ -67,10 +67,31 @@ impl BlockServices {
     /// Commit a transaction by applying the proposed block to the token's blockchain.
     ///
     /// Flow:
-    /// 1. Get the token from local cache
-    /// 2. Call Token::commit_block (handles validation + chain append)
-    /// 3. Update local cache with the modified token
+    /// 1. Get the token from the local cache — warming the cache from the data
+    ///    service on a miss (Phase 1 ingress roadmap, see below)
+    /// 2. Call `Token::commit_block` (handles validation + chain append)
+    /// 3. Persist the advanced token to the data service — the commit is not
+    ///    reported as successful unless the shared store received the new tip
     /// 4. Return the commit result
+    ///
+    /// **Why the cache warms from the provider.** The committer's token cache
+    /// starts empty at every boot and nothing used to populate it for a token
+    /// that was not created by a committed `DeployContract` (`distribute_token`
+    /// has no production caller). A freshly-booted committer therefore failed
+    /// every Commit against a genesis-seeded (or externally-created) token with
+    /// `TokenNotFound` — a cluster could run the whole pipeline up to the last
+    /// hop and never commit. A miss now loads the token from the data service;
+    /// a token absent there too stays the fail-closed `TokenNotFound`.
+    ///
+    /// **Why the advanced token is persisted.** A normal (non-deploy) commit
+    /// previously mutated only the in-memory cache: no `save_token` ran, so the
+    /// committed block was never observable through the data service, the
+    /// sentinel's ADR-019 selection salt for that token stayed pinned at its
+    /// genesis tip forever, and a committer restart silently rolled the chain
+    /// back. The append and its persistence are one unit here; the entry guard
+    /// is held across the write so a concurrent commit of the same token can
+    /// never reorder its save behind this one (which would leave a staler
+    /// chain in the store than in the cache).
     pub fn commit_block(
         &self,
         commit: &TransactionCommit,
@@ -88,6 +109,25 @@ impl BlockServices {
 
         let token_key = commit.token_id.clone();
 
+        // Cache warm on miss: read the token's canonical state from the shared
+        // store, exactly the record every other role reads. The partition is
+        // the environment's token partition — the same key the sentinel
+        // validates against and the finalizer resolves previous hashes under,
+        // so the committer cannot disagree with them about which token it is
+        // appending to.
+        if !self.tokens.contains_key(&token_key) {
+            let loaded = self
+                .data_provider
+                .get_token(&token_key, &self.env_data.token_partition_id)
+                .map_err(|e| {
+                    CommitterError::TokenNotFound(format!(
+                        "{} (also absent from the data service: {e:?})",
+                        bytes_to_hex(&token_key)
+                    ))
+                })?;
+            self.tokens.insert(token_key.clone(), loaded);
+        }
+
         let mut token_entry = self.tokens.get_mut(&token_key).ok_or_else(|| {
             CommitterError::TokenNotFound(bytes_to_hex(&token_key))
         })?;
@@ -101,6 +141,20 @@ impl BlockServices {
             &self.env_data,
             rollback_tip_hash.as_deref(),
         )?;
+
+        // Persist the advanced token before releasing the cache entry — see
+        // the method docs for why the write rides inside the guard and why a
+        // failure is surfaced rather than swallowed.
+        self.data_provider
+            .save_token(
+                &token_key,
+                token_entry.value().clone(),
+                &self.env_data.token_partition_id,
+            )
+            .map_err(|e| CommitterError::TokenPersist {
+                token_id: bytes_to_hex(&token_key),
+                cause: format!("{e:?}"),
+            })?;
 
         self.logger.log(format!(
             "Committed block to token [{}] (chain length: {}, seq: {})",

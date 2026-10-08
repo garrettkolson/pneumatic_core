@@ -1158,6 +1158,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "pneumatic_client"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "pneumatic_core",
+ "tokio",
+]
+
+[[package]]
 name = "pneumatic_committer"
 version = "0.1.0"
 dependencies = [
@@ -1284,9 +1293,12 @@ dependencies = [
  "async-trait",
  "dashmap",
  "ed25519-dalek",
+ "hex",
  "pasta_curves",
+ "pneumatic_client",
  "pneumatic_committer",
  "pneumatic_core",
+ "pneumatic_data_service",
  "pneumatic_executor",
  "pneumatic_finalizer",
  "pneumatic_prover",

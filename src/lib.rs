@@ -85,6 +85,10 @@
 //! * [`telemetry`] — ops telemetry: `tracing` init, a lock-free metrics
 //!   registry rendered in Prometheus text format, a minimal health/metrics
 //!   HTTP endpoint, and a shutdown-signal helper.
+//! * [`ingress`] — client-facing transaction ingress: a bounded raw-`tokio`
+//!   HTTP endpoint that accepts a sender-signed `Process` envelope over the
+//!   wire, re-authenticates it at the edge, and hands it to an injected sink
+//!   (the node-server routes it into the pipeline; ADR-020 / roadmap Phase 1).
 
 pub mod config;
 pub mod conns;
@@ -95,6 +99,7 @@ pub mod encoding;
 pub mod environment;
 pub mod errors;
 pub mod gossiper;
+pub mod ingress;
 pub mod logging;
 pub mod messages;
 pub mod node;

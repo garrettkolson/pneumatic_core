@@ -112,6 +112,16 @@ pub enum CommitterError {
     PoolRollback {
         block: String,
     },
+    /// Phase 1 (ingress roadmap): persisting the ADVANCED token after a
+    /// successful chain append failed — `save_token` returned a `DataError`.
+    /// The block is on this committer's chain but the shared store has not
+    /// received the new tip, so the committed block is not observable through
+    /// the data service. Surfaced, never swallowed: a commit that cannot
+    /// report its persistence is not "committed" for anyone downstream.
+    TokenPersist {
+        token_id: String,
+        cause: String,
+    },
 }
 
 impl From<io::Error> for CommitterError {

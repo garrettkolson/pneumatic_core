@@ -45,3 +45,12 @@ pasta_curves = "=0.5.2"
 # S5.4 tests: the `Connection` trait is `#[async_trait]`; the recording
 # connection in the e2e test impls it.
 async-trait = "0.1.88"
+# Phase 1 ingress e2e: the REAL data service (the production server half)
+# behind the production `DefaultDataProvider` — the committed chain is read
+# back through a live socket, never through the in-process stub.
+pneumatic_data_service = { path = "../data-service" }
+# Phase 1 ingress e2e: the same `TxClient` a shell operator runs (the
+# `pneumatic-tx` binary's library half) submits through the real ingress.
+pneumatic_client = { path = "../client" }
+# Genesis specs key rows by hex-encoded public keys.
+hex = "0.4"

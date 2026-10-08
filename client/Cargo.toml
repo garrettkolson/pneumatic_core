@@ -1,0 +1,27 @@
+[package]
+name = "pneumatic_client"
+version = "0.1.0"
+edition = "2021"
+
+# The submitting side of roadmap Phase 1 (ADR-020): build a `Transaction`,
+# sign it the way a real sender must (hybrid signature over the canonical
+# bytes, then the `Process` envelope over the body), POST the envelope to a
+# node's transaction ingress, and report the node's honest answer.
+#
+# Deliberately thin. The client holds the SAME wire types the nodes hold —
+# there is no client protocol. If a transaction is accepted here and rejected
+# there, that difference is a bug in one of them, and the E2E test in
+# node-server (client over a real socket into a real composite) is where that
+# equivalence is pinned.
+#
+# It does NOT read committed state: after acceptance, the chain of custody
+# passes to the data service (`DefaultDataProvider::get_token`), which is
+# exactly how the Phase-1 exit test observes the commit.
+[dependencies]
+pneumatic_core = { path = ".." }
+tokio = { version = "1.44.2", features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
+hex = "0.4"
+
+[[bin]]
+name = "pneumatic-tx"
+path = "src/main.rs"

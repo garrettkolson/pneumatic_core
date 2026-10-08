@@ -44,6 +44,10 @@ pub struct TestDataProvider {
     /// When true, `save_stake_snapshot`/`save_executor_set` return an error
     /// (simulates a snapshot-persistence failure).
     pub fail_snapshot_save: bool,
+    /// When true, `save_token` returns an error (Phase 1: simulates the
+    /// committed-chain persistence seam — `BlockServices::commit_block` must
+    /// surface `TokenPersist`, never report a commit the store did not keep).
+    pub fail_token_save: bool,
     /// When true, `save_shielded_pool` returns an error (simulates the S5.3
     /// durability seam: the pool delta cannot be persisted).
     pub fail_shielded_save: bool,
@@ -61,6 +65,7 @@ impl TestDataProvider {
             fail_get: false,
             fail_save: false,
             fail_snapshot_save: false,
+            fail_token_save: false,
             fail_shielded_save: false,
             shielded_pool_state: Mutex::new(None),
         }
@@ -74,6 +79,7 @@ impl TestDataProvider {
             fail_get,
             fail_save,
             fail_snapshot_save: false,
+            fail_token_save: false,
             fail_shielded_save: false,
             shielded_pool_state: Mutex::new(None),
         }
@@ -95,6 +101,15 @@ impl TestDataProvider {
         self.fail_shielded_save = fail;
         self
     }
+
+    /// Arm the committed-chain persistence failure, so `save_token` returns
+    /// `Err`. Used to prove `BlockServices::commit_block` surfaces
+    /// `TokenPersist` when the advanced token cannot be written (Phase 1).
+    pub fn with_token_save_failure(mut self, fail: bool) -> Self {
+        self.fail_token_save = fail;
+        self
+    }
+
     pub fn insert_user(&self, key: Vec<u8>, partition_id: String, user: User) {
         self.users
             .lock()
@@ -140,6 +155,9 @@ impl DataProvider for TestDataProvider {
             .ok_or(DataError::DataNotFound)
     }
     fn save_token(&self, key: &Vec<u8>, token: Token, partition_id: &str) -> Result<(), DataError> {
+        if self.fail_token_save {
+            return Err(DataError::FromStore("simulated save_token failure".to_string()));
+        }
         self.tokens
             .lock()
             .unwrap()
@@ -488,7 +506,13 @@ pub fn make_test_committer_with_slash(
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
     let stake_store = Arc::new(StakeStore::new());
     let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
-    let data_provider_core = Arc::new(pneumatic_core::data::DefaultDataProvider::new());
+    // Phase 1: `BlockServices` now READS (cache warm) and WRITES (committed
+    // chain persistence) through its provider — production injects the SAME
+    // provider into `BlockServices` and the `Committer` (`build.rs`), so the
+    // fixture must not hand it a fresh network-touching `DefaultDataProvider`.
+    // (Before persistence, nothing exercised those calls through
+    // `BlockServices`, which is how the fixture's split stayed hidden.)
+    let data_provider_core: Arc<dyn DataProvider> = data_provider.clone();
     let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         stake_store.clone(),
@@ -728,7 +752,10 @@ pub fn build_committer_for_leader_test(
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
     let stake_store = Arc::new(StakeStore::new());
     let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
-    let data_provider_core = Arc::new(pneumatic_core::data::DefaultDataProvider::new());
+    // Same production-parity fix as `make_test_committer_with_slash`: the
+    // leader-proposal fixture must not wire `BlockServices` to a second,
+    // network-touching provider once it persists committed chains.
+    let data_provider_core: Arc<dyn DataProvider> = dp.clone();
     let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         stake_store.clone(),

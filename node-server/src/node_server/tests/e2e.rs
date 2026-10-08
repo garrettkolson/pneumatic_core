@@ -1435,3 +1435,205 @@ async fn pipeline_cross_contract_call_tx_commits_with_call_status() {
     drive_pipeline_to_commit(&server, &rec, &tx, &account, &sender_pk).await;
     assert_committed_result_hash(&server, &a_id, &out.result_data, "xcall");
 }
+
+// --- (Phase 1) the client path: real socket, real ingress, real data service -
+
+/// The Phase-1 exit test in miniature: ONE transaction, from ONE client, over
+/// ONE real TCP socket into the ingress of a four-role composite, committed —
+/// and then observed through the PRODUCTION data path.
+///
+/// Nothing here is a stub of the thing under test:
+///
+/// * the client is `pneumatic_client::TxClient` speaking HTTP over a real loopback
+///   socket to the real `spawn_ingress_server` responder;
+/// * the ingress sink is the shipped `NodeServer::ingress_sink`, dispatching the
+///   node-signed `Verify` through the same `RoleDispatcher` the RNS bridge uses;
+/// * the data layer is a real `pneumatic_data_service` behind the production
+///   `DefaultDataProvider`, boot-seeded with real genesis (the same two boot
+///   reads `data_service_boot.rs` pins), and the composite's token cache starts
+///   EMPTY — `commit_block`'s lazy warm and its post-append `save_token` both
+///   cross the socket;
+/// * the terminal assertion reads the committed chain back through a *fresh*
+///   provider against the service, and recomputes the expected result hash
+///   outside the pipeline (the `selection_salt_through_the_production_data_provider`
+///   discipline: prove the effect where production reads it, never through the
+///   machinery that wrote it).
+///
+/// The inter-role relay (recorder → dispatch) is the established composite
+/// fixture convention standing in for mesh gossip; everything else — wire,
+/// HTTP, signatures, dispatch, execution, commit, persistence — is production.
+#[tokio::test]
+async fn client_transaction_through_the_ingress_commits_observable_through_the_data_service() {
+    use pneumatic_client::{ClientError, TxClient};
+    use pneumatic_core::conns::ConnTarget;
+    use pneumatic_core::data::DefaultDataProvider;
+    use pneumatic_core::ingress::spawn_ingress_server_on;
+    use pneumatic_core::telemetry::{HealthState, Metrics};
+    use pneumatic_data_service::{
+        apply_genesis, spawn as boot_data_service, DataStore, GenesisNode, GenesisSpec,
+    };
+
+    // The composite's token partition, as `CONTRACT_SPEC` declares it — the
+    // same partition the committer's gas deduction and the boot reads use.
+    const PARTITION: &str = "token";
+
+    // --- production data layer: real service, real client half ------------
+    let store = Arc::new(DataStore::new());
+    let (bound, accept_thread) = boot_data_service(
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().expect("loopback:0"),
+        store.clone(),
+        None,
+    )
+    .expect("the data service binds an ephemeral port");
+    std::mem::forget(accept_thread); // keep the service alive for the test's scope
+
+    let provider: Arc<dyn DataProvider> =
+        Arc::new(DefaultDataProvider::new().with_source(ConnTarget::Remote(bound)));
+
+    // Build the config FIRST — genesis must name the composite's own key,
+    // and boot reads (stake snapshot, shielded pool) must not fail closed.
+    let cfg = contract_runtime_config(vec![bad_peer()], type_config_floor(0), provider.clone());
+    let own_key = cfg.public_key.clone();
+    apply_genesis(
+        &GenesisSpec {
+            environment_id: "test_env".to_string(),
+            token_partition_id: PARTITION.to_string(),
+            stake_snapshot_epochs: vec![0, 1],
+            shielded_root_recency: 10,
+            nodes: vec![GenesisNode {
+                public_key_hex: hex::encode(&own_key),
+                stake: 2_000,
+                fuel_balance: 100_000,
+            }],
+            accounts: Vec::new(),
+            seed_shielded_pool: true,
+            seed_partition_token: true,
+        },
+        &*provider,
+    )
+    .expect("genesis applies against a live service");
+
+    // --- the submitting account and the token, both in the SERVICE --------
+    // (Same seed the `pneumatic-tx` CLI defaults to. The token exists ONLY in
+    // the data service — the composite's cache starts empty, so every read
+    // the pipeline performs on it, including `commit_block`'s warm, is a
+    // socket read.)
+    let account = Arc::new(Ed25519Provider::from_seed([0x42u8; 32]));
+    let sender_pk = account.public_key().expect("client pubkey");
+    provider
+        .save_user(&sender_pk, pipeline_user(&sender_pk), PARTITION)
+        .expect("sender user written through the production provider");
+    let token = transfer_token(vec![0x0A]);
+    let token_id = token.id.clone();
+    provider
+        .save_token(&token_id, token.clone(), PARTITION)
+        .expect("genesis token written through the production provider");
+
+    // --- the four-role composite over the production provider -------------
+    // Wrapped in `Arc` exactly as the binary does — `ingress_sink` needs a
+    // shared handle to dispatch to (the sink owns a clone of this Arc).
+    let stake = Arc::new(MapStakeProvider::with_default(2_000));
+    let server = Arc::new(build_runtime(cfg.clone(), stake, provider.clone()).expect("composite boots"));
+
+    // Mesh gossip stands in: own key in all four buckets, each recording
+    // what the previous role gossiped (the fixture convention of every
+    // composite e2e in this file).
+    let rec = fresh_recorders();
+    let reg = server.node_registry();
+    let c = |r: Arc<std::sync::Mutex<Vec<Vec<u8>>>>| {
+        Box::new(RecordingConnection { recorder: r }) as Box<dyn Connection>
+    };
+    assert!(reg.register_peer(own_key.clone(), [1u8; 16], &NodeRegistryType::Sentinel, c(rec.sentinels.clone())), "sentinel peer");
+    assert!(reg.register_peer(own_key.clone(), [2u8; 16], &NodeRegistryType::Executor, c(rec.executors.clone())), "executor peer");
+    assert!(reg.register_peer(own_key.clone(), [3u8; 16], &NodeRegistryType::Finalizer, c(rec.finalizers.clone())), "finalizer peer");
+    assert!(reg.register_peer(own_key.clone(), [4u8; 16], &NodeRegistryType::Committer, c(rec.committers.clone())), "committer peer");
+
+    // --- the ingress on a real socket, wired to the shipped sink ----------
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("ingress bind");
+    let (ingress_addr, _ingress) = spawn_ingress_server_on(
+        listener,
+        server.ingress_sink(),
+        Arc::new(HealthState::new("e2e-ingress")),
+        Arc::new(Metrics::new()),
+    )
+    .expect("ingress spawns");
+
+    // --- the client: sign, POST, and be accepted --------------------------
+    let client = TxClient::new(ingress_addr, "test_env", account.clone());
+    let receipt = client
+        .submit_transfer("e2e_ingress_1", &token_id, vec![0x77], 100, 1)
+        .await
+        .expect("the node accepts the client submission");
+    assert_eq!(receipt.tx_id, "e2e_ingress_1");
+
+    // --- relay the remaining pipeline hops (mesh stand-in) -----------------
+    let exec_preload = next_recorded(&rec.executors, "Preload").await;
+    server.dispatch(exec_preload).await.expect("executor Preload");
+    let _ = next_recorded(&rec.finalizers, "Preload").await;
+    let fin_sign = next_recorded(&rec.finalizers, "Sign").await;
+    server.dispatch(fin_sign).await.expect("finalizer Sign");
+    let commit = next_recorded(&rec.committers, "Commit").await;
+    server.dispatch(commit).await.expect("committer Commit");
+
+    // --- the independent expectation, computed OUTSIDE the pipeline -------
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry};
+    let contract = token.get_asset::<SmartContract>().expect("transfer token has a contract asset");
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    let out = engines
+        .get("Transfer")
+        .expect("Transfer registered")
+        .execute(&ExecutionInput {
+            tx: &pipeline_tx(&*account, &sender_pk, "e2e_ingress_1", "Transfer", &token_id, &vec![0x77], Some(100), vec![]),
+            contract: &contract,
+            sender_state: &pipeline_user(&sender_pk),
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("transfer engine executes");
+    let expected_hash = BasicHashProvider::new().hash(&out.result_data);
+
+    // --- TERMINAL: read the commit back through the production path -------
+    // A FRESH provider against the same live service — nothing in-process
+    // short of the socket can make this read succeed.
+    let reader: Arc<dyn DataProvider> =
+        Arc::new(DefaultDataProvider::new().with_source(ConnTarget::Remote(bound)));
+    let committed = reader
+        .get_token(&token_id, PARTITION)
+        .expect("the committed chain is readable through the data service");
+    assert_eq!(
+        committed.blockchain.get_count(),
+        2,
+        "the service must hold genesis + the block THIS client's transaction committed"
+    );
+    let block = committed.blockchain.get_block_at(1).expect("committed block");
+    assert_eq!(
+        block.signed_trans.transaction.result_hash, expected_hash,
+        "the committed block's result hash must match the engine output computed outside the pipeline"
+    );
+    assert_eq!(
+        block.signed_trans.transaction.id, "e2e_ingress_1",
+        "the block carries THIS client's transaction"
+    );
+
+    // The committer's live cache and the persisted chain are the same object
+    // graph — they must not diverge at rest.
+    assert_eq!(
+        server.tokens().get(&token_id).expect("cache warmed by commit").blockchain.get_count(),
+        2,
+        "the committer cache and the persisted chain agree"
+    );
+
+    // --- the honest negative: a foreign chain never reaches the pipeline --
+    let foreign = TxClient::new(ingress_addr, "other_env", account.clone());
+    let err = foreign
+        .submit_transfer("e2e_ingress_wrong_chain", &token_id, vec![0x77], 100, 1)
+        .await
+        .expect_err("a submission naming a foreign chain must be refused");
+    match err {
+        ClientError::Rejected { status, .. } => assert_eq!(status, 422, "chain mismatch is a pipeline-level refusal: {err}"),
+        other => panic!("expected a 422 refusal, got {other:?}"),
+    }
+}

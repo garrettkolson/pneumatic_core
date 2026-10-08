@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use pneumatic_core::blocks::{Block, BlockFactory};
 use pneumatic_core::config::Config;
 use pneumatic_core::crypto::{AsymCryptoProvider, BasicHashProvider};
-use pneumatic_core::data::{DataError, DataProvider, DefaultDataProvider};
+use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::config::BootstrapPeer;
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::errors::PneumaticError;
@@ -226,7 +226,13 @@ fn make_test_committer(data_provider: Arc<TestDataProvider>) -> (
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
     let stake_store = Arc::new(StakeStore::new());
     let staking_manager = Arc::new(StakingManager::new(stake_store.clone(), env_data.logger.clone()));
-    let data_provider_core = Arc::new(DefaultDataProvider::new());
+    // Phase 1: `BlockServices` now persists the committed chain through its
+    // provider (and warms its token cache on a miss). Production injects ONE
+    // provider into both `BlockServices` and the `Committer`; this fixture must
+    // not hand it a network-touching `DefaultDataProvider` — before
+    // persistence existed nothing exercised those calls through `BlockServices`
+    // (the same split the unit fixtures had).
+    let data_provider_core: Arc<dyn DataProvider> = data_provider.clone();
     let candidate_registry = Arc::new(CandidateRegistry::new());
     let epoch_reconciler = Arc::new(EpochReconciler::new(
         stake_store.clone(),

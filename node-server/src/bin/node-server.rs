@@ -20,12 +20,18 @@
 //! * `PNEUMATIC_HEALTH_ADDR` — health/metrics bind address
 //!   (default `127.0.0.1:9500`; use `0.0.0.0:9500` in containers).
 //! * `PNEUMATIC_EPOCH_INTERVAL_MS` — coordinator tick cadence (default 5000).
+//! * `PNEUMATIC_INGRESS_ADDR` — opt-in client transaction ingress
+//!   (`POST /v1/transactions`, ADR-020). Unset = no ingress surface. The
+//!   runbook pins this to loopback until Phase-4 rate limiting exists; a
+//!   malformed address or a bind failure aborts boot, because an explicitly
+//!   requested surface that silently does not exist is worse than no node.
 
 use std::env;
 use std::sync::Arc;
 
 use pneumatic_core::config::Config;
 use pneumatic_core::data::{DataProvider, DefaultDataProvider};
+use pneumatic_core::ingress::spawn_ingress_server;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::telemetry::{
     init_tracing, spawn_health_server, wait_for_shutdown_signal, HealthState, Metrics,
@@ -147,6 +153,27 @@ async fn main() {
         health_addr = %health_addr,
         "node-server started"
     );
+
+    // 4b. Client transaction ingress (ADR-020), opt-in. Unlike the health
+    // endpoint (fail-soft: a missing scraper surface is not a reason to
+    // stop the node), an operator who sets PNEUMATIC_INGRESS_ADDR explicitly
+    // asked for this surface — a malformed address or a lost bind aborts the
+    // boot instead of leaving a node that answers 200 to nothing.
+    if let Ok(raw) = env::var("PNEUMATIC_INGRESS_ADDR") {
+        let addr: std::net::SocketAddr = match raw.trim().parse() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(value = %raw, error = %e, "PNEUMATIC_INGRESS_ADDR is not a socket address");
+                eprintln!("PNEUMATIC_INGRESS_ADDR is not a socket address: {raw}");
+                return;
+            }
+        };
+        if let Err(e) = spawn_ingress_server(addr, server.ingress_sink(), health.clone(), metrics.clone()) {
+            tracing::error!(%addr, error = ?e, "transaction ingress failed to bind");
+            eprintln!("Transaction ingress failed to bind {addr}: {e:?}");
+            return;
+        }
+    }
 
     // 5. Shutdown channel shared by the coordinator and the metrics poller.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
