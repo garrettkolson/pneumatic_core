@@ -10,11 +10,41 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use pneumatic_core::config::{meets_minimum_stake, Config};
 use pneumatic_core::crypto::AsymCryptoProvider;
+use pneumatic_core::environment::CostModel;
 use pneumatic_core::rns::identity::NodeIdentity;
 use serde::Serialize;
 
 use crate::topology::{Mesh, NodePlan, Placement, Role, TopologyMode};
+
+/// The role set a composite with `stake` will install and declare at boot —
+/// the same qualification the composite applies (`meets_minimum_stake`: the
+/// stake must clear BOTH the protocol-global floor and the role's own floor).
+/// The floors are read from the same env template the nodes boot with,
+/// falling back to the same defaults the composite falls back to, so the
+/// manifest records what the nodes will actually run — not what they are
+/// named after. A single-role manifest over a composite genesis is a fiction:
+/// the peers' directories disagree with it, and mesh-probe rightly reports
+/// the honest composite as wrong-bucket 36 ways at once.
+fn qualifying_roles(stake: u64, template: &serde_json::Value) -> Vec<Role> {
+    let cost_model = template.get("cost_model");
+    let global_min = cost_model
+        .and_then(|c| c.get("global_min_stake"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(CostModel::default_global_min_stake);
+    Role::ALL
+        .into_iter()
+        .filter(|role| {
+            let type_min = cost_model
+                .and_then(|c| c.get("per_type_min_stake"))
+                .and_then(|m| m.get(role.registry_type_str()))
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(Config::default_min_stake);
+            meets_minimum_stake(stake, global_min, type_min)
+        })
+        .collect()
+}
 
 /// Everything the generator needs. Defaults are chosen so that
 /// `pneumatic_testnet_gen --out /tmp/testnet` produces something bootable.
@@ -48,6 +78,13 @@ pub struct GenSpec {
     /// keystore orphans the stake that genesis put under the old key, so a
     /// re-run must be explicit.
     pub force_keys: bool,
+    /// Transfer-token ids (hex) to seed in genesis, so submitted transactions
+    /// name a token that exists. Empty = none (the historical shape).
+    pub tx_tokens: Vec<String>,
+    /// Non-validator account public keys (hex) to fund in genesis — usually
+    /// the `pneumatic-tx` sender, whose key derives from its seed and must be
+    /// a genesis account before it can submit anything.
+    pub client_accounts: Vec<String>,
 }
 
 impl GenSpec {
@@ -76,6 +113,8 @@ impl GenSpec {
             placement: Placement::SingleHost,
             bind_address: None,
             force_keys: false,
+            tx_tokens: Vec::new(),
+            client_accounts: Vec::new(),
         }
     }
 
@@ -96,6 +135,13 @@ impl GenSpec {
 pub struct NodeReport {
     pub name: String,
     pub role: Role,
+    /// Every role this node runs. A composite installs one plugin per role its
+    /// stake qualifies for, so the manifest records the qualifying set — not
+    /// the naming role — because that is what the node declares to peers and
+    /// what mesh-probe must expect in every directory. A cluster whose
+    /// genesis pays below every floor would run no roles at all; generation
+    /// refuses (see `qualifying_roles`).
+    pub roles: Vec<Role>,
     pub dir: String,
     /// Where peers dial this node. A launcher reads this to place the node on
     /// the right machine and to open the right firewall range.
@@ -179,6 +225,20 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
     }
 
     // --- Pass 2: config.json, which needs the whole identity set. ---
+    // The role set every node runs is a stake derivation, not a label: the
+    // composite installs one plugin per role its stake qualifies for. Since
+    // genesis pays every validator the same `spec.stake`, the qualifying set
+    // is the same for all of them. A stake that qualifies for nothing would
+    // boot every node running no role — a cluster that forms no pipeline — so
+    // refuse it here rather than emit a fiction the probe must later call out.
+    let runs_roles = qualifying_roles(spec.stake, &template);
+    if runs_roles.is_empty() {
+        return Err(format!(
+            "genesis stake {} clears no role floor (global + per-type): every node \
+             would boot running no role. Raise --stake or lower the env floors.",
+            spec.stake
+        ));
+    }
     let mut nodes = Vec::new();
     for (index, plan) in mesh.plan.iter().enumerate() {
         let dir = node_dir(&out_dir, &plan.node.name);
@@ -188,6 +248,7 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
         nodes.push(NodeReport {
             name: plan.node.name.clone(),
             role: plan.node.role,
+            roles: runs_roles.clone(),
             dir: dir.display().to_string(),
             address: plan.address.clone(),
             rns_port: plan.base_port,
@@ -207,7 +268,7 @@ pub fn generate(spec: &GenSpec) -> Result<Report, String> {
         .unwrap_or(10) as usize;
     write_json(
         &genesis_path,
-        &build_genesis_json(spec, &nodes, recency),
+        &build_genesis_json(spec, &nodes, recency)?,
     )?;
 
     let manifest = serde_json::json!({
@@ -371,7 +432,23 @@ fn build_genesis_json(
     spec: &GenSpec,
     nodes: &[NodeReport],
     shielded_root_recency: usize,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
+    // Validate hex at generation time, not at first boot: a mistyped token id
+    // surfaced by the data service would be discovered only after the fleet is
+    // up, which is the discovery class this generator exists to remove.
+    for id in &spec.tx_tokens {
+        hex::decode(id.trim()).map_err(|e| format!("--tx-token {id:?} is not valid hex: {e}"))?;
+    }
+    let mut accounts: Vec<serde_json::Value> = Vec::new();
+    for key in &spec.client_accounts {
+        hex::decode(key.trim())
+            .map_err(|e| format!("--client-account {key:?} is not valid hex: {e}"))?;
+        accounts.push(serde_json::json!({
+            "public_key_hex": key.trim(),
+            "fuel_balance": spec.fuel_balance,
+            "stake": 0,
+        }));
+    }
     let validators: Vec<serde_json::Value> = nodes
         .iter()
         .map(|n| {
@@ -382,7 +459,17 @@ fn build_genesis_json(
             })
         })
         .collect();
-    serde_json::json!({
+    let tokens: Vec<serde_json::Value> = spec
+        .tx_tokens
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "token_id_hex": id.trim(),
+                "name": format!("testnet-token-{}", id.trim()),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
         "_about": "Generated by pneumatic_testnet_gen. public_key_hex is each node's Ed25519 key \
                    (NOT its RNS key, which lives in the nodes' bootstrap_peers). Regenerate with \
                    the generator rather than editing by hand.",
@@ -392,10 +479,11 @@ fn build_genesis_json(
         "stake_snapshot_epochs": [0, 1],
         "shielded_root_recency": shielded_root_recency,
         "nodes": validators,
-        "accounts": [],
+        "accounts": accounts,
+        "tokens": tokens,
         "seed_shielded_pool": true,
         "seed_partition_token": true,
-    })
+    }))
 }
 
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {

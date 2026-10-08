@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use pneumatic_core::data::{DataProvider, DataError, ShieldedPoolState};
 use pneumatic_core::epoch::StakeSet;
 use pneumatic_core::shielded::{root_to_bytes, IncrementalMerkleTree, DEFAULT_DEPTH};
-use pneumatic_core::tokens::Token;
+use pneumatic_core::tokens::{SmartContract, Token};
 use pneumatic_core::user::User;
 
 /// A funded, role-eligible validator identity in the genesis set.
@@ -64,6 +64,37 @@ pub struct GenesisAccount {
     pub fuel_balance: u64,
     #[serde(default)]
     pub stake: u64,
+}
+
+/// A transfer token seeded so that submitted transactions have a token to
+/// name.
+///
+/// There is no wire action that creates a token, and a tokenless chain cannot
+/// be exercised at all through the ingress path: the sentinel validates the
+/// transaction's token and ADR-019 salts deterministic selection with its
+/// chain tip, so a transaction naming a token the service does not hold is
+/// refused, not bootstrapped. These records are what makes a generated
+/// testnet able to carry the Phase-2 sustained-traffic run
+/// (`pneumatic-tx --repeat N`) without a hand-written store.
+///
+/// The seeded shape is the one the executor's standard path expects: a
+/// `SmartContract` asset with no bytecode and no `contract_engine` metadata,
+/// so `select_engine` falls through to `"Transfer"`, and the `"Executed"`
+/// block-validation spec (the standard pipeline, not the self-verified
+/// direct-to-committer path). The chain starts empty — the documented genesis
+/// convention for the selection salt (an unmined chain is explicit, not a
+/// collapsed error).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GenesisToken {
+    /// Token id, hex-encoded. The id a submitted transaction names.
+    pub token_id_hex: String,
+    /// Asset name carried on the contract record (identification only).
+    #[serde(default = "default_token_name")]
+    pub name: String,
+}
+
+fn default_token_name() -> String {
+    "genesis-token".to_string()
 }
 
 /// The genesis description for one environment.
@@ -92,6 +123,10 @@ pub struct GenesisSpec {
     /// Non-validator accounts to fund.
     #[serde(default)]
     pub accounts: Vec<GenesisAccount>,
+    /// Transfer tokens to seed, so submitted transactions name a token that
+    /// exists. See [`GenesisToken`].
+    #[serde(default)]
+    pub tokens: Vec<GenesisToken>,
     /// Seed the pristine shielded pool. Required for a composite/committer to
     /// boot against a real `DefaultDataProvider`, which never reports "absent".
     #[serde(default = "default_true")]
@@ -129,18 +164,20 @@ pub struct GenesisReport {
     pub total_stake: u64,
     pub pool_seeded: bool,
     pub partition_token_seeded: bool,
+    pub tokens_seeded: usize,
 }
 
 impl fmt::Display for GenesisReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} users, {} stake snapshot(s), total stake {}, pool seeded: {}, partition token: {}",
+            "{} users, {} stake snapshot(s), total stake {}, pool seeded: {}, partition token: {}, transfer tokens: {}",
             self.users_written,
             self.stake_snapshots_written,
             self.total_stake,
             self.pool_seeded,
             self.partition_token_seeded,
+            self.tokens_seeded,
         )
     }
 }
@@ -155,6 +192,9 @@ pub enum GenesisError {
     /// A hex public key was malformed (caught here rather than at the first
     /// registration attempt, minutes later, on a different node).
     BadPublicKey { field: String, error: hex::FromHexError },
+    /// A hex token id was malformed, caught with the same fail-early reasoning
+    /// as [`GenesisError::BadPublicKey`].
+    BadTokenId { field: String, error: hex::FromHexError },
     /// The data service refused a write.
     Store(String),
     /// The spec was structurally fine but unusable (no epochs to seed, etc.).
@@ -168,6 +208,9 @@ impl fmt::Display for GenesisError {
             GenesisError::Json(e) => write!(f, "parse genesis spec: {e}"),
             GenesisError::BadPublicKey { field, error } => {
                 write!(f, "malformed hex public key in {field}: {error}")
+            }
+            GenesisError::BadTokenId { field, error } => {
+                write!(f, "malformed hex token id in {field}: {error}")
             }
             GenesisError::Store(m) => write!(f, "data service refused a genesis write: {m}"),
             GenesisError::Invalid(m) => write!(f, "invalid genesis spec: {m}"),
@@ -294,6 +337,38 @@ pub fn apply(
             .save_shielded_pool(&state, &spec.token_partition_id)
             .map_err(|e| store_err("save_shielded_pool", &e))?;
         report.pool_seeded = true;
+    }
+
+    // --- transfer tokens (the ids submitted transactions name) -------------
+    // Written after the stake records on purpose: the records above gate
+    // BOOT, these gate TRAFFIC. A genesis that fails on a bad token id must
+    // not leave a half-booted store behind — the decode errors here fire
+    // before any of these writes, and none of these writes is needed for a
+    // node to start.
+    for token_spec in &spec.tokens {
+        let field = format!("tokens[].token_id_hex ({})", token_spec.token_id_hex);
+        let id = hex::decode(token_spec.token_id_hex.trim())
+            .map_err(|error| GenesisError::BadTokenId { field, error })?;
+        let mut token = Token::new().with_id(id.clone());
+        // The standard pipeline: "Executed" block validation, and a contract
+        // asset with no engine metadata so `select_engine` falls through to
+        // the Transfer engine (same shape the ingress exit test seeds).
+        token.block_validation_spec_name = "Executed".to_string();
+        let contract = SmartContract {
+            name: token_spec.name.clone(),
+            bytecode: vec![],
+            version: "1".to_string(),
+            storage: Default::default(),
+            owners: vec![],
+            threshold: 0,
+        };
+        token
+            .set_asset(&contract)
+            .map_err(|e| GenesisError::Store(format!("set_asset(token): {e}")))?;
+        provider
+            .save_token(&id, token, &spec.token_partition_id)
+            .map_err(|e| store_err("save_token(transfer)", &e))?;
+        report.tokens_seeded += 1;
     }
 
     // --- partition token (vestigial; see GenesisSpec::seed_partition_token) ----

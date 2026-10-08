@@ -75,6 +75,28 @@ impl Committer {
         // sibling blocks could both validate and both append. `append_validated_block` reads the tip
         // and appends inside one `&mut self`, which maps here to a single `get_mut` on the token.
         {
+            // Cache warm on miss — the SAME rule `commit_block` follows
+            // (block_services.rs): the in-memory token map starts empty and
+            // nothing in the multi-host flow bootstraps it, so the token's
+            // canonical state must be read from the shared store before the
+            // append, under the same partition key every other role uses.
+            // In the 10/08/2026 multi-host rehearsal every gossip threw
+            // `TokenNotFound("0a")` here even though genesis sat in the data
+            // service: the single-composite e2e never exposed it because the
+            // `Commit` message (which warms) always preceded `BlockFinalized`
+            // (which didn't) in a shared-process registry flow.
+            if !self.tokens.contains_key(token_id) {
+                let loaded = self
+                    .data_provider
+                    .get_token(token_id, &self.env_data.token_partition_id)
+                    .map_err(|e| {
+                        CommitterError::TokenNotFound(format!(
+                            "{} (also absent from the data service: {e:?})",
+                            bytes_to_hex(token_id)
+                        ))
+                    })?;
+                self.tokens.insert(token_id.clone(), loaded);
+            }
             let mut entry = self.tokens.get_mut(token_id).ok_or_else(|| {
                 CommitterError::TokenNotFound(bytes_to_hex(token_id))
             })?;

@@ -287,6 +287,18 @@ impl Config {
         for file in fs::read_dir(dir)? {
             let file_path_buf = file?.path();
             let file_path = file_path_buf.as_path();
+            // Spec candidates only. The env dir legitimately holds non-spec
+            // files: in the multi-host deployment the node's OWN runtime log
+            // (`pneumatic.log`) is written into the bind-mounted env dir, and
+            // the 10/08/2026 rehearsal found every node dead on restart — the
+            // loader had parsed its "[2026-10-08 …" log lines as a spec
+            // ("invalid type: integer `2026`, expected struct
+            // EnvironmentMetadataSpec") and failed the boot fail-closed. A
+            // `.json` file stays fully fail-closed below (malformed specs must
+            // still stop boot); anything else is not a spec by definition.
+            if file_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
             let env_file_read = &match fs::read(file_path) {
                 Ok(r) => r,
                 Err(e) => {
@@ -407,7 +419,11 @@ impl Config {
         configs
     }
 
-    fn default_min_stake() -> u64 {
+    /// The default per-type stake floor (`default_type_configs` seeds every
+    /// role with it). Public because the testnet generator must derive the
+    /// same role qualification a composite computes at boot: the manifest's
+    /// declared-role list is a derivation, never an assumption.
+    pub fn default_min_stake() -> u64 {
         10
     }
 
@@ -745,6 +761,47 @@ mod config_tests {
         let metas = Config::get_environment_metadata_from(dir.path())
             .expect("empty file must be skipped, not fatal");
         assert_eq!(metas.len(), 1);
+    }
+
+    #[test]
+    fn env_dir_ignores_a_nonempty_non_json_file() {
+        // The 10/08/2026 multi-host restart killer: the node's runtime log
+        // accumulates in the bind-mounted env dir, and a NON-EMPTY file that
+        // is not a spec used to fail boot fail-closed ("invalid type: integer
+        // `2026`") — the old empty-file skip proved blind, since real logs are
+        // never empty. A restart must never depend on which files the last
+        // run left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("pneumatic.log");
+        std::fs::write(
+            dir.path().join("env.json"),
+            valid_env_spec_json(log_path.to_str().unwrap()),
+        )
+        .unwrap();
+        std::fs::write(
+            &log_path,
+            b"[2026-10-08T13:46:02] node booted; 12 peers; epoch 0\n",
+        )
+        .unwrap();
+
+        let metas = Config::get_environment_metadata_from(dir.path())
+            .expect("a runtime log in the env dir must not poison boot");
+        assert_eq!(metas.len(), 1);
+
+        // ...while a MALFORMED .json stays fatal (the skip must not leak into
+        // the spec path — boot must never ignore a broken environment spec).
+        std::fs::write(dir.path().join("broken_env.json"), b"{ not json }").unwrap();
+        match Config::get_environment_metadata_from(dir.path()) {
+            Ok(_) => panic!("malformed .json spec must stay fatal"),
+            Err(e) => assert!(
+                matches!(e.kind(), std::io::ErrorKind::InvalidData)
+                    || format!("{e}").contains("invalid type")
+                    || format!("{e}").contains("expected")
+                    || format!("{e}").contains("trailing")
+                    || format!("{e}").contains("key must be a string"),
+                "fatal, but not via a swallowed-assert: {e}"
+            ),
+        }
     }
 
     #[test]

@@ -66,6 +66,7 @@ fn genesis_spec(node_keys: &[Vec<u8>]) -> GenesisSpec {
             .collect(),
         accounts: Vec::new(),
         seed_shielded_pool: true,
+        tokens: Vec::new(),
         seed_partition_token: true,
     }
 }

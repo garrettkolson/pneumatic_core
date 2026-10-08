@@ -860,8 +860,12 @@ async fn e2e_standard_pipeline_commits_over_rns() {
             }
         });
     }
-    // N_FIN: "Preload" → both finalizers (register the tx); "Sign" → both
-    // finalizers (C1 gate + optimistic finalize on the first vote).
+    // N_FIN: "PreloadForFinalizer" → both finalizers (register the tx); "Sign" →
+    // both finalizers (C1 gate + optimistic finalize on the first vote). The
+    // finalizer-bound preload carries its OWN action, not the executor's
+    // "Preload" — a name shared across roles misroutes on a multi-role host
+    // (fact-composite-fanout-role-collision). Matching the exact name here also
+    // keeps the SENTINEL's executor-bound "Preload" out of the finalizers.
     {
         let f1 = f1_finalizer.clone();
         let f2 = f2_finalizer.clone();
@@ -874,7 +878,7 @@ async fn e2e_standard_pipeline_commits_over_rns() {
                 let action = action.clone();
                 rt.spawn(async move {
                     match action.as_str() {
-                        "Preload" => {
+                        "PreloadForFinalizer" => {
                             if let Err(e) = finalizer.handle_preload(&message).await {
                                 eprintln!("[e2e] finalizer.handle_preload error: {e:?}");
                             }

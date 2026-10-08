@@ -32,7 +32,6 @@ use std::sync::Arc;
 use pneumatic_core::config::Config;
 use pneumatic_core::data::{DataProvider, DefaultDataProvider};
 use pneumatic_core::ingress::spawn_ingress_server;
-use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::telemetry::{
     init_tracing, spawn_health_server, wait_for_shutdown_signal, HealthState, Metrics,
 };
@@ -204,44 +203,15 @@ async fn main() {
         tracing::info!("epoch coordinator loop stopped for shutdown");
     });
 
-    // 7. Metrics poller: read-only gauges from the host's shared state.
-    let metrics_poller = server.clone();
-    let mut poller_shutdown = shutdown_rx;
-    tokio::spawn(async move {
-        loop {
-            metrics.set_gauge("pneumatic_epoch_current", metrics_poller.current_epoch());
-            metrics.set_gauge(
-                "pneumatic_installed_roles",
-                metrics_poller.installed_roles().len() as u64,
-            );
-            let mut peers = 0u64;
-            for node_type in [
-                NodeRegistryType::Committer,
-                NodeRegistryType::Sentinel,
-                NodeRegistryType::Executor,
-                NodeRegistryType::Finalizer,
-                NodeRegistryType::Archiver,
-            ] {
-                if let Some(nodes) = metrics_poller.node_registry().get_nodes(&node_type) {
-                    peers += nodes.len() as u64;
-                }
-            }
-            metrics.set_gauge("pneumatic_node_peers", peers);
-            metrics.set_gauge("pneumatic_tokens_cached", metrics_poller.tokens().len() as u64);
-            metrics.set_gauge(
-                "pneumatic_pending_transactions",
-                metrics_poller.pending_registry().in_flight_count() as u64,
-            );
-            metrics.set_gauge(
-                "pneumatic_shielded_transactions",
-                metrics_poller.pending_registry().shielded_count() as u64,
-            );
-            metrics.set_gauge("pneumatic_up", 1);
-            if poller_shutdown.changed().await.is_err() {
-                break; // sender dropped: process is unwinding
-            }
-        }
-    });
+    // 7. Metrics poller: read-only gauges from the host's shared state, on a
+    //    real cadence. Lives in the library so the refresh regression is
+    //    testable — the loop inlined here once polled exactly once, because
+    //    `shutdown_rx.changed()` does not tick (see `metrics_poller` docs).
+    let _metrics_poller = server.spawn_metrics_poller(
+        metrics.clone(),
+        shutdown_rx,
+        std::time::Duration::from_secs(2),
+    );
 
     // 8. Block on the shutdown signal, then drain in order (see module docs).
     wait_for_shutdown_signal().await;

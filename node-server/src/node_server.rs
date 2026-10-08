@@ -34,7 +34,25 @@ use pneumatic_committer::block_services::BlockServices;
 use super::role_dispatcher::{RoleDispatcher, RoleError, RoleHandler, RoleHost};
 
 /// `action` strings the Committer owns on the inbound bus.
-const COMMITTER_ACTIONS: &'static [&'static str] = &["Commit"];
+///
+/// Mirrors `Committer::handle_message`'s dispatch table EXACTLY
+/// (committer/src/committer.rs:304) — the RoleHandler adapter delegates the
+/// message there, and the standalone handler runs its own fail-closed sender
+/// auth (`allowed_senders_for`) per action. A narrower list here silently
+/// lobotomises the gossip half of the pipeline: the 10/08/2026 multi-host
+/// rehearsal committed nothing because `BlockFinalized` — the gossip that
+/// carries the finalized block itself — was refused at the dispatcher as
+/// `UnknownAction` before the handler could authenticate, validate, and apply
+/// it. Any drift between these two lists is a bug: extend both together.
+const COMMITTER_ACTIONS: &'static [&'static str] = &[
+    "Commit",
+    "DistributeToken",
+    "DistributeBlock",
+    "EpochReconcile",
+    "BlockFinalized",
+    "BlockConfirmed",
+    "BlockQuorumReached",
+];
 /// `action` strings the Executor owns (preload a transaction's data ahead of commit).
 const EXECUTOR_ACTIONS: &'static [&'static str] = &["Preload"];
 /// `action` strings the Sentinel owns (verify inbound transactions).
@@ -46,8 +64,17 @@ const SENTINEL_ACTIONS: &'static [&'static str] = &["Verify"];
 /// fail-closed by default: an action not listed here is rejected by
 /// `RoleDispatcher::dispatch` (`UnknownAction`). Since S5.2 the arm bodies in
 /// `handle` route to the real sign-the-public-outputs handlers.
+///
+/// `"PreloadForFinalizer"` is the Finalizer-OWNED preload (the executor's
+/// stamped-tx hop, and the sentinel's pre-notify) that populates the
+/// Finalizer's own `pending_registry` so its optimistic-finality path has an
+/// executable entry before a `"Sign"` arrives. It is deliberately NOT the
+/// executor's `"Preload"`: `RoleDispatcher` admits an action to exactly one
+/// installed role, so on a multi-role host reusing `"Preload"` routed these
+/// finalizer-bound frames into the executor adapter and no finalizer ever got
+/// its entry — the `fact-composite-fanout-role-collision` data-plane failure.
 const FINALIZER_ACTIONS: &'static [&'static str] =
-    &["Sign", "Finalize", "SignShielded", "ShieldedVote"];
+    &["PreloadForFinalizer", "Sign", "Finalize", "SignShielded", "ShieldedVote"];
 
 /// The composite runtime host. Owns the shared DI bundle plus three in-process
 /// layers built across the composite plan: `RoleSelector` (Phase 1 — which roles
@@ -171,10 +198,12 @@ pub fn node_registry(&self) -> Arc<NodeRegistry> {
 pub use self::build::build_runtime;
 pub(crate) use self::plugins::build_role_plugin;
 pub(crate) use self::transport::route_data_plane;
+pub(crate) use self::transport::spawn_data_dispatch;
 
 pub mod build;
 pub mod epoch_coord;
 pub mod ingress_sink;
+pub mod metrics_poller;
 pub mod plugins;
 pub mod role_adapters;
 pub mod transport;
@@ -189,6 +218,7 @@ mod tests {
     mod build;
     mod e2e;
     mod epoch;
+    mod metrics;
     mod shielded;
     mod transport;
 }

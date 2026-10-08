@@ -131,6 +131,16 @@ pub struct Node {
     pub index: usize,
     pub name: String,
     pub role: Role,
+    /// Every role this node runs — and therefore every bucket peers must hold
+    /// it in. A composite installs one plugin per role its stake qualifies
+    /// for, so this is a stake derivation, not a label: `role` stays the
+    /// naming/primary role while `roles` is what mesh-probe expects to find
+    /// in directories. Mesh construction defaults it to `[role]`; the
+    /// generator overwrites it with the qualifying set (a node whose stake
+    /// qualifies for nothing is refused), and `from_manifest` reads it back —
+    /// manifests without the field fall back to `[role]`, so hand-made
+    /// manifests stay valid.
+    pub roles: Vec<Role>,
 }
 
 /// One node's identity in the mesh, plus the transport address it must be
@@ -275,6 +285,11 @@ impl Mesh {
                     index: nodes.len(),
                     name: format!("{}-{}", role.plural().trim_end_matches('s'), i + 1),
                     role,
+                    // Default: the naming role alone. The generator overwrites
+                    // this with the stake-qualifying set before writing the
+                    // manifest, since that — not the name — is what the node
+                    // runs and what the probe must expect.
+                    roles: vec![role],
                 });
             }
         }
@@ -411,12 +426,27 @@ impl Mesh {
         for node in nodes {
             let role: Role = serde_json::from_value(node["role"].clone())
                 .map_err(|e| format!("manifest node role unreadable: {e}"))?;
+            // The declared-role set is optional for hand-made manifests —
+            // absent means "the naming role and nothing else". A present-but-
+            // empty list is a contradiction (a node that runs no role is not
+            // a cluster member), so it fails rather than defaulting.
+            let roles = match node.get("roles") {
+                None => vec![role],
+                Some(value) => {
+                    let roles: Vec<Role> = serde_json::from_value(value.clone())
+                        .map_err(|e| format!("manifest node roles unreadable: {e}"))?;
+                    if roles.is_empty() {
+                        return Err("manifest node lists an empty roles set".to_string());
+                    }
+                    roles
+                }
+            };
             let name = node["name"].as_str().ok_or("manifest node missing name")?.to_string();
             if by_name.insert(name.clone(), plan.len()).is_some() {
                 return Err(format!("manifest lists {name} twice"));
             }
             plan.push(NodePlan {
-                node: Node { index: plan.len(), name, role },
+                node: Node { index: plan.len(), name, role, roles },
                 base_port: node["rns_port"].as_u64().ok_or("manifest node missing rns_port")?
                     as u16,
                 address: node["address"].as_str().unwrap_or("127.0.0.1").to_string(),

@@ -672,7 +672,134 @@ fn a_registered_peer_is_answered_with_the_peers_it_can_vouch_for() {
 
 // ---------------------------------------------------------------------------
 // Directory admission: freshness, replay, and the unregistered observer
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------/// A node is not its own peer. Registration is pairwise, so our entry rides
+/// every peer's buckets; any directory response we ever fetch therefore
+/// names us right back at us. Installing it would plant our own rhash in
+/// our own directories — the exact state mesh-probe flags as `self-present`,
+/// observed on all four nodes of the 10/08/2026 multi-host rehearsal. The
+/// receiver must skip entries that name itself.
+#[test]
+fn a_directory_response_naming_ourselves_never_lands_in_our_own_directories() {
+    let alice = test_identity();
+    let bob = test_identity();
+    let carol = test_identity();
+
+    let alice_reg = registry_for(&alice, ALL_TYPES, &[NodeRegistryType::Committer], vec![]);
+    let bob_reg = registry_for(&bob, ALL_TYPES, &[NodeRegistryType::Committer], vec![]);
+    let carol_reg = registry_for(&carol, ALL_TYPES, &[NodeRegistryType::Committer], vec![]);
+
+    // Alice holds Bob and Carol as vouched committers.
+    alice_reg
+        .handle_control(bob_reg.build_register_request().expect("bob register"))
+        .expect("bob handled");
+    alice_reg
+        .handle_control(carol_reg.build_register_request().expect("carol register"))
+        .expect("carol handled");
+
+    // Bob asks Alice for the committers directory.
+    let request = bob_reg
+        .build_directory_request(&NodeRegistryType::Committer, alice.rhash)
+        .expect("build request");
+    let response = alice_reg
+        .build_directory_response(&request)
+        .expect("a registered peer is answered");
+    assert!(
+        response.entries.iter().any(|e| e.node_rhash == bob.rhash),
+        "the directory necessarily names Bob back at himself"
+    );
+
+    // Bob must hold Alice (registered or seeded) for the response to be trusted.
+    bob_reg.register_peer(
+        key_of(&alice),
+        alice.rhash,
+        &NodeRegistryType::Committer,
+        Box::new(NullConnection),
+    );
+    bob_reg
+        .handle_directory_response(&response)
+        .expect("response from a known peer is accepted");
+
+    let held: Vec<[u8; 16]> = bob_reg
+        .get_nodes(&NodeRegistryType::Committer)
+        .unwrap()
+        .iter()
+        .map(|e| e.value().rhash)
+        .collect();
+    assert!(held.contains(&carol.rhash), "the third-party peer is installed");
+    assert!(
+        !held.contains(&bob.rhash),
+        "a directory response must never install the reader's own rhash"
+    );
+}
+
+/// Directory pulls must be retryable — and must stop once complete. The
+/// first-round-only fetch raced the announces: a node that boots while its
+/// peers' routes are not yet live gets its requests refused, and its peers'
+/// Register acks carry only the acking peer's own entry, so the late node is
+/// left permanently directory-less while its routes heal underneath
+/// (rehearsal, 10/08/2026: a restarted container held live routes to all
+/// three peers and `pneumatic_node_peers 0` forever). The catch-up asks
+/// exactly the bootstrap peers not yet learned — no more while they are
+/// missing, and, crucially, no more once they are held, so a healthy steady
+/// state sends zero directory traffic.
+#[test]
+fn catch_up_asks_exactly_the_bootstrap_peers_not_yet_learned() {
+    let alice = test_identity();
+    let bob = test_identity();
+    let carol = test_identity();
+    let alice_reg = registry_for(
+        &alice,
+        ALL_TYPES,
+        &[NodeRegistryType::Sentinel],
+        vec![bootstrap_peer_for(&bob, 4242), bootstrap_peer_for(&carol, 4243)],
+    );
+    // The rhashes the bootstrap list resolves to — the same derivation the
+    // registration path stores, which is what makes "held" comparable.
+    let bootstraps = alice_reg.bootstrap_peer_rhashes();
+    assert_eq!(bootstraps.len(), 2, "both bootstrap peers resolve");
+
+    // At boot nothing is held: catch-up targets every bootstrap peer.
+    let needing: std::collections::HashSet<[u8; 16]> = alice_reg
+        .bootstrap_peers_needing_directory()
+        .into_iter()
+        .map(|(rhash, _desc)| rhash)
+        .collect();
+    let wanted: std::collections::HashSet<[u8; 16]> =
+        bootstraps.iter().map(|(rhash, _desc)| *rhash).collect();
+    assert_eq!(needing, wanted, "at boot every bootstrap peer needs the directory");
+
+    // Learning Bob — in any one bucket — takes him off the list; Carol stays.
+    alice_reg.register_peer(
+        key_of(&bob),
+        bootstraps[0].0,
+        &NodeRegistryType::Sentinel,
+        Box::new(NullConnection),
+    );
+    let needing: std::collections::HashSet<[u8; 16]> = alice_reg
+        .bootstrap_peers_needing_directory()
+        .into_iter()
+        .map(|(rhash, _desc)| rhash)
+        .collect();
+    assert_eq!(
+        needing,
+        [bootstraps[1].0].into_iter().collect::<std::collections::HashSet<_>>(),
+        "a learned peer must drop off the re-request list"
+    );
+
+    // Learning Carol leaves nothing to ask: a healthy steady state sends no
+    // directory traffic at all (this is what keeps the retry from becoming
+    // a permanent gossip burden).
+    alice_reg.register_peer(
+        key_of(&carol),
+        bootstraps[1].0,
+        &NodeRegistryType::Sentinel,
+        Box::new(NullConnection),
+    );
+    assert!(
+        alice_reg.bootstrap_peers_needing_directory().is_empty(),
+        "once every bootstrap peer is held, catch-up must go silent"
+    );
+}
 
 /// Build a fresh query from `asker` to `responder`, asking for `for_type`.
 fn query_from(

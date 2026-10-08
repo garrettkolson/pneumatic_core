@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use pneumatic_testnet_gen::cli::{flag, parsed};
+use pneumatic_testnet_gen::cli::{flag, flag_all, parsed};
 use pneumatic_testnet_gen::emit::{GenSpec, Report};
 use pneumatic_testnet_gen::topology::{Placement, Role, TopologyMode};
 
@@ -56,6 +56,10 @@ pneumatic_testnet_gen — generate a bootable multi-node testnet
   --bind-ip <ip>           address each node binds. Default: every interface.
                            Set on a multi-homed host, where binding every
                            interface would answer on the wrong network.
+  --tx-token <hex>         token id to seed in genesis so submitted
+                            transactions name a token that exists (repeatable).
+  --client-account <hex>   non-validator account public key to fund in
+                            genesis (repeatable) — the pneumatic-tx sender.
   --force-keys             replace existing keystores (orphans their genesis stake)
   --help                   this text
 
@@ -140,6 +144,11 @@ fn run(args: &[String]) -> Result<Report, String> {
         spec.bind_address = Some(bind);
     }
     spec.force_keys = args.iter().any(|a| a == "--force-keys");
+    // Traffic artifacts: the token ids submitted transactions will name, and
+    // the accounts that submit them. Both must be in genesis before the first
+    // transaction, because nothing on the wire creates either.
+    spec.tx_tokens = flag_all(args, "tx-token");
+    spec.client_accounts = flag_all(args, "client-account");
 
     match flag(args, "topology").as_deref() {
         None | Some("full-mesh") => spec.mode = TopologyMode::FullMesh,

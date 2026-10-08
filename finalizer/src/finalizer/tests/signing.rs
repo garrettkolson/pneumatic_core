@@ -7,7 +7,7 @@ use super::super::*;
 #[tokio::test]
 async fn test_handle_preload() {
     let pending_registry = make_test_pending_registry();
-    let finalizer = make_finalizer(pending_registry);
+    let finalizer = make_finalizer(pending_registry.clone());
 
     let tx = Transaction {
         payload: vec![], gas_limit: 0,
@@ -27,7 +27,7 @@ async fn test_handle_preload() {
     let body = serialize_to_bytes_rmp(&tx).unwrap();
     let message = Message {
         chain_id: "test_env".to_string(),
-        action: String::from("Preload"),
+        action: String::from("PreloadForFinalizer"),
         body,
         signature: vec![],
         public_key: vec![9, 8, 7],
@@ -37,6 +37,21 @@ async fn test_handle_preload() {
     let result = finalizer.handle_preload(&message).await;
     assert!(result.is_ok());
     assert_eq!(finalizer.preload_task_count().await, 1);
+
+    // THE invariant the 10/08/2026 multi-host rehearsal broke: the wire preload
+    // ALONE must leave the finalizer's OWN registry holding the tx in an
+    // executable state — `try_finalize_optimistic` loads from here, and every
+    // "Sign" that arrived without this entry died `TransactionNotInFinalizing`
+    // (fact-composite-fanout-role-collision). A frame swallowed by the wrong
+    // adapter leaves this registry empty.
+    let entry = pending_registry
+        .get_transaction_mut("preload_tx")
+        .expect("the wire preload must materialize the finalizer's own registry entry");
+    assert!(
+        matches!(entry.state, TransactionState::Preloaded { .. }),
+        "the preload hop must leave the entry executable for the optimistic path, got {:?}",
+        entry.state
+    );
 }
 
 #[tokio::test]

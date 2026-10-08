@@ -99,10 +99,13 @@ impl TransactionNotifier {
     ) -> Result<(), NotifyError> {
         let body = serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?;
         // Sign with our own identity — the receiver verifies against the
-        // sender's registered key, never the destination's.
+        // sender's registered key, never the destination's. The action is
+        // FINALIZER-OWNED: "Preload" belongs to the executor's execute hop and
+        // a composite host admits one action to one role — see
+        // `fact-composite-fanout-role-collision`.
         let msg = Message::signed(
             env.token_partition_id.clone(),
-            "Preload",
+            "PreloadForFinalizer",
             body,
             None,
             &self.config.identity,
@@ -533,12 +536,15 @@ mod tests {
 
         assert!(
             poll_recorder(&recorder, 1),
-            "Preload message should reach the finalizer peer"
+            "PreloadForFinalizer message should reach the finalizer peer"
         );
         let raw = recorder.lock().unwrap()[0].clone();
         let message: Message =
             deserialize_rmp_to(&raw).expect("captured payload should be a Message");
-        assert_eq!(message.action, "Preload");
+        // Pinned EXACTLY: the finalizer-bound preload must carry the
+        // finalizer-OWNED action, never the executor's "Preload"
+        // (fact-composite-fanout-role-collision).
+        assert_eq!(message.action, "PreloadForFinalizer");
 
         // Must verify under the sender (sentinel) identity...
         assert_signed_by(&message, &identity);

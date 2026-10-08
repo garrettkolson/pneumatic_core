@@ -41,16 +41,24 @@ fn generate(out: &Path) -> serde_json::Value {
 }
 
 /// Build the snapshot every node *would* report if the mesh formed exactly as
-/// generated.
+/// generated. Each peer is filed under every role its manifest declares —
+/// a composite runs all roles its stake qualifies for, so a healthy directory
+/// shows each peer in every one of its role buckets, not just its naming one.
 fn complete_snapshot(manifest: &serde_json::Value) -> Snapshot {
     let nodes = manifest["nodes"].as_array().expect("nodes");
-    let role_of: BTreeMap<String, String> = nodes
+    let roles_of: BTreeMap<String, Vec<String>> = nodes
         .iter()
         .map(|n| {
-            (
-                n["name"].as_str().unwrap().to_string(),
-                n["role"].as_str().unwrap().to_string(),
-            )
+            let roles = match n.get("roles") {
+                Some(roles) => roles
+                    .as_array()
+                    .expect("roles array")
+                    .iter()
+                    .map(|r| r.as_str().unwrap().to_string())
+                    .collect(),
+                None => vec![n["role"].as_str().unwrap().to_string()],
+            };
+            (n["name"].as_str().unwrap().to_string(), roles)
         })
         .collect();
     let rhash_of: BTreeMap<String, String> = nodes
@@ -69,10 +77,13 @@ fn complete_snapshot(manifest: &serde_json::Value) -> Snapshot {
             let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for peer in n["peers"].as_array().expect("peers") {
                 let name = peer.as_str().expect("peer name");
-                buckets
-                    .entry(format!("{}s", role_of[name]))
-                    .or_default()
-                    .push(rhash_of[name].clone());
+                let peer_roles = roles_of.get(name).expect("peer is a manifest node");
+                for role in peer_roles {
+                    buckets
+                        .entry(format!("{role}s"))
+                        .or_default()
+                        .push(rhash_of[name].clone());
+                }
             }
             NodeSnapshot {
                 name: n["name"].as_str().unwrap().to_string(),
@@ -114,6 +125,54 @@ fn a_healthy_cluster_exits_zero() {
     // The caveat belongs in the success message, not only in the docs: a green
     // probe means control-plane formation, not reachability.
     assert!(text.to_lowercase().contains("reachability"), "success must carry its limit:\n{text}");
+}
+
+/// A composite node runs every role its stake qualifies for, so a healthy
+/// directory shows each peer in ALL its role buckets. If the probe expected
+/// only the naming role, an honest four-role node would be reported wrong
+/// on every other bucket. This asserts the healthy multi-role snapshot is
+/// clean AND that stripping a peer out of one of its non-naming buckets is
+/// still caught as missing — the expectation is genuinely per-declared-role.
+#[test]
+fn a_composite_is_expected_in_every_declared_role_bucket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = generate(dir.path());
+
+    // The generator must have emitted a roles set wider than the naming role.
+    let nodes = manifest["nodes"].as_array().expect("nodes");
+    let sentinel_1 = nodes.iter().find(|n| n["name"] == "sentinel-1").expect("sentinel-1");
+    let roles = sentinel_1["roles"].as_array().expect("roles field present");
+    assert!(
+        roles.len() > 1,
+        "a qualifying composite declares more than its naming role, got {roles:?}"
+    );
+
+    // The full multi-role snapshot is clean.
+    let snapshot = complete_snapshot(&manifest);
+    let path = write_snapshot(dir.path(), "ok.json", &snapshot);
+    let (code, text) = probe(&dir.path().join("manifest.json"), &path, false);
+    assert_eq!(code, 0, "the multi-role mesh must exit 0, got:\n{text}");
+
+    // Now remove one peer from a NON-naming bucket of sentinel-1 and confirm
+    // the probe still flags it: the expectation is per-role, not lumped.
+    let mut snapshot = complete_snapshot(&manifest);
+    let observer = snapshot
+        .nodes
+        .iter_mut()
+        .find(|n| n.name == "sentinel-1")
+        .expect("sentinel-1 snapshot");
+    // Find a bucket that is NOT this observer's naming bucket.
+    let victim_bucket = observer
+        .buckets
+        .keys()
+        .find(|b| b.as_str() != "sentinels")
+        .expect("a non-naming bucket")
+        .clone();
+    observer.buckets.get_mut(&victim_bucket).expect("bucket").remove(0);
+    let path = write_snapshot(dir.path(), "gap.json", &snapshot);
+    let (code, text) = probe(&dir.path().join("manifest.json"), &path, false);
+    assert_eq!(code, 1, "a peer missing from a declared role bucket must exit 1:\n{text}");
+    assert!(text.contains("missing"), "the gap must classify as missing:\n{text}");
 }
 
 #[test]

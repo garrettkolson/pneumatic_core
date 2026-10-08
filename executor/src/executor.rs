@@ -853,10 +853,17 @@ impl ExecutorHandle {
 
         // (1) Preload: register the transaction in the finalizer's registry.
         // The finalizer's `handle_preload` deserializes the body as a
-        // `Transaction` and stores it; the sender is this executor.
+        // `Transaction` and stores it; the sender is this executor. The action
+        // is FINALIZER-OWNED: "Preload" is the executor's OWN inbound action
+        // (the sentinel→executor execute hop), and a composite host admits an
+        // action to exactly one role — reusing the name silently re-routed
+        // these finalizer-bound frames into the local executor adapter, so no
+        // finalizer ever got an executable entry and every "Sign" died
+        // `TransactionNotInFinalizing`
+        // (`fact-composite-fanout-role-collision`, 10/08/2026 rehearsal).
         let preload_message = Message::signed(
             self.env_id.clone(),
-            "Preload",
+            "PreloadForFinalizer",
             tx_bytes,
             None,
             &self.identity,

@@ -318,6 +318,39 @@ impl NodeRegistry {
             .sum()
     }
 
+    /// Bootstrap peers whose rhash we do not hold in ANY of our own buckets
+    /// yet — i.e. peers we have not learned. Pure decision: no transport, so
+    /// the selection logic is testable without a network.
+    pub fn bootstrap_peers_needing_directory(&self) -> Vec<([u8; 16], String)> {
+        let held: std::collections::HashSet<[u8; 16]> =
+            self.known_peers().into_iter().map(|(rhash, _key)| rhash).collect();
+        self.bootstrap_peer_rhashes()
+            .into_iter()
+            .filter(|(rhash, _desc)| !held.contains(rhash))
+            .collect()
+    }
+
+    /// Re-request directories from exactly those bootstrap peers we still have
+    /// not learned, until every one of them lives in our directories.
+    ///
+    /// Why this exists next to the first-round [`Self::
+    /// request_directories_from_bootstrap_peers`]: a directory request can only
+    /// be delivered once the responder's announce has made our route to it
+    /// live, and a booting node peering before that moment has its one-shot
+    /// requests die on "no live route". Register retries per tick, but the
+    /// Register *ack* only carries the responder's own entry — so the late
+    /// node ends up with live routes, no directories, and nothing left to
+    /// retry. Observed 10/08/2026 in the multi-host rehearsal: a restarted
+    /// container validated all three peers' announces, kept routes alive for
+    /// minutes, and held `pneumatic_node_peers 0` forever. The retry stops on
+    /// its own — once every bootstrap peer is held, this sends nothing.
+    pub fn catch_up_directories_from_bootstrap_peers(&self) -> usize {
+        self.bootstrap_peers_needing_directory()
+            .into_iter()
+            .map(|(rhash, _desc)| self.request_directories_from_peer(rhash))
+            .sum()
+    }
+
     /// Every peer we currently hold, deduplicated by public key, as
     /// `(rhash, key)`.
     ///
@@ -417,6 +450,14 @@ impl NodeRegistry {
                     first_round = false;
                 } else {
                     registry.heartbeat_known_peers();
+                    // Re-request directories from bootstrap peers we still have
+                    // not learned. This is the retry the first-round-only fetch
+                    // could not be: on a restart those early requests died on
+                    // "no live route", and once the peer's announce restores the
+                    // route there is nothing else that pulls the directory back
+                    // in. It goes quiet by itself once every bootstrap peer is
+                    // held (see `catch_up_directories_from_bootstrap_peers`).
+                    registry.catch_up_directories_from_bootstrap_peers();
                 }
                 drop(registry);
 

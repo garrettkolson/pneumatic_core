@@ -49,3 +49,31 @@ pub(crate) async fn route_data_plane(
         .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("undecodable data-plane message: {e}"))))?;
     dispatcher.lock().await.dispatch(message).await
 }
+
+/// Run [`route_data_plane`] on the host runtime, never the caller's ambient
+/// context — the ONLY correct shape for the RNS bridge's data-plane branch.
+///
+/// The `on_packet` callback runs on RNS's own inbound **worker threads**:
+/// plain `std::thread`s with no ambient reactor. There, a bare `tokio::spawn`
+/// does not merely fail the frame — it **panics** ("there is no reactor
+/// running") and kills the worker: its inbound queue's receiving half drops,
+/// every subsequent frame logs "inbound queue closed; dropping", and within
+/// one liveness-eviction window the node's directories empty itself —
+/// `pneumatic_node_peers` 12 → 0, mesh gone. Measured 10/08/2026 in the
+/// multi-host rehearsal: the first data-plane frame of a 200-tx burst killed
+/// one worker on every receiving peer; nothing upstream looked wrong from the
+/// sender's side (fan-out swallows RNS send results). A `Handle` captured
+/// inside the host runtime spawns correctly from any thread.
+pub(crate) fn spawn_data_dispatch(
+    rt: &tokio::runtime::Handle,
+    dispatcher: Arc<TokioMutex<RoleDispatcher>>,
+    data: Vec<u8>,
+) {
+    rt.spawn(async move {
+        if let Err(e) = route_data_plane(data, dispatcher).await {
+            // Same promise as `route_data_plane`'s doc: surfaced, never
+            // silently swallowed. (The bridge previously dropped the Result.)
+            eprintln!("[pneumatic] data-plane dispatch failed: {e}");
+        }
+    });
+}

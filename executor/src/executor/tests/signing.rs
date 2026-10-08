@@ -4,9 +4,14 @@ use super::helpers::*;
 use super::super::*;
 
 /// `ExecutorHandle::send_to_finalizer` (the impl spawned execution tasks use)
-/// emits a "Preload" (the serialized tx) followed by a "Sign" vote, both signed
-/// with the executor's identity, never the destination finalizer's key (the
-/// pre-1.1 bug placed the destination key in the signature field).
+/// emits a `"PreloadForFinalizer"` (the serialized tx) followed by a `"Sign"`
+/// vote, both signed with the executor's identity, never the destination
+/// finalizer's key (the pre-1.1 bug placed the destination key in the signature
+/// field). The preload's action name is pinned EXACTLY: it must be the
+/// finalizer-OWNED name, not the executor's own `"Preload"` inbound action —
+/// a composite host admits one action to one role, and the shared name meant
+/// finalizer-bound frames were routed into the executor adapter
+/// (`fact-composite-fanout-role-collision`).
 #[tokio::test]
 async fn send_to_finalizer_signed_with_executor_identity() {
     let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
@@ -46,17 +51,28 @@ async fn send_to_finalizer_signed_with_executor_identity() {
     assert_eq!(
         captured.len(),
         2,
-        "finalizer should receive Preload + Sign"
+        "finalizer should receive PreloadForFinalizer + Sign"
+    );
+    let actions: Vec<String> = captured
+        .iter()
+        .map(|bytes| {
+            let message: pneumatic_core::messages::Message =
+                pneumatic_core::encoding::deserialize_rmp_to(bytes)
+                    .expect("captured payload should be a Message");
+            message.action.clone()
+        })
+        .collect();
+    // Preload FIRST, then Sign — the finalizer's optimistic path loads the
+    // registry entry the preload creates; the same FIFO link orders them.
+    assert_eq!(
+        actions,
+        vec!["PreloadForFinalizer".to_string(), "Sign".to_string()],
+        "the preload hop must carry the finalizer-OWNED action, in order before Sign"
     );
     for bytes in captured.iter() {
         let message: pneumatic_core::messages::Message =
             pneumatic_core::encoding::deserialize_rmp_to(bytes)
                 .expect("captured payload should be a Message");
-        assert!(
-            message.action == "Preload" || message.action == "Sign",
-            "expected Preload or Sign, got {}",
-            message.action
-        );
         assert_signed_by(&message, &identity);
 
         // ...and never under the destination's key.

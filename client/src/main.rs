@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use pneumatic_client::{ClientError, TxClient};
-use pneumatic_core::crypto::Ed25519Provider;
+use pneumatic_core::crypto::{AsymCryptoProvider, Ed25519Provider};
 
 const USAGE: &str = "\
 pneumatic-tx — submit a transaction through a node's ingress (ADR-020)
@@ -27,6 +27,8 @@ pneumatic-tx — submit a transaction through a node's ingress (ADR-020)
 USAGE:
     pneumatic-tx submit --addr <ip:port> --chain-id <id> --token <hex> --to <hex>
                         --amount <n> --nonce <n> [options]
+    pneumatic-tx account [--seed <hex32>]
+                         print the sender public key (what genesis must fund)
 
 SUBMIT OPTIONS:
   --addr <ip:port>       ingress address (required)
@@ -49,6 +51,22 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--help" || a == "-h") || args.is_empty() {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
+    }
+    // `account` answers a question genesis needs BEFORE any submission: which
+    // public key will this seed submit as? A testnet's genesis must fund that
+    // key as an account, and deriving it twice with two code paths is how
+    // genesis and submissions start disagreeing about who the sender is.
+    if args.first().map(String::as_str) == Some("account") {
+        return match account_public_key(&args) {
+            Ok(hex) => {
+                println!("{hex}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("[pneumatic-tx] error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     // One current-thread runtime: the CLI submits sequentially, and the
     // client crate already pins tokio with the runtime features.
@@ -95,16 +113,7 @@ async fn run(args: &[String]) -> Result<usize, String> {
     // A fixed, obvious dev seed by default: local testnets only. A caller who
     // cares passes --seed and gets a stable account they can find in the data
     // service by its public key.
-    let seed: [u8; 32] = match flag(args, "seed") {
-        Some(s) => {
-            let bytes = hex::decode(s.replace("0x", "")).map_err(|e| format!("--seed hex: {e}"))?;
-            bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| format!("--seed must be 32 bytes, got {}", bytes.len()))?
-        }
-        None => [0x42u8; 32],
-    };
+    let seed = sender_seed(args)?;
     let account = Arc::new(Ed25519Provider::from_seed(seed));
     let client = TxClient::new(addr, chain_id, account.clone());
     eprintln!(
@@ -140,6 +149,32 @@ async fn run(args: &[String]) -> Result<usize, String> {
 
 // `main` drives the async `run` through a runtime built inline (see above);
 // no `#[tokio::main]` needed since we manage the ExitCode by hand.
+
+/// The `--seed` bytes, with the dev default. One parser for both `submit` and
+/// `account`, so the key genesis funds and the key submissions come from can
+/// never derive differently.
+fn sender_seed(args: &[String]) -> Result<[u8; 32], String> {
+    match flag(args, "seed") {
+        Some(s) => {
+            let bytes = hex::decode(s.replace("0x", "")).map_err(|e| format!("--seed hex: {e}"))?;
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("--seed must be 32 bytes, got {}", bytes.len()))
+        }
+        None => Ok([0x42u8; 32]),
+    }
+}
+
+/// The hex Ed25519 public key `--seed` submits as — the value genesis must put
+/// in `accounts` before that seed's first transaction.
+fn account_public_key(args: &[String]) -> Result<String, String> {
+    let account = Ed25519Provider::from_seed(sender_seed(args)?);
+    let pk = account
+        .public_key()
+        .map_err(|e| format!("public key: {e:?}"))?;
+    Ok(hex::encode(pk))
+}
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let i = args.iter().position(|a| a == &format!("--{name}"))?;

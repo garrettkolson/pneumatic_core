@@ -31,3 +31,23 @@ pub fn parsed<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Optio
             .map_err(|_| format!("--{name} expected a number, got {raw:?}")),
     }
 }
+
+/// Every occurrence of a repeatable string flag (`--flag a --flag b`), in
+/// command-line order. Repeatable because a genesis with two test tokens is
+/// one keystroke more than a flag returning only the first value would force
+/// into two runs — and a silently-dropped second `--tx-token` is exactly the
+/// quiet surprise the generator's own docs say it exists to remove.
+pub fn flag_all(args: &[String], name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(rest) = arg.strip_prefix(&format!("--{name}=")) {
+            values.push(rest.to_string());
+        } else if arg == &format!("--{name}") {
+            if let Some(value) = iter.next() {
+                values.push(value.clone());
+            }
+        }
+    }
+    values
+}

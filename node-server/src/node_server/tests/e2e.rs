@@ -786,13 +786,11 @@ async fn drive_pipeline_to_commit(
         .await
         .expect("executor Preload dispatch");
 
-    // Hop 3: the finalizer's "Preload" (the executor's) then "Sign".
-    // The executor's "Preload" to the finalizer is NOT relayed through the
-    // dispatcher: the composite's finalizer does not own the "Preload"
-    // action (that routes back to the executor and would re-execute). In the
-    // composite the finalizer reads the tx straight from the shared pending
-    // registry, so only the "Sign" vote is relayed.
-    let _ = next_recorded(&rec.finalizers, "Preload").await;
+    // Hop 3: the finalizer's own preload — the executor's stamped hop, now
+    // riding "PreloadForFinalizer" so it reaches handle_preload instead of
+    // looping back through the executor's dispatcher arm
+    // (fact-composite-fanout-role-collision) — then the "Sign" vote.
+    let _ = next_recorded(&rec.finalizers, "PreloadForFinalizer").await;
     let fin_sign = next_recorded(&rec.finalizers, "Sign").await;
     server
         .dispatch(fin_sign)
@@ -1507,6 +1505,7 @@ async fn client_transaction_through_the_ingress_commits_observable_through_the_d
             }],
             accounts: Vec::new(),
             seed_shielded_pool: true,
+            tokens: Vec::new(),
             seed_partition_token: true,
         },
         &*provider,
@@ -1569,7 +1568,7 @@ async fn client_transaction_through_the_ingress_commits_observable_through_the_d
     // --- relay the remaining pipeline hops (mesh stand-in) -----------------
     let exec_preload = next_recorded(&rec.executors, "Preload").await;
     server.dispatch(exec_preload).await.expect("executor Preload");
-    let _ = next_recorded(&rec.finalizers, "Preload").await;
+    let _ = next_recorded(&rec.finalizers, "PreloadForFinalizer").await;
     let fin_sign = next_recorded(&rec.finalizers, "Sign").await;
     server.dispatch(fin_sign).await.expect("finalizer Sign");
     let commit = next_recorded(&rec.committers, "Commit").await;

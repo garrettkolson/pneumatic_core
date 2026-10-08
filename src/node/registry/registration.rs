@@ -871,6 +871,13 @@ pub fn handle_directory_response(
     // All entries verified: install them via the refresh-only path so a
     // directory response can never overwrite an established rhash.
     for entry in &response.entries {
+        // A node is not its own peer. Our registration travels every other
+        // node's buckets, so every directory response names us right back at
+        // us; installing it would put our own rhash in our own directories
+        // (what mesh-probe flags as self-present).
+        if entry.node_rhash == self.config.rhash || entry.node_key == self.config.public_key {
+            continue;
+        }
         let conn: Box<dyn Connection> = match &self.network {
             Some(network) => Box::new(RnsConnection::new(entry.node_rhash, Arc::clone(network))),
             None => Box::new(NullConnection),

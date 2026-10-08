@@ -93,6 +93,22 @@ impl RoleHandler for pneumatic_finalizer::Finalizer {
     > {
         Box::pin(async move {
             match message.action.as_str() {
+                // The Finalizer-OWNED preload hop: the executor's stamped tx
+                // (and the sentinel's pre-notify) arrive here — and MUST NOT
+                // arrive as `"Preload"`, which the executor adapter owns; on a
+                // multi-role host the dispatcher would silently hand the
+                // finalizer's frames to the executor (`fact-composite-fanout-role-collision`).
+                "PreloadForFinalizer" => {
+                    // DIAGNOSTIC: prove the frame reaches this arm at all.
+                    eprintln!(
+                        "[diag] finalizer adapter: PreloadForFinalizer body={}B",
+                        message.body.len()
+                    );
+                    self.handle_preload(&message)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| RoleError::Downstream(PneumaticError::Network(format!("{e:?}"))))
+                }
                 // The voter inbound path: authenticate the executor's identity,
                 // verify + accumulate its signature, or optimistic-finalize on
                 // the first valid one. The real chokepoint for every voter

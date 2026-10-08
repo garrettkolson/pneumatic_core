@@ -431,3 +431,65 @@ async fn block_finalized_broadcasts_signed_with_committer_identity() {
     let dist: Message = deserialize_rmp_to(&dist_raw).expect("dist payload is a Message");
     assert_signed_by(&dist, &committer.identity);
 }
+
+/// Multi-host shape: the committer node has NEVER seen the token — its
+/// in-memory cache is empty and the canonical token (with genesis chain)
+/// lives only in the shared data service, exactly as in the 10/08/2026
+/// multi-host rehearsal where every `BlockFinalized` gossip threw
+/// `TokenNotFound("0a")` while genesis sat in the sidecar. The finalize path
+/// must warm the token from the store — the same rule `commit_block` follows
+/// (block_services.rs) — then append. Reverting the warm fails with the
+/// rehearsal's own error at the `.expect` below.
+#[tokio::test]
+async fn block_finalized_warms_a_cold_token_from_the_data_service() {
+    let dp = Arc::new(TestDataProvider::new());
+    let (committer, _registry, _logger) = make_test_committer(dp.clone());
+
+    // Bootstrap locally first to mint the genesis chain + self-verification…
+    let mut token = Token::new();
+    token.id = vec![1];
+    committer.bootstrap_token(token);
+    bootstrap_token_chain(&committer);
+    let tip = {
+        let entry = committer.tokens.get(&vec![1]).unwrap();
+        entry.value().blockchain.get_current_chain_state().last_hash_in.clone()
+    };
+
+    // …then move the token OUT of the local cache and INTO the provider:
+    // cold cache, warm store — the multi-host boot state.
+    let token = committer
+        .tokens
+        .remove(&vec![1])
+        .map(|(_, t)| t)
+        .expect("bootstrapped token");
+    let partition = committer.env_data.token_partition_id.clone();
+    dp.tokens
+        .lock()
+        .unwrap()
+        .entry(vec![1])
+        .or_default()
+        .insert(partition, token);
+    assert!(
+        committer.tokens.is_empty(),
+        "the cache must be cold — this test is exactly the warm-on-miss path"
+    );
+
+    let block = make_gossip_block_at_prev("warm_tx", b"alice".to_vec(), &tip);
+    let message = make_block_finalized_message(block);
+
+    committer.handle_block_finalized(message).await.expect(
+        "cold cache + token present in the data service must NOT fail TokenNotFound \
+         — this is the 10/08/2026 multi-host rehearsal: genesis sat in the sidecar \
+         while every BlockFinalized gossip died with TokenNotFound(0a)",
+    );
+
+    let entry = committer
+        .tokens
+        .get(&vec![1])
+        .expect("the finalize path must leave the warmed token in the cache");
+    assert_eq!(
+        entry.value().blockchain.get_count(),
+        2,
+        "genesis (from the store) + the appended gossip block"
+    );
+}

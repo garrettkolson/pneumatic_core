@@ -566,3 +566,54 @@ fn a_manifest_naming_an_unknown_peer_fails_the_reload() {
         .expect_err("an unknown peer name must not reload silently");
     assert!(err.contains("ghost-node"), "must name the offender, got: {err}");
 }
+
+/// The manifest's per-node `roles` is a stake derivation, not a label: a
+/// composite installs one plugin per role its stake qualifies for, so the
+/// default stake (which clears every floor in the repo env template) must
+/// yield the full role set for every node — matching what the node will
+/// actually declare to peers. A single-role manifest is a fiction the probe
+/// would later expose as 36 wrong-bucket findings at once.
+#[test]
+fn the_manifest_declares_every_role_the_stake_qualifies_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    generate(&spec_for(dir.path())).expect("generate");
+    let nodes = manifest(dir.path())["nodes"]
+        .as_array()
+        .expect("nodes")
+        .clone();
+    assert!(!nodes.is_empty(), "spec requests a full cluster");
+
+    for node in &nodes {
+        let name = node["name"].as_str().unwrap();
+        let declared = node["roles"].as_array().unwrap_or_else(|| panic!("{name}: roles present"));
+        let got: std::collections::BTreeSet<&str> =
+            declared.iter().map(|r| r.as_str().unwrap()).collect();
+        let want: std::collections::BTreeSet<&str> =
+            ["sentinel", "executor", "finalizer", "committer"].into_iter().collect();
+        assert_eq!(
+            got, want,
+            "{name}: default stake 1000 clears every floor (10), so the manifest \
+             must declare all four roles it runs"
+        );
+        // The naming role is always a member of the declared set.
+        assert!(
+            got.contains(node["role"].as_str().unwrap()),
+            "{name}: naming role must be inside the declared set"
+        );
+    }
+}
+
+/// A stake that clears no floor would boot every node running no role — a
+/// cluster that forms no pipeline. Generation refuses it at the source rather
+/// than emitting a manifest the probe must later fail.
+#[test]
+fn a_stake_that_qualifies_for_no_role_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut spec = spec_for(dir.path());
+    spec.stake = 0;
+    let err = generate(&spec).expect_err("zero stake must not generate");
+    assert!(
+        err.to_lowercase().contains("role") || err.to_lowercase().contains("stake"),
+        "refusal must say why, got: {err}"
+    );
+}

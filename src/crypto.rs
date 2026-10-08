@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{SigningKey, Signer, Verifier, VerifyingKey};
@@ -28,6 +29,28 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 use crate::errors::PneumaticError;
+
+// ---------------------------------------------------------------------------
+// Verification telemetry — the Phase 2 "verifications/s" number
+// ---------------------------------------------------------------------------
+//
+/// Every protocol verifier (transactions, blocks, registrations, gossip —
+/// 21 call sites across the role crates and the node server) funnels through
+/// `AsymCryptoProvider::check_signature`, so one counter here measures the
+/// node's real signature-verification load. Both outcomes are counted: a
+/// rejected signature costs the same two public-key operations as an accepted
+/// one, and the load number that matters is the work performed, not the work
+/// accepted. Process-global because the crypto layer has no handle on the
+/// node's `Metrics` registry; the node-server poller exports it as
+/// `pneumatic_signature_verifications_total` and the sampler turns it into a
+/// rate by differencing two reads.
+static SIGNATURE_VERIFICATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Signature verifications performed by this process since boot (both
+/// accepted and rejected — see [`SIGNATURE_VERIFICATIONS`]).
+pub fn signature_verifications() -> u64 {
+    SIGNATURE_VERIFICATIONS.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // AsymCryptoProvider — hybrid (classical · post-quantum) asymmetric crypto
@@ -509,6 +532,10 @@ impl AsymCryptoProvider for Ed25519Provider {
         public_key: &[u8],
         data: &[u8],
     ) -> Result<bool, PneumaticError> {
+        // Phase 2 telemetry: count the verification the moment we commit to
+        // performing it, before any early-return. Both outcomes cost the same
+        // two public-key operations, so a rejected signature is load too.
+        SIGNATURE_VERIFICATIONS.fetch_add(1, Ordering::Relaxed);
         let (ed25519_sig, mldsa_pk, mldsa_sig) = match Self::split_hybrid_signature(signature) {
             Some(parts) => parts,
             None => return Ok(false),
@@ -685,6 +712,39 @@ mod tests {
         let data = b"test message";
         let signature = provider.sign_data(data).unwrap();
         assert!(provider.check_signature(&signature, &provider.public_key().unwrap(), data).unwrap());
+    }
+
+    /// The Phase 2 "verifications/s" gauge has to move on the work the node
+    /// actually performs: every check_signature counts — accepted, rejected,
+    /// and malformed alike — because all three cost the verification work.
+    /// Diff-based (`>=`) because sibling tests increment the same global
+    /// counter concurrently.
+    #[test]
+    fn test_verification_counter_moves_on_accept_reject_and_malformed() {
+        let provider = Ed25519Provider::generate();
+        let sig = provider.sign_data(b"counter message").unwrap();
+        let pk = provider.public_key().unwrap();
+
+        let before = signature_verifications();
+        assert!(provider.check_signature(&sig, &pk, b"counter message").unwrap());
+        let after_accept = signature_verifications();
+        assert!(
+            after_accept >= before + 1,
+            "an accepted verification must increment the counter"
+        );
+
+        assert!(!provider.check_signature(&sig, &pk, b"tampered").unwrap());
+        let after_reject = signature_verifications();
+        assert!(
+            after_reject >= after_accept + 1,
+            "a rejected verification is load and must also increment"
+        );
+
+        assert!(!provider.check_signature(b"not a signature", &pk, b"data").unwrap());
+        assert!(
+            signature_verifications() >= after_reject + 1,
+            "a malformed-signature rejection went through the verify path and must count"
+        );
     }
 
     #[test]

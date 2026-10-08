@@ -317,6 +317,7 @@ fn genesis_writes_every_record_a_node_reads_at_boot() {
             stake: 0,
         }],
         seed_shielded_pool: true,
+        tokens: Vec::new(),
         seed_partition_token: true,
     };
 
@@ -358,6 +359,81 @@ fn genesis_writes_every_record_a_node_reads_at_boot() {
 }
 
 #[test]
+fn genesis_seeds_transfer_tokens_the_pipeline_can_execute() {
+    let (_store, provider, _addr) = boot(None);
+    let spec = GenesisSpec {
+        environment_id: "env".to_string(),
+        token_partition_id: PARTITION.to_string(),
+        stake_snapshot_epochs: vec![0, 1],
+        shielded_root_recency: 10,
+        nodes: Vec::new(),
+        accounts: Vec::new(),
+        seed_shielded_pool: false,
+        tokens: vec![pneumatic_data_service::GenesisToken {
+            token_id_hex: "0a".to_string(),
+            name: "rehearsal".to_string(),
+        }],
+        seed_partition_token: false,
+    };
+
+    let report = apply_genesis(&spec, &provider).expect("genesis applies over the wire");
+    assert_eq!(report.tokens_seeded, 1);
+
+    // Read back through the SAME wire path the sentinel uses for a submitted
+    // transaction's token: `get_token(tx.token_id, token_partition_id)`.
+    let token = provider
+        .get_token(&vec![0x0Au8], PARTITION)
+        .expect("token readable over the wire");
+    assert_eq!(token.id, vec![0x0A], "the id a transaction can name");
+    assert_eq!(
+        token.block_validation_spec_name, "Executed",
+        "the standard pipeline spec, not the self-verified direct-to-committer path"
+    );
+    assert!(
+        !token.is_self_verified,
+        "a seeded transfer token must route through the executor, not skip it"
+    );
+    // The executor's contract path requires an asset; its engine dispatch falls
+    // through to "Transfer" only when there is no `contract_engine` metadata.
+    let contract = token
+        .get_asset::<pneumatic_core::tokens::SmartContract>()
+        .expect("executor path requires a contract asset");
+    assert!(contract.bytecode.is_empty(), "a transfer token carries no program");
+    assert_eq!(contract.name, "rehearsal");
+    assert!(
+        !token.metadata.contains_key("contract_engine"),
+        "engine selection must fall through to Transfer"
+    );
+    // Empty chain = the documented genesis convention for the ADR-019 salt:
+    // explicit, not a collapsed error, and it varies once blocks land.
+    assert!(token.blockchain.get_current_chain_state().last_hash_in.is_empty());
+}
+
+#[test]
+fn genesis_rejects_a_malformed_token_id_before_anything_boots() {
+    let (_store, provider, _addr) = boot(None);
+    let spec = GenesisSpec {
+        environment_id: "env".to_string(),
+        token_partition_id: PARTITION.to_string(),
+        stake_snapshot_epochs: vec![0, 1],
+        shielded_root_recency: 10,
+        nodes: Vec::new(),
+        accounts: Vec::new(),
+        seed_shielded_pool: false,
+        tokens: vec![pneumatic_data_service::GenesisToken {
+            token_id_hex: "0xzz".to_string(),
+            name: "x".to_string(),
+        }],
+        seed_partition_token: false,
+    };
+    let err = apply_genesis(&spec, &provider).expect_err("bad token id must fail genesis");
+    assert!(
+        format!("{err}").contains("malformed hex token id"),
+        "the error should name the problem, got {err}"
+    );
+}
+
+#[test]
 fn genesis_rejects_a_malformed_public_key_before_booting_anything() {
     let (_store, provider, _addr) = boot(None);
     let spec = GenesisSpec {
@@ -372,6 +448,7 @@ fn genesis_rejects_a_malformed_public_key_before_booting_anything() {
         }],
         accounts: Vec::new(),
         seed_shielded_pool: false,
+        tokens: Vec::new(),
         seed_partition_token: false,
     };
     let err = apply_genesis(&spec, &provider).expect_err("bad key must fail genesis");
@@ -392,6 +469,7 @@ fn genesis_rejects_an_epoch_less_spec() {
         nodes: Vec::new(),
         accounts: Vec::new(),
         seed_shielded_pool: false,
+        tokens: Vec::new(),
         seed_partition_token: false,
     };
     assert!(apply_genesis(&spec, &provider).is_err(), "a spec with no epochs is unbootable");

@@ -91,6 +91,19 @@ impl Committer {
         let mut wire_authoritative = false;
         if let Err(_) = self.pending_registry.acquire_transaction(&tx_id) {
             if let Ok(entry) = self.pending_registry.get_transaction_mut(&tx_id) {
+                // DIAGNOSTIC (multi-host rehearsal): what state does the entry
+                // have when a Commit copy cannot acquire it, and does the
+                // booked block hash equal the wire copy's?
+                let dbg_state = format!("{:?}", entry.state);
+                let dbg_variant = dbg_state.split_whitespace().next().unwrap_or("?");
+                let booked: Option<Vec<u8>> = match &entry.state {
+                    TransactionState::Committed { block_hash, .. } => Some(block_hash.clone()),
+                    _ => None,
+                };
+                eprintln!(
+                    "[diag] Commit tx={} acquire_fail state={} booked={:02x?} wire={:02x?}",
+                    &tx_id, dbg_variant, booked, &commit.proposed_block.current_hash
+                );
                 if let TransactionState::Committed { ref block_hash, .. } = entry.state {
                     if *block_hash == commit.proposed_block.current_hash {
                         wire_authoritative = true;
@@ -295,6 +308,15 @@ impl Committer {
 
         // Step 6: Distribute the committed block to archivers
         let _ = self.block_services.distribute_to_archivers(&commit.proposed_block).await;
+
+        // DIAGNOSTIC: this commit fully applied (block appended, state
+        // persisted, state booked) — if this line never appears while txs
+        // reach Committed, the booking is optimistic-only and the chain is a
+        // phantom.
+        eprintln!(
+            "[diag] COMMIT-OK tx={} wire={:02x?}",
+            &tx_id, &commit.proposed_block.current_hash
+        );
 
         Ok(())
     }

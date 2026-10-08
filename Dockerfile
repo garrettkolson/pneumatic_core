@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 # Pneumatic node images (Phase 8 deployment infra).
 #
-# One image, two binaries: `pneumatic_committer` (dedicated committer role)
-# and `node-server` (composite runtime hosting every role the node's stake
-# qualifies for). Compose selects via `command:`.
+# One image, three binaries: `pneumatic_committer` (dedicated committer role),
+# `node-server` (composite runtime hosting every role the node's stake
+# qualifies for), and `pneumatic_data_service` (the required per-host
+# side-car). Compose selects via `command:`.
 #
 # Build notes:
 # * rust:1.87 pins the workspace toolchain (wasmi 1.1.0 deliberately excludes
@@ -20,16 +21,22 @@ WORKDIR /src
 # added with a vendored manifest stage if build latency ever matters.)
 COPY . .
 RUN cargo build --release -p pneumatic_committer --bin pneumatic_committer \
-                      -p pneumatic_node_server --bin node-server
+                      -p pneumatic_node_server --bin node-server \
+                      -p pneumatic_data_service --bin pneumatic_data_service
 
 FROM debian:bookworm-slim
 # curl only for the HEALTHCHECK probe; no shells/tools beyond coreutils.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 -m pneumatic
 COPY --from=build /src/target/release/pneumatic_committer /usr/local/bin/pneumatic_committer
 COPY --from=build /src/target/release/node-server /usr/local/bin/node-server
+# The data service ships in the image because the multi-host rehearsal (and the
+# Phase 2 runbook's "one data-service sidecar per host") runs it as a container
+# sharing the node's network namespace. iproute2 rides along so `tc netem` loss
+# injection and socket counts are possible inside a host container.
+COPY --from=build /src/target/release/pneumatic_data_service /usr/local/bin/pneumatic_data_service
 # /pneumatic holds config.json + the node_identity.json keystore + log files:
 # it must be WRITABLE (the keystore is created on first boot), so compose
 # mounts a per-service volume here. /env holds the read-only environment

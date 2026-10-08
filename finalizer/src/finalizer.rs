@@ -209,13 +209,13 @@ pub fn get_stake_set(&self) -> Option<&StakeSet> {
 /// Initialize the finalizer — subscribe to message handlers.
 ///
 /// This method would normally set up the gossiper to receive messages
-/// with actions "Preload" and "Sign". Currently a stub — the closure
+/// with actions "PreloadForFinalizer" and "Sign". Currently a stub — the closure
 /// parameter represents the message handler.
 pub fn initialize<F>(&self, _on_message_received: F)
 where
     F: Fn(Message) + Send + Sync + 'static,
 {
-    // In production: subscribe to "Preload" and "Sign" actions
+    // In production: subscribe to "PreloadForFinalizer" and "Sign" actions
     // via the Gossiper message router.
     // This requires injecting a Gossiper into the Finalizer struct.
     // For now, the closure is accepted but not wired.

@@ -46,7 +46,7 @@ pub mod store;
 
 pub use genesis::{
     apply as apply_genesis, genesis_pool_state, load_spec, GenesisAccount, GenesisError,
-    GenesisNode, GenesisReport, GenesisSpec,
+    GenesisNode, GenesisReport, GenesisSpec, GenesisToken,
 };
 pub use server::{serve, spawn};
 pub use store::DataStore;

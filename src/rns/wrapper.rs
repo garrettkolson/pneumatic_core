@@ -73,6 +73,13 @@ pub const ASPECTS: [&str; 2] = ["udp", "pneumatic"];
 
 const WORKER_THREADS: usize = 4;
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How often a node re-announces its destination while running. The startup
+/// announce alone is not enough: a route only goes live when the announce is
+/// actually received, so any peer whose listener was not yet up (boot skew) or
+/// that dropped the packet stays dead-routed forever. Periodic re-announce is
+/// what makes the mesh converge regardless of start order — see
+/// `RnsNetwork::start_with_announce_interval`.
+const DEFAULT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum plaintext a single RNS direct packet can carry: rns-core's MTU
 /// (500 B) minus the 19-byte HEADER_1. Frames above this ride the Resource
 /// transfer path (`send_data_packet` routes by this cap).
@@ -284,11 +291,23 @@ fn extract_peer_sig_pub(public_key: &[u8; 64]) -> [u8; 32] {
 impl RnsNetwork {
     /// Start the transport: pre-seed routes for bootstrap peers, start the
     /// RNS node, register + announce our single destination, and spawn the
-    /// inbound worker pool.
+    /// inbound worker pool plus the periodic re-announcer at the default
+    /// interval ([`DEFAULT_ANNOUNCE_INTERVAL`]).
     pub fn start(
         node_config: NodeConfig,
         identity: &NodeIdentity,
         bootstrap: &[BootstrapPeer],
+    ) -> Result<Self, PneumaticError> {
+        Self::start_with_announce_interval(node_config, identity, bootstrap, DEFAULT_ANNOUNCE_INTERVAL)
+    }
+
+    /// `start` with the re-announce interval pinned — the seam that lets the
+    /// convergence test below run in seconds instead of minutes.
+    pub fn start_with_announce_interval(
+        node_config: NodeConfig,
+        identity: &NodeIdentity,
+        bootstrap: &[BootstrapPeer],
+        announce_interval: Duration,
     ) -> Result<Self, PneumaticError> {
         let destinations: Arc<DashMap<[u8; 16], AnnouncedIdentity>> = Arc::new(DashMap::new());
         let links: Arc<DashMap<DestHash, LinkId>> = Arc::new(DashMap::new());
@@ -363,13 +382,57 @@ impl RnsNetwork {
         let stopped = Arc::new(AtomicBool::new(false));
         let handler: Arc<RwLock<Option<PacketHandler>>> = Arc::new(RwLock::new(None));
 
-        let mut workers = Vec::with_capacity(WORKER_THREADS);
+        let mut workers = Vec::with_capacity(WORKER_THREADS + 1);
         for rx in rxs {
             let stopped = Arc::clone(&stopped);
             let handler = Arc::clone(&handler);
             let identity = Identity::from_private_key(&private_key);
             workers.push(thread::spawn(move || {
                 worker_loop(&rx, &stopped, &handler, &identity);
+            }));
+        }
+
+        // The periodic re-announcer.
+        //
+        // A destination's route goes live ONLY when its announce is actually
+        // received — the bootstrap pre-seed above has `received_at: 0` and
+        // `route_is_live` refuses it — and every control frame above the
+        // 481-byte direct cap (which is every Register/RegisterAck/directory
+        // frame, since the hybrid binding signature is ~3.8 KB) waits on that
+        // gate. Announce-once-at-boot therefore dead-routes any peer whose
+        // listening socket was not already open at the instant the announce
+        // flew: boot skew, a restart, one lost UDP packet — permanent, with
+        // nothing left to retry against but a "retry after its announce"
+        // promise that will never be kept. This is exactly how the multi-host
+        // rehearsal found the mesh unformable on 10/08/2026 while every
+        // single-host test stayed green (they start peers in one process and
+        // re-announce by hand).
+        //
+        // RNS's own model is periodic announcement; this is the missing half.
+        // At 10 s the floor is one 167-byte frame per interface per interval —
+        // noise next to the resource transfers the same links carry — and any
+        // boot order converges inside two intervals.
+        {
+            let node = Arc::clone(&node);
+            let dest = dest.clone();
+            let private_key = private_key.clone();
+            let stopped = Arc::clone(&stopped);
+            workers.push(thread::spawn(move || {
+                let mut since = std::time::Instant::now();
+                loop {
+                    if stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                    if since.elapsed() >= announce_interval {
+                        since = std::time::Instant::now();
+                        let identity = Identity::from_private_key(&private_key);
+                        // A transient send failure is worth nothing but the
+                        // next tick; the whole point is that there IS a next
+                        // tick.
+                        let _ = node.announce(&dest, &identity, None);
+                    }
+                }
             }));
         }
 
@@ -392,10 +455,12 @@ impl RnsNetwork {
 
     /// Re-announce this node's destination to its peers. A startup announce races
     /// the peer's listener coming up, so it can leave the peer's bootstrap-seeded
-    /// route dead. Call this once both nodes are listening: each announce
-    /// re-traverses the established links, which is what upgrades a synthetic
-    /// bootstrap route to a usable one. The RNS identity is reconstructed from the
-    /// stored private key.
+    /// route dead. `start` schedules this on [`DEFAULT_ANNOUNCE_INTERVAL`] in a
+    /// background thread — production has no reason to call it by hand; the
+    /// manual call exists for tests that want a kick at a specific moment. Each
+    /// announce re-traverses the established links, which is what upgrades a
+    /// synthetic bootstrap route to a usable one. The RNS identity is
+    /// reconstructed from the stored private key.
     /// Do we know how to reach `rhash`? True once we have seen an announce from it
     /// (which also seeds the destination table) or seeded it from bootstrap
     /// config. A reply we cannot deliver is worth nothing, and requiring this of a
@@ -874,6 +939,32 @@ mod tests {
             RnsNetwork::start(node_config, identity, &bootstrap).expect("start rns node")
         }
 
+        /// Same topology, with the periodic re-announce interval pinned short
+        /// enough for a test to wait on convergence.
+        fn start_node_with_interval(
+            identity: &NodeIdentity,
+            peer_pub_key_hex: &str,
+            peer_port: u16,
+            this_port: u16,
+            interval: Duration,
+        ) -> RnsNetwork {
+            let bootstrap = if peer_pub_key_hex.is_empty() {
+                Vec::new()
+            } else {
+                vec![BootstrapPeer {
+                    public_key: peer_pub_key_hex.to_string(),
+                    ip: "127.0.0.1".to_string(),
+                    port: peer_port,
+                }]
+            };
+            let node_config = RnsNodeConfigBuilder::new()
+                .with_udp_port(this_port)
+                .add_peer("127.0.0.1", peer_port)
+                .build(&identity.rns);
+            RnsNetwork::start_with_announce_interval(node_config, identity, &bootstrap, interval)
+                .expect("start rns node")
+        }
+
         /// Positive: a ~3.8 KB payload — larger than RNS's 500 B packet cap —
         /// traverses the native Resource transfer and reassembles byte-identical
         /// at the receiver. This is the negation of the audit finding that no
@@ -968,6 +1059,74 @@ mod tests {
             );
 
             net.stop();
+        }
+
+        /// Boot-skew convergence — the multi-host rehearsal's failure mode,
+        /// reproduced on loopback (2026-10-08: every RNS route stayed dead on a
+        /// 4-container network while all 42 loopback test targets stayed green,
+        /// because a node's only announce fires at its own boot and no
+        /// production code re-announces).
+        ///
+        /// Start the EARLY node while its peer is still down — its startup
+        /// announce is lost to nobody. Start the LATE node after: the early
+        /// node hears the late one's startup announce (it is listening), but
+        /// the late node has never received anything from the early node, and
+        /// its bootstrap-seeded route is dead by definition (`received_at: 0`
+        /// fails `route_is_live`). Only the periodic re-announcer can repair
+        /// that direction, and a live route must then carry real traffic.
+        #[test]
+        fn boot_skew_routes_converge_via_periodic_announce() {
+            let early = NodeIdentity::generate_in_memory();
+            let early_port = free_port();
+            let late = NodeIdentity::generate_in_memory();
+            let late_port = free_port();
+            let early_pub = hex::encode(early.rns.get_public_key().expect("early pub"));
+            let late_pub = hex::encode(late.rns.get_public_key().expect("late pub"));
+            let interval = Duration::from_millis(300);
+
+            let early_net =
+                start_node_with_interval(&early, &late_pub, late_port, early_port, interval);
+            // The early node's startup announce flies now — into silence.
+            thread::sleep(Duration::from_millis(400));
+            let late_net =
+                start_node_with_interval(&late, &early_pub, early_port, late_port, interval);
+
+            // The direction the rehearsal killed: late -> early had no
+            // announce to live on at boot. The re-announcer must resurrect it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !late_net.route_is_live(early.rhash) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "late->early route never went live — periodic re-announce is not converging"
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                early_net.route_is_live(late.rhash),
+                "late node's startup announce should have reached the listening early node"
+            );
+
+            // A live route must carry real traffic: deliver a
+            // over-cap payload late -> early — the direction that was dead.
+            let (cap_tx, cap_rx) = mpsc::channel::<Vec<u8>>();
+            early_net.on_packet(Arc::new(move |data| {
+                let _ = cap_tx.send(data);
+            }));
+            let frame = NetworkPacket {
+                control: None,
+                data: Some(vec![3u8; 2000]),
+            };
+            let payload = serialize_to_bytes_rmp(&frame).expect("serialize NetworkPacket");
+            late_net
+                .send_resource_to(early.rhash, payload.clone())
+                .expect("late->early resource send after convergence");
+            let received = cap_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("late->early resource delivered over the recovered route");
+            assert_eq!(received, payload, "reassembled payload must match");
+
+            late_net.stop();
+            early_net.stop();
         }
     }
 

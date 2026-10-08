@@ -149,8 +149,8 @@ impl Finding {
             Finding::UnknownPeer { observer, role, rhash_hex } =>
                 format!("{observer} holds unknown rhash {rhash_hex} in its {role} bucket (not a member of this cluster)"),
             Finding::WrongBucket { observer, node, found_in, should_be } =>
-                format!("{observer} holds {node} in its {found_in} bucket, but it is {} — expected in {}",
-                    should_be.join("/"), found_in),
+                format!("{observer} holds {node} in its {found_in} bucket, but its declared roles are {} — expected in {}",
+                    should_be.join("/"), should_be.join("/")),
             Finding::SelfPresent { observer } =>
                 format!("{observer} lists itself as a peer (a node is not its own peer)"),
             Finding::NotReported { node } =>
@@ -342,26 +342,43 @@ pub fn evaluate(
         }
 
         // Bucket → the set of members that bucket *may* legitimately hold.
-        // Derived from the topology, so role-graph sparsity is expected here
-        // rather than reported as missing.
+        // Derived from each peer's declared-role set (the roles its stake
+        // qualifies for), so a composite that runs four roles is expected in
+        // four buckets per observer, not one. Role-graph sparsity is expected
+        // here rather than reported as missing.
         let mut expected: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for &peer_index in &plan.peers {
             let peer = &mesh.plan[peer_index];
-            expected
-                .entry(peer.node.role.plural().to_string())
-                .or_default()
-                .push(peer.node.name.clone());
+            for role in &peer.node.roles {
+                expected
+                    .entry(role.plural().to_string())
+                    .or_default()
+                    .push(peer.node.name.clone());
+            }
         }
 
         // Index everything the node reported, by rhash, with the buckets found in.
         let mut found_by_rhash: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (role, rhashes) in &snapshot_node.buckets {
             for rhash in rhashes {
-                observed_edges += 1;
                 found_by_rhash
                     .entry(rhash.clone())
                     .or_default()
                     .push(role.clone());
+            }
+        }
+
+        // A mesh link is observed when the reporter holds that peer in at least
+        // one bucket, no matter how many of the peer's declared role buckets
+        // carry it. Counting links — not bucket memberships — keeps
+        // `observed_edges` directly comparable to `expected_edges` under the
+        // multi-role model, where one honest peer legitimately fills four.
+        for &peer_index in &plan.peers {
+            let peer_name = &mesh.plan[peer_index].node.name;
+            if let Some(rhash) = cluster.rhash_for(peer_name) {
+                if found_by_rhash.contains_key(rhash) {
+                    observed_edges += 1;
+                }
             }
         }
 
@@ -411,12 +428,17 @@ pub fn evaluate(
                     continue;
                 }
             };
+            // The buckets this member legitimately belongs in: every role it
+            // declares (its stake-qualifying set), intersected with the fact
+            // that it IS a peer of this observer. A composite declaring four
+            // roles is expected in four buckets, so extra buckets are correct,
+            // not wrong-bucket.
             let should_be: Vec<String> = plan
                 .peers
                 .iter()
                 .map(|&i| mesh.plan[i].clone())
                 .filter(|p| p.node.name == member)
-                .map(|p| p.node.role.plural().to_string())
+                .flat_map(|p| p.node.roles.iter().map(|r| r.plural().to_string()).collect::<Vec<_>>())
                 .collect();
             if should_be.is_empty() {
                 // Known cluster member, but not a peer of this node at all.

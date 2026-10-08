@@ -130,6 +130,12 @@ async fn try_finalize(&self, tx_id: &str) -> Result<Vec<u8>, PneumaticError> {
             transaction.clone()
         }
         _ => {
+            // DIAGNOSTIC (multi-host rehearsal, 10/08/2026): the entry EXISTS
+            // (missing is a different error) — print WHICH state the gate met.
+            eprintln!(
+                "[diag] finalize gate: tx {} found in state {:?}",
+                tx_id, entry.state
+            );
             return Err(PneumaticError::Registry(format!(
                 "Transaction {} not in executable state for finalization",
                 tx_id
@@ -235,6 +241,12 @@ pub(crate) async fn try_finalize_optimistic(
             transaction.clone()
         }
         _ => {
+            // DIAGNOSTIC (multi-host rehearsal, 10/08/2026): the entry EXISTS
+            // (missing is a different error) — print WHICH state the gate met.
+            eprintln!(
+                "[diag] finalize gate: tx {} found in state {:?}",
+                tx_id, entry.state
+            );
             return Err(PneumaticError::Registry(format!(
                 "Transaction {} not in executable state for finalization",
                 tx_id

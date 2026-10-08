@@ -92,6 +92,19 @@ impl ManifestNodes {
         self.0[name]["role"].as_str().expect("role").to_string()
     }
 
+    /// Every role the manifest declares for this node — the buckets peers must
+    /// hold it in. Falls back to the naming role when the field is absent, so
+    /// a hand-made manifest still drives the fixture.
+    fn roles(&self, name: &str) -> Vec<String> {
+        match &self.0[name]["roles"] {
+            serde_json::Value::Array(roles) => roles
+                .iter()
+                .map(|r| r.as_str().expect("role string").to_string())
+                .collect(),
+            _ => vec![self.role(name)],
+        }
+    }
+
     fn peers(&self, name: &str) -> Vec<String> {
         self.0[name]["peers"]
             .as_array()
@@ -139,22 +152,26 @@ fn write_fragments_for_generated_cluster(cluster_dir: &Path) -> serde_json::Valu
         ));
 
         // Seed this node's peers, keyed by their Ed25519 key (the registry's map
-        // key) and carrying their rhash (what a fragment reports).
+        // key) and carrying their rhash (what a fragment reports). A composite
+        // peer declares every role its stake qualifies for, so it belongs in
+        // each of those role buckets — a full-stake peer is a member of all four.
         for peer in nodes.peers(name) {
             let key = hex::decode(
                 nodes.0[&peer]["ed25519_public_key_hex"].as_str().expect("key"),
             )
             .expect("hex key");
-            registry
-                .get_nodes(&role_type(&nodes.role(&peer)))
-                .unwrap_or_else(|| panic!("{name}: {} role must be installed", nodes.role(&peer)))
-                .insert(
-                    key,
-                    NodeRegistryNode::new(
-                        rhash_of(&nodes.rhash(&peer)),
-                        Box::new(NullConnection),
-                    ),
-                );
+            for role in nodes.roles(&peer) {
+                registry
+                    .get_nodes(&role_type(&role))
+                    .unwrap_or_else(|| panic!("{name}: {role} role must be installed"))
+                    .insert(
+                        key.clone(),
+                        NodeRegistryNode::new(
+                            rhash_of(&nodes.rhash(&peer)),
+                            Box::new(NullConnection),
+                        ),
+                    );
+            }
         }
 
         MeshFragment::dump_to(&registry, &config.identity, &fragment_path)

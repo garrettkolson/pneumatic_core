@@ -238,6 +238,16 @@ pub fn build_runtime(
         let network = network_ref.clone();
         let registry = node_registry.clone();
         let dispatcher = role_dispatcher.clone();
+        // Capture the BOOT runtime's handle for the data-plane branch below.
+        // RNS invokes this callback on its own worker threads — plain
+        // `std::thread`s with no ambient reactor — where a bare `tokio::spawn`
+        // panics and kills the worker (see `spawn_data_dispatch`; cost us the
+        // mesh in the 10/08/2026 rehearsal). `build_runtime` always runs
+        // inside the host runtime: `#[tokio::main]` in node-server.rs,
+        // `#[tokio::test]` in tests — so `Handle::current()` here is that
+        // runtime, and spawning through the captured handle works from any
+        // thread.
+        let bridge_rt = tokio::runtime::Handle::current();
         network.on_packet(Arc::new(move |raw: Vec<u8>| {
             match pneumatic_core::encoding::deserialize_rmp_to::<pneumatic_core::node::NetworkPacket>(&raw) {
                 Ok(packet) => {
@@ -264,9 +274,7 @@ pub fn build_runtime(
                             return;
                         }
                         let d = dispatcher.clone();
-                        tokio::spawn(async move {
-                            route_data_plane(data, d).await
-                        });
+                        spawn_data_dispatch(&bridge_rt, d, data);
                     }
                 }
                 Err(e) => {
