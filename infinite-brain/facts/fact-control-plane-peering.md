@@ -4,11 +4,11 @@ title: "Peering initiator: the control plane now has a client half"
 type: fact
 namespace: pneumatic
 visibility: namespace
-summary: "10/02/2026: `src/node/registry/peering.rs` sends the control plane (Register / directory Request / Heartbeat) on a retry loop from both binaries. A node advertises `declared_roles` — the roles it actually runs, not config's `node_registry_types` — and a control frame's ~5.9 KB size means peering can only begin after the peer's announce makes its route live."
+summary: "10/02/2026: `src/node/registry/peering.rs` sends the control plane (Register / directory Request / Heartbeat) on a retry loop from both binaries. A node advertises `declared_roles` — the roles it actually runs, not config's `node_registry_types` — and a control frame's ~5.9 KB size means peering can only begin after the peer's announce makes its route live. **10/08/2026 amendment:** the loop now also re-requests directories from bootstrap peers not yet held every tick (`catch_up_directories_from_bootstrap_peers`) — the first-round-only fetch stalled late joiners at zero directories forever (`fact-peering-late-join-convergence`) — and the announce that unblocks it is periodic (`fact-rns-periodic-announce`)."
 auto_inject: true
 applicable_when: "Any multi-node run, launcher/peering work, or debugging a cluster where nodes boot but no traffic flows between roles"
 confidence: 1.0
-verified_at: "10/05/2026"
+verified_at: "10/08/2026"
 verified_by: "dsh-agent"
 staleness_signal: "If peering.rs changes shape, if the binding signature size changes (moving control frames under the direct-packet cap), or if a binary stops calling start_peering"
 tags: [fact, peering, control-plane, node-registry, rns, testnet, boot]
@@ -41,6 +41,14 @@ edges:
     type: supports
     weight: 0.9
     note: "Peering was the load-bearing blocker for a multi-node testnet"
+  - target: fact-peering-late-join-convergence
+    type: related_to
+    weight: 0.9
+    note: "The 10/08 amendment: late joiners needed state-driven directory re-requests, not a first-round-only fetch"
+  - target: fact-rns-periodic-announce
+    type: depends_on
+    weight: 0.9
+    note: "The periodic announce is what makes a late node's routes live so peering can begin at all"
 related: ["[[NodeRegistry: per-type peer directories + signed registration protocol]]", "[[RNS transport: the production inter-node wire (RnsNetwork over rns-net, Resource transfer for large payloads)]]"]
 source_url: "Empty"
 ---
