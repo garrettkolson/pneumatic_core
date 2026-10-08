@@ -4,7 +4,7 @@ title: "Multi-host testnet rollout: from a working local cluster to production"
 type: task
 namespace: pneumatic
 visibility: namespace
-summary: "PHASED, IN PROGRESS. **Phase 0 closed 10/07/2026** (per-token selection salt + production-provider exit test, per-key send accounting, quorum measured against a declared set with the committer gate fixed). A correctly configured cluster can boot and peer on one host; it cannot be driven from outside. **Read the Live scorecard and Pickup cards near the top of this node before anything else** — they carry current status per phase, what is already in place, the first thing to do, and the trap each phase has. Remaining: (1) transaction ingress — nothing exists, do this next; (2) transport off loopback — instrumented but never run, no code needed to start; (3) durable staking ops; (4) rate limiting and key custody; (5) operability metrics; (6) public testnet; (7) shard boundaries, capacity-gated and deliberately refused in code. Phase 2 is the riskiest unknown and must not be deferred."
+summary: "PHASED, IN PROGRESS. **Phase 0 closed 10/07/2026** (per-token selection salt + production-provider exit test, per-key send accounting, quorum measured against a declared set with the committer gate fixed). **Phase 1 closed 10/07/2026** (ADR-020 ingress: `POST /v1/transactions` on the composite carrying the existing `Process` envelope, `pneumatic_client`/`pneumatic-tx`, exit proven client→ingress→commit→data-service; it required fixing the committer's cache-only commit, `fact-committer-commit-was-cache-only`). A correctly configured cluster can boot and peer on one host; it can now also be driven from outside on that host. **Read the Live scorecard and Pickup cards near the top of this node before anything else** — they carry current status per phase, what is already in place, the first thing to do, and the trap each phase has. Remaining: (1) transport off loopback — instrumented but never run, no code needed to start; (2) durable staking ops; (3) rate limiting and key custody; (4) operability metrics; (5) public testnet; (6) shard boundaries, capacity-gated and deliberately refused in code. Phase 2 is the riskiest unknown and must not be deferred."
 auto_inject: true
 applicable_when: "Planning or executing multi-host / cloud testnet deployment, deciding what to build next, or sizing a validator fleet"
 confidence: 0.9
@@ -65,6 +65,14 @@ edges:
     type: related_to
     weight: 0.6
     note: "Baseline at rollout start: 1101/37/0, all single-host"
+  - target: decision-transaction-ingress-http-edge
+    type: related_to
+    weight: 0.95
+    note: "Phase 1's closed decision (ADR-020): the ingress surface, its edge authentication, and the no-wire-change/no-new-role refusals the pickup card demanded"
+  - target: fact-committer-commit-was-cache-only
+    type: related_to
+    weight: 0.9
+    note: "The live-path defect Phase 1's exit test exposed: commits were cache-only and unpersisted, so no committed block was ever readable through the data service"
 related: ["[[RNS transport: the production inter-node wire (RnsNetwork over rns-net, Resource transfer for large payloads)]]"]
 source_url: "Empty"
 ---
@@ -113,7 +121,7 @@ useful for its reasoning and stop being used for its state.
 | Phase | Status | Already in place | First thing to do |
 |---|---|---|---|
 | **0 — live-path defects** | **✅ closed 10/07** | ADR-019 per-token salt; per-key send accounting; declared `ResponsibleSet`; committer confirmation gate verified | Nothing. If you touch quorum, finality or selection, re-run the mutation checks in `playbook-picking-up-a-roadmap-phase` first |
-| **1 — ingress** | **○ not started** | No *transaction* ingress: no client binary, no RPC, `rest_api_version` vestigial. Note there *is* one HTTP responder in the tree — the health/metrics server in `src/telemetry.rs`, raw tokio, no HTTP crate — which is the shape a first ingress endpoint would reuse | Decide the ingress surface (see the pickup card) *before* writing a handler; then one transaction from a client to a committed block, observable in the data service |
+ | **1 — ingress** | **✅ closed 10/07** | `POST /v1/transactions` on the composite node (ADR-020 `decision-transaction-ingress-http-edge`): raw-tokio HTTP edge carrying the existing inner `Process` envelope — no new wire type, no new role; authenticates both signatures at the edge and dispatches into the same `RoleDispatcher` the RNS bridge uses. `pneumatic_client` lib + `pneumatic-tx` CLI (`--repeat N`) share the node's wire types. The committer had to be fixed first: commit was cache-only and never persisted (`fact-committer-commit-was-cache-only`). Exit proven by `client_transaction_through_the_ingress_commits_observable_through_the_data_service`: real client → real ingress socket → one composite with all four roles in-process (the established composite-e2e shape, not four separate hosts) → real data service, one transaction, result hash recomputed outside the pipeline | Nothing for the ingress surface itself. Rate limiting at the edge is deferred to Phase 4; keep `PNEUMATIC_INGRESS_ADDR` loopback-pinned until it lands. Driving *sustained* traffic (`pneumatic-tx --repeat N`) across four separate hosts is Phase 2's transport run, not this phase's |
 | **2 — transport off loopback** | **◐ instrumented, unrun** | Loopback-bind fix, `Placement::PerHost`, signed mesh fragments, `mesh-probe --fragments`, `directory_observer` posture (probe needs no stake), send accounting so failures reach the probe | Book four instances and run it. No code first |
 | **3 — persistence & restart** | **◐ partial** | Chain state + stake/executor snapshots persist: `advance_epoch_to` writes both (`committer/src/committer/epoching.rs:156-171`) and boot loads one fail-closed | `StubStakingManager` is still a stub: decide what staking ops must survive a restart, then make one of them survive one |
 | **4 — enforcement, admission, custody** | **◐ partly landed** | Slashing **is** enforced: two sites — an invalid chain's tip proposer and double-sign resolution (`committer/src/epoch_manager.rs:205-227`, `:262-275`) — applied through a real `StakingManager` (`:111-124`) and persisted with the epoch snapshot. Config hygiene items done | Rate limiting at the sentinel — nothing exists in `src/` and it gates any gateway |
@@ -141,6 +149,11 @@ useful for its reasoning and stop being used for its state.
 - *Observability "under-reports"* — the per-key send path now carries the same
   `delivery_failures` accounting as `send_to_all`, so a dropped finalizer request is
   counted. Residual: `register_peer` still signals capacity refusal as a bare `bool`.
+- *Transaction ingress "Missing"* — **closed 10/07/2026** by ADR-020
+  (`decision-transaction-ingress-http-edge`): `POST /v1/transactions` on the composite,
+  the existing `Process` envelope as the body, `pneumatic_client` + `pneumatic-tx`. The
+  row's reasoning (the `telemetry.rs` responder as the shape to reuse, the vestigial
+  `rest_api_version`) is exactly how the surface was built; its state is not.
 
 ## Pickup cards
 
@@ -148,7 +161,7 @@ One per open phase: what to read, what the first commit looks like, and the trap
 specific phase has. Phases 1 and 2 are the only two worth starting today; the rest are
 recorded so they are not started out of order.
 
-### Phase 1 — ingress
+### Phase 1 — ingress *(✅ closed 10/07/2026 — recorded for the next reader; decision in `decision-transaction-ingress-http-edge`)*
 - **Read first:** this section, `fact-control-plane-silent-drop-paths` (what "it looked
   healthy" means here), `task-testnet-launcher` (the generator side is done; the runbook
   half is not).
@@ -157,13 +170,27 @@ recorded so they are not started out of order.
   nodes already speak), and whether the ingress node is a sentinel or a new role. The
   wire already has no client-facing message type; inventing one is a wire change, and
   rmp encodes positionally, so it is lockstep with everything.
+  - **Correction carried out of this phase (verified in the tree 10/07):** the claim that
+    "rmp encodes positionally" is **stale** — the wire has used **named maps**
+    (`rmp_serde::to_vec_named`, `src/encoding.rs:17`) since 10/01, so adding an additive
+    field is NOT positional lockstep the way a tuple encoding would be. It is still a
+    wire change every participant must agree on, so the pickup card's *conclusion* (do
+    not invent a client message type; reuse the existing `Process` envelope) stands — but
+    for the right reason. Recorded so the next reader does not inherit the wrong mental
+    model of the encoding.
 - **Then:** one transaction, one client, one 4-node cluster, assert the committed block
   is readable through the data service — the same shape as
   `selection_salt_through_the_production_data_provider`: assert the *effect* through the
-  production path, never through a stub.
+  production path, never through a stub. **Landed as**
+  `client_transaction_through_the_ingress_commits_observable_through_the_data_service`
+  (real client → real ingress socket → four-role composite → real data service, result
+  hash recomputed outside the pipeline). It exposed and required
+  `fact-committer-commit-was-cache-only` first: no committed block was readable through
+  the data service at all until the committer persisted what it committed.
 - **Trap:** the gateway question is a Phase 2 topology question wearing an ingress hat.
   Gateways consume leaf links; if they are not in `testnet-gen`'s plan they silently
-  change the mesh.
+  change the mesh. (Respected: ADR-020 puts no gateway in the ingress surface; that stays
+  a Phase 2 decision.)
 
 ### Phase 2 — transport
 - **Read first:** `fact-mesh-verification-probe`, `fact-fanout-graph-density`,
@@ -402,18 +429,43 @@ that currently reports success when it did not succeed, and finalizes on whoever
 > exists to close. It needs a `DefaultDataProvider`-against-a-real-data-service test (or a
 > service-backed test fixture) before Phase 0 can be called complete.
 
-## Phase 1 — Transaction ingress and a client
+## Phase 1 — Transaction ingress and a client *(✅ closed 10/07/2026)*
 
 Nothing downstream is measurable without it: no load testing, no epoch behavior
 under traffic, no capacity number to size a fleet from.
 
+**How it closed.** The decision (ADR-020, `decision-transaction-ingress-http-edge`)
+landed before any handler, as this phase demanded: HTTP edge on the composite node,
+the existing inner `Process` envelope as the POST body — no client-facing wire type,
+no new role — edge authentication of both signatures, dispatch injected through the
+same `RoleDispatcher` the RNS bridge uses. Implementation: `src/ingress.rs` (bounded
+raw-tokio responder; the drain-before-respond rule earns its place the first time an
+early 4xx meets a client mid-write), `node-server/src/node_server/ingress_sink.rs`
+(the `UnknownAction` ⇒ 503 / `TransactionAlreadyExists` ⇒ 409 / refusal ⇒ 422
+taxonomy, with the debug-string fragility pinned by test), the `pneumatic_client`
+crate + `pneumatic-tx` CLI (`--repeat N` for the sustained streams Phase 2 will
+drive), and `PNEUMATIC_INGRESS_ADDR` opt-in on the binary.
+
+The exit test was not satisfiable as written, and that is the phase's real find:
+**no committed block had ever been observable through the data service** — the
+committer's commit was a cache-only event (`fact-committer-commit-was-cache-only`).
+Fixed, mutation-verified, and pinned by the E2E through a fresh provider over a real
+socket. Suite 1156/37/0 → 1179/37/0; new tests re-verified against three mutants
+(remove persist, disable warm, bypass envelope check — the last one exposed a
+coverage gap mid-mutation, and the test that now closes it is
+`an_envelope_signature_that_fails_under_the_bound_key_is_401`).
+
 Design constraint to respect from day one: a gateway reaches sentinels through the
 same leaf links as every other node, so **gateways consume interfaces too** and
 belong *inside* the topology rather than outside it. A gateway count that isn't in
-`testnet-gen`'s plan will silently change the mesh.
+`testnet-gen`'s plan will silently change the mesh. (Respected: nothing in the
+landed ingress presupposes a gateway.)
 
-**Exit test:** a script drives sustained transactions through a 4-node cluster and
-they reach commit, with the committed block observable through the data service.
+**Exit test (met in shape):** a client transaction reaches commit and the committed
+block is observable through the data service — proven through the production read
+path, result hash recomputed outside the pipeline. The four-*host* sustained run of
+this same surface is Phase 2's transport run; the ingress itself carries no
+loopback assumption beyond the Phase-4 rate-limiting caveat.
 
 ## Phase 2 — Transport viability off loopback *(do not defer)*
 
