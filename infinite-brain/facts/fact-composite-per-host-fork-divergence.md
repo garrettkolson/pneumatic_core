@@ -8,9 +8,9 @@ summary: "10/08/2026, surfaced the moment self-delivery landed and commits start
 auto_inject: false
 applicable_when: "Fixing finalizer assignment or the finalizer-bound hop; adding any send to the Finalizer bucket; reasoning about why committed chains differ per host; reading per-node COMMIT-OK/acquire_fail/ChainLinkage tallies; touching `is_requested_finalizer` or the reassignment path"
 confidence: 0.95
-verified_at: "10/08/2026"
+verified_at: "10/09/2026"
 verified_by: "dsh-agent"
-staleness_signal: "When the primary path selects and RECORDS a finalizer before the finalizer-bound hop, delivers that hop to the selected key only, and the finalizer refuses a request naming another finalizer — then per-host COMMIT-OK counts stop exceeding the transaction count and the HASH_DIFFER/ChainLinkage rejections become the byzantine case rather than the normal one. Also re-verify if RoleDispatcher ever gains per-key delivery or `send_to_nodes` starts honoring the key parameter it discards."
+staleness_signal: "RESOLVED on the primary path 10/09/2026 — re-verify the table below against the code before repeating it. The five-step fix shape at the bottom is now implemented, with an extra step it did not anticipate: the decision must belong to the TRANSACTION (a second Sentinel that re-attests re-opens this exact fault), and the committer must compare the incoming decision against the one its own registry holds. Re-open this node if a finalizer-bound hop ever goes back to a bucket broadcast, if a Sentinel overwrites a routing record that arrived with a transaction, or if COMMIT-OK counts again exceed the transaction count."
 tags: [fact, finalizer, selection, optimistic-finality, fanout, composite, committer, multihost, per-host-placement]
 edges:
   - target: decision-deterministic-per-tx-routing
@@ -37,9 +37,30 @@ edges:
     type: related_to
     weight: 0.95
     note: "Phase 2's open data-plane blocker once chain growth became possible"
+  - target: fact-h12-assumes-lockstep-execution
+    type: related_to
+    weight: 0.95
+    note: "What replaced this fault once routing landed: one producer per tx, and committers that refuse each other's blocks"
+  - target: decision-deterministic-per-tx-routing
+    type: resolves
+    weight: 0.9
+    note: "The ADR the fix implemented; the node's `contradicts` edge is now historical"
 ---
 
 # Nobody is the chosen finalizer, so everybody finalizes
+
+> **RESOLVED on the primary path, 10/09/2026** (`3c0d867`, `89584e5`). Selection runs on
+> the standard path and is attested; the finalizer hop goes to one key; the Finalizer
+> gates preload, vote intake and the finalize choke point; the Committer refuses a block
+> whose routing decision is not the one it holds. Measured change on the four-container
+> rehearsal: before — committer-1 appended **two** blocks with two different hashes for
+> one transaction while every host built its own; after — exactly one host produces and
+> commits, and the other three refuse instead of booking their own. The tables below are
+> kept as the record of what the code did, because they are the diagnosis that produced
+> the fix; treat them as historical and verify against the tree before quoting them.
+> **What this did NOT fix is convergence** — with one producer, the receivers refuse the
+> producer's block on the H12 payload compare:
+> [[fact-h12-assumes-lockstep-execution]].
 
 ## What the design says
 
