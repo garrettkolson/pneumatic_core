@@ -554,6 +554,7 @@ fn canary_run(
         payload: Vec::new(),
         gas_limit: CANARY_FUEL_BUDGET,
         result_data: vec![],
+        selection: None,
     };
     let contract = SmartContract {
         name: "canary".to_string(),

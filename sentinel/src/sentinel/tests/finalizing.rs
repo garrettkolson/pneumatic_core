@@ -143,7 +143,8 @@ fn handle_rejection_terminal_state_returns_error() {
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],},
+            result_data: vec![],selection: None,
+            },
             vec![],
         );
     }

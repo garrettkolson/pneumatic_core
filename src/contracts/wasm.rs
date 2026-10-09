@@ -671,6 +671,7 @@ mod tests {
             payload: vec![1, 2, 3, 4],
             gas_limit: 1234,
             result_data: vec![],
+            selection: None,
         }
     }
 

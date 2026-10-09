@@ -325,6 +325,7 @@ pub fn synthesize_call_tx(
         payload: call_payload.to_vec(),
         gas_limit: sub_budget,
         result_data: Vec::new(),
+        selection: None,
     }
 }
 
@@ -500,6 +501,7 @@ mod tests {
             payload: vec![1, 2, 3, 4],
             gas_limit: 0,
             result_data: vec![],
+            selection: None,
         }
     }
 

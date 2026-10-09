@@ -1112,6 +1112,7 @@ fn make_transaction(submitter_id: &Arc<NodeIdentity>) -> Transaction {
         result_hash: vec![],
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     };
     // Sign the canonical tx bytes with the submitter's Ed25519 key (the
     // sentinel's fail-closed sender-auth binds envelope sender == tx.sender).

@@ -57,7 +57,8 @@ fn on_data_received_process_with_valid_body_no_encoding_error() {
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],}).unwrap(),
+        result_data: vec![],selection: None,
+        }).unwrap(),
         signature: vec![1, 2, 3],
         public_key: vec![4, 5, 6],
         stake_set: None,
@@ -116,7 +117,8 @@ fn process_tx_with_valid_sender_signature_accepted() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     c3_sign(&mut tx, &sender_identity);
 
     let msg = c3_process_message(sender_pk, tx);
@@ -160,7 +162,8 @@ fn unauthorized_submitter_debit_is_rejected() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     // The payload really was authorized by victim, so the signature check passes —
     // only the binding check (network submitter != account) can stop this.
     c3_sign(&mut tx, &victim);
@@ -194,7 +197,8 @@ fn forged_sender_signature_rejected() {
         result_hash: vec![],
         sender_signature: vec![], // empty -> verify returns Ok(false)
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
 
     let msg = c3_process_message(sender_pk, tx);
     match sentinel.handle_process_request(msg) {
@@ -226,7 +230,8 @@ fn sender_signature_does_not_cross_accounts() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     // A signs the canonical bytes; the binding (envelope == "B" == tx.sender) holds,
     // but verifying A's signature against "B" fails.
     c3_sign(&mut tx, &a);
@@ -288,7 +293,8 @@ fn sentinel_self_signed_token_flow_end_to_end() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
 
     // Validate with SelfSigned spec directly
     let spec = SelfSignedBlockValidatorSpec::new();
@@ -330,7 +336,8 @@ fn compute_gas_used_with_zero_amount_returns_base_cost() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=0, multiplier=1.0 → 1 + 0 = 1
     assert_eq!(gas, 1);
@@ -357,7 +364,8 @@ fn compute_gas_used_preload_with_amount_applies_multiplier() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=100, Preload multiplier=2.0 → 1 + 200 = 201
     assert_eq!(gas, 201);
@@ -384,7 +392,8 @@ fn compute_gas_used_unknown_action_defaults_to_one() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let gas = validator.compute_gas_used(&tx);
     // base_cost=1, amount=100, unknown multiplier=1.0 → 1 + 100 = 101
     assert_eq!(gas, 101);
@@ -413,7 +422,8 @@ fn transaction_notifier_send_to_executors_does_not_panic() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     // Should succeed (spawns async task; no nodes registered means no sends)
     let result = notifier.send_to_executors_for_preload(&tx, &env);
     assert!(result.is_ok());
@@ -440,7 +450,8 @@ fn transaction_notifier_send_to_finalizer_does_not_panic() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let result = notifier.send_to_finalizer_for_preload(&tx, b"finalizer_key", &env);
     assert!(result.is_ok());
 }
@@ -489,7 +500,8 @@ fn handle_self_signed_enqueues_to_pool() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
 
     // Pre-register the transaction (as handle_self_signed in the real flow does)
     registry.register_pending(tx.id.clone()).unwrap();
@@ -539,7 +551,8 @@ fn handle_process_request_routes_self_verified_token_owner_operation() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     c3_sign(&mut tx, &sender_identity);
     let msg = c3_process_message(sender_pk.clone(), tx);
 
@@ -595,7 +608,8 @@ fn handle_process_request_rejects_self_verified_tx_from_non_owner() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     c3_sign(&mut tx, &attacker_identity);
     let msg = c3_process_message(attacker_pk.clone(), tx);
 
@@ -641,7 +655,8 @@ fn handle_process_request_enqueues_standard_tx_to_pool() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
 
     // Pre-register the transaction (as handle_process_request does)
     let tx_id = tx.id.clone();
@@ -711,7 +726,8 @@ fn handle_process_request_rejects_duplicate_nonce() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     c3_sign(&mut tx1, &sender_identity);
     let msg1 = c3_process_message(sender_pk.clone(), tx1);
     // First tx must reach the pool enqueue (Step 6), so the nonce is now consumed.
@@ -737,7 +753,8 @@ fn handle_process_request_rejects_duplicate_nonce() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     c3_sign(&mut tx2, &sender_identity);
     let msg2 = c3_process_message(sender_pk.clone(), tx2);
     match sentinel.handle_process_request(msg2) {
@@ -769,6 +786,7 @@ fn pool_ordering_is_deterministic() {
             result_hash: vec![],
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         };
         let tx_id = tx.id.clone();
         registry.register_pending(tx_id.clone()).unwrap();
@@ -938,7 +956,8 @@ fn send_to_executor_for_preload_follows_current_epoch() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
 
     // Both shard candidates must be registered. The fire-and-forget send this
     // replaced tolerated an empty registry; now that delivery is accounted for,

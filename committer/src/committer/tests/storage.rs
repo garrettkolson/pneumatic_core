@@ -69,6 +69,7 @@ fn make_contract_call_tx(token_id: Vec<u8>, module_output: Vec<u8>, delta: Stora
         result_hash,
         sender_signature: vec![],
         result_data,
+        selection: None,
     }
 }
 

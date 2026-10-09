@@ -708,6 +708,7 @@ fn pipeline_tx(
         payload,
         gas_limit: 0,
         result_data: vec![],
+        selection: None,
     };
     let canon = tx.canonical_signature_bytes().expect("canonical signature bytes");
     tx.sender_signature = account.sign_data(&canon).expect("sender signs the tx");

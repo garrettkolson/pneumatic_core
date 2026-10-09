@@ -271,6 +271,7 @@ async fn executor_call_wiring_resolves_target_and_folds_result() {
         result_hash: vec![],
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     };
     let pending = PendingTransaction::new(
         "xcall_tx_001".to_string(),

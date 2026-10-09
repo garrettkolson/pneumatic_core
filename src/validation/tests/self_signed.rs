@@ -136,6 +136,7 @@ fn self_signed_token_flow_end_to_end() {
         result_hash: vec![],
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     };
 
     // Validate with SelfSigned spec

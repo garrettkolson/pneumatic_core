@@ -23,7 +23,8 @@ async fn test_handle_preload() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let body = serialize_to_bytes_rmp(&tx).unwrap();
     let message = Message {
         chain_id: "test_env".to_string(),

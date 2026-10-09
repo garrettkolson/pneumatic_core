@@ -431,7 +431,8 @@ mod tests {
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],}
+        result_data: vec![],selection: None,
+        }
     }
 
     #[test]

@@ -157,6 +157,140 @@ impl PendingTransaction {
 // Transaction — full model with all protocol fields
 // ---------------------------------------------------------------------------
 
+/// ADR-004 routing decision — the single Finalizer that owns one transaction,
+/// made by the Sentinel (ADR-007 makes it the routing authority) and **attested
+/// by the Sentinel's own signature**.
+///
+/// Why a signed record rides on the transaction instead of being re-derived or
+/// asserted at each hop:
+///
+/// * **It has to reach the enforcing roles.** ADR-004's whole point is that
+///   exactly one Finalizer finalizes a transaction, and three roles have to act
+///   on that fact: the Finalizer that must refuse a transaction it was not
+///   chosen for, and the Committer that must accept a block only from the chosen
+///   one. The Executor forwards the transaction it was handed, so the decision
+///   rides the transaction and needs no new hop.
+/// * **It cannot be asserted by the party being checked.** The Finalizer is the
+///   node the check constrains. A record it could write — a field on the block
+///   or on `TransactionCommit`, or `SignedTransaction.finalizer_addr` — is one
+///   it could name itself in, and the check would pass while enforcing nothing
+///   (the exact defect this replaces: the Commit path accepted any block from
+///   "some registered Finalizer", and the gossip path verified the finalizer
+///   signature against `finalizer_addr`, a key taken from the block itself).
+///   Here the key is bound by a signature the Finalizer cannot mint.
+/// * **Re-derivation is not the same thing, and is not a drop-in.** A verifier
+///   could recompute `deterministic_select(stakers, FINALIZER_DOMAIN, tx_id,
+///   epoch_number, salt)` — `Block::epoch_number` is on the wire for exactly
+///   that reason (`src/blocks.rs:40-41`) — but it needs (a) the stake snapshot
+///   for *that* epoch and (b) ADR-019's salt, the tip of the token's chain at
+///   selection time, which the verifier cannot know: the tip it holds has
+///   usually advanced, and a salt one block off selects a different Finalizer.
+///   So `salt` and `epoch_number` ride here as the *audit* surface: with a
+///   per-role epoch-keyed snapshot read (Phase 7's "declare and verify the
+///   responsible set") a verifier can check the derivation itself, not just the
+///   signature. Until then the signature is what makes the record the
+///   Sentinel's, and the residual is named at the verification sites.
+///
+/// `salt` is carried, not yet re-derived-and-compared, at every verifier today.
+///
+/// Not part of `CanonicalTransaction`: the sender cannot sign a routing decision
+/// the Sentinel makes after validating the transaction. `#[serde(default,
+/// skip_serializing_if)]` follows the additive-field pattern (Ground Rule 4), so
+/// a transaction without a routing decision keeps its legacy wire bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SelectionRecord {
+    /// The one Finalizer selected for this transaction — a staker key, which is
+    /// the same Ed25519 key the node registry holds it under and that its
+    /// message envelopes carry.
+    pub finalizer_public_key: Vec<u8>,
+    /// Epoch whose stake snapshot produced the selection.
+    pub epoch_number: u64,
+    /// ADR-019 selection salt: the tip of the chain this transaction extends, as
+    /// read when the selection was made.
+    pub salt: Vec<u8>,
+    /// The Sentinel that made and signed the decision.
+    pub sentinel_public_key: Vec<u8>,
+    /// `sentinel_public_key`'s signature over [`SelectionRecord::attestation_surface`].
+    pub attestation: Vec<u8>,
+}
+
+impl SelectionRecord {
+    /// The exact bytes a Sentinel signs for a routing decision, and the exact
+    /// bytes a verifier re-serializes. Fixed-order and domain-tagged, so an
+    /// attestation for one role's selection (leader, executor shard) can never
+    /// be read as one for another, and a serde change cannot silently move the
+    /// signed surface.
+    pub fn attestation_surface(
+        tx_id: &str,
+        domain: u8,
+        finalizer_public_key: &[u8],
+        epoch_number: u64,
+        salt: &[u8],
+    ) -> Result<Vec<u8>, PneumaticError> {
+        crate::encoding::serialize_to_bytes_rmp(&(
+            tx_id.as_bytes(),
+            domain,
+            finalizer_public_key,
+            epoch_number,
+            salt,
+        ))
+        .map_err(|e| PneumaticError::Encoding(e.to_string()))
+    }
+
+    /// Build and sign a routing decision. `domain` must be the domain the
+    /// selection was made under (`FINALIZER_DOMAIN` for this record's purpose),
+    /// and must match what the verifier recomputes against.
+    pub fn attest(
+        crypto: &dyn crate::crypto::AsymCryptoProvider,
+        tx_id: &str,
+        domain: u8,
+        finalizer_public_key: Vec<u8>,
+        epoch_number: u64,
+        salt: Vec<u8>,
+    ) -> Result<Self, PneumaticError> {
+        let surface =
+            Self::attestation_surface(tx_id, domain, &finalizer_public_key, epoch_number, &salt)?;
+        let attestation = crypto.sign_data(&surface)?;
+        Ok(SelectionRecord {
+            sentinel_public_key: crypto.public_key()?,
+            finalizer_public_key,
+            epoch_number,
+            salt,
+            attestation,
+        })
+    }
+
+    /// Verify the attestation is the signature of `sentinel_public_key` over this
+    /// transaction's routing surface. `Ok(true)` means the decision is the
+    /// Sentinel's — NOT that the key it names is the one a stake snapshot would
+    /// select (see the type's note on `salt`), and NOT that the attester is a
+    /// registered Sentinel: callers hold the registry and must check that too,
+    /// or any key with a self-signed record would be an authority.
+    pub fn verify(
+        &self,
+        tx_id: &str,
+        domain: u8,
+        crypto: &dyn crate::crypto::AsymCryptoProvider,
+    ) -> Result<bool, PneumaticError> {
+        if self.attestation.is_empty() || self.sentinel_public_key.is_empty() {
+            return Ok(false);
+        }
+        let surface = Self::attestation_surface(
+            tx_id,
+            domain,
+            &self.finalizer_public_key,
+            self.epoch_number,
+            &self.salt,
+        )?;
+        crypto.check_signature(&self.attestation, &self.sentinel_public_key, &surface)
+    }
+
+    /// The decision's answer to the one question every enforcing role asks.
+    pub fn names(&self, key: &[u8]) -> bool {
+        !key.is_empty() && self.finalizer_public_key == key
+    }
+}
+
 /// Represents a pending transaction in the pipeline.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Transaction {
@@ -216,6 +350,25 @@ pub struct Transaction {
     /// `CanonicalTransaction` (the sender does not sign the execution output).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub result_data: Vec<u8>,
+    /// ADR-004 routing decision: the ONE Finalizer this transaction is assigned
+    /// to, stamped by the Sentinel after validation and attested by its
+    /// signature (ADR-007). Every role downstream enforces it — the Finalizer
+    /// refuses a transaction it was not chosen for, the Executor delivers the
+    /// finalize hop to that key alone, and the Committer accepts a block only
+    /// from the Finalizer named here.
+    ///
+    /// `None` means no routing decision was made, which is only true of a
+    /// transaction that never entered the standard pipeline: a self-verified
+    /// token skips the Executor and Finalizer entirely and is committed by the
+    /// epoch leader. Enforcing roles treat `None` on a path that has a Finalizer
+    /// as a refusal, not as "unconstrained" — see
+    /// `fact-composite-per-host-fork-divergence` for what "unconstrained" produced.
+    ///
+    /// Additive wire field (Ground Rule 4), **not** part of
+    /// `CanonicalTransaction`: the sender does not sign a decision the Sentinel
+    /// makes about which node will finalize its transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionRecord>,
 }
 
 /// Serde `skip_serializing_if` predicate for the additive `gas_limit` field:
@@ -351,7 +504,8 @@ impl SignedTransaction {
                 payload: vec![],
                 gas_limit: 0,
                 result_data: vec![],
-            },
+            selection: None,
+                },
             total_stake: 42,
             total_voters: 3,
             leader_address: vec![],
@@ -480,7 +634,8 @@ impl ShieldedTransaction {
             payload: vec![],
             gas_limit: 0,
             result_data: vec![],
-        }
+        selection: None,
+            }
     }
 }
 
@@ -618,7 +773,7 @@ impl Transaction {
         let bytes = crate::encoding::serialize_to_bytes_rmp(self)?;
         Ok(BasicHashProvider::new().hash(&bytes))
     }
-}
+    }
 
 // ---------------------------------------------------------------------------
 // TransactionCommit — message sent to Committers
@@ -767,7 +922,8 @@ mod tests {
             payload: vec![],
             gas_limit: 0,
             result_data: vec![],
-        }
+        selection: None,
+            }
     }
 
     fn make_validated_result() -> TransactionValidationResult {
@@ -1298,4 +1454,5 @@ mod tests {
         tx.payload.push(0xFF);
         assert!(!tx.verify_sender_signature().expect("verify after tamper"));
     }
+
 }

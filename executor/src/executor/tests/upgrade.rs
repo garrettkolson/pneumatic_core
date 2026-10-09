@@ -89,6 +89,7 @@ fn upgrade_entry(
         result_hash: vec![],
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     };
     let pending = PendingTransaction::new(
         "upgrade_tx_001".to_string(),

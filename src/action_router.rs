@@ -396,6 +396,7 @@ mod tests {
             amount: Some(amount), timestamp: 0, result_hash: vec![],
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         };
         let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
         make_message_with_body("Process", public_key, body)
@@ -409,6 +410,7 @@ mod tests {
             amount: Some(amount), timestamp: 0, result_hash: vec![],
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         };
         let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
         make_message_with_body("Preload", public_key, body)
@@ -441,6 +443,7 @@ mod tests {
             amount: None, timestamp: 0, result_hash: vec![],
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         };
         let body = crate::encoding::serialize_to_bytes_rmp(&tx).unwrap();
         let msg = make_message_with_body("Process", vec![1, 2, 3], body);

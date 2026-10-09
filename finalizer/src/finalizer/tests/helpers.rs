@@ -240,7 +240,8 @@ pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
         result_hash: vec![1, 2, 3, 4],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let validation = TransactionValidationResult::valid(
         vec![5, 6, 7, 8], // finalizer key
         pneumatic_core::errors::TransactionRiskFactor {

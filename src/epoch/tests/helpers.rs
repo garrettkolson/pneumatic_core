@@ -41,6 +41,7 @@ pub fn make_validated_registry() -> PendingTransactionRegistry {
                 timestamp: 1000, result_hash: vec![],
                 sender_signature: vec![],
                 result_data: vec![],
+                selection: None,
             },
             TransactionValidationResult::valid(
                 vec![99],
@@ -64,6 +65,7 @@ pub fn make_validated_registry() -> PendingTransactionRegistry {
                 timestamp: 2000, result_hash: vec![],
                 sender_signature: vec![],
                 result_data: vec![],
+                selection: None,
             },
             TransactionValidationResult::valid(
                 vec![99],

@@ -205,7 +205,8 @@ async fn backpressure_slot_freed_after_settle() {
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],};
+        result_data: vec![],selection: None,
+        };
         let pending =
             PendingTransaction::new(tx_id.clone(), TransactionState::Preloaded { transaction: tx });
         let _ = pending_registry.add_transaction(tx_id, pending);

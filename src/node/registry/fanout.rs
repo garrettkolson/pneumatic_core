@@ -85,6 +85,143 @@ pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
     join_all(send_futs).await;
 }
 
+/// Targeted fan-out to a named set of keys (async), with the same delivery
+/// accounting and the same same-host rule as [`Self::send_to_peers_blocking`].
+///
+/// This is the async twin that ADR-004 needed and did not exist. The finalize
+/// hop is single-recipient — the transaction names one Finalizer — and the role
+/// that must make that hop (`Executor::send_to_finalizer`) is `async` and runs
+/// on the runtime. The two primitives that did exist could not express it:
+/// `send_to_all` cannot name a key at all (which is precisely how a per-tx
+/// assignment got broadcast away), and the blocking variant would park a tokio
+/// worker thread for up to `send_timeout` per hop.
+///
+/// Returns the keys that did NOT receive the payload, for the same reason the
+/// blocking variant does: a target that is not in the bucket has no known rhash,
+/// so a failure against it cannot be attributed to the delivery-failure counter
+/// and can only be reported to the caller — which, for ADR-004, is what turns
+/// "the assigned Finalizer was unreachable" into a failed transaction instead of
+/// a transaction that silently never finalizes.
+///
+/// A target naming this host's own key is served through the inbound path (see
+/// [`Self::deliver_self_copy`]) and never enters the peer loop — the bucket
+/// cannot hold the local entry, so the bucket lookup would report it as
+/// undelivered on the exact host that can always serve it.
+pub async fn send_to_peers(
+    &self,
+    keys: &[Vec<u8>],
+    node_type: &NodeRegistryType,
+    data: &[u8],
+) -> Vec<Vec<u8>> {
+    let nodes = match self.get_nodes(node_type) {
+        Some(nodes) => nodes,
+        None => {
+            // No bucket for the type. A target naming our own key can still be
+            // served locally; every other target is undelivered rather than the
+            // call quietly succeeding.
+            let own_key = self.config.public_key.clone();
+            return keys
+                .iter()
+                .filter(|key| !(key.as_slice() == own_key.as_slice()
+                    && self.deliver_self_copy(data, node_type)))
+                .cloned()
+                .collect();
+        }
+    };
+
+    // Resolve targets up front so no DashMap guard is live across a send
+    // (same discipline as `send_to_all`). `None` rhash = not in the bucket.
+    let targets: Vec<(Vec<u8>, Option<[u8; 16]>)> = keys
+        .iter()
+        .map(|key| (key.clone(), nodes.get(key).map(|entry| entry.value().rhash)))
+        .collect();
+
+    let failures = Arc::clone(&self.delivery_failures);
+    let own_key = self.config.public_key.clone();
+    let peers: Vec<(Vec<u8>, Option<[u8; 16]>)> = targets
+        .into_iter()
+        .filter(|(key, rhash)| {
+            rhash.is_some() || key != &own_key || !self.deliver_self_copy(data, node_type)
+        })
+        .collect();
+
+    let mut undelivered: Vec<Vec<u8>> = Vec::new();
+
+    if let Some(network) = &self.network {
+        let futs = peers.into_iter().filter_map(|(key, rhash)| {
+            let Some(rhash) = rhash else {
+                undelivered.push(key);
+                return None;
+            };
+            let network = Arc::clone(network);
+            let node_type = node_type.clone();
+            let failures = Arc::clone(&failures);
+            let send_data = data.to_vec();
+            Some(async move {
+                match bounded_send_async(self.send_timeout, move || {
+                    let _ = RnsSender::new(network, rhash).get_response(&send_data);
+                })
+                .await
+                {
+                    Ok(()) => None,
+                    Err(e) => {
+                        record_delivery_failure(&failures, rhash, &node_type, e);
+                        Some(key)
+                    }
+                }
+            })
+        });
+        for missed in join_all(futs).await {
+            if let Some(key) = missed {
+                undelivered.push(key);
+            }
+        }
+        return undelivered;
+    }
+
+    // Direct branch: same concurrency as `send_to_all`, restricted to the named
+    // keys. A key evicted between resolution and send reports as undelivered
+    // instead of counting as a delivery that never happened.
+    let futs = peers.into_iter().map(|(key, rhash)| {
+        let node_type = node_type.clone();
+        let failures = Arc::clone(&failures);
+        let nodes_clone = Arc::clone(&nodes);
+        let send_data = data.to_vec();
+        async move {
+            let Some(entry) = nodes_clone.get(&key) else {
+                return Some(key);
+            };
+            let rhash = entry.value().rhash;
+            match tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
+            {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => {
+                    record_delivery_failure(&failures, rhash, &node_type, e);
+                    Some(key)
+                }
+                Err(_) => {
+                    record_delivery_failure(
+                        &failures,
+                        rhash,
+                        &node_type,
+                        ConnError::Timeout(format!(
+                            "direct send exceeded {:?}",
+                            self.send_timeout
+                        )),
+                    );
+                    Some(key)
+                }
+            }
+        }
+    });
+    for missed in join_all(futs).await {
+        if let Some(key) = missed {
+            undelivered.push(key);
+        }
+    }
+    undelivered
+}
+
 /// Blocking version for sync contexts (runs sends sequentially). Each send
 /// is bounded by `self.send_timeout` and runs on a detached std thread, with no
 /// ambient runtime assumed (H7): a hung RNS route or socket degrades to

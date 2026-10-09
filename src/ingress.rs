@@ -469,6 +469,7 @@ mod tests {
             result_hash: vec![],
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         };
         let canonical = tx.canonical_signature_bytes().expect("canonical bytes");
         tx.sender_signature = account.sign_data(&canonical).expect("sender signs");

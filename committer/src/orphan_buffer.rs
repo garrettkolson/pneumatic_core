@@ -219,7 +219,8 @@ mod tests {
                 result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],},
+            result_data: vec![],selection: None,
+            },
             total_voters: 3,
             total_stake: 42,
             leader_hash: previous_hash.to_vec(),

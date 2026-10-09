@@ -56,6 +56,7 @@ pub fn make_tx(sender: &[u8], receiver: &[u8], amount: Option<u64>, seq: usize) 
         result_hash: vec![],
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     }
 }
 
@@ -87,6 +88,7 @@ pub fn make_signed_tx_with_fields(
             result_hash,
             sender_signature: vec![],
             result_data: vec![],
+            selection: None,
         },
         total_stake: 42,
         total_voters: 3,
@@ -122,6 +124,7 @@ pub fn make_valid_block(signed_tx: SignedTransaction, blockchain: &mut Blockchai
                 result_hash: vec![],
                 sender_signature: vec![],
                 result_data: vec![],
+                selection: None,
             },
             total_stake: 42,
             total_voters: 3,

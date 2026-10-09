@@ -88,6 +88,7 @@ fn make_upgrade_tx(
         result_hash,
         sender_signature: vec![],
         result_data: vec![],
+        selection: None,
     }
 }
 

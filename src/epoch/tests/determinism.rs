@@ -223,6 +223,7 @@ fn signed_trans(sig_order: usize, meta_order: usize) -> SignedTransaction {
             gas_limit: 10,
             payload: vec![],
             result_data: vec![],
+            selection: None,
         },
         total_stake: 6,
         total_voters: 3,

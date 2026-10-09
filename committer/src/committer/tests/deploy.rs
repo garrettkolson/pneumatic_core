@@ -40,7 +40,8 @@ fn make_deploy_tx(sender: Vec<u8>, nonce: usize, params: DeployParams) -> Transa
         result_hash,
         sender_signature: vec![],
     
-    result_data: vec![],}
+    result_data: vec![],selection: None,
+    }
 }
 
 fn spec_params() -> DeployParams {

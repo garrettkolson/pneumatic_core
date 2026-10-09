@@ -171,6 +171,7 @@ impl TxClient {
             payload: Vec::new(),
             gas_limit: 0,
             result_data: Vec::new(),
+            selection: None,
         };
         self.submit(&mut tx).await
     }

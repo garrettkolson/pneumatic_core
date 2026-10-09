@@ -252,7 +252,8 @@ pub fn make_finalizing_entry(registry: &PendingTransactionRegistry, tx_id: &str,
                 timestamp: 0, result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],},
+            result_data: vec![],selection: None,
+            },
             TransactionValidationResult::valid(
                 finalizer_key.clone(),
                 TransactionRiskFactor {

@@ -777,6 +777,7 @@ mod tests {
             payload: vec![1, 2, 3, 4],
             gas_limit: 1234,
             result_data: vec![],
+            selection: None,
         }
     }
 
@@ -1447,6 +1448,7 @@ mod tests {
             payload: random_bytes(&mut rng, 32),
             gas_limit: [0, 5, 50, 1000][rng.gen_range(0..4)],
             result_data: vec![],
+            selection: None,
         };
         let contract = SmartContract {
             name: format!("dcontract-{}", rng.gen::<u32>()),

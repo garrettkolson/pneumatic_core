@@ -47,7 +47,8 @@ async fn test_executor_backpressure_rejects() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let pending = PendingTransaction::new("capacity_tx".to_string(), TransactionState::Preloaded { transaction: tx });
     let _ = pending_registry.add_transaction("capacity_tx".to_string(), pending);
 
@@ -122,7 +123,8 @@ async fn test_executor_rejects_transaction_in_terminal_state() {
         result_hash: vec![],
         sender_signature: vec![],
     
-    result_data: vec![],};
+    result_data: vec![],selection: None,
+    };
     let pending = PendingTransaction::new("failed_tx".to_string(), TransactionState::Failed {
         transaction: tx,
         reasons: vec![],
@@ -177,7 +179,8 @@ async fn full_backpressure_cycle() {
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],};
+        result_data: vec![],selection: None,
+        };
         let pending = PendingTransaction::new(
             tx_id.to_string(),
             TransactionState::Preloaded { transaction: tx },

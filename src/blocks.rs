@@ -675,6 +675,7 @@ pub mod tests {
                 result_hash: vec![0xAA],
                 sender_signature: vec![],
                 result_data: vec![],
+                selection: None,
             },
             total_stake: 1000,
             total_voters: 5,
