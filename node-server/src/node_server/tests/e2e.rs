@@ -1636,3 +1636,208 @@ async fn client_transaction_through_the_ingress_commits_observable_through_the_d
         other => panic!("expected a 422 refusal, got {other:?}"),
     }
 }
+
+// --- the self-delivery pin: the same pipeline with the relay REMOVED ---------
+
+/// `fact-composite-no-self-delivery`, pinned. The test above is the composite
+/// suite's established shape: every role-to-role hop is *replayed by the test*
+/// from what a recording connection caught — a mesh stand-in that was itself
+/// the missing production capability. This test is the same production path
+/// (real client, real socket, real ingress, real data service, four live role
+/// plugins) with the stand-in **removed**: nothing registers this host's own key
+/// in a bucket, and the test dispatches exactly one message — the client's
+/// submission, through the ingress.
+///
+/// So every remaining hop (`Preload` → `PreloadForFinalizer` → `Sign` →
+/// `Commit`) has to reach the role this same host runs by way of the bridge's
+/// self-subscription, or the transaction sits in the pool forever and the chain
+/// never grows. Both halves are load-bearing: the fan-out has to deliver the
+/// local copy, and the receiving handler's sender gate has to believe that this
+/// host's own key holds the role it fans out as.
+///
+/// Adding a relay here would make this test prove nothing. It is the unit-test
+/// form of the one proof that matters for Phase 2: the four-container rehearsal
+/// growing a chain with no test-side machinery in the loop.
+#[tokio::test]
+async fn a_composite_pipeline_commits_with_no_test_side_relay() {
+    use pneumatic_client::TxClient;
+    use pneumatic_core::conns::ConnTarget;
+    use pneumatic_core::data::DefaultDataProvider;
+    use pneumatic_core::ingress::spawn_ingress_server_on;
+    use pneumatic_core::telemetry::{HealthState, Metrics};
+    use pneumatic_data_service::{
+        apply_genesis, spawn as boot_data_service, DataStore, GenesisNode, GenesisSpec,
+    };
+
+    const PARTITION: &str = "token";
+
+    // --- production data layer ---------------------------------------------
+    let store = Arc::new(DataStore::new());
+    let (bound, accept_thread) = boot_data_service(
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().expect("loopback:0"),
+        store.clone(),
+        None,
+    )
+    .expect("the data service binds an ephemeral port");
+    std::mem::forget(accept_thread);
+
+    let provider: Arc<dyn DataProvider> =
+        Arc::new(DefaultDataProvider::new().with_source(ConnTarget::Remote(bound)));
+
+    let cfg = contract_runtime_config(vec![bad_peer()], type_config_floor(0), provider.clone());
+    let own_key = cfg.public_key.clone();
+    apply_genesis(
+        &GenesisSpec {
+            environment_id: "test_env".to_string(),
+            token_partition_id: PARTITION.to_string(),
+            stake_snapshot_epochs: vec![0, 1],
+            shielded_root_recency: 10,
+            nodes: vec![GenesisNode {
+                public_key_hex: hex::encode(&own_key),
+                stake: 2_000,
+                fuel_balance: 100_000,
+            }],
+            accounts: Vec::new(),
+            seed_shielded_pool: true,
+            tokens: Vec::new(),
+            seed_partition_token: true,
+        },
+        &*provider,
+    )
+    .expect("genesis applies against a live service");
+
+    let account = Arc::new(Ed25519Provider::from_seed([0x42u8; 32]));
+    let sender_pk = account.public_key().expect("client pubkey");
+    provider
+        .save_user(&sender_pk, pipeline_user(&sender_pk), PARTITION)
+        .expect("sender user written through the production provider");
+    let token = transfer_token(vec![0x0A]);
+    let token_id = token.id.clone();
+    provider
+        .save_token(&token_id, token.clone(), PARTITION)
+        .expect("genesis token written through the production provider");
+
+    // --- the four-role composite -------------------------------------------
+    let stake = Arc::new(MapStakeProvider::with_default(2_000));
+    let server =
+        Arc::new(build_runtime(cfg.clone(), stake, provider.clone()).expect("composite boots"));
+
+    // Four roles installed means the self-subscription covers all four — the
+    // bridge does both from the same list. Asserted rather than assumed, because
+    // everything below is only a statement about self-delivery if this is true.
+    assert_eq!(
+        server.node_registry().self_delivery_roles().len(),
+        4,
+        "the bridge subscribed the host to its own fan-out for every role it installed"
+    );
+
+    // --- and NO bucket entries for this host's own key. That is the whole test:
+    // the peer path has nowhere to carry a same-host hop, so only self-delivery
+    // can complete the pipeline.
+    for role in [
+        NodeRegistryType::Committer,
+        NodeRegistryType::Sentinel,
+        NodeRegistryType::Executor,
+        NodeRegistryType::Finalizer,
+    ] {
+        assert!(
+            server
+                .node_registry()
+                .get_nodes(&role)
+                .map(|nodes| nodes.is_empty())
+                .unwrap_or(true),
+            "the {role:?} bucket must hold no peers — a registered self would be \
+             a relay wearing a fixture's clothes"
+        );
+    }
+
+    // --- exactly one message enters this process: the client's submission ----
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("ingress bind");
+    let (ingress_addr, _ingress) = spawn_ingress_server_on(
+        listener,
+        server.ingress_sink(),
+        Arc::new(HealthState::new("e2e-no-relay")),
+        Arc::new(Metrics::new()),
+    )
+    .expect("ingress spawns");
+
+    let client = TxClient::new(ingress_addr, "test_env", account.clone());
+    let receipt = client
+        .submit_transfer("no_relay_1", &token_id, vec![0x77], 100, 1)
+        .await
+        .expect("the node accepts the client submission");
+    assert_eq!(receipt.tx_id, "no_relay_1");
+
+    // --- the independent expectation, computed OUTSIDE the pipeline ---------
+    use pneumatic_core::contracts::{ContractEngine, ContractEngineRegistry};
+    let contract = token
+        .get_asset::<SmartContract>()
+        .expect("transfer token has a contract asset");
+    let engines = Arc::new(ContractEngineRegistry::new());
+    engines.register_defaults();
+    let out = engines
+        .get("Transfer")
+        .expect("Transfer registered")
+        .execute(&ExecutionInput {
+            tx: &pipeline_tx(
+                &*account,
+                &sender_pk,
+                "no_relay_1",
+                "Transfer",
+                &token_id,
+                &vec![0x77],
+                Some(100),
+                vec![],
+            ),
+            contract: &contract,
+            sender_state: &pipeline_user(&sender_pk),
+            token: &token,
+            gas_limit: 0,
+            storage: contract.storage.clone(),
+            call_ctx: None,
+        })
+        .expect("transfer engine executes");
+    let expected_hash = BasicHashProvider::new().hash(&out.result_data);
+
+    // --- TERMINAL: the committed chain, read back through a FRESH provider --
+    // The hops are asynchronous with no relay to synchronise on, so this polls
+    // the production read path until the block shows up: the same terminal
+    // assertion as the relayed test, without the test driving the finish.
+    let reader: Arc<dyn DataProvider> =
+        Arc::new(DefaultDataProvider::new().with_source(ConnTarget::Remote(bound)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let committed = loop {
+        let read = reader
+            .get_token(&token_id, PARTITION)
+            .expect("the token is readable through the data service");
+        if read.blockchain.get_count() >= 2 {
+            break read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no block committed — the pipeline stalled with no relay in the loop. \
+             committer cache chain length = {}",
+            server
+                .tokens()
+                .get(&token_id)
+                .map(|t| t.blockchain.get_count())
+                .unwrap_or(0),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    assert_eq!(
+        committed.blockchain.get_count(),
+        2,
+        "genesis + the block THIS transaction committed, with no relay in the loop"
+    );
+    let block = committed.blockchain.get_block_at(1).expect("committed block");
+    assert_eq!(
+        block.signed_trans.transaction.result_hash, expected_hash,
+        "the committed block's result hash matches the engine output computed outside the pipeline"
+    );
+    assert_eq!(
+        block.signed_trans.transaction.id, "no_relay_1",
+        "the block carries THIS client's transaction"
+    );
+}

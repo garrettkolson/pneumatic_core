@@ -56,6 +56,21 @@ const COMMITTER_ACTIONS: &'static [&'static str] = &[
 /// `action` strings the Executor owns (preload a transaction's data ahead of commit).
 const EXECUTOR_ACTIONS: &'static [&'static str] = &["Preload"];
 /// `action` strings the Sentinel owns (verify inbound transactions).
+///
+/// Deliberately narrower than `Sentinel::on_data_received`'s match table, and
+/// self-delivery is what made the difference visible: once a role's fan-out
+/// reached the host's own buckets, the sentinel's cross-sentinel `Clear`
+/// notification (its own confirmation path, `notify_delete`) started arriving
+/// here and was refused — `unknown action: "Clear"`, surfaced, not swallowed.
+/// It stays refused. `on_data_received` is fed the *inner* envelope (`"Verify"`
+/// wrapping `"Process"`/`"ShieldedTransfer"`/`"Confirm"`), so admitting the
+/// bare `"Clear"`/`"Delete"` names would hand the adapter a `tx_id` body where
+/// it expects an envelope; and its handler removes the transaction from the
+/// pending registry, which on a composite is the role-shared one — clearing an
+/// entry the committer has not consumed yet would be a new failure mode, not a
+/// fix. Residual: cross-sentinel cleanup has no owner on a composite host. It
+/// needs either a wrapper convention at the send site or an explicit statement
+/// that one sentinel per host does not need it.
 const SENTINEL_ACTIONS: &'static [&'static str] = &["Verify"];
 /// `action` strings the Finalizer owns (sign / finalize blocks).
 ///

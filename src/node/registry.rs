@@ -86,6 +86,11 @@ pub struct NodeRegistry {
     /// `Arc` and roles are re-evaluated per epoch, so the registry is told at
     /// install time and every outbound message picks the new set up.
     declared_roles: std::sync::RwLock<Vec<NodeRegistryType>>,
+    /// Same-host delivery of a role's fan-out, installed by the composite
+    /// bridge only. `None` for every single-role host, which is what keeps a
+    /// split deployment from receiving copies of its own broadcast.
+    /// See [`self_delivery`].
+    self_delivery: std::sync::RwLock<Option<Arc<self_delivery::SelfDelivery>>>,
 }
 
 /// Canonical bytes for a directory response's envelope signature: the full
@@ -213,6 +218,7 @@ pub fn init(
         admission_lock: Arc::new(std::sync::Mutex::new(())),
         peering: Mutex::new(None),
         declared_roles,
+        self_delivery: std::sync::RwLock::new(None),
     };
     let mut registry = registry;
     if network.is_some() {
@@ -366,6 +372,7 @@ pub mod fanout;
 pub mod heartbeat;
 pub mod peering;
 pub mod registration;
+pub mod self_delivery;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -380,4 +387,5 @@ mod tests {
     mod lifecycle;
     mod peering;
     mod registration;
+    mod self_delivery;
 }

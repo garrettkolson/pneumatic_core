@@ -845,7 +845,15 @@ impl ExecutorHandle {
             .get_nodes(&NodeRegistryType::Finalizer)
             .ok_or_else(|| ExecutorError::NoFinalizers("No finalizers registered".to_string()))?;
 
-        if finalizer_nodes.is_empty() {
+        // A bucket this host also *runs* is not empty in the sense this gate
+        // means. On a composite the finalizer is the same machine's own role,
+        // and a bucket holds peers only — so the emptiness test alone refused a
+        // vote that the fan-out below would have delivered locally. The gate
+        // asks the registry which roles the host actually serves rather than
+        // trusting bucket occupancy as a proxy for "a finalizer exists".
+        if finalizer_nodes.is_empty()
+            && !self.node_registry.serves_locally(&NodeRegistryType::Finalizer)
+        {
             return Err(ExecutorError::NoFinalizers(
                 "No finalizers registered".to_string(),
             ));

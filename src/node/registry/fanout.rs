@@ -11,6 +11,12 @@ impl NodeRegistry {
 /// send is observable. Both the RNS and the direct branches fan out
 /// concurrently (`join_all`).
 pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
+    // Same-host hop first (see `self_delivery`): on a composite this host is a
+    // member of the target set and is not in its own bucket, so this copy is
+    // owed and no peer send will carry it. Delivered before the peer fan-out so
+    // a hung peer route cannot delay a hop that never leaves the machine.
+    self.deliver_self_copy(&data, node_type);
+
     let Some(nodes) = self.get_nodes(node_type) else { return };
 
     // If RNS transport is available, send via RNS. Fan out concurrently —
@@ -85,6 +91,9 @@ pub async fn send_to_all(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
 /// `Err(ConnError::Timeout)` instead of hanging the caller. Every failed
 /// delivery is recorded + logged (Phase 6.2).
 pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) {
+    // Same-host hop first — see `send_to_all` and `self_delivery`.
+    self.deliver_self_copy(&data, node_type);
+
     let Some(nodes) = self.get_nodes(node_type) else { return };
 
     // If RNS transport is available, send via RNS
@@ -215,8 +224,24 @@ pub fn send_to_peers_blocking(
     let failures = Arc::clone(&self.delivery_failures);
     let mut undelivered: Vec<Vec<u8>> = Vec::new();
 
+    // A target naming this host's own key is a same-host hop. The bucket cannot
+    // hold it — peering registers peers and directory sync refuses our own entry
+    // — so an unresolved self-target used to be reported as undelivered, which
+    // on a composite is the common case rather than the rare one: the sentinel
+    // that selects its own host's finalizer (`request_single_finalizer`, and the
+    // shard-preload variant) was failing a transaction it could have served
+    // itself. Deliver it through the inbound path, and only fall through to the
+    // peer machinery for everyone else.
+    let own_key = self.config.public_key.clone();
+    let peers: Vec<(Vec<u8>, Option<[u8; 16]>)> = targets
+        .into_iter()
+        .filter(|(key, rhash)| {
+            rhash.is_some() || key != &own_key || !self.deliver_self_copy(data, node_type)
+        })
+        .collect();
+
     if let Some(network) = &self.network {
-        for (key, rhash) in targets {
+        for (key, rhash) in peers {
             let Some(rhash) = rhash else {
                 undelivered.push(key);
                 continue;
@@ -244,7 +269,7 @@ pub fn send_to_peers_blocking(
         .build()
         .expect("build local runtime for targeted send");
 
-    for (key, rhash) in targets {
+    for (key, rhash) in peers {
         let Some(rhash) = rhash else {
             undelivered.push(key);
             continue;

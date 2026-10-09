@@ -17,12 +17,12 @@ pub fn node_is_already_registered(&self, key: &Vec<u8>, node_type: &NodeRegistry
 /// selection may have placed it under a different type. This is the
 /// committer's sender-authentication lookup: it maps an Ed25519 public key
 /// to the role that node is registered under.
+///
+/// A composite's own key is never in its own buckets (peering registers
+/// peers), so its locally held roles come from the self-subscription — see
+/// [`super::self_delivery`].
 pub fn find_node_type_by_public_key(&self, key: &[u8]) -> Option<NodeRegistryType> {
-    NodeRegistryType::iter().find(|t| {
-        self.get_nodes(t)
-            .map(|nodes| nodes.contains_key(key))
-            .unwrap_or(false)
-    })
+    self.roles_of_key(key).into_iter().next()
 }
 
 /// The set of registry types `key` is registered under, in registration
@@ -34,9 +34,39 @@ pub fn find_node_type_by_public_key(&self, key: &[u8]) -> Option<NodeRegistryTyp
 /// of the same lookups — both read the live map, so for any type the key
 /// holds, both agree it is present.
 pub fn find_node_types_by_public_key(&self, key: &[u8]) -> Vec<NodeRegistryType> {
-    NodeRegistryType::iter()
+    self.roles_of_key(key)
+}
+
+/// The lookups behind both role-resolution accessors: the buckets `key`
+/// appears in, plus — for this host's own key — every role the host itself
+/// runs.
+///
+/// The extra term is what makes a self-delivered message authenticatable.
+/// A composite's inbound handlers authenticate their sender by asking this
+/// registry which role the key holds, and on a composite the sender of a
+/// same-host hop is this host's own identity, which peering never put in a
+/// bucket: without this, the copy a role owes its own host would arrive and
+/// be refused as an `Unregistered` sender, and the chain still would not
+/// grow. It widens nothing. An envelope that verifies under this host's
+/// public key can only have been produced by this host, and the roles it
+/// resolves to are exactly the plugins the bridge installed on it — so the
+/// answer is true rather than permissive. A host with no self-subscription
+/// (every single-role process) gets the bucket-only answer unchanged.
+fn roles_of_key(&self, key: &[u8]) -> Vec<NodeRegistryType> {
+    let mut roles: Vec<NodeRegistryType> = NodeRegistryType::iter()
         .filter(|t| self.get_nodes(t).map(|nodes| nodes.contains_key(key)).unwrap_or(false))
-        .collect()
+        .collect();
+    if key == self.config.public_key.as_slice() {
+        for role in self.self_delivery_roles() {
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+    }
+    // Enum order regardless of how the two sources arrived: the accessors
+    // promise "registration order", and the single-role view takes the head.
+    roles.sort_by_key(|role| NodeRegistryType::iter().position(|t| &t == role));
+    roles
 }
 
 /// Role-set auth (Phase 6): `key` may send an action governed by

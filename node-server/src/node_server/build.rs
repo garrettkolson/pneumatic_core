@@ -234,21 +234,30 @@ pub fn build_runtime(
     // Wire the RNS transport to the in-process role dispatcher: control-plane
     // packets go to the node registry, data-plane packets route to the installed
     // role that owns the message's action (the `route_data_plane` unit, Phase 7).
-    if let Some(network_ref) = &network {
-        let network = network_ref.clone();
-        let registry = node_registry.clone();
-        let dispatcher = role_dispatcher.clone();
-        // Capture the BOOT runtime's handle for the data-plane branch below.
-        // RNS invokes this callback on its own worker threads — plain
-        // `std::thread`s with no ambient reactor — where a bare `tokio::spawn`
-        // panics and kills the worker (see `spawn_data_dispatch`; cost us the
-        // mesh in the 10/08/2026 rehearsal). `build_runtime` always runs
-        // inside the host runtime: `#[tokio::main]` in node-server.rs,
-        // `#[tokio::test]` in tests — so `Handle::current()` here is that
-        // runtime, and spawning through the captured handle works from any
-        // thread.
-        let bridge_rt = tokio::runtime::Handle::current();
-        network.on_packet(Arc::new(move |raw: Vec<u8>| {
+    //
+    // Built once, outside the transport branch, because it is TWO things now:
+    // the transport's inbound handler *and* the sink a same-host fan-out is fed
+    // into. One closure for both is the point — a local copy then traverses the
+    // same parse, the same directory-response branch, the same admit-lists and
+    // the same dispatcher as a frame that arrived over the wire. It captures no
+    // transport state, so it stands on its own when the host booted without one
+    // (`fact-composite-no-self-delivery`: a composite's fan-out reached every
+    // peer's copy of a role and never its own, because the buckets hold peers
+    // only and nothing else ever delivered to the host's own membership).
+    let registry = node_registry.clone();
+    let dispatcher = role_dispatcher.clone();
+    // Capture the BOOT runtime's handle for the data-plane branch below.
+    // RNS invokes this callback on its own worker threads — plain
+    // `std::thread`s with no ambient reactor — where a bare `tokio::spawn`
+    // panics and kills the worker (see `spawn_data_dispatch`; cost us the
+    // mesh in the 10/08/2026 rehearsal). `build_runtime` always runs
+    // inside the host runtime: `#[tokio::main]` in node-server.rs,
+    // `#[tokio::test]` in tests — so `Handle::current()` here is that
+    // runtime, and spawning through the captured handle works from any
+    // thread.
+    let bridge_rt = tokio::runtime::Handle::current();
+    let inbound_handler: pneumatic_core::rns::wrapper::PacketHandler =
+        Arc::new(move |raw: Vec<u8>| {
             match pneumatic_core::encoding::deserialize_rmp_to::<pneumatic_core::node::NetworkPacket>(&raw) {
                 Ok(packet) => {
                     if let Some(control) = packet.control {
@@ -281,7 +290,17 @@ pub fn build_runtime(
                     eprintln!("[pneumatic] dropping undecodable transport packet: {}", e);
                 }
             }
-        }));
+        });
+
+    // Self-subscription: "this host runs these roles, and this is its inbound
+    // path". Installed whether or not the transport came up — the self-hop never
+    // touches the network, and a composite that booted without one still has
+    // roles that must reach each other.
+    node_registry.install_self_delivery(installed_roles.clone(), inbound_handler.clone());
+
+    if let Some(network_ref) = &network {
+        let network = network_ref.clone();
+        network.on_packet(inbound_handler.clone());
 
         // Peering: this node announces itself to its bootstrap peers and asks
         // them for role directories, then keeps both warm. A composite had no
