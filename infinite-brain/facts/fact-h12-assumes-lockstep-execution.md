@@ -25,6 +25,10 @@ edges:
     type: related_to
     weight: 0.8
     note: "The executor's pure-read model is why each host re-executes locally at all"
+  - target: fact-finalizer-signature-did-not-bind-payload
+    type: blocks
+    weight: 0.95
+    note: "The prerequisite, landed 10/09/2026: the local compare was the only check on a rewritten result, so the signature had to start binding the payload first"
   - target: task-multihost-testnet-rollout
     type: related_to
     weight: 0.9
@@ -81,6 +85,18 @@ block, and a block built from a host's own execution trivially matches that host
 local copy. One producer per transaction — the thing ADR-004 asked for — makes the
 compare a cross-host agreement requirement, and there is no such agreement in the
 protocol.
+
+## The prerequisite landed first (10/09/2026, `294a2bb`)
+
+Narrowing this compare was not safe as written, and finding out why turned into its own
+piece of work: the committer verified the finalizer signature against
+`finalizer_sig.transaction_hash` — a hash delivered inside the same message as the payload
+it was supposed to authenticate — so it bound nothing, and the H12 compare below was the
+*only* thing catching a rewritten execution result. `result_data` is outside the sender's
+canonical surface entirely, and only the deploy/upgrade/wasm delta sites re-derive
+`hash(result_data)`. So Stage 1 made the signature bind the payload for real; only then can
+the compare below be narrowed to identity fields. See
+[[fact-finalizer-signature-did-not-bind-payload]].
 
 ## Why H12 is still right
 
