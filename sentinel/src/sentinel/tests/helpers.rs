@@ -85,6 +85,33 @@ pub fn make_test_node_registry() -> Arc<NodeRegistry> {
 }
 
 
+/// Register `keys` as Finalizer peers in `sentinel`'s node registry.
+///
+/// Finalizer selection only considers staked keys the sentinel can actually address,
+/// so a fixture that wants an assignment has to make its staked keys reachable as
+/// Finalizers — which is exactly what a deployment does by registering them. A
+/// snapshot whose stakers are all unregistered now fails closed with a `Routing`
+/// error naming both counts, so this helper is what a fixture owes for the honesty of
+/// its own stake set.
+pub fn register_finalizers(sentinel: &Sentinel, keys: &[Vec<u8>]) {
+    struct NoOp;
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for NoOp {
+        async fn send(&self, _data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            Ok(())
+        }
+    }
+    for key in keys {
+        assert!(
+            sentinel
+                .node_registry
+                .register_peer(key.clone(), [0x0F; 16], &NodeRegistryType::Finalizer, Box::new(NoOp)),
+            "fixture finalizer registers"
+        );
+    }
+}
+
+
 pub fn make_test_env_data() -> EnvironmentMetadata {
     let json = r#"{"environment_id":"test","environment_name":"test",
         "partitions":[{"id":"token","partition_type":"Token"},

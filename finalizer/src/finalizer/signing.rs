@@ -85,6 +85,23 @@ pub async fn handle_preload(&self, message: &Message) -> Result<Vec<u8>, Pneumat
     let tx: Transaction = deserialize_rmp_to(&message.body)
         .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
 
+    // ADR-004: register only what this node was chosen to finalize.
+    //
+    // Refusing here is the cheapest place to stop a fork, because everything
+    // downstream of a preload reads from this registry: a Finalizer that stores a
+    // transaction assigned elsewhere goes on to build a block for it the moment its
+    // executor's vote arrives. On a composite this also closes the shared-registry
+    // route, where the entry is already present because *this host's own Sentinel
+    // role* registered it — the refresh path below is exactly how a not-mine
+    // transaction would otherwise be adopted.
+    //
+    // Note the asymmetry with the envelope: preload carries no sender
+    // authentication (see below, and the C1 scoping note), so this is not a
+    // "who sent it" check. It is a "is this mine" check, and it holds regardless of
+    // who delivered it — a forged or misrouted preload names a Finalizer, and if
+    // that is not this node, nothing happens here.
+    self.finalize_authority(&tx)?;
+
     // Store as a preload task. We persist the *serialized transaction*, not
     // the envelope signature — after Phase 1.1 `message.signature` is a live
     // 64-byte Ed25519 signature, and storing it here would masquerade as
@@ -143,6 +160,13 @@ pub async fn handle_preload(&self, message: &Message) -> Result<Vec<u8>, Pneumat
         }
     }
 
+    // This transaction may already hold a vote. A preload that lands after its own
+    // executor's "Sign" is not a rare interleaving — it is what a transport that
+    // acknowledges on receipt plus a task-spawning bridge produces, and it happened on
+    // every frame of the RNS pipeline e2e. Registering the entry is only half of
+    // catching up: the optimistic attempt that ran without one has to run again.
+    self.retry_finalize_from_collected(&tx.id).await;
+
     // Acknowledge receipt
     Ok(pneumatic_core::messages::acknowledge())
 }
@@ -195,6 +219,13 @@ pub async fn handle_signature(&self, message: &Message) -> Result<Vec<u8>, Pneum
     // (C1) Stamp the voter's real stake from the epoch snapshot — never the
     // self-reported stake carried in the message.
     sig.current_stake = self.current_stake_for_voter(&voter_pubkey);
+
+    // ADR-004: a vote is only actionable by the Finalizer the transaction was
+    // routed to. Checking before the collector, not just before the block, keeps a
+    // transaction assigned elsewhere out of this node's signature registry at all —
+    // otherwise every host in the epoch accumulates votes for work it does not own,
+    // and the difference only shows up as a second block for one transaction.
+    self.finalize_authority_for_id(&tx_id)?;
 
     // Add the signature to the collector. This is the only path a key enters
     // the registry, and the key is already authenticated.

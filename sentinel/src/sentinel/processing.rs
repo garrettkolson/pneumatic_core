@@ -131,22 +131,80 @@ impl Sentinel {
             return self.handle_self_signed(tx, gas_used);
         }
 
-        // Step 6: Transition to Validated and enqueue into the pool for leader ordering.
+        // Step 6 (ADR-004): choose the ONE Finalizer this transaction is routed to,
+        // and make that choice something every downstream role can act on and check.
+        //
+        // This is the step the standard path never had. The types were here —
+        // `TransactionValidationResult::finalizer_public_key`,
+        // `TransactionState::Finalizing{finalizer_key}` — and the Executor dutifully
+        // read the key out and wrote it back; but on this path the value was the
+        // literal `vec![]` below, the Finalizer hop went to the whole bucket
+        // regardless of its contents, and no role ever compared anything to its own
+        // identity. With N hosts running a Finalizer, N blocks appeared for one
+        // transaction: `fact-composite-per-host-fork-divergence`.
+        //
+        // ADR-007: the Sentinel is the routing authority, so the choice is made
+        // here and not by the roles that enforce it. The salt is the tip of the
+        // chain the transaction extends (ADR-019), taken from the `token` this
+        // function already loaded for validation, so the salt cannot disagree with
+        // the token the transaction was validated against.
+        //
+        // Fail-closed by returning: no stake snapshot, an empty stake set, or a
+        // zero-stake winner all mean there is no defensible answer to "who
+        // finalizes this", and a transaction admitted without an owner is exactly
+        // the condition that produced one block per host. The pre-lock taken at
+        // Step 3 is released here — the existing error paths below leaked it, which
+        // is how a rejection at this line would have parked a registry entry
+        // write-locked forever rather than failing a transaction.
+        let epoch_number = *self.current_epoch.lock();
+        let salt = Self::chain_tip_of(&token);
+        let finalizer_key = match self.assign_finalizer_deterministic(&tx_id, epoch_number, &salt) {
+            Ok(key) => key,
+            Err(e) => {
+                let _ = self.registry.release_transaction(&tx_id);
+                return Err(e);
+            }
+        };
+        // The record must be the Sentinel's, not merely well-formed: the Finalizer
+        // this names is the one node allowed to finalize, and the Committer must
+        // accept a block only from it. Both checks are worthless if the party being
+        // constrained can write the answer, hence the attestation.
+        let selection = match self
+            .transaction_notifier
+            .attest_selection(&tx_id, finalizer_key.clone(), epoch_number, &salt)
+        {
+            Ok(record) => record,
+            Err(e) => {
+                let _ = self.registry.release_transaction(&tx_id);
+                return Err(SentinelError::from(e));
+            }
+        };
+        let mut tx = tx;
+        tx.selection = Some(selection);
+
+        // Step 7: Transition to Validated and enqueue into the pool for leader ordering.
         // Reject a replayed nonce (Phase 5.6 / H14) instead of silently admitting it.
         let risk = self.transaction_validator.calculate_risk(&tx);
-        self.registry.transition_to_validated_and_enqueue(
+        let enqueued = self.registry.transition_to_validated_and_enqueue(
             &tx_id,
             tx.clone(),
             pneumatic_core::transactions::TransactionValidationResult {
                 is_valid: true,
                 risk,
                 failure_reasons: vec![],
-                finalizer_public_key: vec![],
+                // The routing decision, in the field the Executor already reads back
+                // to stamp `Finalizing{finalizer_key}`. Until now this was
+                // `vec![]` on the standard path — the only two assignments it ever
+                // carried were `vec![]` here and `vec![]` for a self-signed token.
+                finalizer_public_key: finalizer_key,
             },
-        )
-        .map_err(|e| SentinelError::Registry(e.to_string()))?;
+        );
+        if let Err(e) = enqueued {
+            let _ = self.registry.release_transaction(&tx_id);
+            return Err(SentinelError::Registry(e.to_string()));
+        }
 
-        // Step 7: Standard pipeline — send to Executor for preloading
+        // Step 8: Standard pipeline — send to Executor for preloading
         self.send_to_executor_for_preload(&tx)
     }
 
@@ -166,6 +224,12 @@ impl Sentinel {
                 risk,
                 failure_reasons: vec![],
                 finalizer_public_key: vec![], // Empty — self-signed, no finalizer
+                // No `selection` either, and that is the invariant the enforcing
+                // roles rely on: a self-verified token skips the Executor and the
+                // Finalizer entirely and is committed by the epoch leader, so there
+                // is no Finalizer to name. Everywhere else, a transaction that
+                // reaches a Finalizer or a Commit hop without a routing decision is
+                // refused rather than treated as unconstrained.
             },
         )
         .map_err(|e| SentinelError::Registry(e.to_string()))?;

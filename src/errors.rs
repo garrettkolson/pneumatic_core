@@ -45,6 +45,13 @@ pub enum PneumaticError {
     /// `halo2_proofs::plonk::verify_proof` on its own greppable variant rather
     /// than being swallowed into a generic crypto error.
     Shielded(String),
+    /// ADR-004 routing refusal: a node was asked to act on a transaction the
+    /// Sentinel's routing decision did not assign to it, or that carried no routing
+    /// decision at all. Its own variant for the same reason `Shielded` has one —
+    /// "which node refused this transaction, and was it a fork attempt or a bug"
+    /// must be greppable in a node log, not folded into a registry or crypto error
+    /// that sends the reader to the wrong subsystem.
+    Routing(String),
     /// Filesystem failure on an observability path (mesh fragments). Separate
     /// from `Network`/`Registry` so an operator grepping for "Io(" finds exactly
     /// the writes that failed, and so a failed fragment never masquerades as a
@@ -58,6 +65,7 @@ impl std::fmt::Display for PneumaticError {
             PneumaticError::CryptoError(msg) => write!(f, "CryptoError({})", msg),
             PneumaticError::Encoding(msg) => write!(f, "Encoding({})", msg),
             PneumaticError::Io(msg) => write!(f, "Io({})", msg),
+            PneumaticError::Routing(msg) => write!(f, "Routing({})", msg),
             PneumaticError::Data(e) => write!(f, "Data({})", e),
             PneumaticError::Network(msg) => write!(f, "Network({})", msg),
             PneumaticError::Resource(msg) => write!(f, "Resource({})", msg),

@@ -152,6 +152,45 @@ impl Sentinel {
             }
         };
 
+        // ADR-004: re-stamp and re-attest the routing decision for the new owner.
+        //
+        // A reassignment that leaves the previous Finalizer in the record is a
+        // reassignment that will not be honoured: the new owner refuses a
+        // transaction naming someone else, and the old one refuses a transaction it
+        // has been told to let go — so the transaction would sit in Finalizing with
+        // both nodes correctly declining it.
+        //
+        // The epoch and salt carry over unchanged. The retry shifted only the
+        // tie-break input (`{tx_id}_retry`), and re-deriving against a *newer* tip
+        // would change the committee the rejection was meant to move past rather
+        // than the one it moves to.
+        let reassigned_tx = match reassigned_tx {
+            Some(tx) => {
+                let (epoch_number, salt) = match &tx.selection {
+                    Some(record) => (record.epoch_number, record.salt.clone()),
+                    None => {
+                        let tip = self.selection_tip(&tx.token_id)?;
+                        (*self.current_epoch.lock(), tip)
+                    }
+                };
+                match self
+                    .transaction_notifier
+                    .attest_selection(&tx_id, new_key.clone(), epoch_number, &salt)
+                {
+                    Ok(record) => {
+                        let mut tx = tx;
+                        tx.selection = Some(record);
+                        Some(tx)
+                    }
+                    Err(e) => {
+                        let _ = self.registry.release_transaction(&tx_id);
+                        return Err(SentinelError::from(e));
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Send the transaction to the new finalizer. The result was discarded
         // here before, which is how a dropped send became a silently stuck
         // transaction: the new finalizer never receives it, so no rejection ever
@@ -254,8 +293,45 @@ impl Sentinel {
             return Err(SentinelError::Routing("Stake set is empty".into()));
         }
 
+        // The snapshot decides *weight*; the registry decides *addressability*.
+        //
+        // A stake snapshot is a set of staked keys, and a staked key is not
+        // necessarily a Finalizer — the same snapshot also elects leaders and is
+        // keyed by every staked node in the environment, executors and committers
+        // included. Selecting over all of it and then sending to the Finalizer bucket
+        // picks a staked non-Finalizer a fraction of the time, and since the hop now
+        // has exactly one recipient that transaction fails closed instead of being
+        // picked up by whichever Finalizer happened to be listening. A routing
+        // decision that cannot be delivered is not a routing decision, so the
+        // candidate set is the staked Finalizers: snapshot ∩ registered Finalizers.
+        //
+        // What stays exactly as ADR-004 specifies is the authority for the outcome:
+        // the epoch-frozen snapshot supplies the weights, and the walk is the same
+        // seeded, lexicographically-sorted one. The intersection removes candidates
+        // this sentinel cannot reach; it does not reweight or reorder what remains.
+        //
+        // Residual, named rather than hidden: the Finalizer bucket is this node's
+        // local view, so two sentinels with different views can choose differently for
+        // the same transaction. The attestation makes that visible and attributable
+        // (and ADR-007 already places routing authority in the Sentinel), but the
+        // clean fix is a role-scoped candidate set persisted per epoch next to the
+        // `ExecutorSet` — `deterministic_select_shard` gets executors from an
+        // `ExecutorSet` for exactly this reason, and finalizers have no equivalent.
+        // That belongs with Phase 7's "declare and verify the responsible set".
+        let candidates = self.staked_finalizers(&snapshot);
+        if candidates.total_stake() == 0 {
+            return Err(SentinelError::Routing(format!(
+                "epoch {} snapshot has no staked key registered as a Finalizer ({} staked \
+                 keys, {} registered Finalizers); refusing to route tx {}",
+                epoch_number,
+                snapshot.stakers.len(),
+                self.registered_finalizer_count(),
+                tx_id
+            )));
+        }
+
         let finalizer_key = pneumatic_core::deterministic_select(
-            &snapshot,
+            &candidates,
             FINALIZER_DOMAIN,
             tx_id.as_bytes(),
             epoch_number,
@@ -268,6 +344,54 @@ impl Sentinel {
         }
 
         Ok(finalizer_key)
+    }
+
+    /// The epoch snapshot restricted to the Finalizers this sentinel can address:
+    /// registered peers, plus this host's own Finalizer when it runs one.
+    ///
+    /// Weights come from the snapshot and nothing else; the registry only drops
+    /// candidates. A Finalizer that is registered but holds no stake is gone — the
+    /// selection walk skips zero-stake keys anyway (AUDIT Phase 6.6), so an
+    /// un-staked node was never a legitimate candidate to begin with.
+    ///
+    /// The own-key case is not a corner; on a composite it is the only case. Peering
+    /// registers *peers*, so a host's own roles are never in its own bucket, and a
+    /// same-host hop travels through self-delivery instead. A candidate set built from
+    /// the bucket alone would therefore declare a single-host deployment un-routable
+    /// and refuse every transaction on it. `self_delivery_roles()` is the same
+    /// authority `deliver_self_copy` consults, so "I can name this Finalizer" and "I
+    /// can reach this Finalizer" remain one fact rather than two that can disagree.
+    fn staked_finalizers(&self, snapshot: &pneumatic_core::epoch::StakeSet) -> pneumatic_core::epoch::StakeSet {
+        let registered: Vec<Vec<u8>> = self
+            .node_registry
+            .get_nodes(&NodeRegistryType::Finalizer)
+            .map(|nodes| nodes.iter().map(|e| e.key().clone()).collect())
+            .unwrap_or_default();
+        let own_key = self.node_registry.get_config().public_key.clone();
+        let host_runs_a_finalizer = self
+            .node_registry
+            .self_delivery_roles()
+            .contains(&NodeRegistryType::Finalizer);
+        let stakers = snapshot
+            .stakers
+            .iter()
+            .filter(|(key, stake)| {
+                **stake > 0
+                    && (registered.contains(key)
+                        || (host_runs_a_finalizer && **key == own_key))
+            })
+            .map(|(key, stake)| (key.clone(), *stake))
+            .collect();
+        pneumatic_core::epoch::StakeSet { stakers }
+    }
+
+    /// Count of registered Finalizers, for the routing error that names why a
+    /// transaction could not be assigned.
+    fn registered_finalizer_count(&self) -> usize {
+        self.node_registry
+            .get_nodes(&NodeRegistryType::Finalizer)
+            .map(|nodes| nodes.len())
+            .unwrap_or(0)
     }
 
     /// Assign a finalizer deterministically, with a retry suffix if the

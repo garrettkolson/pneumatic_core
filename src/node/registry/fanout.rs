@@ -3,6 +3,67 @@
 
 use super::*;
 
+/// Drive one direct (non-RNS) send to completion, from whatever context the caller
+/// happens to be in.
+///
+/// `Connection::send` is `async`, so a synchronous caller needs a runtime. Building
+/// one on the current thread is correct when there is no runtime around — and a hard
+/// panic ("Cannot start a runtime from within a runtime") when the caller is already
+/// running inside one, which is the shape of every role handler on a composite host
+/// and of any `#[tokio::test]` that drives a role directly. So: no runtime below us,
+/// own one here; already inside one, hand the send to a thread that can own a runtime
+/// and join it. That join cannot deadlock on the calling runtime, because a direct
+/// send needs nothing from it — the payload is already serialized and the connection
+/// is this node's own socket, not a task the outer scheduler has to advance.
+///
+/// This is the cost of a synchronous send over an async transport, stated rather
+/// than hidden: bounded by `timeout`, and reported as a `ConnError` on failure, so a
+/// caller never reads a stall as a delivery.
+fn direct_send_blocking(
+    nodes: &Nodes,
+    key: &[u8],
+    data: &[u8],
+    timeout: Duration,
+) -> Result<(), ConnError> {
+    let nodes = Arc::clone(nodes);
+    let key = key.to_vec();
+    let data = data.to_vec();
+    let drive = move || -> Result<(), ConnError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ConnError::IO(format!("build runtime for direct send: {e}")))?;
+        runtime.block_on(async move {
+            match nodes.get(&key) {
+                Some(entry) => {
+                    tokio::time::timeout(timeout, entry.value().conn.send(&data))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ConnError::Timeout(format!(
+                                "direct send exceeded {:?}",
+                                timeout
+                            )))
+                        })
+                }
+                // Evicted between resolution and send: a failure, not a no-op.
+                None => Err(ConnError::IO(
+                    "peer removed from the bucket before the send".to_string(),
+                )),
+            }
+        })
+    };
+
+    if tokio::runtime::Handle::try_current().is_err() {
+        return drive();
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(drive)
+            .join()
+            .unwrap_or_else(|_| Err(ConnError::IO("direct send panicked".to_string())))
+    })
+}
+
 impl NodeRegistry {
 /// Send data to all registered nodes of a given type (async, concurrent).
 /// Each send is bounded by `self.send_timeout` so a hung route or socket
@@ -189,6 +250,21 @@ pub async fn send_to_peers(
         let send_data = data.to_vec();
         async move {
             let Some(entry) = nodes_clone.get(&key) else {
+                // Resolved to a peer a moment ago and then vanished. The caller gets
+                // the undelivered key, and the counter gets the rhash that was
+                // resolved for it — the same treatment the blocking variant gives an
+                // evicted entry, because a miss the caller sees but the counters do
+                // not is the silence-as-emptiness Phase 6.2 exists to remove.
+                if let Some(rhash) = rhash {
+                    record_delivery_failure(
+                        &failures,
+                        rhash,
+                        &node_type,
+                        ConnError::IO(
+                            "peer removed from the bucket before the send".to_string(),
+                        ),
+                    );
+                }
                 return Some(key);
             };
             let rhash = entry.value().rhash;
@@ -258,24 +334,14 @@ pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) 
     }
 
     // Direct-connection branch. This path must *actually* send, not drop a
-    // detached future: the `async_trait` `send` future needs a runtime to
-    // drive, and a detached std thread has none. Build a self-contained
-    // `current_thread` runtime here (no ambient runtime assumed — consistent
-    // with 6.1) and `block_on` each send. A failed send or elapsed bound is
-    // recorded + logged (Phase 6.2).
-    // Direct-connection branch. This path must *actually* send, not drop a
-    // detached future: the `async_trait` `send` future needs a runtime to
-    // drive, and a detached std thread has none. Build a self-contained
-    // `current_thread` runtime here (no ambient runtime assumed — consistent
-    // with 6.1) and `block_on` each send. A failed send or elapsed bound is
-    // recorded + logged (Phase 6.2).
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build local runtime for blocking direct send");
-
+    // detached future: the `async_trait` `send` future needs a runtime to drive, and
+    // a detached std thread has none. `direct_send_blocking` owns that runtime,
+    // including when the caller is itself inside a runtime — a `block_on` written
+    // here panicked outright in that case, which is how a synchronous role handler
+    // driven from an async adapter died. A failed send or elapsed bound is recorded +
+    // logged (Phase 6.2).
     // Collect (key, rhash) pairs up front to release DashMap guards before
-    // driving each send on the local runtime.
+    // driving each send.
     let keys: Vec<Vec<u8>> = nodes.iter().map(|e| e.key().clone()).collect();
     let peers: Vec<(Vec<u8>, [u8; 16])> = {
         let mut v = Vec::new();
@@ -289,29 +355,11 @@ pub fn send_to_all_blocking(&self, data: Vec<u8>, node_type: &NodeRegistryType) 
 
     let failures = Arc::clone(&self.delivery_failures);
     for (key, rhash) in peers {
-        let nodes_for_send = Arc::clone(&nodes);
-        let send_data = data.clone();
-        let result = runtime.block_on(async move {
-            match nodes_for_send.get(&key) {
-                Some(entry) => {
-                    tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
-                }
-                // Evicted between collection and send. Reporting `Ok(Ok(()))`
-                // here counted a delivery that never happened — the same
-                // silence-as-emptiness the Phase 6.2 counters exist to remove.
-                // Wrapped as `Ok(Err(..))` to match `timeout`'s inner result.
-                None => Ok(Err(ConnError::IO(
-                    "peer removed from the bucket before the send".to_string(),
-                ))),
-            }
-        });
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => record_delivery_failure(&failures, rhash, node_type, e),
-            Err(_) => record_delivery_failure(
-                &failures, rhash, node_type,
-                ConnError::Timeout(format!("direct send exceeded {:?}", self.send_timeout)),
-            ),
+        // An evicted entry is a failure inside `direct_send_blocking`, not a
+        // silent success — the same silence-as-emptiness the Phase 6.2 counters
+        // exist to remove.
+        if let Err(e) = direct_send_blocking(&nodes, &key, &data, self.send_timeout) {
+            record_delivery_failure(&failures, rhash, node_type, e);
         }
     }
 }
@@ -398,47 +446,20 @@ pub fn send_to_peers_blocking(
         return undelivered;
     }
 
-    // Direct branch: one self-contained runtime for the whole batch. A
-    // `current_thread` runtime is reused across `block_on` calls, so this is
-    // one thread per send *site* rather than one per key.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build local runtime for targeted send");
-
+    // Direct branch. `direct_send_blocking` owns the runtime the async
+    // `Connection::send` needs, wherever this call happens to be running — a
+    // `block_on` here used to panic outright when a synchronous role handler was
+    // driven from inside a runtime.
     for (key, rhash) in peers {
         let Some(rhash) = rhash else {
             undelivered.push(key);
             continue;
         };
-        let nodes_for_send = Arc::clone(&nodes);
-        let send_key = key.clone();
-        let send_data = data.to_vec();
-        let result = runtime.block_on(async move {
-            match nodes_for_send.get(&send_key) {
-                Some(entry) => {
-                    tokio::time::timeout(self.send_timeout, entry.value().conn.send(&send_data)).await
-                }
-                // Evicted between resolution and send: a failure, not a no-op.
-                // `Ok(Err(..))` to match `timeout`'s inner result type.
-                None => Ok(Err(ConnError::IO(
-                    "peer removed from the bucket before the send".to_string(),
-                ))),
-            }
-        });
+        let result = direct_send_blocking(&nodes, &key, data, self.send_timeout);
         match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(()) => {}
+            Err(e) => {
                 record_delivery_failure(&failures, rhash, node_type, e);
-                undelivered.push(key);
-            }
-            Err(_) => {
-                record_delivery_failure(
-                    &failures,
-                    rhash,
-                    node_type,
-                    ConnError::Timeout(format!("direct send exceeded {:?}", self.send_timeout)),
-                );
                 undelivered.push(key);
             }
         }

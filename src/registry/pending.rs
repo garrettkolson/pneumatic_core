@@ -167,13 +167,38 @@ impl PendingTransactionRegistry {
     }
 
     /// Check if a transaction's finalizer matches the expected key.
+    ///
+    /// Reads the routing decision wherever the pipeline has recorded it, not one
+    /// state's copy of it. The Sentinel writes the assignment into
+    /// `Validated{validation.finalizer_public_key}` at validation time (ADR-004) and
+    /// the Executor copies it into `Finalizing{finalizer_key}` when it takes the
+    /// transaction — both are the same decision, at different points in the chain.
+    ///
+    /// Matching only `Finalizing` made the gate answer "no" for a transaction that
+    /// had been assigned and had not yet been executed, so an assigned Finalizer
+    /// speaking about a transaction it *was* chosen for was refused as unassigned.
+    /// It also hid the case this primitive exists to catch: with the Sentinel's
+    /// standard path writing `vec![]` until now, an empty assignment matched nothing,
+    /// and every Confirm/Reject arriving against such an entry was reported as coming
+    /// from an unassigned finalizer — an error message that blamed the sender for a
+    /// routing decision that was never made.
     pub fn is_requested_finalizer(&self, id: &str, expected_key: &[u8]) -> bool {
+        if expected_key.is_empty() {
+            // Nothing is assigned; nothing is authorized to speak for it. An empty
+            // `expected_key` compared against an empty stored key would otherwise
+            // authorize the first sender that bothered to omit a key.
+            return false;
+        }
         let entry = match self.transactions.get_mut(id) {
             Some(e) => e,
             None => return false,
         };
         match &entry.state {
             TransactionState::Finalizing { finalizer_key, .. } => finalizer_key == expected_key,
+            TransactionState::Validated { validation, .. } => {
+                !validation.finalizer_public_key.is_empty()
+                    && validation.finalizer_public_key == expected_key
+            }
             _ => false,
         }
     }

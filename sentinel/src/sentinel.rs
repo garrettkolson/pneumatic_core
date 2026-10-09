@@ -76,7 +76,28 @@ impl Sentinel {
             super::transaction_notifier::TransactionNotifier::new(config, Arc::clone(&node_registry))
         );
         let validator = super::transaction_validator::TransactionValidator::new(env_data.clone(), Arc::clone(&data_provider));
-        let partition_id = env_data.environment_id.clone();
+        // The partition every epoch snapshot is *stored* under.
+        //
+        // This was `env_data.environment_id`. Stake and executor-set snapshots are
+        // written under `token_partition_id` by every writer in the system —
+        // `GenesisSpec::apply` (the data service's genesis, `stake_snapshot_epochs`)
+        // and `Committer::advance_epoch` (`save_stake_snapshot(new_epoch, …,
+        // &self.env_data.token_partition_id)`) — and every other reader asks with the
+        // same key: the committer's boot read in `committer/src/main.rs`, and the
+        // Finalizer's own `stake_cache`, which is built from the `token_partition_id`
+        // its host hands it. The Sentinel alone asked with the environment id, so
+        // against a real data service its snapshot fetch returned `StoreNotFound` for
+        // every epoch, permanently, on both caches.
+        //
+        // That stayed invisible only because nothing on the primary path called it.
+        // The sole production caller of `assign_finalizer_deterministic` was the
+        // rejection-recovery path, and no component has ever sent `"Reject"`; the
+        // executor-set read degraded to unsharded routing instead of failing. So a
+        // routing authority that could not read its own stake set looked like an
+        // unused code path rather than a broken one — and ADR-004 could not have been
+        // enforced on the standard path with this in place, because the selection
+        // would have failed closed on every transaction.
+        let partition_id = env_data.token_partition_id.clone();
         // Each fetch closure captures its own clone of the provider Arc so
         // the `data_provider` field can still be moved into the struct below.
         let stake_dp = data_provider.clone();
@@ -171,6 +192,7 @@ mod tests {
     mod processing;
     mod finalizing;
     mod registering;
+    mod routing;
     mod epoching;
     mod shielded;
     mod error;

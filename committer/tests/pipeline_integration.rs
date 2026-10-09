@@ -388,6 +388,38 @@ fn bootstrap_token_chain(tokens: &DashMap<Vec<u8>, Token>) {
     tokens.insert(token.id.clone(), token);
 }
 
+/// The routing decision ADR-004 puts on a transaction, attested by `sentinel` and
+/// naming `finalizer_key` as the Finalizer chosen for it.
+///
+/// A hand-built block needs one because the committer now refuses a block whose
+/// transaction was never routed, whose attestation does not verify, whose attester is
+/// not a registered Sentinel, or whose assigned node is not the node that sent it.
+/// Four separate refusals, and a fixture has to satisfy all four — which is the point:
+/// "the Finalizer that got here first" is no longer a credential.
+fn routed_selection(
+    sentinel: &pneumatic_core::rns::identity::NodeIdentity,
+    tx_id: &str,
+    finalizer_key: &[u8],
+) -> pneumatic_core::transactions::SelectionRecord {
+    pneumatic_core::transactions::SelectionRecord::attest(
+        &sentinel.ed25519,
+        tx_id,
+        pneumatic_core::epoch::FINALIZER_DOMAIN,
+        finalizer_key.to_vec(),
+        0,
+        vec![0x5A; 32],
+    )
+    .expect("the sentinel attests its routing decision")
+}
+
+/// Register a Sentinel identity in `registry` and return it, for fixtures that need
+/// an attester a committer can resolve by role.
+fn register_sentinel(
+    registry: &NodeRegistry,
+) -> pneumatic_core::rns::identity::NodeIdentity {
+    register_node(registry, NodeRegistryType::Sentinel)
+}
+
 fn make_block_finalized_message(block: Block, finalizer: &pneumatic_core::rns::identity::NodeIdentity) -> Message {
     let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
     Message::signed("test".to_string(), "BlockFinalized", body, None, finalizer)
@@ -719,6 +751,12 @@ async fn test_pipeline_no_conflict() {
             &NodeRegistryType::Finalizer,
             Box::new(NullConnection),
         );
+    // ADR-004 needs an attester as well as a sender: the routing decision on the
+    // block's transaction is honored only if the key that signed it holds the
+    // Sentinel role in this registry, and it has to name the node that sends the
+    // block — so the same key both signs the block and appears in the decision.
+    let sentinel = register_sentinel(&node_registry);
+    let finalizer_key = finalizer.ed25519.public_key().expect("finalizer public key");
 
     // Bootstrap token and chain
     bootstrap_token_chain(&tokens);
@@ -749,7 +787,8 @@ async fn test_pipeline_no_conflict() {
                 result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],selection: None,
+            result_data: vec![],
+            selection: Some(routed_selection(&sentinel, "test_tx", &finalizer_key)),
             },
             total_voters: 3,
             total_stake: 42,
@@ -819,6 +858,10 @@ async fn commit_from_empty_registry_materializes_and_commits() {
     // Register a Finalizer so the "Commit" envelope passes the fail-closed auth
     // gate — "Commit" is Finalizer-only.
     let finalizer = register_node(&node_registry, NodeRegistryType::Finalizer);
+    // See `test_pipeline_no_conflict`: an attester the committer can resolve, and the
+    // key the routing decisions name.
+    let sentinel = register_sentinel(&node_registry);
+    let finalizer_key = finalizer.ed25519.public_key().expect("finalizer public key");
 
     // Bootstrap token + genesis chain.
     bootstrap_token_chain(&tokens);
@@ -850,7 +893,8 @@ async fn commit_from_empty_registry_materializes_and_commits() {
                 result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],selection: None,
+            result_data: vec![],
+            selection: Some(routed_selection(&sentinel, "commit_sink_tx", &finalizer_key)),
             },
             total_voters: 3,
             total_stake: 42,
@@ -932,6 +976,12 @@ async fn test_pipeline_conflict_and_slashing() {
             &NodeRegistryType::Finalizer,
             Box::new(NullConnection),
         );
+    // ADR-004 needs an attester as well as a sender: the routing decision on the
+    // block's transaction is honored only if the key that signed it holds the
+    // Sentinel role in this registry, and it has to name the node that sends the
+    // block — so the same key both signs the block and appears in the decision.
+    let sentinel = register_sentinel(&node_registry);
+    let finalizer_key = finalizer.ed25519.public_key().expect("finalizer public key");
 
     // Bootstrap token and chain
     bootstrap_token_chain(&tokens);
@@ -962,7 +1012,8 @@ async fn test_pipeline_conflict_and_slashing() {
                 result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],selection: None,
+            result_data: vec![],
+            selection: Some(routed_selection(&sentinel, "conflict_tx_1", &finalizer_key)),
             },
             total_voters: 3,
             total_stake: 42,
@@ -1010,7 +1061,8 @@ async fn test_pipeline_conflict_and_slashing() {
                 result_hash: vec![],
                 sender_signature: vec![],
             
-            result_data: vec![],selection: None,
+            result_data: vec![],
+            selection: Some(routed_selection(&sentinel, "conflict_tx_2", &finalizer_key)),
             },
             total_voters: 3,
             total_stake: 42,

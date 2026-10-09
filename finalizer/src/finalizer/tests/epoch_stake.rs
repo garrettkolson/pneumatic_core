@@ -182,6 +182,9 @@ async fn test_optimistic_finalize_with_seeded_token() {
     // and the voter to be registered as an Executor. The real intent of this
     // test — optimistic finalize with a real previous_hash lookup against a
     // seeded token — is unchanged.
+    // ADR-004: the entry carries a routing decision naming this finalizer.
+    route_existing(&finalizer, "test_tx_001");
+
     let message = build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);
 
     // First signature → optimistic finalize, now with a real previous_hash

@@ -25,6 +25,20 @@ impl Committer {
         // Validate the transaction message
         self.validate_transaction_message(&commit)?;
 
+        // ADR-004: accept this block only from the Finalizer the Sentinel routed the
+        // transaction to. Before anything else — no materialization, no lock, no
+        // chain append.
+        //
+        // `message.public_key` is the sender the envelope signature proved, so this
+        // is the first time on this path that the identity of the sender is checked
+        // against anything other than "is it some Finalizer". Role membership was
+        // the whole gate: with `Exact(Finalizer)` admitting any registered Finalizer
+        // and nothing comparing the sender to the transaction's assignment, every
+        // host that finalized a transaction could commit its own block, and the
+        // per-host divergence that followed looked like optimistic-finality
+        // behaviour rather than an unimplemented ADR.
+        self.commit_authority(&commit, &message.public_key)?;
+
         // Check and commit the transaction results. The authenticated sender key (verified by
         // `authenticate_message`) is threaded through as the finalizer key: it identifies the
         // node that actually authenticated this Commit, which is more trustworthy than the

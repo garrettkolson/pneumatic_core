@@ -212,6 +212,35 @@ async fn try_finalize(&self, tx_id: &str) -> Result<Vec<u8>, PneumaticError> {
         .map_err(|e| PneumaticError::Encoding(e.to_string()))?)
 }
 
+/// Re-run the optimistic path for a transaction whose vote arrived first.
+///
+/// Frames are handled in the order the transport delivers them, and each one is
+/// handed to a task — so an executor's "Sign" can be handled before its own
+/// "PreloadForFinalizer", even though the executor sent the preload first and waited
+/// for it to be received. The vote is admitted (the routing gate cannot prove a
+/// transaction is someone else's when this node holds no entry for it — see
+/// `finalize_authority_for_id`), the optimistic attempt then fails on the missing
+/// entry, and nothing revisits it: the transaction would sit registered, holding a
+/// valid vote in the collector, and never become a block. Measured in the RNS
+/// pipeline e2e, where both executors' votes were handled before either preload on
+/// both finalizers — four frames, zero blocks.
+///
+/// A failed replay is not a failed preload. The preload did its job either way and
+/// still acknowledges; the replay's failure is logged because it is the only signal
+/// that a transaction is stuck.
+pub(crate) async fn retry_finalize_from_collected(&self, tx_id: &str) {
+    let Some((voter, sig)) = self.signature_collector.first_signature(tx_id) else {
+        return;
+    };
+    if let Err(e) = self.try_finalize_optimistic(tx_id, &sig, &voter).await {
+        log::warn!(
+            "optimistic finalize replay for tx {} (its vote arrived before its preload): {}",
+            tx_id,
+            e
+        );
+    }
+}
+
 /// Attempt to finalize a transaction optimistically (first executor signature).
 ///
 /// This is the fast path — no quorum waiting, no signature reconciliation.
@@ -254,6 +283,14 @@ pub(crate) async fn try_finalize_optimistic(
         }
     };
     drop(entry);
+
+    // ADR-004, at the one place a block is actually made. `handle_preload` and
+    // `handle_signature` both refuse first; this is the last gate before the
+    // signature, so no future caller can reach a block without passing it. The
+    // check reads the transaction's routing decision, not this node's opinion: a
+    // Finalizer that builds a block for a transaction assigned elsewhere is the
+    // fork, whatever else about the transaction is valid.
+    self.finalize_authority(&transaction)?;
 
     // P10: stamp the verified executor vote hash onto the canonical tx
     // BEFORE it goes into the block, so the shared-registry entry and the

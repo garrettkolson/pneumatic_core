@@ -256,7 +256,7 @@ async fn executor_call_wiring_resolves_target_and_folds_result() {
 
     // A pending registry with a tx that targets A (token [0xAA]).
     let pending_registry = Arc::new(PendingTransactionRegistry::new());
-    let tx = Transaction {
+    let mut tx = Transaction {
         payload: vec![],
         gas_limit: 0,
         id: "xcall_tx_001".to_string(),
@@ -273,7 +273,21 @@ async fn executor_call_wiring_resolves_target_and_folds_result() {
         result_data: vec![],
         selection: None,
     };
-    let pending = PendingTransaction::new(
+
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);    let pending = PendingTransaction::new(
         "xcall_tx_001".to_string(),
         TransactionState::Preloaded { transaction: tx },
     );

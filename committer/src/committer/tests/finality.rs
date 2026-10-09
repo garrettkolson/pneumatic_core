@@ -315,8 +315,11 @@ async fn handle_block_finalized_unknown_token_returns_error() {
     let dp = Arc::new(TestDataProvider::new());
     let (committer, _registry, _logger) = make_test_committer(dp);
 
-    // A valid finalizer signature so the block clears the C5 gate and reaches the expected
-    // TokenNotFound path (this block targets a token that is not in the committer's cache).
+    // A valid finalizer signature, and a routing decision naming that same Finalizer,
+    // so the block clears both gates and reaches the expected TokenNotFound path
+    // (this block targets a token that is not in the committer's cache). The signer
+    // and the routed node have to agree: the finalizer signature is verified under the
+    // key the routing decision names, not under `finalizer_addr`.
     let unknown_finalizer = Ed25519Provider::generate();
     let unknown_finalizer_addr = unknown_finalizer.public_key().expect("finalizer public key");
     let unknown_tx_hash = b"unknown-transaction-hash".to_vec();
@@ -326,6 +329,10 @@ async fn handle_block_finalized_unknown_token_returns_error() {
         transaction_id: "unknown".to_string(),
         transaction: Transaction {
             payload: vec![], gas_limit: 0,
+            selection: Some(gossip_selection_named(
+                "unknown",
+                &unknown_finalizer_addr,
+            )),
             id: "unknown".to_string(),
             action: "Process".into(),
             token_id: vec![99], // not in committer's token cache
@@ -338,14 +345,14 @@ async fn handle_block_finalized_unknown_token_returns_error() {
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],selection: None,
+        result_data: vec![],
         },
         total_voters: 3,
         total_stake: 42,
         leader_hash: vec![],
         leader_address: vec![],
         leader_stake: 0,
-        finalizer_addr: unknown_finalizer_addr,
+        finalizer_addr: unknown_finalizer_addr.clone(),
         finalizer_sig: TransactionSignature {
             transaction_id: vec![],
             env_id: vec![],
@@ -368,7 +375,7 @@ async fn handle_block_finalized_unknown_token_returns_error() {
         epoch_number: 0,
     };
 
-    let message = make_block_finalized_message(block);
+    let message = make_block_finalized_message_from(block, unknown_finalizer_addr);
 
     let result = committer.handle_block_finalized(message).await;
     assert!(matches!(result, Err(CommitterError::TokenNotFound(_))));

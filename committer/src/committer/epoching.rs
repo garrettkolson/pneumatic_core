@@ -256,6 +256,32 @@ impl Committer {
         let epoch_number = self.current_epoch_number.load(Ordering::SeqCst);
 
         for (tx, signed) in batch {
+            // ADR-004: the leader proposes only transactions that were never routed
+            // to a Finalizer — in practice, self-verified-token transactions, which
+            // carry no `selection` for exactly that reason.
+            //
+            // A transaction carrying a routing decision belongs to the Finalizer the
+            // Sentinel named. Proposing it here would append a block built by a node
+            // the decision does not name, with `finalizer_addr` and `finalizer_sig`
+            // empty — and because the leader path calls the commit routine directly
+            // instead of going through the inbound `Commit` handler, it is the one
+            // route on which the new `commit_authority` check would never run. The
+            // queue is shared with the Finalizer pipeline on a composite, so this is
+            // not hypothetical: a routed transaction sits `Validated` in the pool for
+            // the whole time its Executor and Finalizer are working on it.
+            //
+            // Skipping is the whole handling; it does not cancel the transaction. It
+            // was already dequeued, so it will not be offered again, and its
+            // Finalizer's `Commit` needs nothing from the pool.
+            if tx.selection.is_some() {
+                self.logger().log(format!(
+                    "Leader-propose: skipping tx {} — it is routed to Finalizer {}, so only \
+                     that node's block for it may be committed",
+                    tx.id,
+                    bytes_to_hex(&tx.selection.as_ref().map(|r| r.finalizer_public_key.clone()).unwrap_or_default())
+                ));
+                continue;
+            }
             let commit = TransactionCommit {
                 trans_id: tx.id.into_bytes(),
                 token_id: token_id_vec.clone(),

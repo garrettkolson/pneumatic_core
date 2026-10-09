@@ -530,7 +530,7 @@ impl ExecutorHandle {
         transaction.result_data = final_result.result_data.clone();
 
         // Step 9: Get finalizer key from validation result
-        let finalizer_key = self.get_finalizer_key(tx_id);
+        let finalizer_key = self.get_finalizer_key(&transaction);
 
         // Step 10: Transition to Finalizing state
         {
@@ -552,6 +552,7 @@ impl ExecutorHandle {
                 tx_bytes,
                 final_result.result_data.clone(),
                 final_result.result_hash.clone(),
+                &finalizer_key,
             )
             .await
         {
@@ -625,6 +626,27 @@ impl ExecutorHandle {
         // and `catch_unwind` isolates panics so a buggy engine fails the
         // transaction deterministically instead of unwinding the task.
         let join = tokio::task::spawn_blocking(move || {
+            // A contract executes against the transaction the sender signed, not the
+            // one the pipeline stamped.
+            //
+            // `ExecutionInput::canonical_bytes()` is the Wasm module's stdin and it
+            // covers the whole `Transaction` — including `selection`, the ADR-004
+            // routing decision the Sentinel attests *after* the sender signs. That
+            // field must not reach a program for two reasons:
+            //
+            // * It is not user intent. It names which node finalizes; nothing a
+            //   contract should compute depends on it.
+            // * It is deliberately outside `CanonicalTransaction`, so the sender
+            //   never signed it. Feeding it in would give the Sentinel — a role whose
+            //   authority is routing (ADR-007), not execution — the power to change
+            //   what a contract computes, and therefore the committed result hash, by
+            //   changing its own attestation.
+            //
+            // Only the engine's view is stripped. Routing, finalization and the block
+            // hash all still ride on the stamped transaction, which is what makes the
+            // decision enforceable in the first place.
+            let mut tx = tx;
+            tx.selection = None;
             let input = ExecutionInput {
                 tx: &tx,
                 contract: &contract,
@@ -800,27 +822,47 @@ impl ExecutorHandle {
         })
     }
 
-    /// Get the finalizer public key from the transaction's validation result.
-    fn get_finalizer_key(&self, tx_id: &str) -> Vec<u8> {
-        match self.pending_registry.get_transaction_mut(tx_id) {
-            Ok(entry) => {
-                if let pneumatic_core::transactions::TransactionState::Validated { validation, .. } =
-                    &entry.state
-                {
-                    return validation.finalizer_public_key.clone();
-                }
+    /// The Finalizer this transaction is routed to (ADR-004).
+    ///
+    /// Read from the transaction's routing decision first. The transaction is the
+    /// only carrier that survives the pipeline's state transitions: the entry sits in
+    /// `Executing` by the time this is asked (step 4's `transition_to_executing`
+    /// precedes it), so a reader that looks only in `Validated{validation}` gets
+    /// nothing — which is exactly what happened here. That is why the previous
+    /// implementation returned `vec![]` on *every* transaction, on *every* run, and
+    /// nobody noticed: its caller fed the value into `send_to_all`, where an empty
+    /// key changed nothing about who received the transaction. An unread routing
+    /// decision and a broken one are indistinguishable when nothing acts on either.
+    ///
+    /// The registry read remains as a fallback for a transaction that arrived without
+    /// a selection — an entry the Sentinel stamped before this field existed — and it
+    /// now covers the states an in-flight transaction is actually in.
+    fn get_finalizer_key(&self, tx: &pneumatic_core::transactions::Transaction) -> Vec<u8> {
+        if let Some(record) = &tx.selection {
+            if !record.finalizer_public_key.is_empty() {
+                return record.finalizer_public_key.clone();
             }
-            Err(_) => {}
         }
-        vec![]
+        match self.pending_registry.get_transaction_mut(&tx.id) {
+            Ok(entry) => match &entry.state {
+                pneumatic_core::transactions::TransactionState::Validated { validation, .. } => {
+                    validation.finalizer_public_key.clone()
+                }
+                pneumatic_core::transactions::TransactionState::Finalizing { finalizer_key, .. } => {
+                    finalizer_key.clone()
+                }
+                _ => vec![],
+            },
+            Err(_) => vec![],
+        }
     }
 
-    /// Send the execution result to the Finalizers.
+    /// Send the execution result to the ONE Finalizer this transaction is routed to.
     ///
-    /// Two messages ride to each finalizer, in order (same RNS link ⇒ FIFO):
+    /// Two messages ride to that Finalizer, in order (same RNS link ⇒ FIFO):
     ///
-    /// 1. `"Preload"` carrying the serialized transaction — registers the tx
-    ///    in the finalizer's own pending registry, which its
+    /// 1. `"PreloadForFinalizer"` carrying the serialized transaction — registers
+    ///    the tx in the finalizer's own pending registry, which its
     ///    optimistic-finality path loads from (without it, the "Sign" vote
     ///    below is rejected with "not found in registry").
     /// 2. `"Sign"` — the executor's signed vote. The executor is a *voter*
@@ -832,32 +874,37 @@ impl ExecutorHandle {
     ///
     /// `current_stake` is sent as 0: the finalizer stamps the real stake from
     /// the epoch snapshot (C1 — never trust a self-reported stake).
+    ///
+    /// The recipient is `finalizer_key`, the ADR-004 routing decision the Sentinel
+    /// attached to the transaction — not the Finalizer bucket. Both frames are
+    /// delivered with `send_to_peers`, which reports an unreachable target: with
+    /// one recipient, a send that does not land fails the transaction rather than
+    /// being one delivery among several.
     async fn send_to_finalizer(
         &self,
         tx_id: &str,
         tx_bytes: Vec<u8>,
         execution_result: Vec<u8>,
         result_hash: Vec<u8>,
+        finalizer_key: &[u8],
     ) -> Result<(), ExecutorError> {
-        // Look up the finalizer nodes in the registry
-        let finalizer_nodes = self
-            .node_registry
-            .get_nodes(&NodeRegistryType::Finalizer)
-            .ok_or_else(|| ExecutorError::NoFinalizers("No finalizers registered".to_string()))?;
-
-        // A bucket this host also *runs* is not empty in the sense this gate
-        // means. On a composite the finalizer is the same machine's own role,
-        // and a bucket holds peers only — so the emptiness test alone refused a
-        // vote that the fan-out below would have delivered locally. The gate
-        // asks the registry which roles the host actually serves rather than
-        // trusting bucket occupancy as a proxy for "a finalizer exists".
-        if finalizer_nodes.is_empty()
-            && !self.node_registry.serves_locally(&NodeRegistryType::Finalizer)
-        {
-            return Err(ExecutorError::NoFinalizers(
-                "No finalizers registered".to_string(),
-            ));
+        // ADR-004: this hop has exactly ONE recipient — the Finalizer the Sentinel
+        // routed this transaction to. It used to be `send_to_all(…, Finalizer)`,
+        // which is how a per-transaction decision became an epoch-wide one: every
+        // host running a Finalizer received the transaction, its optimistic path
+        // booked a block of its own, and the commit layer had to sort out four
+        // candidates for one slot (`fact-composite-per-host-fork-divergence`).
+        //
+        // An empty key is not "unconstrained, broadcast it". A transaction the
+        // Sentinel routed always carries a decision; an empty key here means it
+        // entered through something other than the routed path, and the only safe
+        // reading of that is that no Finalizer owns it. Failing the transaction is
+        // also the honest outcome operationally: broadcasting it produces N
+        // conflicting owners, which looks like progress until the chains diverge.
+        if finalizer_key.is_empty() {
+            return Err(ExecutorError::NoRoutingDecision(tx_id.to_string()));
         }
+        let target = finalizer_key.to_vec();
 
         // (1) Preload: register the transaction in the finalizer's registry.
         // The finalizer's `handle_preload` deserializes the body as a
@@ -878,9 +925,20 @@ impl ExecutorHandle {
         )?;
         let preload_payload =
             serialize_to_bytes_rmp(&preload_message).map_err(|e| ExecutorError::Encoding(e))?;
-        self.node_registry
-            .send_to_all(preload_payload, &NodeRegistryType::Finalizer)
+        let missed = self
+            .node_registry
+            .send_to_peers(std::slice::from_ref(&target), &NodeRegistryType::Finalizer, &preload_payload)
             .await;
+        if !missed.is_empty() {
+            // One recipient means an undelivered send is a total loss, not one
+            // delivery among many: no other Finalizer will pick this up, so the
+            // caller must fail the transaction instead of leaving it in
+            // Finalizing with no owner.
+            return Err(ExecutorError::NoFinalizers(format!(
+                "the Finalizer assigned to tx {} is not reachable from this executor",
+                tx_id
+            )));
+        }
 
         // (2) Sign: the executor's signed vote. Sign the execution-output
         // hash with this executor's identity key — the finalizer's inner
@@ -915,8 +973,18 @@ impl ExecutorHandle {
 
         let payload = serialize_to_bytes_rmp(&message).map_err(|e| ExecutorError::Encoding(e))?;
 
-        // Broadcast to all finalizers via registered connections
-        self.node_registry.send_to_all(payload, &NodeRegistryType::Finalizer).await;
+        // (2) goes to the same single recipient, after (1) on the same route, so
+        // the finalizer's registry holds the transaction before the vote arrives.
+        let missed = self
+            .node_registry
+            .send_to_peers(std::slice::from_ref(&target), &NodeRegistryType::Finalizer, &payload)
+            .await;
+        if !missed.is_empty() {
+            return Err(ExecutorError::NoFinalizers(format!(
+                "the vote for tx {} did not reach its assigned Finalizer",
+                tx_id
+            )));
+        }
 
         Ok(())
     }
@@ -1011,6 +1079,13 @@ pub enum ExecutorError {
     Validation(Vec<ValidationFailureReason>),
     /// No finalizer nodes registered
     NoFinalizers(String),
+    /// The transaction reached the finalize hop without an ADR-004 routing
+    /// decision — no Finalizer owns it. Not the same as "no finalizers are
+    /// registered": here nothing names a recipient, so the alternatives are to
+    /// broadcast (which manufactures one owner per host, the defect ADR-004 exists
+    /// to prevent) or to fail the transaction. Failing it is the honest outcome,
+    /// and the message says which condition the operator actually has.
+    NoRoutingDecision(String),
     /// Signing the execution-result hash failed (vote path, audit C1)
     Crypto(PneumaticError),
     /// Backpressure: executor is at max capacity

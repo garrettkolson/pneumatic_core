@@ -92,9 +92,43 @@ pub fn make_test_node_registry() -> Arc<NodeRegistry> {
     ))
 }
 
+/// The Finalizer the executor fixtures route their transactions to.
+///
+/// Since ADR-004 was enforced, the finalize hop has exactly one recipient and an
+/// executor holding a transaction with no routing decision fails it
+/// (`ExecutorError::NoRoutingDecision`) instead of handing it to every Finalizer in
+/// the bucket. A fixture that wants an executed transaction therefore has to say who
+/// was chosen, and register that key as a peer so the hop has somewhere to land —
+/// which is what the `register_peer(…, Finalizer, …)` calls in these tests are for.
+pub const TEST_FINALIZER_KEY: [u8; 32] = [0xAB; 32];
+
+/// A routing decision for `tx_id`, attested by a freshly generated Sentinel.
+///
+/// The executor does not verify the attestation (the Finalizer and the Committer
+/// both do); the record exists here because it is what the transaction actually
+/// carries on the wire, so a fixture that omitted it would be testing a shape the
+/// pipeline no longer produces.
+pub fn routed_selection(tx_id: &str) -> pneumatic_core::transactions::SelectionRecord {
+    let sentinel = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
+    pneumatic_core::transactions::SelectionRecord::attest(
+        &sentinel.ed25519,
+        tx_id,
+        pneumatic_core::epoch::FINALIZER_DOMAIN,
+        TEST_FINALIZER_KEY.to_vec(),
+        1,
+        vec![0x5A; 32],
+    )
+    .expect("the sentinel attests its routing decision")
+}
+
+/// Give a hand-built transaction the routing decision the Sentinel would have added.
+pub fn route_tx(tx: &mut Transaction) {
+    tx.selection = Some(routed_selection(&tx.id));
+}
+
 pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
     let registry = Arc::new(PendingTransactionRegistry::new());
-    let tx = Transaction {
+    let mut tx = Transaction {
         payload: vec![], gas_limit: 0,
         id: "test_tx_001".to_string(),
         action: "Transfer".to_string(),
@@ -110,6 +144,7 @@ pub fn make_test_pending_registry() -> Arc<PendingTransactionRegistry> {
     
     result_data: vec![],selection: None,
     };
+    route_tx(&mut tx);
     let pending = PendingTransaction::new("test_tx_001".to_string(), TransactionState::Preloaded { transaction: tx });
     let _ = registry.add_transaction("test_tx_001".to_string(), pending);
     registry

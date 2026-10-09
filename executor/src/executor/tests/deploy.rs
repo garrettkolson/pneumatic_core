@@ -46,7 +46,7 @@ fn deploy_entry(
     sender: Vec<u8>,
     nonce: usize,
 ) -> (PendingTransaction, DeployParams, Vec<u8>) {
-    let tx = Transaction {
+    let mut tx = Transaction {
         payload: serialize_to_bytes_rmp(&params).unwrap(),
         gas_limit: 0,
         id: "deploy_tx_001".to_string(),
@@ -63,7 +63,21 @@ fn deploy_entry(
     
     result_data: vec![],selection: None,
     };
-    let pending =
+
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);    let pending =
         PendingTransaction::new("deploy_tx_001".to_string(), TransactionState::Preloaded {
             transaction: tx,
         });

@@ -493,3 +493,91 @@ pub fn make_stake_set(stakes: Vec<(Vec<u8>, u64)>) -> StakeSet {
         stakers: stakes.into_iter().collect(),
     }
 }
+
+/// Register `sentinel` in the finalizer's node registry as a Sentinel.
+///
+/// The role lookup is not decoration. A `SelectionRecord` signed by an arbitrary key
+/// verifies perfectly well against that same key — which is exactly why the gate also
+/// requires the attester to hold the Sentinel role. Registering the attester is what
+/// makes a fixture's routing decision honest instead of a forgery that happens to
+/// carry a valid signature.
+pub fn register_sentinel(registry: &Arc<NodeRegistry>, sentinel: &NodeIdentity) {
+    registry
+        .get_config()
+        .type_configs
+        .insert(
+            NodeRegistryType::Sentinel,
+            pneumatic_core::node::NodeTypeConfig { min: 0, max: 10, min_stake: 0 },
+        );
+    let pk = sentinel.ed25519.public_key().expect("sentinel public key");
+    assert!(
+        registry.register_peer(
+            pk,
+            sentinel.rhash,
+            &NodeRegistryType::Sentinel,
+            Box::new(NoOpConnection)
+        ),
+        "sentinel should register within capacity"
+    );
+}
+
+/// Stamp `tx` with the routing decision a Sentinel would have attached, naming
+/// `finalizer` as the assigned Finalizer and attested by `sentinel`.
+///
+/// Required by every inbound finalizer path since ADR-004 was enforced:
+/// `handle_preload`, the executor's vote, and the finalize path itself all refuse a
+/// transaction this node was not chosen for. A hand-built transaction with
+/// `selection: None` is now a refusal by design rather than an unconstrained one, so a
+/// test that exercises the happy path has to say who was chosen.
+///
+/// Tests that want the *refusal* — a transaction assigned elsewhere, an attestation
+/// from an unregistered key, no decision at all — build those records directly; the
+/// fields this helper picks (salt, epoch) are visible here so a test can mutate
+/// exactly one of them.
+pub fn route_to_finalizer(tx: &mut Transaction, finalizer: &Finalizer, sentinel: &NodeIdentity) {
+    register_sentinel(&finalizer.node_registry, sentinel);
+    let record = pneumatic_core::transactions::SelectionRecord::attest(
+        &sentinel.ed25519,
+        &tx.id,
+        pneumatic_core::epoch::FINALIZER_DOMAIN,
+        finalizer.public_key.clone(),
+        finalizer.current_epoch,
+        vec![0x5A; 32],
+    )
+    .expect("the sentinel attests its routing decision");
+    tx.selection = Some(record);
+}
+
+/// Route an entry that is already in the finalizer's pending registry to that
+/// finalizer, registering a Sentinel attester in its node registry.
+///
+/// The shape the inbound-path tests want: the transaction arrives through the
+/// registry (preload, or the composite's shared registry), and the routing decision
+/// is the thing that makes it this node's to finalize.
+pub fn route_existing(finalizer: &Finalizer, tx_id: &str) {
+    let sentinel = NodeIdentity::generate_in_memory();
+    register_sentinel(&finalizer.node_registry, &sentinel);
+    let record = pneumatic_core::transactions::SelectionRecord::attest(
+        &sentinel.ed25519,
+        tx_id,
+        pneumatic_core::epoch::FINALIZER_DOMAIN,
+        finalizer.public_key.clone(),
+        finalizer.current_epoch,
+        vec![0x5A; 32],
+    )
+    .expect("the sentinel attests its routing decision");
+    let mut entry = finalizer
+        .pending_registry
+        .get_transaction_mut(tx_id)
+        .unwrap_or_else(|e| panic!("entry {tx_id} must exist to be routed: {e}"));
+    match &mut entry.state {
+        TransactionState::Preloaded { transaction }
+        | TransactionState::Executing { transaction }
+        | TransactionState::Validated { transaction, .. }
+        | TransactionState::Finalizing { transaction, .. } => {
+            transaction.selection = Some(record);
+        }
+        other => panic!("cannot route an entry in state {:?}", other),
+    }
+    drop(entry);
+}

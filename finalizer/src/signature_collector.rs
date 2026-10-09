@@ -330,6 +330,21 @@ impl SignatureCollector {
     pub fn has_signatures(&self, tx_id: &str) -> bool {
         self.signature_count(tx_id) > 0
     }
+
+    /// The collected vote a finalize should be built from: the
+    /// lexicographically-smallest voter key, so the choice does not depend on which
+    /// executor's frame this node happened to receive first.
+    ///
+    /// The optimistic path uses the signature that just arrived, which is the same
+    /// thing while exactly one vote is collected — the case optimistic finality runs
+    /// in. This exists for the other case: a vote admitted before the transaction's
+    /// preload arrived, where there is no "just arrived" signature left to use and the
+    /// finalize has to be replayed from what the collector holds.
+    pub fn first_signature(&self, tx_id: &str) -> Option<(Vec<u8>, TransactionSignature)> {
+        self.signature_registry
+            .get_transaction_registry(tx_id)
+            .and_then(|map| map.into_iter().min_by(|a, b| a.0.cmp(&b.0)))
+    }
 }
 
 // ---------------------------------------------------------------------------

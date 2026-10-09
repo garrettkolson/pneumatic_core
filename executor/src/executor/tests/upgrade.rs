@@ -74,7 +74,7 @@ fn upgrade_entry(
     sender: Vec<u8>,
     nonce: usize,
 ) -> (PendingTransaction, UpgradeParams) {
-    let tx = Transaction {
+    let mut tx = Transaction {
         payload: serialize_to_bytes_rmp(&params).unwrap(),
         gas_limit: 0,
         id: "upgrade_tx_001".to_string(),
@@ -91,7 +91,21 @@ fn upgrade_entry(
         result_data: vec![],
         selection: None,
     };
-    let pending = PendingTransaction::new(
+
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);
+    // ADR-004: the Sentinel routed this transaction here.
+    route_tx(&mut tx);    let pending = PendingTransaction::new(
         "upgrade_tx_001".to_string(),
         TransactionState::Preloaded { transaction: tx },
     );

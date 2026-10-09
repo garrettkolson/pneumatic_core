@@ -451,7 +451,9 @@ async fn block_finalized_counts_our_own_vote_and_replays_early_ones() {
         action: String::from("BlockFinalized"),
         body,
         signature: vec![],
-        public_key: vec![],
+        // ADR-004: the block's routing decision names `gossip_finalizer`, so this is
+        // the node that has to be sending it.
+        public_key: gossip_finalizer().public_key().expect("finalizer public key"),
         stake_set: Some(stake_set)
     };
     committer

@@ -9,7 +9,7 @@ async fn test_handle_preload() {
     let pending_registry = make_test_pending_registry();
     let finalizer = make_finalizer(pending_registry.clone());
 
-    let tx = Transaction {
+    let mut tx = Transaction {
         payload: vec![], gas_limit: 0,
         id: "preload_tx".to_string(),
         action: "Transfer".to_string(),
@@ -25,6 +25,9 @@ async fn test_handle_preload() {
     
     result_data: vec![],selection: None,
     };
+    // ADR-004: this node is the Finalizer the transaction was routed to. Preload
+    // refuses one it was not chosen for, so the frame carries the decision.
+    route_to_finalizer(&mut tx, &finalizer, &NodeIdentity::generate_in_memory());
     let body = serialize_to_bytes_rmp(&tx).unwrap();
     let message = Message {
         chain_id: "test_env".to_string(),
@@ -67,6 +70,9 @@ async fn test_handle_signature_adds_to_collector() {
         Arc::new(StubDataProvider::new()),
     );
 
+    // ADR-004: the entry is this node's to finalize (see `route_existing`).
+    route_existing(&finalizer, "test_tx_001");
+
     let message =
         build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);
 
@@ -76,6 +82,89 @@ async fn test_handle_signature_adds_to_collector() {
     // 0 after finalize.
     assert!(result.is_ok());
     assert_eq!(finalizer.signature_count("test_tx_001"), 0);
+}
+
+/// The vote-before-preload race, and the replay that resolves it.
+///
+/// A transport that acknowledges on receipt and a bridge that spawns a task per frame
+/// mean a "Sign" can be handled before the "PreloadForFinalizer" that carries the
+/// transaction it votes on — even though the executor sent the preload first and
+/// waited for it. The vote is admitted (with no entry there is nothing to prove the
+/// transaction belongs to another Finalizer), the optimistic attempt fails on the
+/// missing entry, and the preload that lands afterwards has to replay it. Without the
+/// replay the transaction sits registered, holding a valid vote, forever.
+#[tokio::test]
+async fn preload_arriving_after_the_vote_replays_the_optimistic_finalize() {
+    let node_registry = make_test_node_registry();
+    let voter = NodeIdentity::generate_in_memory();
+    register_executor(&node_registry, &voter);
+    let pending_registry = make_test_pending_registry();
+    let data_provider = Arc::new(
+        StubDataProvider::new()
+            .with_token(vec![0, 1, 2], "test_env".to_string(), Token::new().with_id(vec![0, 1, 2])),
+    );
+    let finalizer = make_finalizer_with_registry_and_data_provider(
+        node_registry,
+        pending_registry.clone(),
+        data_provider,
+    );
+
+    // 1. The vote, while this node holds no entry for the transaction at all.
+    let message =
+        build_signed_sign_message("test_env", b"late_preload_tx", vec![1, 2, 3], 10, &voter);
+    let early = finalizer.handle_signature(&message).await;
+    assert!(
+        early.is_err(),
+        "a vote with nothing registered cannot finalize: {early:?}"
+    );
+    assert_eq!(
+        finalizer.signature_count("late_preload_tx"),
+        1,
+        "the vote has to survive the failed attempt — it is the only evidence this \
+         node was ever told about this transaction"
+    );
+
+    // 2. Then the preload for that same transaction, routed to this finalizer.
+    let mut tx = Transaction {
+        payload: vec![], gas_limit: 0,
+        id: "late_preload_tx".to_string(),
+        action: "Transfer".to_string(),
+        token_id: vec![0, 1, 2],
+        bid: None,
+        sequence_number: 1,
+        sender: vec![10, 20, 30],
+        receiver: vec![40, 50, 60],
+        amount: Some(50),
+        timestamp: 1000,
+        result_hash: vec![1, 2, 3],
+        sender_signature: vec![],
+        result_data: vec![7],
+        selection: None,
+    };
+    route_to_finalizer(&mut tx, &finalizer, &NodeIdentity::generate_in_memory());
+    let preload = Message {
+        chain_id: "test_env".to_string(),
+        action: String::from("PreloadForFinalizer"),
+        body: serialize_to_bytes_rmp(&tx).unwrap(),
+        signature: vec![],
+        public_key: vec![9, 8, 7],
+        stake_set: None,
+    };
+    finalizer
+        .handle_preload(&preload)
+        .await
+        .expect("the preload is accepted");
+
+    // 3. Registering the entry is not the fix; finalizing is.
+    let entry = pending_registry
+        .get_transaction_mut("late_preload_tx")
+        .expect("the preload registered the entry");
+    assert!(
+        matches!(entry.state, TransactionState::Committed { .. }),
+        "the preload must replay the optimistic finalize, not just register the \
+         transaction — got {:?}",
+        entry.state
+    );
 }
 
 #[tokio::test]
@@ -89,6 +178,9 @@ async fn test_handle_signature_optimistic_first_sig() {
         pending_registry,
         Arc::new(StubDataProvider::new()),
     );
+
+    // ADR-004: the entry is this node's to finalize (see `route_existing`).
+    route_existing(&finalizer, "test_tx_001");
 
     let message =
         build_signed_sign_message("test_env", b"test_tx_001", vec![1, 2, 3], 10, &voter);

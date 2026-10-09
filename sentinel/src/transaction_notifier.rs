@@ -4,12 +4,13 @@ use pneumatic_core::config::Config;
 use pneumatic_core::conns::ConnError;
 use pneumatic_core::data::DataError;
 use pneumatic_core::encoding::serialize_to_bytes_rmp;
+use pneumatic_core::epoch::FINALIZER_DOMAIN;
 use pneumatic_core::errors::PneumaticError;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::messages::Message;
 use pneumatic_core::node::NodeRegistryType;
 use pneumatic_core::node::registry::NodeRegistry;
-use pneumatic_core::transactions::{ShieldedTransaction, Transaction};
+use pneumatic_core::transactions::{SelectionRecord, ShieldedTransaction, Transaction};
 
 /// Handles all outbound message sending from the Sentinel to other node types.
 /// Packages transactions and commands into the proper `Message` wire format.
@@ -90,7 +91,50 @@ impl TransactionNotifier {
         Ok(())
     }
 
-    /// Send a validated transaction to the assigned Finalizer for execution preloading.
+    /// Attest a routing decision the Sentinel has just made (ADR-004, ADR-007).
+    ///
+    /// The Sentinel is the routing authority, so what matters downstream is not
+    /// only *which* Finalizer was chosen but that the choice is the Sentinel's and
+    /// not the writer's. Every enforcing role asks a question the party it
+    /// constrains could otherwise answer for itself: a Finalizer asked to finalize
+    /// would accept any transaction naming it, and a Committer asked to trust a
+    /// block would accept any block whose own field names the sender (which is
+    /// exactly what `verify_block_finalizer_sig` did — verifying a signature
+    /// against `finalizer_addr`, a key taken from the block itself). The signature
+    /// is what turns the record into evidence instead of an assertion.
+    ///
+    /// The domain is `FINALIZER_DOMAIN`, the domain the selection was made under,
+    /// so an attestation cannot be re-read as one for a leader or an executor shard.
+    pub fn attest_selection(
+        &self,
+        tx_id: &str,
+        finalizer_key: Vec<u8>,
+        epoch_number: u64,
+        salt: &[u8],
+    ) -> Result<SelectionRecord, NotifyError> {
+        SelectionRecord::attest(
+            &self.config.identity.ed25519,
+            tx_id,
+            FINALIZER_DOMAIN,
+            finalizer_key,
+            epoch_number,
+            salt.to_vec(),
+        )
+        .map_err(NotifyError::from)
+    }
+
+    /// Send a validated transaction to the ONE Finalizer it was routed to.
+    ///
+    /// This took a `finalizer_key` and then called
+    /// `send_to_nodes(NodeRegistryType::Finalizer, …)` — a broadcast to the whole
+    /// bucket under a signature that promised one recipient (ADR-004). A key
+    /// parameter that is not load-bearing is worse than no parameter at all: it
+    /// made the routing look implemented at precisely the line where it was being
+    /// thrown away, and it is why four hosts each produced a block for one
+    /// transaction (`fact-composite-per-host-fork-divergence`).
+    ///
+    /// A send that does not land is an error, not something to discard: no other
+    /// Finalizer will pick this up.
     pub fn send_to_finalizer_for_preload(
         &self,
         tx: &Transaction,
@@ -112,20 +156,64 @@ impl TransactionNotifier {
         )?;
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
-        self.send_to_nodes(NodeRegistryType::Finalizer, payload)
+        self.deliver_to_finalizer(finalizer_key, &payload, &tx.id, env)
     }
 
-    /// Notify the assigned Finalizers of an admitted shielded transfer so one
+    /// One recipient in the Finalizer bucket, or a failure that says so.
+    ///
+    /// The targeted send reports the keys it could not reach; a bucket that does
+    /// not contain the assigned Finalizer is a routing failure the caller must
+    /// see, because the transaction will otherwise sit in the Finalizing state
+    /// owned by a node that never hears of it.
+    ///
+    /// Runs synchronously because the Sentinel's inbound dispatch is synchronous
+    /// (`on_data_received` is called from both a bridge thread and an async
+    /// adapter), so there is nothing above this to await. The send it drives is
+    /// still bounded and still reports a target it could not reach.
+    fn deliver_to_finalizer(
+        &self,
+        finalizer_key: &[u8],
+        payload: &[u8],
+        tx_id: &str,
+        env: &EnvironmentMetadata,
+    ) -> Result<(), NotifyError> {
+        if finalizer_key.is_empty() {
+            return Err(NotifyError::NoTarget(NodeRegistryType::Finalizer));
+        }
+        let undelivered = self.node_registry.send_to_peers_blocking(
+            &[finalizer_key.to_vec()],
+            &NodeRegistryType::Finalizer,
+            payload,
+        );
+        if !undelivered.is_empty() {
+            env.logger.log(format!(
+                "Finalizer-bound send for tx {} did not reach the assigned finalizer",
+                tx_id
+            ));
+            return Err(NotifyError::NoTarget(NodeRegistryType::Finalizer));
+        }
+        Ok(())
+    }
+
+    /// Notify the ONE assigned Finalizer of an admitted shielded transfer so it
     /// can sign it (Phase S5.1; the finalizer's own path is S5.2).
     ///
-    /// Mirrors `send_to_finalizer_for_preload` — same envelope, same
-    /// sender-identity signing discipline, same fail-closed `NoTarget`. The
-    /// two differences: the body is the shielded tx's **canonical bytes**
-    /// (the S3.1 binding surface — the finalizer in S5.2 signs
-    /// `stx.hash()` over exactly these bytes, so its signature binds to what
-    /// the sentinel validated and registered) and the action is
-    /// `"SignShielded"` (already in `FINALIZER_ACTIONS` — no dispatcher
-    /// change).
+    /// Same envelope and sender-identity discipline as `send_to_finalizer_for_preload`,
+    /// and now the same single recipient: the caller performs the identical
+    /// `assign_finalizer_deterministic` call, so broadcasting this meant every
+    /// Finalizer in the epoch was invited to sign a transfer with exactly one
+    /// owner. Two differences from the standard path: the body is the shielded
+    /// tx's **canonical bytes** (the S3.1 binding surface — the finalizer in S5.2
+    /// signs `stx.hash()` over exactly these bytes, so its signature binds to what
+    /// the sentinel validated and registered) and the action is `"SignShielded"`
+    /// (already in `FINALIZER_ACTIONS`).
+    ///
+    /// Routing only, not yet enforcement: `ShieldedTransaction` carries no routing
+    /// decision, so a receiving Finalizer cannot refuse a `SignShielded` it was not
+    /// named for, and the placeholder transaction a shielded block carries leaves
+    /// the Committer with nothing to check against. Putting the record there means
+    /// touching the S3.1 canonical surface the ZK binding rides on, which is a
+    /// deliberate separate step.
     pub fn send_sign_shielded(
         &self,
         stx: &ShieldedTransaction,
@@ -144,7 +232,7 @@ impl TransactionNotifier {
         )?;
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
-        self.send_to_nodes(NodeRegistryType::Finalizer, payload)
+        self.deliver_to_finalizer(finalizer_key, &payload, &stx.id, env)
     }
 
     /// Notify all Sentinels to continue processing a cleared transaction.
@@ -197,7 +285,16 @@ impl TransactionNotifier {
         Ok(vec![])
     }
 
-    /// Request a specific Finalizer (by key) to take responsibility for a validated transaction.
+    /// Request the newly assigned Finalizer (by key) to take responsibility for a
+    /// reassigned transaction.
+    ///
+    /// The action is `PreloadForFinalizer`, the name the Finalizer's inbound set
+    /// admits — this used to send `"FinalizerRequest"`, which appears in no admit
+    /// list anywhere in the workspace. On a composite host the dispatcher resolves
+    /// an unadmitted action to `UnknownAction` and refuses it, so the reassignment
+    /// recovery path could never deliver on a composite; in a split deployment the
+    /// name was simply one the Finalizer had no handler for. A recovery send whose
+    /// recipient cannot receive it is the same as no recovery send at all.
     pub fn request_single_finalizer(
         &self,
         tx: &Transaction,
@@ -207,33 +304,14 @@ impl TransactionNotifier {
         let body = serialize_to_bytes_rmp(tx).map_err(NotifyError::Encoding)?;
         let msg = Message::signed(
             env.token_partition_id.clone(),
-            "FinalizerRequest",
+            "PreloadForFinalizer",
             body,
             None,
             &self.config.identity,
         )?;
 
         let payload = serialize_to_bytes_rmp(&msg).map_err(NotifyError::Encoding)?;
-
-        // Exactly one intended recipient, so a send that does not land is a
-        // failure and not something to discard: no other finalizer will pick
-        // this up. The previous version spawned a thread and a fresh runtime,
-        // ignored the result, and returned Ok even when the assigned finalizer
-        // was not in the bucket at all.
-        let undelivered = self.node_registry.send_to_peers_blocking(
-            std::slice::from_ref(&finalizer_key),
-            &NodeRegistryType::Finalizer,
-            &payload,
-        );
-        if !undelivered.is_empty() {
-            env.logger.log(format!(
-                "FinalizerRequest for tx {} did not reach the assigned finalizer",
-                tx.id
-            ));
-            return Err(NotifyError::NoTarget(NodeRegistryType::Finalizer));
-        }
-
-        Ok(())
+        self.deliver_to_finalizer(&finalizer_key, &payload, &tx.id, env)
     }
 
     /// Broadcast a message to all nodes of a given type in the registry.

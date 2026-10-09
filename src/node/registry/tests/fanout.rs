@@ -334,6 +334,61 @@ fn targeted_send_reports_every_target_when_the_bucket_is_unavailable() {
     );
 }
 
+/// A synchronous send driven from inside a runtime.
+///
+/// This is the shape every role handler has on a composite: the dispatcher is
+/// synchronous, the adapter that calls it is `async`, and the registry has no RNS
+/// transport (unit fixtures register recording connections), so the call lands in the
+/// direct branch. That branch used to `block_on` on a runtime it built itself, which
+/// panics outright inside an existing runtime — "Cannot start a runtime from within a
+/// runtime" — and took the node's request down with it. Surfaced by the shielded
+/// wire-privacy test, which drives the Sentinel exactly this way.
+#[tokio::test]
+async fn blocking_targeted_send_works_from_inside_a_runtime() {
+    let reg = registry_with_capacity(&[(NodeRegistryType::Finalizer, 2)]);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    for i in 1u8..=2 {
+        reg.register_peer(
+            vec![i],
+            [i; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConnection { tx: tx.clone() }),
+        );
+    }
+    let keys: Vec<Vec<u8>> = (1u8..=2).map(|i| vec![i]).collect();
+
+    let undelivered = reg.send_to_peers_blocking(&keys, &NodeRegistryType::Finalizer, &[9u8]);
+
+    assert!(
+        undelivered.is_empty(),
+        "a blocking send inside a runtime still delivers: {:?}",
+        undelivered
+    );
+    let mut received = 0;
+    while rx.try_recv().is_ok() {
+        received += 1;
+    }
+    assert_eq!(received, 2, "both peers received the payload");
+
+    // Same for the broadcast variant, which shared the same nested-runtime bug.
+    let (tx2, mut rx2) = mpsc::channel::<Vec<u8>>(4);
+    let reg2 = registry_with_capacity(&[(NodeRegistryType::Finalizer, 2)]);
+    for i in 1u8..=2 {
+        reg2.register_peer(
+            vec![i],
+            [i; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConnection { tx: tx2.clone() }),
+        );
+    }
+    reg2.send_to_all_blocking(vec![3u8], &NodeRegistryType::Finalizer);
+    let mut received2 = 0;
+    while rx2.try_recv().is_ok() {
+        received2 += 1;
+    }
+    assert_eq!(received2, 2, "the broadcast variant delivers too");
+}
+
 /// Positive control: when every target is registered the call is clean, so the
 /// failure arms above cannot be passing on a setup that always fails.
 #[test]

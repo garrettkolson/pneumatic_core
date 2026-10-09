@@ -203,6 +203,7 @@ pub mod distributing;
 pub mod finalizing;
 pub mod quoruming;
 pub mod epoching;
+mod routing;
 
 impl Committer {
     /// Create a new Committer with all required components.
@@ -520,6 +521,7 @@ mod tests {
     mod distribution;
     mod pool;
     mod deploy;
+    mod routing;
     mod storage;
     mod upgrade;
 }

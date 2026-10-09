@@ -459,6 +459,8 @@ pub fn make_test_committer_with_slash(
                 pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
             tc.insert(NodeRegistryType::Sentinel.clone(),
                 pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
+            tc.insert(NodeRegistryType::Finalizer.clone(),
+                pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
             tc.insert(NodeRegistryType::Archiver.clone(),
                 pneumatic_core::node::NodeTypeConfig { min: 1, max: 10, min_stake: 0 });
             tc
@@ -474,6 +476,7 @@ pub fn make_test_committer_with_slash(
         None,
         Arc::new(|_, _| true),
     ));
+    register_gossip_roles(&node_registry);
 
     let gossiper_identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
     let gossiper_rhash = gossiper_identity.rhash;
@@ -720,6 +723,7 @@ pub fn build_committer_for_leader_test(
         None,
         Arc::new(|_, _| true),
     ));
+    register_gossip_roles(&node_registry);
 
     let gossiper_identity = pneumatic_core::rns::identity::NodeIdentity::generate_in_memory();
     let gossiper_rhash = gossiper_identity.rhash;
@@ -902,6 +906,97 @@ pub fn make_gossip_block(committer: &Committer, trans_id: &str, proposer_key: Ve
 }
 
 
+/// The Finalizer every gossip/commit fixture routes its transactions to, and the
+/// Sentinel that attests that decision.
+///
+/// Both are seeded rather than generated so a test can name them by key: since
+/// ADR-004 was enforced, `handle_block_finalized` and `handle_commit` refuse a block
+/// whose routing decision names a different sender, and they accept an attestation
+/// only from a key that holds the Sentinel role in the node registry. A fixture that
+/// builds a block by hand therefore has to name a Finalizer *and* make the attester
+/// resolvable — the same two facts production gets from the Sentinel's signature and
+/// the registry.
+///
+/// Seeded, not random, because the block is built in one helper and the sender key is
+/// needed in another. A test that wants a *different* finalizer — the refusal tests —
+/// builds its own record instead of mutating these.
+pub fn gossip_finalizer() -> Ed25519Provider {
+    Ed25519Provider::from_seed([0xF1; 32])
+}
+
+/// See [`gossip_finalizer`].
+pub fn gossip_sentinel() -> Ed25519Provider {
+    Ed25519Provider::from_seed([0x5E; 32])
+}
+
+/// The routing decision that chose [`gossip_finalizer`] for `tx_id`, attested by
+/// [`gossip_sentinel`].
+pub fn gossip_selection(tx_id: &str) -> pneumatic_core::transactions::SelectionRecord {
+    gossip_selection_named(tx_id, &gossip_finalizer().public_key().expect("finalizer public key"))
+}
+
+/// The same decision, naming an arbitrary Finalizer — for a fixture that signs the
+/// block with its own key and has to route it to that same key (the committer
+/// verifies the block's finalizer signature under the key the decision names, so
+/// signer and routed node must agree).
+pub fn gossip_selection_named(
+    tx_id: &str,
+    finalizer_key: &[u8],
+) -> pneumatic_core::transactions::SelectionRecord {
+    let sentinel = gossip_sentinel();
+    pneumatic_core::transactions::SelectionRecord::attest(
+        &sentinel,
+        tx_id,
+        pneumatic_core::epoch::FINALIZER_DOMAIN,
+        finalizer_key.to_vec(),
+        0,
+        vec![0x5A; 32],
+    )
+    .expect("the sentinel attests its routing decision")
+}
+
+/// Register the gossip Finalizer and its attesting Sentinel as peers, so the role
+/// lookups the commit/finality gates perform resolve.
+pub fn register_gossip_roles(registry: &Arc<NodeRegistry>) {
+    struct NoOpConn;
+    #[async_trait::async_trait]
+    impl pneumatic_core::conns::Connection for NoOpConn {
+        async fn send(&self, _data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+            Ok(())
+        }
+    }
+    // Capacity first: fixtures build their registries differently (the leader-test
+    // fixture starts with an empty `type_configs`), and `register_peer` refuses any
+    // type without a capacity entry. Only fill what is missing.
+    for ty in [NodeRegistryType::Finalizer, NodeRegistryType::Sentinel] {
+        registry
+            .get_config()
+            .type_configs
+            .entry(ty)
+            .or_insert(pneumatic_core::node::NodeTypeConfig { min: 0, max: 10, min_stake: 0 });
+    }
+    let fin = gossip_finalizer();
+    let sen = gossip_sentinel();
+    assert!(
+        registry.register_peer(
+            fin.public_key().expect("finalizer public key"),
+            [0xF1; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(NoOpConn)
+        ),
+        "the gossip fixture's finalizer registers"
+    );
+    assert!(
+        registry.register_peer(
+            sen.public_key().expect("sentinel public key"),
+            [0x5E; 16],
+            &NodeRegistryType::Sentinel,
+            Box::new(NoOpConn)
+        ),
+        "the gossip fixture's sentinel registers"
+    );
+}
+
 /// Build a gossip block with a caller-supplied `previous_hash` (so several blocks can share a
 /// frozen parent, as in a sibling-race test) and a valid finalizer signature. Distinct
 /// `trans_id`s yield distinct `transaction_hash`/`signature` values, hence distinct
@@ -917,7 +1012,7 @@ pub fn make_gossip_block_at_prev(
     // Ed25519 sign over the stored `transaction_hash`, which `verify_block_finalizer_sig`
     // re-checks against `finalizer_addr`. Any fixed value works for `transaction_hash` — it
     // only has to survive inside the canonical bytes that `create_hash` hashes.
-    let finalizer = Ed25519Provider::generate();
+    let finalizer = gossip_finalizer();
     let finalizer_addr = finalizer.public_key().expect("finalizer public key");
     let transaction_hash = format!("gossip-{trans_id}").into_bytes();
     let signature = finalizer.sign_data(&transaction_hash).expect("finalizer signature");
@@ -939,7 +1034,10 @@ pub fn make_gossip_block_at_prev(
             result_hash: vec![],
             sender_signature: vec![],
         
-        result_data: vec![],selection: None,
+        // ADR-004: this block's transaction was routed to `gossip_finalizer`, and
+        // the decision is attested by `gossip_sentinel` — the two facts the committer
+        // now requires before it appends anything.
+        result_data: vec![],selection: Some(gossip_selection(trans_id)),
         },
         total_voters: 3,
         total_stake: 42,
@@ -982,7 +1080,25 @@ pub fn make_block_finalized_message(block: Block) -> Message {
         action: String::from("BlockFinalized"),
         body,
         signature: vec![],
-        public_key: vec![],
+        // ADR-004: the gate compares the sender against the Finalizer the routing
+        // decision names. `message.public_key` stands in for the authenticated sender
+        // when the handler is driven directly; the dispatcher's envelope check is the
+        // real version of this in production.
+        public_key: gossip_finalizer().public_key().expect("finalizer public key"),
+        stake_set: None,
+    }
+}
+
+/// As [`make_block_finalized_message`], but sent by `sender_key` — for a fixture
+/// whose block is signed by a Finalizer other than [`gossip_finalizer`].
+pub fn make_block_finalized_message_from(block: Block, sender_key: Vec<u8>) -> Message {
+    let body = serialize_to_bytes_rmp(&block).expect("Block serialization");
+    Message {
+        chain_id: "test".to_string(),
+        action: String::from("BlockFinalized"),
+        body,
+        signature: vec![],
+        public_key: sender_key,
         stake_set: None,
     }
 }

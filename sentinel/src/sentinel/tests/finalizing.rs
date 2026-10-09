@@ -187,6 +187,11 @@ fn assign_finalizer_changes_with_mined_tip() {
         make_sentinel_fixture_with_env_and_data_provider(empty_tip, make_test_env_data());
     let (s_block, _r) =
         make_sentinel_fixture_with_env_and_data_provider(one_block_tip, make_test_env_data());
+    // Candidates are staked keys the sentinel can address, so both sentinels need
+    // their three stakers registered as Finalizers.
+    for s in [&s_empty, &s_block] {
+        register_finalizers(s, &[vec![10], vec![20], vec![30]]);
+    }
 
     let salt_empty: Vec<u8> = Vec::new();
     let salt_block = token_with_one_block().blockchain.get_current_chain_state().last_hash_in;
@@ -240,6 +245,8 @@ fn handle_rejection_follows_current_epoch() {
             token_with_one_block(),
         );
     let (sentinel, registry) = make_sentinel_fixture_with_data_provider(data_provider);
+    // The stakers named by both epochs' snapshots are reachable Finalizers.
+    register_finalizers(&sentinel, &[vec![1], vec![2], vec![3], vec![10], vec![20], vec![30]]);
 
     // Put the transaction into Finalizing with finalizer_key = vec![1]
     // (a member of the epoch-1 stake set) — i.e. the assigned finalizer rejects.
@@ -352,6 +359,8 @@ fn handle_rejection_delivers_the_transaction_to_the_new_finalizer() {
             token_with_one_block(),
         );
     let (sentinel, registry) = make_sentinel_fixture_with_data_provider(data_provider);
+    // The stakers named by both epochs' snapshots are reachable Finalizers.
+    register_finalizers(&sentinel, &[vec![1], vec![2], vec![3], vec![10], vec![20], vec![30]]);
 
     let rejected_key = vec![1];
     make_finalizing_entry(&registry, "tx_reject_deliver", rejected_key.clone());
@@ -397,11 +406,43 @@ fn handle_rejection_delivers_the_transaction_to_the_new_finalizer() {
 
     let delivered: Message =
         deserialize_rmp_to(&sent[0]).expect("payload must be a Message");
-    assert_eq!(delivered.action, "FinalizerRequest");
+    // The action the Finalizer actually admits. This asserted `"FinalizerRequest"`,
+    // a name that appears in no admit list in the workspace: the composite dispatcher
+    // resolved it to `UnknownAction` and refused it, so the recovery path this test
+    // exists to protect could never deliver on a composite host.
+    assert_eq!(delivered.action, "PreloadForFinalizer");
     let delivered_tx: Transaction =
         deserialize_rmp_to(&delivered.body).expect("body must carry the transaction");
     assert_eq!(
         delivered_tx.id, "tx_reject_deliver",
         "the transaction handed to the new finalizer must be the reassigned one"
+    );
+
+    // ADR-004: the reassignment must travel *with* the decision it reassigns. The
+    // new Finalizer refuses a transaction whose routing decision names someone else,
+    // so a re-stamped record is not a nicety — without it the reassignment lands and
+    // is declined, which is the same dead end the old "no delivery at all" bug was,
+    // just one step later.
+    let record = delivered_tx
+        .selection
+        .as_ref()
+        .expect("a reassigned transaction must carry a routing decision for its new owner");
+    assert!(
+        record.names(&new_key),
+        "the record must name the NEW finalizer, not the one that rejected it"
+    );
+    assert!(
+        record.verify(
+            &delivered_tx.id,
+            pneumatic_core::epoch::FINALIZER_DOMAIN,
+            &pneumatic_core::crypto::Ed25519Provider::generate()
+        )
+        .unwrap_or(false),
+        "the re-attestation must verify under the key the record itself names"
+    );
+    assert!(
+        !record.salt.is_empty(),
+        "the retry carries the salt the original selection used, so the retry's \
+         tie-break is the only thing that moved"
     );
 }

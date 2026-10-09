@@ -55,10 +55,12 @@ impl Committer {
             self.replay_pending_votes(&block_hash).await;
         }
 
-        // Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5): reject a block whose
-        // finalizer signature does not verify. Pure computation over the block's own fields — no
-        // lock is held here.
-        self.verify_block_finalizer_sig(&block)?;
+        // Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5), now anchored
+        // on the routing decision instead of on the block's own claim (ADR-004): the
+        // signature must verify under the key the Sentinel's decision names, and the
+        // node that sent this must be that key. Blocks with no decision keep the C5
+        // treatment — the shielded placeholder case — with the reason logged.
+        self.gossip_authority(&block, &message.public_key)?;
 
         // Validate linkage + hash and append under a SINGLE mutable borrow of the token (AUDIT
         // Phase 3.3 / C5). This closes the read-then-`get_mut` gap: previously the tip was read via

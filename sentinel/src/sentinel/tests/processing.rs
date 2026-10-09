@@ -430,15 +430,41 @@ fn transaction_notifier_send_to_executors_does_not_panic() {
 }
 
 
-#[test]
-fn transaction_notifier_send_to_finalizer_does_not_panic() {
-    let node_registry = make_test_node_registry();
-    let config = make_test_config();
-    let notifier = TransactionNotifier::new(config, node_registry);
-    let env = make_test_env_data();
-    let tx = Transaction {
+/// A `Connection` that records what was sent through it, so a test can say who
+/// actually received a frame.
+struct RecordingConn {
+    recorder: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl pneumatic_core::conns::Connection for RecordingConn {
+    async fn send(&self, data: &Vec<u8>) -> Result<(), pneumatic_core::conns::ConnError> {
+        self.recorder.lock().unwrap().push(data.clone());
+        Ok(())
+    }
+}
+
+/// Register `key` as a Finalizer peer whose sends land in `recorder`.
+fn register_finalizer_peer(
+    registry: &Arc<NodeRegistry>,
+    key: Vec<u8>,
+    recorder: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    assert!(
+        registry.register_peer(
+            key,
+            [0x0F; 16],
+            &NodeRegistryType::Finalizer,
+            Box::new(RecordingConn { recorder })
+        ),
+        "the fixture finalizer registers within capacity"
+    );
+}
+
+fn preload_fixture_tx(id: &str) -> Transaction {
+    Transaction {
         payload: vec![], gas_limit: 0,
-        id: "test_tx".into(),
+        id: id.into(),
         action: "Preload".into(),
         token_id: vec![1],
         bid: None,
@@ -449,13 +475,75 @@ fn transaction_notifier_send_to_finalizer_does_not_panic() {
         timestamp: 0,
         result_hash: vec![],
         sender_signature: vec![],
-    
-    result_data: vec![],selection: None,
-    };
-    let result = notifier.send_to_finalizer_for_preload(&tx, b"finalizer_key", &env);
-    assert!(result.is_ok());
+        result_data: vec![],
+        selection: None,
+    }
 }
 
+#[test]
+fn transaction_notifier_send_to_finalizer_delivers_only_to_the_assigned_finalizer() {
+    // ADR-004 gives the preload hop exactly one recipient: the Finalizer the
+    // Sentinel selected. The old notifier broadcast to the entire Finalizer bucket,
+    // which is why "does not panic" was the strongest claim this test could make.
+    // With a single-recipient send, the assertions worth having are about *who*
+    // received it — the assigned node once, and nobody else at all.
+    let node_registry = make_test_node_registry();
+    let assigned_key = vec![0xA1; 32];
+    let bystander_key = vec![0xB2; 32];
+    let assigned: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let bystander: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    register_finalizer_peer(&node_registry, assigned_key.clone(), assigned.clone());
+    register_finalizer_peer(&node_registry, bystander_key.clone(), bystander.clone());
+
+    let config = make_test_config();
+    let notifier = TransactionNotifier::new(config, node_registry);
+    let env = make_test_env_data();
+    let tx = preload_fixture_tx("test_tx");
+
+    notifier
+        .send_to_finalizer_for_preload(&tx, &assigned_key, &env)
+        .expect("the assigned finalizer is reachable");
+
+    assert_eq!(
+        assigned.lock().unwrap().len(),
+        1,
+        "the assigned Finalizer receives the preload exactly once"
+    );
+    assert!(
+        bystander.lock().unwrap().is_empty(),
+        "a Finalizer the transaction was not routed to must not be handed it"
+    );
+}
+
+#[test]
+fn transaction_notifier_send_to_finalizer_fails_closed_without_a_route() {
+    // The other half of ADR-004 on this path: no route is an error, not a
+    // broadcast. Falling back to "send it to every Finalizer we happen to know"
+    // would put the transaction in front of nodes entitled to finalize it, which is
+    // the property the routing decision exists to protect — and it would let a lost
+    // selection silently widen the blast radius instead of surfacing.
+    let node_registry = make_test_node_registry();
+    let config = make_test_config();
+    let notifier = TransactionNotifier::new(config, node_registry);
+    let env = make_test_env_data();
+    let tx = preload_fixture_tx("test_tx_unreachable");
+
+    let err = notifier
+        .send_to_finalizer_for_preload(&tx, &vec![0xA1; 32], &env)
+        .expect_err("an unroutable finalizer key is an error, not a silent broadcast");
+    assert!(
+        matches!(err, crate::transaction_notifier::NotifyError::NoTarget(_)),
+        "expected NoTarget, got {err:?}"
+    );
+
+    let empty = notifier
+        .send_to_finalizer_for_preload(&tx, &vec![], &env)
+        .expect_err("no routing decision is not the same as an unconstrained one");
+    assert!(
+        matches!(empty, crate::transaction_notifier::NotifyError::NoTarget(_)),
+        "expected NoTarget, got {empty:?}"
+    );
+}
 
 #[test]
 fn transaction_notifier_notify_clear_does_not_panic() {
@@ -698,14 +786,26 @@ fn handle_process_request_rejects_duplicate_nonce() {
     // (override_quorum_percentage == 0.0, but any 2-party transfer scores > 0), and the
     // plain fixture registers no token. To let `validate_transaction` succeed and reach
     // the pool enqueue (Step 6), we raise the risk gate and register token [1].
+    //
+    // Step 6 also runs ADR-004's finalizer selection, which reads the epoch stake
+    // snapshot and fails closed without one — so the fixture seeds a snapshot for the
+    // epochs a fresh sentinel can be in (it starts at 1, epoch 0 for the sentinel
+    // paths that read the previous boundary).
     let mut env_data = make_test_env_data();
     env_data.override_quorum_percentage = 100.0;
     let mut token = Token::new();
     token.set_metadata("owner".to_string(), "bob".to_string());
-    let data_provider =
-        StubDataProvider::new().with_token(vec![1], "token".to_string(), token);
+    let stakers = pneumatic_core::epoch::StakeSet {
+        stakers: vec![(vec![0xF1; 32], 100u64)].into_iter().collect(),
+    };
+    let data_provider = StubDataProvider::new()
+        .with_token(vec![1], "token".to_string(), token)
+        .with_stake_snapshot(0, stakers.clone())
+        .with_stake_snapshot(1, stakers);
     let (sentinel, registry) =
         make_sentinel_fixture_with_env_and_data_provider(data_provider, env_data);
+    // …and that staker has to be a Finalizer the sentinel can address.
+    register_finalizers(&sentinel, &[vec![0xF1; 32]]);
 
     // A valid sender signs the canonical transaction bytes (C3 gate passes).
     let sender_identity = NodeIdentity::generate_in_memory();

@@ -16,7 +16,7 @@ use super::super::*;
 async fn send_to_finalizer_signed_with_executor_identity() {
     let identity = Arc::new(pneumatic_core::rns::identity::NodeIdentity::generate_in_memory());
     let node_registry = make_test_node_registry();
-    // The finalizer peer's registered key.
+    // The finalizer peer's registered key — and the key the routing decision names.
     let finalizer_key = vec![0xAB; 32];
     let recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
     assert!(node_registry.register_peer(
@@ -24,6 +24,17 @@ async fn send_to_finalizer_signed_with_executor_identity() {
         [5u8; 16],
         &NodeRegistryType::Finalizer,
         Box::new(RecordingConnection { recorder: recorder.clone() }),
+    ));
+    // A second, *unassigned* Finalizer in the same bucket. Before ADR-004 was
+    // enforced this hop was `send_to_all`, so this node received the transaction and
+    // its optimistic path booked a block for work it had not been given. Asserting
+    // on it is what turns "targeted" from a comment into a tested property.
+    let other_recorder = Arc::new(std::sync::Mutex::new(Vec::new()));
+    assert!(node_registry.register_peer(
+        vec![0xCD; 32],
+        [6u8; 16],
+        &NodeRegistryType::Finalizer,
+        Box::new(RecordingConnection { recorder: other_recorder.clone() }),
     ));
 
     let executor = Executor::new(
@@ -43,9 +54,21 @@ async fn send_to_finalizer_signed_with_executor_identity() {
     // "Preload" (serialized tx) followed by a "Sign" vote over the result hash.
     executor
         .clone_handle()
-        .send_to_finalizer("test_tx_001", vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9])
+        .send_to_finalizer(
+            "test_tx_001",
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+            vec![7, 8, 9],
+            &finalizer_key,
+        )
         .await
         .expect("send should succeed");
+
+    assert!(
+        other_recorder.lock().unwrap().is_empty(),
+        "ADR-004: the finalize hop goes to the assigned Finalizer only — a second \
+         registered Finalizer in the same bucket received frames it was not chosen for"
+    );
 
     let captured = recorder.lock().unwrap();
     assert_eq!(

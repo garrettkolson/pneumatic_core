@@ -261,6 +261,7 @@ pub fn advance_epoch(&mut self) {
 pub mod finalizing;
 pub mod shielded;
 pub mod signing;
+mod routing;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -270,6 +271,7 @@ pub mod signing;
 mod tests {
     pub mod helpers;
     mod epoch_stake;
+    mod routing;
     mod shielded;
     mod signing;
 }

@@ -122,6 +122,19 @@ pub enum CommitterError {
         token_id: String,
         cause: String,
     },
+    /// ADR-004: this block did not come from the Finalizer the Sentinel routed its
+    /// transaction to, or carried no routing decision at all, or its attestation
+    /// does not hold. The Committer is the node that decides what enters the chain,
+    /// so this is the check that actually prevents a fork from becoming history:
+    /// with N hosts finalizing one transaction, the one that commits first wins and
+    /// the rest are divergent copies (`fact-composite-per-host-fork-divergence`).
+    ///
+    /// Distinct from `InvalidFinalizerSignature` (the signature is bad) and from
+    /// `UnauthorizedRole` (the sender is not a Finalizer at all): here the sender may
+    /// be a perfectly well-behaved Finalizer that was simply not the one chosen, and
+    /// an operator needs to tell "our routing is broken" apart from "someone is
+    /// attacking us".
+    Routing(String),
 }
 
 impl From<io::Error> for CommitterError {

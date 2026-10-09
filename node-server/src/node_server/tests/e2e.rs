@@ -530,6 +530,18 @@ impl ContractE2eProvider {
             stakers: Arc::new(std::sync::Mutex::new(HashMap::from_iter(stakers))),
         }
     }
+
+    /// Replace the stake snapshot's contents with a single staker.
+    ///
+    /// Needed because the composite's own key is only known once its `Config`
+    /// exists, and ADR-004 reads this map to decide who finalizes: the host that
+    /// registers itself as the only Finalizer peer must be the staker the selection
+    /// can pick, or the transaction has no reachable owner.
+    fn set_staker(&self, key: Vec<u8>, stake: u64) {
+        let mut map = self.stakers.lock().unwrap();
+        map.clear();
+        map.insert(key, stake);
+    }
 }
 
 impl DataProvider for ContractE2eProvider {
@@ -860,6 +872,15 @@ async fn contract_composite(
         provider_dyn.clone(),
     );
     let own_key = cfg.public_key.clone();
+    // ADR-004 makes the stake snapshot load-bearing: it decides which Finalizer
+    // every transaction is routed to. The fixture's placeholder staker key
+    // (`own_staker_key`, `vec![0xE0, 0x01]`) was chosen when the snapshot was read
+    // only by the stake-gated role checks — all floors are 0 here, so its value never
+    // mattered. Now it does: a staker that is not this host selects a Finalizer that
+    // is not in the bucket, and the finalize hop fails closed instead of broadcasting
+    // into the void. The comment on `own_staker_key` claimed "the composite's own key
+    // is the staker"; here it finally is.
+    provider.set_staker(own_key.clone(), 2_000);
     let stake = Arc::new(MapStakeProvider::with_default(2_000));
     let server = build_runtime(cfg.clone(), stake, provider_dyn.clone())
         .expect("composite boots");
@@ -962,9 +983,12 @@ async fn pipeline_transfer_tx_commits_with_independent_transfer_hash() {
 }
 
 fn own_staker_key() -> Vec<u8> {
-    // The composite's own key is the staker; the stake snapshot is only
-    // read for stake-gated role checks (all floors are 0), so the key's
-    // value is unimportant — it just must be non-empty.
+    // A placeholder, and no longer the whole story. It was written when the stake
+    // snapshot was read only for stake-gated role checks (all floors are 0 here), so
+    // its value was unimportant as long as it was non-empty. ADR-004 also reads it to
+    // pick a transaction's Finalizer, so a fixture that wants its own host to
+    // finalize must name its own host in the snapshot —
+    // `contract_composite` overwrites this key with the composite's real one.
     vec![0xE0, 0x01]
 }
 

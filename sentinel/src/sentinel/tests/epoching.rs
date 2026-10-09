@@ -69,6 +69,9 @@ fn advance_epoch_routes_follows_new_epoch() {
         );
     let (sentinel, _registry) =
         make_sentinel_fixture_with_env_and_data_provider(data_provider, make_test_env_data_sharded());
+    // Every staked key in either epoch's snapshot is a reachable Finalizer, so the
+    // selection's candidate set is the snapshot itself (see `register_finalizers`).
+    register_finalizers(&sentinel, &[vec![1], vec![2], vec![3], vec![10], vec![20], vec![30]]);
 
     let tx_id = "tx_epoch_route".to_string();
 

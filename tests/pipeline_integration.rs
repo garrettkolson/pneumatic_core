@@ -525,10 +525,18 @@ async fn e2e_standard_pipeline_commits_over_rns() {
 
     // --- Shared fixtures for the data providers ---
     let sender_pk = submitter_id.ed25519.public_key().expect("submitter public key");
+    // Every node in the mesh is a staked node, which is what a real epoch snapshot
+    // looks like: executors, finalizers and committers all have stake at risk.
+    // Finalizer selection starts from this set, so the finalizers have to be in it —
+    // and starting from it is exactly why the selection then restricts candidates to
+    // the keys the sentinel can address as Finalizers. A stake set that named only
+    // finalizers would hide that; this one doesn't.
     let stake_set = StakeSet {
         stakers: [
             (e1_id.ed25519.public_key().expect("e1 pk"), 100u64),
             (e2_id.ed25519.public_key().expect("e2 pk"), 100u64),
+            (f1_id.ed25519.public_key().expect("f1 pk"), 100u64),
+            (f2_id.ed25519.public_key().expect("f2 pk"), 100u64),
         ]
         .into_iter()
         .collect(),
@@ -583,7 +591,18 @@ async fn e2e_standard_pipeline_commits_over_rns() {
 
     // --- Sentinels S1, S2 (both on N_SENT). Registry peer: the executor RNS
     //     node (e1_id.rhash) — a single connection; N_EXEC fans the Preload
-    //     out to both E1 and E2. ---
+    //     out to both E1 and E2.
+    //
+    //     F1 is registered as a Finalizer too, because a sentinel that routes has to
+    //     know whom it can route to: the candidate set for finalizer selection is the
+    //     epoch stake snapshot restricted to registered Finalizers (see
+    //     `Sentinel::staked_finalizers`). Only F1, not F2 — F2 shares F1's RNS anchor
+    //     (`anchor_of` maps both onto the single N_FIN node), so F2 has no transport
+    //     address of its own and a decision naming it could never be delivered.
+    //     Nothing is sent over this Finalizer connection on the standard path — the
+    //     sentinel decides and attests, the executor delivers — so the absence of a
+    //     SENT↔FIN edge in `rns_edge_list` is not exercised here; if the sentinel ever
+    //     starts sending finalizer-bound frames itself, that edge has to be added. ---
     let s1_registry = make_registry(s1_id);
     let s2_registry = make_registry(s2_id);
     for (registry, node, peer) in [
@@ -598,6 +617,15 @@ async fn e2e_standard_pipeline_commits_over_rns() {
                 node.conn_to(peer),
             ),
             "sentinel: executor peer registers"
+        );
+        assert!(
+            registry.register_peer(
+                f1_id.ed25519.public_key().expect("f1 pk"),
+                f1_id.rhash,
+                &NodeRegistryType::Finalizer,
+                node.conn_to(f1_id),
+            ),
+            "sentinel: finalizer peer registers"
         );
     }
 
@@ -783,7 +811,16 @@ async fn e2e_standard_pipeline_commits_over_rns() {
     ));
 
     // --- Committers C1, C2 (both on N_COMM). Registry peers: the finalizer
-    //     RNS node (envelope auth + role gate for "Commit"/"BlockFinalized"). ---
+    //     RNS node (envelope auth + role gate for "Commit"/"BlockFinalized"), and
+    //     the sentinels.
+    //
+    //     The sentinels are here because a block's routing decision has to be
+    //     attributable: `gossip_authority` accepts a block only if the key that
+    //     attested its routing decision holds the Sentinel role in this committer's
+    //     registry. Without that lookup, a routing decision signed by the sender's own
+    //     key would verify perfectly well against that key — signature validity is not
+    //     role validity, and the committer is the role that turns a block into a
+    //     committed state change. ---
     let c1_registry = make_registry(c1_id);
     let c2_registry = make_registry(c2_id);
     for (registry, node) in [
@@ -799,6 +836,17 @@ async fn e2e_standard_pipeline_commits_over_rns() {
                     node.conn_to(f1_id),
                 ),
                 "committer: finalizer peer registers"
+            );
+        }
+        for peer in [s1_id, s2_id] {
+            assert!(
+                registry.register_peer(
+                    peer.ed25519.public_key().expect("sentinel pk"),
+                    s1_id.rhash,
+                    &NodeRegistryType::Sentinel,
+                    node.conn_to(s1_id),
+                ),
+                "committer: sentinel peer registers"
             );
         }
     }
