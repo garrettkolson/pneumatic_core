@@ -577,7 +577,16 @@ impl AsymCryptoProvider for Ed25519Provider {
         // Ed25519 half — fixed 64-byte signature.
         let ed25519_sig = signing_key.sign(data).to_vec();
 
-        // ML-DSA half (deterministic): sign then take the detached signature bytes.
+        // ML-DSA half: sign then take the detached signature bytes.
+        //
+        // NOT deterministic, whatever this comment used to say. The PQClean entry point
+        // signs with fresh randomness, so one key signing one message twice produces two
+        // different signatures — measured 10/09/2026 while writing the Committer's
+        // routing test, which had assumed byte-stable attestations. Nothing here may
+        // therefore compare signatures byte-for-byte or deduplicate by signature bytes;
+        // `check_signature` is the only sound question to ask of a signature. Callers
+        // that need "the same answer" compare the signed fields — see
+        // `SelectionRecord::same_decision_as`, the site that found this.
         let mldsa_keys = self.mldsa_keypair.read().map_err(|e| {
             PneumaticError::CryptoError(format!("RwLock poisoned: {:?}", e))
         })?;

@@ -156,27 +156,21 @@ impl Sentinel {
         // Step 3 is released here — the existing error paths below leaked it, which
         // is how a rejection at this line would have parked a registry entry
         // write-locked forever rather than failing a transaction.
-        let epoch_number = *self.current_epoch.lock();
-        let salt = Self::chain_tip_of(&token);
-        let finalizer_key = match self.assign_finalizer_deterministic(&tx_id, epoch_number, &salt) {
-            Ok(key) => key,
+        // ADR-004 / ADR-007: the routing decision for this transaction, either the one
+        // it already carries or a fresh selection attested here. See
+        // `routing_decision_for` for why a decision that arrives is never recomputed.
+        let (finalizer_key, selection) = match self.routing_decision_for(&tx, &token) {
+            Ok(decision) => decision,
             Err(e) => {
+                // Fail-closed by returning: no stake snapshot, an empty stake set, or a
+                // zero-stake winner all mean there is no defensible answer to "who
+                // finalizes this", and a transaction admitted without an owner is exactly
+                // the condition that produced one block per host. The pre-lock taken at
+                // Step 3 is released here — the existing error paths below leaked it,
+                // which is how a rejection at this line would have parked a registry
+                // entry write-locked forever rather than failing a transaction.
                 let _ = self.registry.release_transaction(&tx_id);
                 return Err(e);
-            }
-        };
-        // The record must be the Sentinel's, not merely well-formed: the Finalizer
-        // this names is the one node allowed to finalize, and the Committer must
-        // accept a block only from it. Both checks are worthless if the party being
-        // constrained can write the answer, hence the attestation.
-        let selection = match self
-            .transaction_notifier
-            .attest_selection(&tx_id, finalizer_key.clone(), epoch_number, &salt)
-        {
-            Ok(record) => record,
-            Err(e) => {
-                let _ = self.registry.release_transaction(&tx_id);
-                return Err(SentinelError::from(e));
             }
         };
         let mut tx = tx;
@@ -325,6 +319,67 @@ impl Sentinel {
                 }
             }
         }
+    }
+
+
+    /// The routing decision for a transaction entering the standard path: the one it
+    /// already carries, or a fresh selection this Sentinel makes and attests.
+    ///
+    /// One transaction, one decision — the Sentinel that admits it makes the decision,
+    /// and a decision already travelling with the transaction is honoured rather than
+    /// recomputed.
+    ///
+    /// That is not a convenience. On a composite every host runs a Sentinel, and a
+    /// transaction reaches the other hosts' Sentinels by gossip after the first has
+    /// admitted and routed it. If each of them ran the selection for itself, the
+    /// environment would hold as many routing decisions as hosts for a single
+    /// transaction — ADR-004 would be true inside each host and false across them. That
+    /// is what the four-host rehearsal measured on 10/09/2026: each host's own Sentinel
+    /// routed the transaction to its own host's Finalizer, each Finalizer then honestly
+    /// built a block for the transaction it had been handed, and the Committer was left
+    /// choosing between four honest claims. A gate that compares an incoming block
+    /// against "the" decision can only work if there is one.
+    ///
+    /// Honouring the carried record does not mean trusting it. The roles the record
+    /// constrains verify it themselves — `Finalizer::finalize_authority` and
+    /// `Committer::block_authority` both verify the attestation and require the attester
+    /// to hold the Sentinel role — so a forged record is refused downstream. What this
+    /// function refuses to do is overwrite it, which would be a second node claiming the
+    /// routing authority ADR-007 gives to one.
+    pub(crate) fn routing_decision_for(
+        &self,
+        tx: &Transaction,
+        token: &pneumatic_core::tokens::Token,
+    ) -> Result<
+        (
+            Vec<u8>,
+            pneumatic_core::transactions::SelectionRecord,
+        ),
+        SentinelError,
+    > {
+        if let Some(carried) = tx.selection.clone() {
+            self.env_data.logger.log(format!(
+                "tx {} arrives with a routing decision; honouring it instead of selecting again",
+                tx.id
+            ));
+            return Ok((carried.finalizer_public_key.clone(), carried));
+        }
+
+        let epoch_number = *self.current_epoch.lock();
+        // The salt is the tip of the chain the transaction extends (ADR-019), taken from
+        // the `token` the caller already validated against, so the salt cannot disagree
+        // with the state the transaction was admitted into.
+        let salt = Self::chain_tip_of(token);
+        let finalizer_key = self.assign_finalizer_deterministic(&tx.id, epoch_number, &salt)?;
+        // The record must be this Sentinel's, not merely well-formed: the Finalizer it
+        // names is the one node allowed to finalize, and the Committer must accept a
+        // block only from it. Both checks are worthless if the party being constrained
+        // can write the answer, hence the attestation.
+        let selection = self
+            .transaction_notifier
+            .attest_selection(&tx.id, finalizer_key.clone(), epoch_number, &salt)
+            .map_err(SentinelError::from)?;
+        Ok((finalizer_key, selection))
     }
 
 }

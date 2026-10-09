@@ -185,3 +185,107 @@ async fn the_finalizer_signature_is_checked_against_the_routed_key_not_the_self_
         "the block has to have actually been appended, got a chain of {chain_len}"
     );
 }
+
+/// The check the four-host rehearsal found missing.
+///
+/// A routing record travels inside the block it authorizes, so on its own it is a
+/// claim the sender writes about itself. Checks 1-3 of `block_authority` validate that
+/// claim (attestation, attester role, sender naming) and every block in the rehearsal
+/// passed them — each host's own Sentinel had routed the transaction to that host's own
+/// Finalizer, and each host then delivered a block that named its own sender. What makes
+/// the decision a constraint on *this* committer is that it compares the incoming record
+/// with the record its own Sentinel recorded.
+#[tokio::test]
+async fn a_block_carrying_a_different_decision_for_the_same_transaction_is_refused() {
+    let (committer, registry, _logger) = committer_fixture();
+    let tip = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+
+    // What this node holds: the decision its own Sentinel wrote when it admitted the
+    // transaction. Stamped directly, because the fixture has no Sentinel in-process.
+    let tx = Transaction {
+        selection: Some(gossip_selection("contested_tx")),
+        ..make_gossip_block_at_prev("contested_tx", b"proposer".to_vec(), &tip)
+            .signed_trans
+            .transaction
+    };
+    registry
+        .add_transaction(
+            "contested_tx".to_string(),
+            PendingTransaction::new(
+                "contested_tx".to_string(),
+                TransactionState::Finalizing {
+                    transaction: tx.clone(),
+                    finalizer_key: gossip_finalizer().public_key().expect("finalizer pk"),
+                },
+            ),
+        )
+        .expect("the fixture transaction is added");
+
+    // The block matching that decision is accepted — the refusal below has to be about
+    // the decision, not about some unrelated defect in the fixture.
+    let first = make_gossip_block_at_prev("contested_tx", b"proposer".to_vec(), &tip);
+    let first_at = first.current_hash.clone();
+    committer
+        .handle_block_finalized(make_block_finalized_message(first))
+        .await
+        .expect("the block whose decision matches this node's is committed");
+
+    // A second block for the SAME transaction, honestly attested by the registered
+    // Sentinel, honestly signed, and delivered by the Finalizer it names — but naming a
+    // different Finalizer than this node was told. That is the second host in the
+    // rehearsal, and appending it is the divergence ADR-004 exists to prevent.
+    let stranger = pneumatic_core::crypto::Ed25519Provider::from_seed([0xEE; 32]);
+    let stranger_key = stranger.public_key().expect("stranger pk");
+    let mut second = make_gossip_block_at_prev("contested_tx", b"proposer".to_vec(), &tip);
+    second.signed_trans.transaction.selection =
+        Some(gossip_selection_named("contested_tx", &stranger_key));
+    second.signed_trans.finalizer_addr = stranger_key.clone();
+    second.signed_trans.finalizer_sig.signature = stranger
+        .sign_data(&second.signed_trans.finalizer_sig.transaction_hash)
+        .expect("stranger signs");
+    second.current_hash = BlockFactory::create_hash(&second).expect("re-hash");
+
+    let err = committer
+        .handle_block_finalized(make_block_finalized_message_from(second, stranger_key))
+        .await
+        .expect_err("a second, differently routed block for one transaction is not a second block");
+    let message = match &err {
+        CommitterError::Routing(m) => m.clone(),
+        other => panic!("expected a Routing refusal, got {other:?}"),
+    };
+    assert!(
+        message.contains("not the one this node holds"),
+        "the refusal has to name the disagreement, got: {message}"
+    );
+
+    let chain_len = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_count();
+    assert_eq!(
+        chain_len, 2,
+        "genesis plus the ONE accepted block — the refused block must not have appended"
+    );
+    let tip_after = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    assert_eq!(
+        tip_after, first_at,
+        "the chain tip must still be the block this node's own decision named"
+    );
+}

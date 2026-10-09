@@ -36,10 +36,25 @@
 //!    the key the block claims. Same bytes as C5, different anchor, and now applied
 //!    on the path that appends.
 //!
-//! H12 (the payload hash-compare) covers this field for free: `selection` is part of
-//! `Transaction`, so the whole-struct hash the committer compares already binds the
-//! routing decision to the transaction that was validated and pooled. A block cannot
-//! arrive with a swapped-in decision while still matching the pooled payload.
+//! The decision a block carries must also be the decision **this node holds** for that
+//! transaction (step 4 below). That check is not redundant with H12, and an earlier
+//! version of this file said it was — wrongly. H12 compares `Transaction::hash()`, which
+//! is SHA-256 over `canonical_bytes()`, and `selection` is deliberately absent from
+//! `CanonicalTransaction`: the routing decision is not user intent and the sender never
+//! signs it, so binding it into the payload hash the sender authorized would let a
+//! Sentinel change what a transaction authorizes. The consequence is that nothing binds
+//! the record inside a block to anything the receiver believes, and the record is a claim
+//! the sender writes into the very object it is authorizing.
+//!
+//! The four-host rehearsal (10/09/2026) is what found it. Every host runs every role, so
+//! each host's Sentinel admitted the same client transaction and stamped its own record,
+//! each host's Finalizer built a block for it, and `committer-1` appended two blocks with
+//! two different hashes for one transaction — each of which satisfied every check above
+//! on its own terms, because each carried a decision naming the node that sent it.
+//! Comparing the incoming record against the one this node's own Sentinel recorded turns
+//! the decision from a self-serving assertion into a constraint the receiver can check.
+//! Where this node holds no entry for the transaction there is nothing to compare, and
+//! the remaining checks still apply.
 //!
 //! Not verified here, and named as the residual: that the assignment is the one
 //! `deterministic_select` would produce for this epoch and salt. The record carries
@@ -159,7 +174,24 @@ impl Committer {
             )));
         }
 
-        // (4) The block's finalizer signature, checked under the assigned key rather
+        // (4) The decision the block carries must be the one THIS node holds for that
+        // transaction. Without it, every host whose own Sentinel stamped itself can
+        // deliver its own block and pass checks 1-3 — which is precisely what the
+        // four-host rehearsal did, twice, for one transaction.
+        if let Some(held) = self.held_decision(tx_id) {
+            if !held.same_decision_as(record) {
+                return Err(CommitterError::Routing(format!(
+                    "block for tx {} carries a routing decision (finalizer {}, attester {})                      that is not the one this node holds for that transaction (finalizer {},                      attester {}); two nodes have routed the same transaction differently,                      and the one this node was told to is the one it will commit",
+                    tx_id,
+                    hex(&record.finalizer_public_key),
+                    hex(&record.sentinel_public_key),
+                    hex(&held.finalizer_public_key),
+                    hex(&held.sentinel_public_key),
+                )));
+            }
+        }
+
+        // (5) The block's finalizer signature, checked under the assigned key rather
         // than the key the block declares about itself.
         let finalizer_sig = &block.signed_trans.finalizer_sig;
         if finalizer_sig.signature.is_empty() {
@@ -175,6 +207,26 @@ impl Committer {
         }
 
         Ok(())
+    }
+
+    /// The routing decision this node already holds for `tx_id`.
+    ///
+    /// Read from this node's own registry, which on a composite is where its own
+    /// Sentinel wrote the transaction it admitted — that is the whole point: the
+    /// comparison is against what *this* node was told, not against what the sender
+    /// says. A `Committed` entry returns `None` so a repeat commit of the same block
+    /// keeps its existing wire-authoritative handling rather than being read as a
+    /// routing disagreement.
+    fn held_decision(&self, tx_id: &str) -> Option<pneumatic_core::transactions::SelectionRecord> {
+        let entry = self.pending_registry.get_transaction_mut(tx_id).ok()?;
+        let tx = match &entry.state {
+            TransactionState::Preloaded { transaction }
+            | TransactionState::Validated { transaction, .. }
+            | TransactionState::Executing { transaction, .. }
+            | TransactionState::Finalizing { transaction, .. } => transaction,
+            _ => return None,
+        };
+        tx.selection.clone()
     }
 }
 

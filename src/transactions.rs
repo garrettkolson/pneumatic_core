@@ -289,6 +289,28 @@ impl SelectionRecord {
     pub fn names(&self, key: &[u8]) -> bool {
         !key.is_empty() && self.finalizer_public_key == key
     }
+
+    /// Whether two records state the same routing decision.
+    ///
+    /// The attestation bytes are deliberately **not** compared. Hybrid signing here is
+    /// randomized — `Ed25519Provider::sign_data` embeds an ML-DSA signature produced
+    /// with fresh randomness, so the same key signing the same bytes twice yields
+    /// different 3,796-byte signatures (measured, 10/09/2026, while writing the
+    /// Committer's routing test). A byte-for-byte comparison would therefore reject a
+    /// faithful re-attestation of the very decision it is meant to accept, and would
+    /// pass nothing that verification does not already cover.
+    ///
+    /// What has to agree is the decision and who claims to have made it: the assigned
+    /// Finalizer, the attesting Sentinel, the epoch the snapshot was read at, and the
+    /// salt that seeded the walk. Authenticity stays with `verify`, which is the
+    /// operation the signature exists for; this function answers "is it the same
+    /// answer", which is a question about the fields, not about the proof.
+    pub fn same_decision_as(&self, other: &SelectionRecord) -> bool {
+        self.finalizer_public_key == other.finalizer_public_key
+            && self.sentinel_public_key == other.sentinel_public_key
+            && self.epoch_number == other.epoch_number
+            && self.salt == other.salt
+    }
 }
 
 /// Represents a pending transaction in the pipeline.

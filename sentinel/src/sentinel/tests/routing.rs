@@ -108,3 +108,89 @@ fn the_host_serving_a_finalizer_counts_as_reachable_for_its_own_key() {
         "the own-key candidate is the one this host can actually deliver to"
     );
 }
+
+/// One transaction, one decision.
+///
+/// Every host in the composite rehearsal ran a Sentinel, each admitted the same gossiped
+/// transaction, and each stamped its own decision for its own host — so the environment
+/// held four routing decisions for one transaction, four Finalizers each built a block for
+/// the one it had been handed, and the Committer had to choose between them
+/// (`fact-composite-per-host-fork-divergence`). ADR-007 puts routing authority in the
+/// Sentinel that admits a transaction; a second Sentinel selecting for itself is a second
+/// authority claiming the same transaction.
+///
+/// The A/B is the fixture itself. This Sentinel has no stake snapshot, so a transaction
+/// that asks it to route fails closed — it has no defensible answer to "who finalizes
+/// this". The same transaction arriving already routed does not, and the record it gets
+/// back is the one that arrived, byte for byte: the attestation of a *different* key,
+/// which this node could not have produced. A re-attestation with this node's own key
+/// would be the rehearsal's bug wearing a fresh signature, so the comparison is of the
+/// whole record rather than just the Finalizer key.
+#[test]
+fn a_decision_that_arrives_with_the_transaction_is_honoured_not_recomputed() {
+    let sentinel = {
+        let (sentinel, _registry) = super::helpers::make_sentinel_fixture();
+        sentinel
+    };
+    let token = pneumatic_core::tokens::Token::new();
+
+    let mut tx = Transaction {
+        payload: vec![],
+        gas_limit: 0,
+        id: "one_decision_tx".into(),
+        action: "Process".into(),
+        token_id: vec![1],
+        bid: None,
+        sequence_number: 1,
+        sender: vec![1],
+        receiver: vec![2],
+        amount: Some(100),
+        timestamp: 0,
+        result_hash: vec![],
+        sender_signature: vec![],
+        result_data: vec![],
+        selection: None,
+    };
+    let carried = {
+        let attester = NodeIdentity::generate_in_memory();
+        pneumatic_core::transactions::SelectionRecord::attest(
+            &attester.ed25519,
+            "one_decision_tx",
+            pneumatic_core::epoch::FINALIZER_DOMAIN,
+            vec![0xC0; 32],
+            1,
+            vec![0x5A; 32],
+        )
+        .expect("the first Sentinel attests its decision")
+    };
+
+    // Control: no snapshot and nothing carried, so there is nothing to route from.
+    let unrouted = sentinel
+        .routing_decision_for(&tx, &token)
+        .expect_err("no snapshot and no carried decision means no decision");
+    assert!(
+        matches!(unrouted, SentinelError::Routing(_)),
+        "the premise of the second half is that this fixture cannot route on its own: {unrouted:?}"
+    );
+
+    // Same Sentinel, same fixture, transaction already routed.
+    tx.selection = Some(carried.clone());
+    let (finalizer_key, record) = sentinel
+        .routing_decision_for(&tx, &token)
+        .expect("a transaction that arrives routed is admitted with the decision it carries");
+
+    assert_eq!(finalizer_key, vec![0xC0; 32], "the routed Finalizer is the one the decision names");
+    assert_eq!(
+        record, carried,
+        "the record must be the one that arrived — including another node's attestation"
+    );
+    assert_ne!(
+        record.sentinel_public_key,
+        sentinel
+            .node_registry
+            .get_config()
+            .public_key
+            .clone(),
+        "and it must not have been re-attested by this node"
+    );
+}

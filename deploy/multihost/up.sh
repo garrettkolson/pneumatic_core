@@ -35,6 +35,8 @@ for n in m["nodes"]:
 EOF
 )
 
+EXTRA=0   # host-port counter for the non-committer sidecars, see below
+
 sidecar_ip() { echo "${1%.*}.$(( ${1##*.} + 10 ))"; }
 
 # --- data services first: every node fails closed at boot without one ------
@@ -45,9 +47,17 @@ while read -r name role addr; do
     # (examples/read_token_chain) can read the committed chain from the
     # outside — "observable through the data service", not through a log line.
     # Match the manifest's serde spelling: roles are lowercase there.
+    # Every sidecar is published, not just the committer's. On the run4 mesh all
+    # four hosts run the committer role, so a routing fault shows up as the four
+    # chains DISAGREEING — a fact that is unobservable while only one of them can
+    # be read from outside. The committer keeps 15555 so traffic.sh's gate is
+    # unchanged; the others land on 15556+.
     publish=()
     if [ "$role" = "committer" ]; then
         publish=(-p 127.0.0.1:15555:55555)
+    else
+        EXTRA=$((EXTRA + 1))
+        publish=(-p "127.0.0.1:1555$((5 + EXTRA)):55555")
     fi
     docker run -d --name "pmesh-dsvc-$name" --net "$NET" --ip "$ds_ip" \
         --user "$USER_ID" -v "$RUN:$RUN" ${publish[@]+"${publish[@]}"} \
