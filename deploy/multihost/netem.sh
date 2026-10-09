@@ -30,7 +30,13 @@ NONCE=$(cat "$NONCE_FILE" 2>/dev/null || echo 1)
 [ -x "$TX" ] || { echo "missing $TX — cargo build -p pneumatic_client" >&2; exit 1; }
 [ -x "$READER" ] || { echo "missing $READER — cargo build --example read_token_chain" >&2; exit 1; }
 
-chain() { "$READER" "$COMMITTER_DS" 0a token | awk '{print $5}'; }
+# The reader prints `token=… blocks=… sequence=… tip=…`; take the field by name.
+# Both of this script's assertions are growth assertions, so both read `sequence`
+# (bumped once per committed block, never on a trim) rather than `blocks` — a
+# token's chain is a 5-block sliding window (Token::security_level,
+# src/tokens.rs:46), which pins the count at 5 and makes any count-difference gate
+# unsatisfiable. See traffic.sh and RUNBOOK §4.
+chain() { "$READER" "$COMMITTER_DS" 0a token | tr ' ' '\n' | sed -n 's/^sequence=//p'; }
 
 netem_add() {   # netem_add CONTAINER
     docker exec --user 0 "pmesh-$1" tc qdisc add dev eth0 root netem loss "${LOSS}%"
@@ -43,7 +49,7 @@ netem_del() {   # netem_del CONTAINER  (tolerate absence — always-clean exit)
 trap 'netem_del sentinel-1; netem_del committer-1' EXIT
 
 before=$(chain)
-echo "committer chain before: $before block(s)"
+echo "committer commit counter before: $before"
 
 # Sustained stream in the background; injection lands mid-stream.
 "$TX" submit --addr "$ADDR" --chain-id env --token 0a --to 77 \
@@ -78,10 +84,10 @@ for _ in $(seq 1 45); do
     [ "$after" -ge $((before + REPEAT)) ] && break
 done
 after=$(chain)
-echo "committer chain after: $after block(s) (submitted $REPEAT under ${LOSS}% loss)"
+echo "committer commit counter after: $after (submitted $REPEAT under ${LOSS}% loss)"
 if [ "$after" -ge $((before + REPEAT)) ]; then
     echo "DELIVERED UNDER LOSS: every tx committed despite ${LOSS}% injected loss — retransmission carried the pipeline"
 else
-    echo "INCOMPLETE UNDER LOSS: chain grew by $((after - before)) of $REPEAT"
+    echo "INCOMPLETE UNDER LOSS: $((after - before)) commits landed of $REPEAT submitted"
     exit 1
 fi
