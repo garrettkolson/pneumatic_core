@@ -13,7 +13,10 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 RUN="$ROOT/deploy/multihost/run4"
-IMAGE=pneumatic:phase2
+# Overridable so a candidate image can be rehearsed without displacing the
+# tag the last recorded run was made with (`docker build -t pneumatic:<tag> .`
+# then `IMAGE=pneumatic:<tag> ./up.sh`).
+IMAGE=${IMAGE:-pneumatic:phase2}
 NET=pmesh
 GATEWAY=172.31.77.1
 USER_ID="$(id -u):$(id -g)"

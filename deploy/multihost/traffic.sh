@@ -20,8 +20,20 @@ NONCE=$(cat "$NONCE_FILE" 2>/dev/null || echo 1)
 [ -x "$TX" ] || { echo "missing $TX — cargo build -p pneumatic_client" >&2; exit 1; }
 [ -x "$READER" ] || { echo "missing $READER — cargo build --example read_token_chain" >&2; exit 1; }
 
-before=$("$READER" "$COMMITTER_DS" 0a token | awk "{print \$5}")
-echo "committer chain before: $before block(s)"
+# The reader prints `token=… blocks=N sequence=N tip=…`; take the field by name.
+# The gate is on `sequence`, NOT `blocks`, and the 10/08/2026 rehearsal is the
+# reason: a token's chain is a sliding window (`Token::security_level`, default
+# 5 — `src/tokens.rs:46`). Once the window is full every commit trims the oldest
+# block and appends the new one, so the COUNT sits at 5 forever while the chain
+# advances — a count gate reports "grew by 0 of 20" against a pipeline that was
+# delivering every transaction. `sequence` is bumped exactly once per committed
+# block (`Token::commit_block`) and never on a trim, so it is monotonic in
+# commits no matter what the window is doing.
+read_field() { "$READER" "$COMMITTER_DS" 0a token | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+
+before_seq=$(read_field sequence)
+before_blocks=$(read_field blocks)
+echo "committer chain before: sequence=$before_seq blocks=$before_blocks"
 
 "$TX" submit --addr "$ADDR" --chain-id env --token 0a --to 77 \
     --amount 100 --nonce "$NONCE" --repeat "$REPEAT" --interval-ms "$INTERVAL_MS" \
@@ -34,15 +46,19 @@ echo "$((NONCE + REPEAT))" > "$NONCE_FILE"
 echo "waiting for the pipeline to drain, then reading the committer chain"
 for _ in $(seq 1 30); do
     sleep 2
-    after=$("$READER" "$COMMITTER_DS" 0a token | awk "{print \$5}")
-    [ "$after" -ge $((before + REPEAT)) ] && break
+    after_seq=$(read_field sequence)
+    [ "$after_seq" -ge $((before_seq + REPEAT)) ] && break
 done
 
-after=$("$READER" "$COMMITTER_DS" 0a token | awk "{print \$5}")
-echo "committer chain after: $after block(s) (submitted $REPEAT)"
-if [ "$after" -ge $((before + REPEAT)) ]; then
+after_seq=$(read_field sequence)
+after_blocks=$(read_field blocks)
+echo "committer chain after: sequence=$after_seq blocks=$after_blocks (submitted $REPEAT)"
+if [ "$after_seq" -ge $((before_seq + REPEAT)) ]; then
     echo "DELIVERED: every submitted transaction is visible as a committed block through the data service"
+    if [ "$after_blocks" -le "$before_blocks" ]; then
+        echo "  (blocks did not grow — that is the $after_blocks-block window trimming as it appends; sequence moved $before_seq → $after_seq)"
+    fi
 else
-    echo "NOT DELIVERED: chain grew by $((after - before)) of $REPEAT — transport or pipeline failure"
+    echo "NOT DELIVERED: $((after_seq - before_seq)) of $REPEAT submissions reached a committed block — transport or pipeline failure"
     exit 1
 fi

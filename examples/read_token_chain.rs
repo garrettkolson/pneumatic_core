@@ -48,10 +48,21 @@ fn main() -> std::process::ExitCode {
     match provider.get_token(&token_id, partition) {
         Ok(token) => {
             let state = token.blockchain.get_current_chain_state();
+            // `blocks` alone cannot answer "is the chain growing", and the
+            // 10/08/2026 rehearsal is the proof: a token's chain is a sliding
+            // window (`Token::security_level`, default 5) — once it is full,
+            // every commit trims the oldest block and appends the new one, so
+            // the COUNT sits at the window size forever while the chain
+            // advances underneath it. `sequence` is the counter that answers
+            // the question: `Token::commit_block` bumps it exactly once per
+            // committed block and never on a trim, so it is monotonic in
+            // commits regardless of the window. `key=value` so a caller can
+            // take the field it means instead of counting words.
             println!(
-                "token {} partition {partition}: {} block(s), tip {}",
+                "token={} partition={partition} blocks={} sequence={} tip={}",
                 hex::encode(&token.id),
                 token.blockchain.get_count(),
+                token.sequence_number,
                 hex::encode(&state.last_hash_in),
             );
             std::process::ExitCode::SUCCESS
