@@ -4,13 +4,13 @@ title: "A composite host cannot receive its own role-to-role messages: send_to_a
 type: fact
 namespace: architecture
 visibility: namespace
-summary: "10/08/2026, the true final Phase 2 blocker — proven arithmetically on the live cluster after the PreloadForFinalizer fix landed. Every per-tx hop is a send_to_all to a role bucket; on a four-full-node composite every host IS that role too, but the bucket contains only the 3 REMOTE entries — nothing registers or loopbacks the host's own membership. Measured with 5 txs on committer-1: 3 Commit copies arrive (the peers'), 0 from its own finalizer role; its local optimistic-path booking (Committed + own block hash, P10) matches only the never-arriving self copy — 15/15 acquire_fail HASH_DIFFER, zero COMMIT-OK, chain 0 of 5. Every node accepts only its own forked block and its own block never reaches it: chain growth is mathematically impossible. The single-composite e2e never saw it because the test harness manually relays every hop (the 'mesh stand-in', e2e.rs ~1570) — the tests ARE the missing self-delivery. Fix belongs in the bridge layer: self-subscription on the node's own destination (deliver a copy locally whenever a role's fan-out targets a type this host runs)."
+summary: "**RESOLVED 10/08/2026** (`2fb44dc`) — proven live: the 4-container rehearsal grew the chain with no test-side relaying, then pinned by a composite e2e with the harness relay REMOVED. Original finding, 10/08/2026, the true final Phase 2 blocker: every per-tx hop is a send_to_all to a role bucket; on a four-full-node composite every host IS that role too, but the bucket contains only the 3 REMOTE entries — nothing registers or loopbacks the host's own membership. Measured with 5 txs on committer-1: 3 Commit copies arrive (the peers'), 0 from its own finalizer role; its local optimistic-path booking (Committed + own block hash, P10) matches only the never-arriving self copy — 15/15 acquire_fail HASH_DIFFER, zero COMMIT-OK, chain 0 of 5. Delivery alone was not the whole fix: sender authentication is bucket-derived, so a self copy signed by the host's own identity resolved to zero roles and was refused as `Unregistered` — role resolution had to learn the self-subscription too."
 auto_inject: false
 applicable_when: "Any composite message-flow bug where a sender's own role never sees its fan-out; writing or reviewing composite e2e relays; implementing self-delivery; debugging 'handler works on peers but never locally'"
 confidence: 1.0
 verified_at: "10/08/2026"
 verified_by: "dsh-agent"
-staleness_signal: "When self-delivery lands: a committed block appears WITHOUT the harness relay — proven live (chain grows in the 4-container rehearsal with no test-side relaying), and a two-role one-process test that does NOT relay shows the local handler receiving the fan-out"
+staleness_signal: "RESOLVED 10/08/2026 and re-verify if: a role ever stops receiving its own host's fan-out (the self-subscription is installed in exactly one place — build.rs after role install); if a self copy is ever delivered twice for one fan-out (both guards must hold: host runs the role, host not already in the bucket); if a same-host sender is ever refused as Unregistered; or if a composite e2e grows a relay again — the no-relay test is the pin and must stay relay-free"
 tags: [fact, composite, self-delivery, fanout, node-registry, per-host-placement, multihost]
 edges:
   - target: fact-composite-fanout-role-collision
@@ -80,3 +80,52 @@ must arrive exactly once per fan-out, hit the same dispatcher and the same
 admit-lists, and never double on non-composite hosts (where the host is not in
 the target bucket). The first proof is not a unit test: **the 4-container
 rehearsal must grow the chain** — then pin it with the no-relay two-role test.
+
+## Resolved 10/08/2026 (`2fb44dc`) — what actually landed
+
+Fan-out-side self-dispatch through the **same inbound closure**, in
+`src/node/registry/self_delivery.rs`. Of the two sketched shapes, the sink won:
+the RNS wrapper has no local-delivery seam (`send_frame` errors "no route to
+rhash", and sending to the host's own rhash kills the worker — see
+[[fact-rns-bridge-spawn-kills-worker]]), whereas feeding the framed
+`NetworkPacket` to `build_runtime`'s `on_packet` closure needs no transport at
+all and traverses the identical parse, control branch, admit-lists and
+dispatcher. `install_self_delivery(roles, sink)` is called by the composite
+bridge and by nothing else; `set_declared_roles` deliberately does **not**
+subscribe a host to its own fan-out (a standalone full-node config declares all
+four types and must keep peer-only behavior).
+
+Exactly-once is structural, not opportunistic: the host must **run** the target
+role, and must **not** already be in the target bucket. The second guard is what
+keeps the existing relay-convention fixtures — which register the node's own key
+as a peer — from receiving both the recording-connection copy and a local copy.
+Targeted sends are keyed, not typed: a local copy is owed only when the key list
+names this host's own key, and an unserved self-target stays reported
+undelivered so `NoTarget` still reaches the caller.
+
+**The half the sketch missed: delivery is not enough.** Every inbound handler
+authenticates its sender by asking the registry which role the key holds, and
+that lookup is bucket-derived. A self copy signed by the host's own identity
+therefore arrived and was refused as an `Unregistered` sender — the pipeline
+stalled with the copy in hand. `roles_of_key` now unions the installed
+self-roles when the key is this host's own. That is *true*, not permissive: an
+envelope that verifies under this host's public key can only have been produced
+by this host, and the roles it resolves to are exactly the plugins the bridge
+installed on it. Any other key resolves unchanged, so `Unregistered` stays
+reachable (pinned).
+
+Proof, in the order this node demanded: the rehearsal grew the chain (0 → 5 with
+no test-side machinery; see `deploy/multihost/run4-phase2d-evidence/NOTES.txt`),
+then `a_composite_pipeline_commits_with_no_test_side_relay` pinned it — the
+production pipeline with the relay removed and no bucket entry for the host's own
+key. Both halves are load-bearing there: withholding the local copy stalls it
+("no block committed … chain length = 0"), and so does dropping the own-key role
+resolution (the copy arrives, refused as an unregistered sender). 12 core unit
+tests, each mutation-verified; the 4-container run showed no transaction
+committed twice with the same block hash on any node.
+
+What self-delivery then **exposed**, rather than caused: the sentinel's
+cross-sentinel `Clear` now arrives at its own host and is refused
+(`unknown action: "Clear"`) because no installed role owns it — documented at
+`SENTINEL_ACTIONS`, deliberately unfixed. And it made per-host fork divergence
+visible for the first time: [[fact-composite-per-host-fork-divergence]].

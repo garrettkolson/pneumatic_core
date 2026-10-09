@@ -63,6 +63,16 @@ right while the design was unimplementable across hosts.**
 
 ## The decision ahead (three shapes, all touch contracts)
 
+**RESOLVED the same night, 10/08/2026 — option 1 (distinct action names).** The
+executor→finalizer forward now rides a Finalizer-OWNED `"PreloadForFinalizer"`
+admitted in `FINALIZER_ACTIONS`; the sentinel→executor hop keeps `"Preload"`, and
+`RoleDispatcher`'s single-owner policy is unchanged — a pairwise-disjointness test
+fails loudly if any two roles ever share a name again. The 8-node real-RNS pipeline
+e2e is the "cannot be faked by one composite" pin this section asked for. What the
+fix did NOT resolve is the blocker it exposed: the fan-out still had no local
+member to reach, [[fact-composite-no-self-delivery]]. The three shapes below are
+kept as written, because the reasoning is the reusable part.
+
 1. **Distinct action names per hop** (e.g. the executor's forward becomes
    `"ExecutedPreload"` owned by the finalizer) — smallest blast radius;
    changes the wire contract the standalone crates speak; pipeline tests pin
