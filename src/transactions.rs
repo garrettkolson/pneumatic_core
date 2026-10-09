@@ -724,6 +724,225 @@ pub(crate) fn canonical_signed_trans_bytes(
 }
 
 // ---------------------------------------------------------------------------
+// The Finalizer's signature digest — ONE implementation, shared by signer and verifier
+// ---------------------------------------------------------------------------
+
+/// The `finalizer_sig` field as it stands *before* the Finalizer signs — the value the
+/// digest is computed over.
+///
+/// The digest covers a serialized `SignedTransaction`, and that struct contains the
+/// signature being produced. The signer resolves the circularity by serializing the
+/// carrier with this placeholder in the signature slot; a verifier therefore has to put
+/// the same placeholder back before it can recompute what was signed. It is part of the
+/// signed surface, so it is not an implementation detail of one side — hence it lives
+/// here rather than inside the Finalizer crate.
+pub fn finalizer_placeholder_sig(transaction: &Transaction) -> TransactionSignature {
+    TransactionSignature {
+        transaction_id: transaction.id.as_bytes().to_vec(),
+        env_id: transaction.token_id.clone(),
+        transaction_hash: vec![],
+        signature: vec![],
+        current_stake: 0,
+    }
+}
+
+/// The digest a Finalizer signs over a `SignedTransaction`, and the digest every verifier
+/// must **reconstruct** from the payload in front of it.
+///
+/// ```text
+/// H( H(rmp(signed_tx with placeholder finalizer_sig))
+///    || H(concat(executor signature bytes, ordered by voter key)) )
+/// ```
+///
+/// The execution result is inside that surface — `signed_tx.transaction` is serialized
+/// whole, `result_hash` and `result_data` included — so the Finalizer's signature is what
+/// binds a block to *the* execution result it accepted. That binding is the only thing
+/// standing between "accept a block from the Finalizer the routing decision names" and
+/// "accept whatever bytes arrived inside a block from a key that happens to match", which
+/// is why this function exists as a single implementation rather than as a few lines in
+/// the Finalizer's block builder.
+///
+/// It is deliberately the *same* function the signer calls. A digest built twice is a
+/// digest that drifts, and drift between signer and verifier fails closed as
+/// "everybody's blocks are invalid" — the loud case. The quiet case is a verifier that
+/// checks a digest the sender supplied instead of one it derived itself, which verifies
+/// perfectly and means nothing. See [`verify_finalizer_signature`].
+/// The carrier as the Finalizer's digest sees it: every field of [`SignedTransaction`],
+/// with the executor signatures collected into a key-ordered map and the signature slot
+/// holding its placeholder.
+///
+/// The ordering is not cosmetic. `SignedTransaction.executor_sigs` is a `HashMap`, and a
+/// `HashMap`'s iteration order depends on the process's random `RandomState` seed — so
+/// serializing the struct directly produces different BYTES for the same logical block in
+/// two different processes. The original digest did exactly that
+/// (`hash(serialize_to_bytes_rmp(&signed_tx))` in the Finalizer's block builder), which
+/// meant the bytes a Finalizer signed were not reproducible by any other node for any
+/// block carrying more than one executor signature. It survived because nothing ever
+/// re-derived that digest: the Committer verified the signature against the hash the
+/// sender carried. The block HASH was never affected — `canonical_signed_trans_bytes`
+/// collects the same map into a `BTreeMap` for exactly this reason, and this view mirrors
+/// it.
+#[derive(Serialize)]
+struct CanonicalFinalizerCarrier<'a> {
+    transaction_id: &'a str,
+    transaction: &'a Transaction,
+    total_stake: u64,
+    total_voters: u32,
+    leader_address: &'a [u8],
+    leader_stake: u64,
+    leader_hash: &'a [u8],
+    finalizer_addr: &'a [u8],
+    /// Always the placeholder — see [`finalizer_placeholder_sig`].
+    finalizer_sig: &'a TransactionSignature,
+    /// Key-ordered, so the bytes are a function of the block's contents and nothing else.
+    executor_sigs: BTreeMap<&'a Vec<u8>, &'a TransactionSignature>,
+    proposer_key: &'a [u8],
+    shielded: &'a Option<ShieldedTransaction>,
+}
+
+/// The digest a Finalizer signs over a `SignedTransaction`, and the digest every verifier
+/// must **reconstruct** from the payload in front of it.
+///
+/// ```text
+/// H( H(canonical_carrier(signed_tx with placeholder finalizer_sig))
+///    || H(concat(executor signature bytes, ordered by voter key)) )
+/// ```
+///
+/// `canonical_carrier` is [`CanonicalFinalizerCarrier`]: every field of the carrier with
+/// the executor signatures in voter-key order. Determinism is the whole point — a digest
+/// that two nodes compute over different bytes is not a shared commitment, so this
+/// function is the single definition both the signer and the verifier use.
+///
+/// The execution result is inside that surface — `transaction` is embedded whole,
+/// `result_hash` and `result_data` included — so the Finalizer's signature is what binds a
+/// block to *the* execution result it accepted. That binding is the only thing standing
+/// between "accept a block from the Finalizer the routing decision names" and "accept
+/// whatever bytes arrived inside a block from a key that happens to match", which is why
+/// this lives in core as one implementation rather than a few lines inside the Finalizer
+/// crate. A digest built twice is a digest that drifts; the drift that matters is a
+/// verifier checking a digest the sender supplied, which verifies perfectly and means
+/// nothing. See [`verify_finalizer_signature`].
+pub fn finalizer_digest(
+    signed: &SignedTransaction,
+    hash_provider: &dyn HashProvider,
+) -> Result<Vec<u8>, PneumaticError> {
+    // The signature slot holds its placeholder: the signature being produced cannot be
+    // part of what it covers, and a verifier must be able to rebuild these bytes after
+    // the signature is attached.
+    let placeholder = finalizer_placeholder_sig(&signed.transaction);
+
+    // The executor signatures, ordered by voter key — for both halves of the digest. A
+    // HashMap's iteration order is not an input to consensus.
+    let ordered: BTreeMap<&Vec<u8>, &TransactionSignature> = signed.executor_sigs.iter().collect();
+    let mut sig_input = Vec::new();
+    for sig in ordered.values() {
+        sig_input.extend_from_slice(&sig.signature);
+    }
+
+    let carrier = CanonicalFinalizerCarrier {
+        transaction_id: &signed.transaction_id,
+        transaction: &signed.transaction,
+        total_stake: signed.total_stake,
+        total_voters: signed.total_voters,
+        leader_address: &signed.leader_address,
+        leader_stake: signed.leader_stake,
+        leader_hash: &signed.leader_hash,
+        finalizer_addr: &signed.finalizer_addr,
+        finalizer_sig: &placeholder,
+        executor_sigs: ordered,
+        proposer_key: &signed.proposer_key,
+        shielded: &signed.shielded,
+    };
+    let tx_bytes = crate::encoding::serialize_to_bytes_rmp(&carrier)
+        .map_err(|e| PneumaticError::Encoding(format!("finalizer digest: signed_tx: {e}")))?;
+
+    let tx_hash = hash_provider.hash(&tx_bytes);
+    let sig_hash = hash_provider.hash(&sig_input);
+    let mut combined = tx_hash;
+    combined.extend_from_slice(&sig_hash);
+    Ok(hash_provider.hash(&combined))
+}
+
+/// Why [`verify_finalizer_signature`] refused. Structured rather than a sentence,
+/// because the two refusals mean different operational things and each caller maps them
+/// to its own error type — "someone edited this block" is an incident, "I could not
+/// verify it" is a bug or a key problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizerSignatureFailure {
+    /// The block carries no finalizer signature at all.
+    Missing,
+    /// The signature is over a different payload than the block carries. `claimed` is the
+    /// digest the signature says it signed; `derived` is the digest of the bytes received.
+    PayloadMismatch { claimed: Vec<u8>, derived: Vec<u8> },
+    /// The digest reconstructs exactly, but the signature is not valid under the key the
+    /// verifier expected — including the case where the crypto provider failed to answer.
+    InvalidUnderKey,
+}
+
+impl std::fmt::Display for FinalizerSignatureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "block carries no finalizer signature"),
+            Self::PayloadMismatch { claimed, derived } => write!(
+                f,
+                "finalizer signature covers a different payload than this block carries: the \
+                 signature claims {} but the received contents hash to {} — the embedded \
+                 transaction, its execution result, or its executor signatures were changed \
+                 after signing",
+                hex::encode(claimed),
+                hex::encode(derived)
+            ),
+            Self::InvalidUnderKey => {
+                write!(f, "finalizer signature is not valid under the expected key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FinalizerSignatureFailure {}
+
+/// Verify a Finalizer's signature **against the payload in front of you**.
+///
+/// The naive form of this check — verify `signature` over `finalizer_sig.transaction_hash`
+/// — is what this codebase did, and it is not a check on the payload. It proves that
+/// *some* hash was signed by *some* key; the hash it uses arrives in the same message as
+/// the bytes it is supposed to authenticate, so a block carrying an edited execution
+/// result and the original signature pair sails through it, signing and all. Verification
+/// has to start from the payload, derive the digest, and require that the digest the
+/// signature claims is the one derived. Only then does "the Finalizer signed this" mean
+/// what it sounds like.
+///
+/// `expected_finalizer_key` is the key the *verifier* believes should have signed — on the
+/// commit path that is the key the Sentinel's routing decision names, not the block's
+/// self-reported `finalizer_addr`.
+pub fn verify_finalizer_signature(
+    signed: &SignedTransaction,
+    expected_finalizer_key: &[u8],
+    crypto: &dyn AsymCryptoProvider,
+    hash_provider: &dyn HashProvider,
+) -> Result<(), FinalizerSignatureFailure> {
+    if signed.finalizer_sig.signature.is_empty() {
+        return Err(FinalizerSignatureFailure::Missing);
+    }
+
+    // Reconstruct from the payload. This is the step that turns a signature over a
+    // claimed hash into a binding on the block's contents.
+    let derived = finalizer_digest(signed, hash_provider)
+        .map_err(|_| FinalizerSignatureFailure::InvalidUnderKey)?;
+    if derived != signed.finalizer_sig.transaction_hash {
+        return Err(FinalizerSignatureFailure::PayloadMismatch {
+            claimed: signed.finalizer_sig.transaction_hash.clone(),
+            derived,
+        });
+    }
+
+    match crypto.check_signature(&signed.finalizer_sig.signature, expected_finalizer_key, &derived) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(FinalizerSignatureFailure::InvalidUnderKey),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Canonical serialization for the sender signature (AUDIT C3 / Phase 3.1)
 // ---------------------------------------------------------------------------
 
@@ -925,6 +1144,182 @@ impl TransactionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Finalizer's digest, pinned against the specification rather than against
+    /// itself, plus the four properties the commit path's trust rests on.
+    ///
+    /// Why this is written out longhand instead of calling the function twice: the signer
+    /// and the verifier now share one implementation, which is the right design but makes
+    /// a self-comparison test worthless — change the format and both sides move together.
+    /// So the first assertion re-expresses the spec from the doc comment
+    /// (`H(H(carrier with placeholder signature) || H(sorted executor signature bytes))`),
+    /// and the rest assert the properties, each of which corresponds to a way the design
+    /// could be wrong:
+    ///
+    /// - the execution result is inside the signed surface, so the Finalizer's signature
+    ///   is a statement about a *specific* result — the whole reason the Committer may
+    ///   accept a result it did not compute itself;
+    /// - the executor signatures are inside it, so a block cannot swap in votes from other
+    ///   executors than the ones the Finalizer counted;
+    /// - the signature fields are NOT inside it, which is what makes reconstruction
+    ///   possible at all: a verifier that had to know the signature to check the signature
+    ///   would be back where it started.
+    #[test]
+    fn finalizer_digest_follows_the_specification_and_covers_the_execution_result() {
+        let hash = BasicHashProvider::new();
+        let carrier_for = |tx: &Transaction, sigs: HashMap<Vec<u8>, TransactionSignature>| {
+            SignedTransaction {
+                shielded: None,
+                transaction_id: tx.id.clone(),
+                transaction: tx.clone(),
+                total_voters: 3,
+                total_stake: 42,
+                leader_hash: vec![7; 32],
+                leader_address: vec![1; 32],
+                leader_stake: 5,
+                finalizer_addr: vec![9; 32],
+                finalizer_sig: finalizer_placeholder_sig(tx),
+                executor_sigs: sigs,
+                proposer_key: vec![1; 32],
+            }
+        };
+        let vote = |key: Vec<u8>, bytes: Vec<u8>| {
+            (
+                key.clone(),
+                TransactionSignature {
+                    transaction_id: b"tx_test".to_vec(),
+                    env_id: vec![1, 2],
+                    transaction_hash: bytes.clone(),
+                    signature: bytes,
+                    current_stake: 1,
+                },
+            )
+        };
+
+        let mut tx = make_test_tx();
+        tx.result_hash = vec![0xA1; 32];
+        let mut votes = HashMap::new();
+        let (k2, v2) = vote(vec![0x02; 32], b"executor-two-vote".to_vec());
+        let (k1, v1) = vote(vec![0x01; 32], b"executor-one-vote".to_vec());
+        votes.insert(k2, v2);
+        votes.insert(k1, v1);
+        let signed = carrier_for(&tx, votes.clone());
+
+        // --- the specification, re-expressed ---
+        //
+        // Written against the spec in `finalizer_digest`'s doc comment rather than by
+        // calling it: its own key-ordered view of the carrier, with the placeholder in the
+        // signature slot. Notably it does NOT serialize `SignedTransaction` directly,
+        // because that map's iteration order belongs to the process, not to the block.
+        #[derive(serde::Serialize)]
+        struct HandCarrier<'a> {
+            transaction_id: &'a str,
+            transaction: &'a Transaction,
+            total_stake: u64,
+            total_voters: u32,
+            leader_address: &'a [u8],
+            leader_stake: u64,
+            leader_hash: &'a [u8],
+            finalizer_addr: &'a [u8],
+            finalizer_sig: &'a TransactionSignature,
+            executor_sigs: BTreeMap<&'a Vec<u8>, &'a TransactionSignature>,
+            proposer_key: &'a [u8],
+            shielded: &'a Option<ShieldedTransaction>,
+        }
+        let hand_placeholder = finalizer_placeholder_sig(&signed.transaction);
+        let hand_ordered: BTreeMap<&Vec<u8>, &TransactionSignature> =
+            signed.executor_sigs.iter().collect();
+        let hand_bytes = crate::encoding::serialize_to_bytes_rmp(&HandCarrier {
+            transaction_id: &signed.transaction_id,
+            transaction: &signed.transaction,
+            total_stake: signed.total_stake,
+            total_voters: signed.total_voters,
+            leader_address: &signed.leader_address,
+            leader_stake: signed.leader_stake,
+            leader_hash: &signed.leader_hash,
+            finalizer_addr: &signed.finalizer_addr,
+            finalizer_sig: &hand_placeholder,
+            executor_sigs: hand_ordered.clone(),
+            proposer_key: &signed.proposer_key,
+            shielded: &signed.shielded,
+        })
+        .expect("serializes");
+        let mut hand_sig_input = Vec::new();
+        for sig in hand_ordered.values() {
+            hand_sig_input.extend_from_slice(&sig.signature);
+        }
+        let mut hand_combined = hash.hash(&hand_bytes);
+        hand_combined.extend_from_slice(&hash.hash(&hand_sig_input));
+        let hand_built = hash.hash(&hand_combined);
+        assert_eq!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            hand_built,
+            "the shared digest must be exactly H(H(carrier with placeholder signature) || \
+             H(executor signature bytes ordered by voter key))"
+        );
+
+        // --- the execution result is inside the signed surface ---
+        let mut moved = make_test_tx();
+        moved.result_hash = vec![0xB2; 32];
+        assert_ne!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            finalizer_digest(&carrier_for(&moved, votes.clone()), &hash).expect("digest"),
+            "a different execution result must produce a different digest — otherwise the \
+             Finalizer's signature is not a statement about the result, and the Committer \
+             has no basis for accepting a result it did not compute itself"
+        );
+
+        // ... and so is `result_data`, which is outside the SENDER's canonical surface and
+        // carries the state deltas the Committer applies.
+        let mut with_data = make_test_tx();
+        with_data.result_hash = tx.result_hash.clone();
+        with_data.result_data = b"storage-delta".to_vec();
+        assert_ne!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            finalizer_digest(&carrier_for(&with_data, votes.clone()), &hash).expect("digest"),
+            "`result_data` must be inside the finalizer's signed surface"
+        );
+
+        // --- the executor votes are inside it ---
+        let mut other_votes = votes.clone();
+        let (ko, vo) = vote(vec![0x01; 32], b"a-different-executor-vote".to_vec());
+        other_votes.insert(ko, vo);
+        assert_ne!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            finalizer_digest(&carrier_for(&tx, other_votes), &hash).expect("digest"),
+            "swapping an executor signature must change the digest"
+        );
+        assert_eq!(
+            votes.len(),
+            2,
+            "the fixture relies on two voters so map iteration order is exercised"
+        );
+        // ... and ordering must not matter: the same votes in a differently-ordered map
+        // digest identically, because a HashMap's order is not a consensus input.
+        let mut reshuffled = HashMap::new();
+        let mut entries: Vec<_> = votes.iter().collect();
+        entries.reverse();
+        for (key, sig) in entries {
+            reshuffled.insert(key.clone(), sig.clone());
+        }
+        assert_eq!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            finalizer_digest(&carrier_for(&tx, reshuffled), &hash).expect("digest"),
+            "the digest must order executor signatures by voter key, not by map order"
+        );
+
+        // --- the signature fields are NOT inside it, which is what makes a verifier
+        // able to reconstruct the digest after the signature has been attached ---
+        let mut attached = signed.clone();
+        attached.finalizer_sig.signature = vec![0xEE; 64];
+        attached.finalizer_sig.transaction_hash = vec![0xFF; 32];
+        assert_eq!(
+            finalizer_digest(&signed, &hash).expect("digest"),
+            finalizer_digest(&attached, &hash).expect("digest"),
+            "the digest must ignore the signature it is about to carry — this is what lets \
+             a verifier recompute it from the received block and compare"
+        );
+    }
 
     // --- helpers ---
 

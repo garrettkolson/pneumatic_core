@@ -191,20 +191,19 @@ impl Committer {
             }
         }
 
-        // (5) The block's finalizer signature, checked under the assigned key rather
-        // than the key the block declares about itself.
-        let finalizer_sig = &block.signed_trans.finalizer_sig;
-        if finalizer_sig.signature.is_empty() {
-            return Err(CommitterError::InvalidFinalizerSignature);
-        }
-        let valid = self.identity.ed25519.check_signature(
-            &finalizer_sig.signature,
-            &record.finalizer_public_key,
-            &finalizer_sig.transaction_hash,
-        )?;
-        if !valid {
-            return Err(CommitterError::InvalidFinalizerSignature);
-        }
+        // (5) The block's finalizer signature — under the key the routing decision names,
+        // not the key the block declares about itself, and against a digest RECONSTRUCTED
+        // from the bytes that arrived rather than the hash the sender carried.
+        //
+        // The reconstruction is what makes steps (1)-(4) mean anything. Every check above
+        // asks a question about a claim inside the block; this one is the only place the
+        // block's own contents are authenticated, so if it verifies against a
+        // sender-supplied hash then a block whose execution result was edited after
+        // signing passes all five steps with an untouched signature. That is also the
+        // precondition for the next change on this path — accepting a block whose
+        // execution result differs from what this node computed locally — which is safe
+        // only once the result is bound by a signature that was actually re-derived.
+        self.verify_finalizer_sig_under(&block.signed_trans, &record.finalizer_public_key, tx_id)?;
 
         Ok(())
     }

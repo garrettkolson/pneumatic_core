@@ -997,6 +997,26 @@ pub fn register_gossip_roles(registry: &Arc<NodeRegistry>) {
     );
 }
 
+/// Sign a `SignedTransaction` the way a real Finalizer signs one.
+///
+/// Test blocks used to put an invented `transaction_hash` in the signature slot and sign
+/// that value — sound only while the verifier trusted whatever hash arrived with the
+/// block. The verifier now re-derives the digest from the payload it received
+/// (`pneumatic_core::transactions::finalizer_digest`, the same function the Finalizer's
+/// block builder calls), so a fabricated hash is refused. That refusal is the point: a
+/// signature over a hash nobody derived from the block says nothing about the block, and
+/// these helpers exist to produce blocks a real pipeline would accept.
+pub fn sign_like_finalizer(signed: &mut SignedTransaction, finalizer: &Ed25519Provider) {
+    let hash = pneumatic_core::crypto::BasicHashProvider::new();
+    // The carrier as the signer sees it: the signature slot holds its pre-signing
+    // placeholder, which is part of what gets hashed.
+    signed.finalizer_sig = pneumatic_core::transactions::finalizer_placeholder_sig(&signed.transaction);
+    let digest = pneumatic_core::transactions::finalizer_digest(signed, &hash)
+        .expect("the test carrier serializes");
+    signed.finalizer_sig.transaction_hash = digest.clone();
+    signed.finalizer_sig.signature = finalizer.sign_data(&digest).expect("the test finalizer signs");
+}
+
 /// Build a gossip block with a caller-supplied `previous_hash` (so several blocks can share a
 /// frozen parent, as in a sibling-race test) and a valid finalizer signature. Distinct
 /// `trans_id`s yield distinct `transaction_hash`/`signature` values, hence distinct
@@ -1008,14 +1028,10 @@ pub fn make_gossip_block_at_prev(
     proposer_key: Vec<u8>,
     prev_hash: &[u8],
 ) -> Block {
-    // A throwaway test finalizer key. `finalizer_addr` is its public key; `signature` is an
-    // Ed25519 sign over the stored `transaction_hash`, which `verify_block_finalizer_sig`
-    // re-checks against `finalizer_addr`. Any fixed value works for `transaction_hash` — it
-    // only has to survive inside the canonical bytes that `create_hash` hashes.
+    // A throwaway test finalizer key. The signature is produced by `sign_like_finalizer`
+    // below — over the digest reconstructed from this exact carrier, not an invented hash.
     let finalizer = gossip_finalizer();
     let finalizer_addr = finalizer.public_key().expect("finalizer public key");
-    let transaction_hash = format!("gossip-{trans_id}").into_bytes();
-    let signature = finalizer.sign_data(&transaction_hash).expect("finalizer signature");
 
     let signed = SignedTransaction {
         shielded: None,
@@ -1048,13 +1064,15 @@ pub fn make_gossip_block_at_prev(
         finalizer_sig: TransactionSignature {
             transaction_id: vec![],
             env_id: vec![],
-            transaction_hash: transaction_hash.clone(),
-            signature,
+            transaction_hash: vec![],
+            signature: vec![],
             current_stake: 0,
         },
         executor_sigs: HashMap::new(),
         proposer_key: proposer_key,
     };
+    let mut signed = signed;
+    sign_like_finalizer(&mut signed, &finalizer);
 
     let mut block = Block {
         signed_trans: signed,

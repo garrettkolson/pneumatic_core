@@ -322,8 +322,6 @@ async fn handle_block_finalized_unknown_token_returns_error() {
     // key the routing decision names, not under `finalizer_addr`.
     let unknown_finalizer = Ed25519Provider::generate();
     let unknown_finalizer_addr = unknown_finalizer.public_key().expect("finalizer public key");
-    let unknown_tx_hash = b"unknown-transaction-hash".to_vec();
-    let unknown_sig = unknown_finalizer.sign_data(&unknown_tx_hash).expect("finalizer signature");
     let signed = SignedTransaction {
         shielded: None,
         transaction_id: "unknown".to_string(),
@@ -356,13 +354,18 @@ async fn handle_block_finalized_unknown_token_returns_error() {
         finalizer_sig: TransactionSignature {
             transaction_id: vec![],
             env_id: vec![],
-            transaction_hash: unknown_tx_hash,
-            signature: unknown_sig,
+            transaction_hash: vec![],
+            signature: vec![],
             current_stake: 0,
         },
         executor_sigs: HashMap::new(),
         proposer_key: b"unknown".to_vec(),
     };
+    let mut signed = signed;
+    // Signed over the digest of THIS carrier. The fixture's point is that the block clears
+    // both the routing gate and the signature gate and only then fails on the missing
+    // token, so the signature has to be one a real Finalizer would have produced.
+    sign_like_finalizer(&mut signed, &unknown_finalizer);
 
     let block = Block {
         signed_trans: signed,
@@ -499,5 +502,94 @@ async fn block_finalized_warms_a_cold_token_from_the_data_service() {
         entry.value().blockchain.get_count(),
         2,
         "genesis (from the store) + the appended gossip block"
+    );
+}
+
+/// A block whose execution result was rewritten after signing is refused — and an
+/// untouched block from the same builder is accepted.
+///
+/// This is the payload the rest of the commit path is built on. `result_hash` is what the
+/// Committer applies state from, and it travels inside the block, covered by the
+/// Finalizer's signature. But for as long as the signature was verified against
+/// `finalizer_sig.transaction_hash` — a hash delivered inside the same message as the
+/// bytes it supposedly authenticated — the coverage was theoretical: editing the execution
+/// result and shipping the original signature pair produced a block that passed
+/// authentication, because nobody re-derived the hash from what actually arrived.
+///
+/// The tampered block is deliberately *self-consistent*: `current_hash` is re-derived after
+/// the edit, so the linkage check finds nothing. Nothing here needs an invalid signature, a
+/// bad sender, or a broken chain — the block is well-formed in every way the pipeline
+/// checked before this. That is also why the control half is in the same test: an
+/// implementation that refused everything would pass the second half alone, and the
+/// refusal has to be about the swap.
+#[tokio::test]
+async fn a_block_whose_execution_result_was_swapped_after_signing_is_refused() {
+    let boot = |name: &'static str| -> (Committer, Vec<u8>) {
+        let (committer, _registry, _logger) = make_test_committer(Arc::new(TestDataProvider::new()));
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+        let len = committer
+            .tokens
+            .get(&vec![1])
+            .unwrap()
+            .value()
+            .blockchain
+            .get_current_chain_state()
+            .last_hash_in;
+        (committer, len)
+    };
+
+    // Control first: the same builder, unedited, is accepted. If this ever stops being
+    // true, the refusal asserted below means nothing.
+    let (committer, before) = boot("control");
+    let honest = make_gossip_block(&committer, "honest_result", b"proposer".to_vec());
+    committer
+        .handle_block_finalized(make_block_finalized_message(honest.clone()))
+        .await
+        .expect("a block whose signature covers its own contents is a valid gossip block");
+    let after_control = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    assert_ne!(
+        after_control, before,
+        "the control block must actually have been appended — otherwise the refusal below \
+         could be passing on a pipeline that accepts nothing"
+    );
+
+    // Same well-formed block, execution result swapped, signature left exactly as the
+    // Finalizer produced it, block hash re-derived so the chain linkage still checks out.
+    let (committer, before) = boot("tampered");
+    let mut block = make_gossip_block(&committer, "swapped_result", b"proposer".to_vec());
+    block.signed_trans.transaction.result_hash = b"a-result-this-finalizer-never-produced".to_vec();
+    block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+        .expect("the edited block re-hashes cleanly — that is the point");
+
+    let result = committer
+        .handle_block_finalized(make_block_finalized_message(block))
+        .await;
+    assert!(
+        matches!(result, Err(CommitterError::SignaturePayloadMismatch(_))),
+        "an execution result that the signature does not cover must be refused by name, \
+         not by an incidental linkage failure: {result:?}"
+    );
+
+    let after = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    assert_eq!(
+        after, before,
+        "a refused block must not have entered the chain"
     );
 }

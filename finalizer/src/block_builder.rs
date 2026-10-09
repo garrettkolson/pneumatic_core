@@ -206,24 +206,14 @@ impl BlockBuilder {
         &self,
         signed_tx: &mut SignedTransaction,
     ) -> Result<TransactionSignature, PneumaticError> {
-        // Hash the transaction bytes
-        let tx_bytes = serialize_to_bytes_rmp(&signed_tx)
-            .map_err(|e| PneumaticError::Encoding(e.to_string()))?;
-
-        // Hash the ordered executor signatures
-        let mut sig_input = Vec::new();
-        let mut sig_map: Vec<_> = signed_tx.executor_sigs.iter().collect();
-        sig_map.sort_by_key(|(key, _)| key.clone());
-        for (_key, sig) in sig_map {
-            sig_input.extend_from_slice(&sig.signature);
-        }
-
-        // Combined hash: hash(tx_bytes) || hash(sig_input)
-        let tx_hash = self.hash_provider.hash(&tx_bytes);
-        let sig_hash = self.hash_provider.hash(&sig_input);
-        let mut combined_input = tx_hash;
-        combined_input.extend_from_slice(&sig_hash);
-        let transaction_hash = self.hash_provider.hash(&combined_input);
+        // The digest a verifier can RECONSTRUCT from the block it receives. Built by the
+        // shared core function rather than inline here on purpose: the Finalizer crate's
+        // version of this digest was the only implementation, so the Committer verified
+        // the signature against the hash the sender carried and never re-derived it from
+        // the payload — which authenticates nothing about the bytes in front of it. See
+        // `pneumatic_core::transactions::finalizer_digest`.
+        let transaction_hash =
+            pneumatic_core::transactions::finalizer_digest(signed_tx, self.hash_provider.as_ref())?;
 
         // Sign the transaction hash with the finalizer's hybrid identity key.
         // This produces a `[Ed25519 · ML-DSA pk · ML-DSA sig]` hybrid

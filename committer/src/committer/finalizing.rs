@@ -21,20 +21,66 @@ impl Committer {
     /// whole `finalizer_sig` into the block hash (canonical serialization includes it), a swapped
     /// signature would already fail the linkage/hash check in `append_validated_block`. Reject a
     /// missing or unverified signature rather than silently accepting it.
+    /// Verify a block's finalizer signature under `expected_key`, RECONSTRUCTING the
+    /// digest from the bytes that arrived.
+    ///
+    /// Both commit paths route through this one function so that neither can drift back
+    /// to the shape this codebase had: `check_signature(sig, key, finalizer_sig
+    /// .transaction_hash)` — verifying the signature against a hash delivered inside the
+    /// very message whose contents that hash was supposed to authenticate. That form
+    /// accepts any block whose contents were edited after signing, as long as the edited
+    /// copy travels with the original signature pair, which is the whole of what a
+    /// signature is for. The reconstruction lives in core
+    /// (`pneumatic_core::transactions::finalizer_digest`) and is the same function the
+    /// Finalizer calls when it signs, so signer and verifier cannot drift apart.
+    pub(crate) fn verify_finalizer_sig_under(
+        &self,
+        signed: &pneumatic_core::transactions::SignedTransaction,
+        expected_key: &[u8],
+        tx_id: &str,
+    ) -> Result<(), CommitterError> {
+        use pneumatic_core::crypto::BasicHashProvider;
+        use pneumatic_core::transactions::FinalizerSignatureFailure;
+        // Same provider the delta-apply re-derivations in `committing.rs` use; block
+        // hashing is SHA-256 workspace-wide (`BlockFactory::create_hash` takes none).
+        let hash = BasicHashProvider::new();
+        // A block with a signature that reconstructs and verifies is accepted; anything
+        // else is refused with the reason carried through. `SignaturePayloadMismatch` is
+        // its own variant because it is the one refusal here that means "someone changed
+        // this block", as opposed to "this block was never signed correctly".
+        pneumatic_core::transactions::verify_finalizer_signature(
+            signed,
+            expected_key,
+            &self.identity.ed25519,
+            &hash,
+        )
+        .map_err(|failure| match failure {
+            FinalizerSignatureFailure::Missing | FinalizerSignatureFailure::InvalidUnderKey => {
+                CommitterError::InvalidFinalizerSignature
+            }
+            FinalizerSignatureFailure::PayloadMismatch { .. } => {
+                CommitterError::SignaturePayloadMismatch(format!("tx {tx_id}: {failure}"))
+            }
+        })
+    }
+
+    /// Fail-closed finalizer-signature check (AUDIT Phase 3.3 / C5), now with the digest
+    /// reconstructed from the payload rather than taken from the sender.
+    ///
+    /// A `BlockFinalized` block carries exactly one authoritative signature — the
+    /// finalizer's, in `SignedTransaction.finalizer_sig` — and this path has no routing
+    /// decision to contradict, so it verifies under the key the block declares. Where a
+    /// routing decision DOES exist, the commit path uses the key the Sentinel named
+    /// instead (`Committer::block_authority`); this function is the fallback for blocks
+    /// that arrive without one. Reject a missing or unverifiable signature rather than
+    /// silently accepting it.
     pub(crate) fn verify_block_finalizer_sig(&self, block: &Block) -> Result<(), CommitterError> {
-        let finalizer_sig = &block.signed_trans.finalizer_sig;
-        if finalizer_sig.signature.is_empty() {
-            return Err(CommitterError::InvalidFinalizerSignature);
-        }
-        let valid = self.identity.ed25519.check_signature(
-            &finalizer_sig.signature,
+        let tx_id = block.signed_trans.transaction.id.clone();
+        self.verify_finalizer_sig_under(
+            &block.signed_trans,
             &block.signed_trans.finalizer_addr,
-            &finalizer_sig.transaction_hash,
-        )?;
-        if !valid {
-            return Err(CommitterError::InvalidFinalizerSignature);
-        }
-        Ok(())
+            &tx_id,
+        )
     }
 
     pub(crate) async fn handle_block_finalized(&self, message: Message) -> Result<(), CommitterError> {

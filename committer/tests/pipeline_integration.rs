@@ -40,6 +40,26 @@ use pneumatic_committer::committer_error::CommitterError;
 use pneumatic_committer::epoch_manager::{EpochReconciler, LeaderSelector as CommLeaderSelector};
 use pneumatic_committer::epoch_manager::{StakeStore, StakingManager};
 
+/// Sign a block's `SignedTransaction` the way a real Finalizer does — over the digest
+/// reconstructed from that exact carrier by `pneumatic_core::transactions::finalizer_digest`,
+/// the same function the Finalizer's block builder calls.
+///
+/// These fixtures used to write a literal string into `transaction_hash` and sign that
+/// string, which the verifier then trusted because it verified against the hash the sender
+/// carried. Now that the verifier re-derives the digest from the payload, such a block is
+/// refused as tampered — correctly: a signature over a hash nobody computed from the block
+/// says nothing about the block. The fixtures sign honestly so that what they test is the
+/// pipeline, not the signature gap.
+fn sign_like_finalizer(signed: &mut SignedTransaction, key: &pneumatic_core::crypto::Ed25519Provider) {
+    let hash = pneumatic_core::crypto::BasicHashProvider::new();
+    signed.finalizer_sig =
+        pneumatic_core::transactions::finalizer_placeholder_sig(&signed.transaction);
+    let digest = pneumatic_core::transactions::finalizer_digest(signed, &hash)
+        .expect("the test carrier serializes");
+    signed.finalizer_sig.transaction_hash = digest.clone();
+    signed.finalizer_sig.signature = key.sign_data(&digest).expect("finalizer signs");
+}
+
 // --- In-memory DataProvider mock for tests ---
 
 struct TestDataProvider {
@@ -769,7 +789,7 @@ async fn test_pipeline_no_conflict() {
         .get_current_chain_state()
         .last_hash_in;
 
-    let block = Block {
+    let mut block = Block {
         signed_trans: SignedTransaction {
             shielded: None,
             transaction_id: "test_tx".to_string(),
@@ -803,8 +823,8 @@ async fn test_pipeline_no_conflict() {
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: b"pipeline_no_conflict_tx_hash".to_vec(),
-                signature: finalizer.ed25519.sign_data(b"pipeline_no_conflict_tx_hash").expect("finalizer sig"),
+                transaction_hash: vec![],
+                signature: vec![],
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -819,6 +839,7 @@ async fn test_pipeline_no_conflict() {
         epoch_number: 0,
     };
 
+    sign_like_finalizer(&mut block.signed_trans, &finalizer.ed25519);
     // Compute valid block hash
     let expected_hash = BlockFactory::create_hash(&block)
         .expect("well-formed test block hash");
@@ -875,7 +896,7 @@ async fn commit_from_empty_registry_materializes_and_commits() {
         .blockchain
         .get_current_chain_state()
         .last_hash_in;
-    let block = Block {
+    let mut block = Block {
         signed_trans: SignedTransaction {
             shielded: None,
             transaction_id: "commit_sink_tx".to_string(),
@@ -905,11 +926,8 @@ async fn commit_from_empty_registry_materializes_and_commits() {
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: b"commit_sink_tx_hash".to_vec(),
-                signature: finalizer
-                    .ed25519
-                    .sign_data(b"commit_sink_tx_hash")
-                    .expect("finalizer sig"),
+                transaction_hash: vec![],
+                signature: vec![],
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -923,6 +941,7 @@ async fn commit_from_empty_registry_materializes_and_commits() {
         proposer_key: vec![],
         epoch_number: 0,
     };
+    sign_like_finalizer(&mut block.signed_trans, &finalizer.ed25519);
     let block = Block {
         current_hash: BlockFactory::create_hash(&block).expect("well-formed test block hash"),
         ..block
@@ -994,7 +1013,7 @@ async fn test_pipeline_conflict_and_slashing() {
         .get_current_chain_state()
         .last_hash_in;
 
-    let block1 = Block {
+    let mut block1 = Block {
         signed_trans: SignedTransaction {
             shielded: None,
             transaction_id: "conflict_tx_1".to_string(),
@@ -1027,8 +1046,8 @@ async fn test_pipeline_conflict_and_slashing() {
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: b"pipeline_conflict_1_tx_hash".to_vec(),
-                signature: finalizer.ed25519.sign_data(b"pipeline_conflict_1_tx_hash").expect("finalizer sig"),
+                transaction_hash: vec![],
+                signature: vec![],
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -1043,7 +1062,7 @@ async fn test_pipeline_conflict_and_slashing() {
         epoch_number: 0,
     };
 
-    let block2 = Block {
+    let mut block2 = Block {
         signed_trans: SignedTransaction {
             shielded: None,
             transaction_id: "conflict_tx_2".to_string(),
@@ -1076,8 +1095,8 @@ async fn test_pipeline_conflict_and_slashing() {
             finalizer_sig: TransactionSignature {
                 transaction_id: vec![],
                 env_id: vec![],
-                transaction_hash: b"pipeline_conflict_2_tx_hash".to_vec(),
-                signature: finalizer.ed25519.sign_data(b"pipeline_conflict_2_tx_hash").expect("finalizer sig"),
+                transaction_hash: vec![],
+                signature: vec![],
                 current_stake: 0,
             },
             executor_sigs: HashMap::new(),
@@ -1092,17 +1111,19 @@ async fn test_pipeline_conflict_and_slashing() {
         epoch_number: 0,
     };
 
+    sign_like_finalizer(&mut block1.signed_trans, &finalizer.ed25519);
+    sign_like_finalizer(&mut block2.signed_trans, &finalizer.ed25519);
     // Compute valid block hashes
     let block1_hash = BlockFactory::create_hash(&block1)
         .expect("well-formed test block hash");
     let block2_hash = BlockFactory::create_hash(&block2)
         .expect("well-formed test block hash");
 
-    let block1 = Block {
+    let mut block1 = Block {
         current_hash: block1_hash,
         ..block1
     };
-    let block2 = Block {
+    let mut block2 = Block {
         current_hash: block2_hash,
         ..block2
     };

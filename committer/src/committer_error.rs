@@ -28,9 +28,24 @@ pub enum CommitterError {
     EnvironmentMismatch { expected: String, got: String },
     /// Proposed block has an empty hash
     InvalidBlockHash,
-    /// The block's finalizer signature is missing or does not verify against the claimed
-    /// `finalizer_addr` — fail closed (AUDIT Phase 3.3 / C5).
+    /// The block's finalizer signature is missing or does not verify under the key the
+    /// verifier expected — fail closed (AUDIT Phase 3.3 / C5).
     InvalidFinalizerSignature,
+    /// The finalizer signature is a valid signature, from the right key, over a hash —
+    /// just not over the block in front of us. The digest is reconstructed from the
+    /// received bytes and compared with the hash the signature claims; a difference means
+    /// the embedded transaction, its execution result, or its executor signatures were
+    /// changed after signing.
+    ///
+    /// This is the check that made the others mean anything. Verifying a signature
+    /// against `finalizer_sig.transaction_hash` — the hash shipped inside the same message
+    /// as the bytes it is supposed to authenticate — proves a hash was signed and nothing
+    /// about the payload. It is also what has to exist before the commit path can accept
+    /// a block whose execution result differs from this node's own local execution (the
+    /// committer's H12 payload compare was the only thing catching a rewritten result,
+    /// and it is the compare that keeps the mesh from converging — see
+    /// `fact-h12-assumes-lockstep-execution`).
+    SignaturePayloadMismatch(String),
     /// Block validation/commit failed on the token
     BlockCommit(BlockCommitError),
     /// Unknown message action

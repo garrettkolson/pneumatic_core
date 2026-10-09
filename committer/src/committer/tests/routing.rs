@@ -161,8 +161,16 @@ async fn the_finalizer_signature_is_checked_against_the_routed_key_not_the_self_
 
     // Routed to `gossip_finalizer` (the sender), and genuinely signed by it — but the
     // self-reported address inside the block claims a different key.
+    //
+    // The re-sign is not optional bookkeeping: `finalizer_addr` is INSIDE the signed
+    // surface, so editing it after signing yields a block whose signature covers different
+    // bytes, which now gets refused as tampered rather than tested for key choice. Signing
+    // after the edit makes the fixture say what the test means — the routed key attested a
+    // block that declares somebody else — and the acceptance below then proves the
+    // signature was checked under the routed key and not the address the block advertises.
     let wrong_addr = pneumatic_core::crypto::Ed25519Provider::from_seed([0x77; 32]);
     block.signed_trans.finalizer_addr = wrong_addr.public_key().expect("wrong addr pk");
+    sign_like_finalizer(&mut block.signed_trans, &gossip_finalizer());
     let block = reseal(block);
 
     let message = make_block_finalized_message(block);
