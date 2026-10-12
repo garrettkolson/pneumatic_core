@@ -503,3 +503,97 @@ async fn a_commits_execution_result_may_differ_from_what_this_node_computed() {
          {result:?}"
     );
 }
+
+/// A second block for an already-committed transaction is refused, and the record that refuses
+/// it outlives the transaction's registry entry.
+///
+/// The measured mesh failure this closes: one host put 4 distinct transactions into 6 blocks —
+/// `ph2-1091` inside both `d413eb8f…` and `e0d3b338…` — and its chain left the majority's
+/// (`fact-two-decisions-one-transaction-double-commit`). Two Sentinels disagreed about which
+/// Finalizer owned the transaction, each decision was honoured when it arrived, and both
+/// Finalizers' blocks satisfied every gate that existed.
+///
+/// What makes the fixture unusual is the second half: the transaction is *re-pooled* before the
+/// rival block arrives, exactly as the mesh did when the same transaction came through a second
+/// path. That is the whole point — after the first commit the entry is released and removed, so
+/// the registry has no booked block hash and no held decision left. A gate at admission could
+/// not see this, because the transaction looks new. Only a record that survives the entry can
+/// refuse it, which is why this test drives the second commit through a freshly pooled entry.
+#[tokio::test]
+async fn a_second_block_for_a_committed_transaction_is_refused_after_the_entry_is_gone() {
+    let dp = Arc::new(TestDataProvider::new());
+    dp.insert_user(
+        b"alice".to_vec(),
+        "token".to_string(),
+        User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        },
+    );
+    let (committer, registry, _logger) = make_test_committer(dp.clone());
+    let mut token = Token::new();
+    token.id = vec![1];
+    committer.bootstrap_token(token);
+    bootstrap_token_chain(&committer);
+
+    let tx_id = "tx_rival_block";
+    make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+    let block_a = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+    let tip_a = block_a.current_hash.clone();
+    let commit_a = TransactionCommit {
+        trans_id: tx_id.as_bytes().to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block_a,
+    };
+    committer
+        .check_and_commit_transaction_results(&commit_a, vec![])
+        .await
+        .expect("the first block for a transaction commits");
+
+    // The transaction arrives again, on another path. In the mesh this was a second Sentinel with
+    // a different view of the candidate set; here it is the same fixture the first arrival used,
+    // which is the point: the node has no memory of the transaction except the one the commit
+    // path left behind.
+    assert!(
+        registry.get_transaction_mut(tx_id).is_err(),
+        "the committed entry is gone — the registry alone cannot refuse the rival block"
+    );
+    make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+
+    // A rival block: built after A was appended, so it is a different block that links validly
+    // onto the moved tip. It fails nothing else — linkage holds, its hash is self-consistent, and
+    // it carries the same transaction.
+    let block_b = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+    assert_ne!(
+        block_b.current_hash, tip_a,
+        "the fixture must actually be a rival block, not a replay of the first"
+    );
+    let commit_b = TransactionCommit {
+        trans_id: tx_id.as_bytes().to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block_b,
+    };
+
+    let result = committer.check_and_commit_transaction_results(&commit_b, vec![]).await;
+    assert!(
+        matches!(result, Err(CommitterError::TransactionAlreadyCommitted(_, _))),
+        "a transaction already committed must not enter a second block: {result:?}"
+    );
+
+    let tip = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    assert_eq!(
+        tip, tip_a,
+        "and the chain keeps the block it committed first — the rival is dropped, not swapped in"
+    );
+}

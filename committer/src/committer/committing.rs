@@ -60,12 +60,51 @@ impl Committer {
     /// 3. Apply the block via BlockServices (commit + distribute)
     /// 4. Update transaction state to Committed (or remove from pool for leader path)
     /// 5. Release the transaction lock
+/// Opportunistic pruning point for the committed-transaction cache: above this many records
+/// the commit path drops entries whose epoch has passed. Sized to a few busy epochs so the
+/// duplicate window stays narrow in the common case while a long-running node's memory stays
+/// bounded by epochs rather than by history.
+const PRUNE_THRESHOLD: usize = 4096;
+
     pub(crate) async fn check_and_commit_transaction_results(
         &self,
         commit: &TransactionCommit,
         finalizer_key: Vec<u8>,
     ) -> Result<(), CommitterError> {
         let tx_id = String::from_utf8_lossy(&commit.trans_id).to_string();
+
+        // Duplicate-commit gate (`fact-two-decisions-one-transaction-double-commit`).
+        //
+        // Checked FIRST, before the registry is touched, because the case it exists for is the one
+        // where the registry has nothing left to say: the entry for a committed transaction is
+        // released and removed, so by the time a rival block for that transaction arrives there is
+        // no held decision and no booked block hash to compare against. An admission-side gate
+        // cannot catch this — the transaction looks new. Only a record that outlives the entry can.
+        //
+        // Measured before the gate existed: one host put 4 distinct transactions into 6 blocks,
+        // `ph2-1091` inside both `d413eb8f…` and `e0d3b338…`, and its chain left the majority's.
+        // Both blocks passed every gate that existed, because each was built by a Finalizer that
+        // this node's routing decision had, at that moment, named.
+        //
+        // A replay of the SAME block is refused here too, and that is deliberate: the append path
+        // (`Blockchain::append_validated_block`) has no duplicate guard, so an accepted replay
+        // would put the identical block on the chain twice.
+        if let Some(booked) = self.committed_txs.get(&tx_id) {
+            let (epoch, block_hash) = booked.value();
+            let booked_hex = block_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let incoming = &commit.proposed_block.current_hash;
+            let incoming_hex = incoming.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            eprintln!(
+                "[dup] refusing tx={} booked={} (epoch {epoch}) incoming={}",
+                &tx_id, booked_hex, incoming_hex
+            );
+            return Err(CommitterError::TransactionAlreadyCommitted(
+                tx_id, booked_hex,
+            ));
+        }
 
         // AUDIT Phase 4.1 / H4: sink path. In the live pipeline the pending registry is normally
         // populated upstream (e.g. by the sentinel), so this entry usually already exists here. But
@@ -364,6 +403,21 @@ impl Committer {
 
         if should_remove {
             let _ = self.pending_registry.remove_transaction(&tx_id);
+        }
+
+        // Book the transaction as committed. Everything above succeeded, the block is on the
+        // chain, and this is the record the duplicate gate above reads — so it is written only
+        // once the block is really there. Epoch-stamped so `prune_committed_txs` can bound the
+        // set, and carrying the block hash so a later refusal can name the block that holds it.
+        self.committed_txs.insert(
+            tx_id.clone(),
+            (
+                commit.proposed_block.epoch_number,
+                commit.proposed_block.current_hash.clone(),
+            ),
+        );
+        if self.committed_txs.len() > Self::PRUNE_THRESHOLD {
+            self.prune_committed_txs();
         }
 
         // Step 6: Distribute the committed block to archivers

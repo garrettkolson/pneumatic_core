@@ -123,6 +123,32 @@ pub struct Committer {
     node_registry: Arc<NodeRegistry>,
     /// Token cache — token_id -> Token, DashMap-backed for concurrency
     tokens: Arc<DashMap<Vec<u8>, Token>>,
+    /// Transactions this Committer has already committed, as `(epoch, block hash)` — the epoch
+    /// that bounds the record, and the block that booked it so a refusal can name it. This is
+    /// the chain's memory of what it contains.
+    ///
+    /// It exists because that memory used to be a pointer. Duplicate detection lived entirely in
+    /// the `PendingTransactionRegistry` entry, and committing releases and removes the entry. A
+    /// transaction that arrived a second time — on another path, carrying another Sentinel's
+    /// routing decision — was re-pooled as though it were new and committed again into a second
+    /// block. Measured: 4 distinct transactions in 6 blocks on one host, its tip off the
+    /// majority's (`fact-two-decisions-one-transaction-double-commit`).
+    ///
+    /// Bounded by epoch via [`Self::prune_committed_txs`], so it holds roughly one epoch of ids
+    /// rather than the chain's history. Two honest limits follow from that choice:
+    ///
+    /// - **Empty after a restart.** In-memory. A duplicate arriving after a restart is refused by
+    ///   nothing but the routing decision, so the window this closes reopens across a restart.
+    ///   The durable form belongs in the data service and is named on
+    ///   `task-multihost-testnet-rollout` as required before anything resembling production;
+    ///   this cache is the step that stops the live failure, not the finished design.
+    /// - **Rollback is not reflected, because rollback does not exist yet.** A rolled-back block's
+    ///   transaction must leave this set in the same step, or a losing block silently becomes a
+    ///   transaction that can never be committed. There is no chain-tip rollback today
+    ///   (`Blockchain::remove_block` has no non-test caller, and
+    ///   `CommitConflictOutcome::CommitWinnerAfterRollback` has no rollback behind it). Whoever
+    ///   lands rollback owns this cleanup.
+    committed_txs: DashMap<String, (u64, Vec<u8>)>,
     /// Transaction registry for state tracking
     pending_registry: Arc<PendingTransactionRegistry>,
     /// Stake store for epoch management
@@ -238,6 +264,7 @@ impl Committer {
             block_services,
             node_registry,
             tokens,
+            committed_txs: DashMap::new(),
             pending_registry,
             stake_store,
             staking_manager,
@@ -494,6 +521,22 @@ impl Committer {
     /// stake cache (`StakeIndex`) can advance its refresher to the current
     /// epoch on epoch boundaries (AUDIT Phase 4.4) — the single source of
     /// truth for "which epoch's stake set is live" is this counter.
+    /// Forget committed-transaction records whose epoch has passed.
+    ///
+    /// This is what keeps [`Self::committed_txs`] a replay cache rather than a second copy of the
+    /// chain: it holds roughly one epoch of transaction ids. The trade is explicit — past an epoch
+    /// boundary, a duplicate of a transaction committed in the *previous* epoch is no longer
+    /// refused by this cache. That is a wider window than the one it replaces (which was "the
+    /// registry entry still happens to be in memory"), and it is still a window; the durable index
+    /// on `task-multihost-testnet-rollout` is what closes it.
+    ///
+    /// Called opportunistically from the commit path rather than from an epoch-transition hook, so
+    /// the cache cannot grow without bound on a node that never advances an epoch.
+    pub(crate) fn prune_committed_txs(&self) {
+        let current = self.current_epoch_number();
+        self.committed_txs.retain(|_, (epoch, _)| *epoch >= current);
+    }
+
     pub fn current_epoch_number(&self) -> u64 {
         self.current_epoch_number.load(Ordering::SeqCst)
     }

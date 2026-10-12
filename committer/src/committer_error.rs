@@ -46,6 +46,23 @@ pub enum CommitterError {
     /// and it is the compare that keeps the mesh from converging — see
     /// `fact-h12-assumes-lockstep-execution`).
     SignaturePayloadMismatch(String),
+    /// The transaction this block carries was already committed into a *different* block, and
+    /// this Committer still remembers it (see `Committer::committed_txs`). Carries the
+    /// transaction id and the hash of the block that already holds it.
+    ///
+    /// Until now nothing could produce this refusal, because nothing knew. The only object that
+    /// had ever recorded a transaction as committed was its `PendingTransactionRegistry` entry,
+    /// and the commit path releases and removes that entry — correct for memory, but it left
+    /// duplicate detection with the lifetime of a pointer. Measured consequence: one host put 4
+    /// distinct transactions into 6 blocks (`ph2-1091` inside two different blocks) and its chain
+    /// left the majority's — `fact-two-decisions-one-transaction-double-commit`.
+    ///
+    /// Not evidence of an attack on its own. The ordinary way to reach it is one transaction
+    /// arriving twice over two paths, which in the measured mesh happened because two Sentinels
+    /// disagreed about which Finalizer owned it — hence the booked block hash in the message, so
+    /// an operator can tell a replay of the same block from a rival block for the same
+    /// transaction.
+    TransactionAlreadyCommitted(String, String),
     /// Block validation/commit failed on the token
     BlockCommit(BlockCommitError),
     /// Unknown message action
