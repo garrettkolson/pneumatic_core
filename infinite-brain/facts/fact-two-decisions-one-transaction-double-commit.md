@@ -7,7 +7,7 @@ visibility: namespace
 summary: "Measured 10/09/2026 on the four-host mesh (`pneumatic:stage2`, `8e4f86e`). The diverging host MOVES between runs (executor-1 in one, committer-1 in the next) and always shows more `COMMIT-OK` lines than distinct transactions: in one run committer-1 committed 4 distinct transactions in 6 blocks — `ph2-1091` inside `d413eb8f…` AND inside `e0d3b338…`, `ph2-1094` inside `1ecd6973…` AND `dcce7eec…`. Chain length 6 vs the majority's 4, different tip. Two independent defects make this possible. (D1, cause) ADR-004 says an arriving routing record is HONOURED, never re-attested — and `Committer::held_decision` is nothing more than the current `tx.selection` on the registry entry, so when a second Sentinel's decision naming a DIFFERENT Finalizer arrives after the first commit removed the entry, the re-created entry carries the new decision and the second Finalizer's block passes the authority gate too. The rule that makes a single decision trustworthy has no rule for a second, conflicting one. (D2, why the chain does not defend itself) Nothing at commit time or append time asks whether this transaction id is already on this token's chain: dedup lived entirely in the in-memory `PendingTransactionRegistry` entry, which is released and removed on commit, and `Blockchain` keeps no transaction index — `add_block`/`append_validated_block` do hash chaining only. Fixing D1 alone removes this trigger; D2 is what makes a wrong-but-agreed block recoverable rather than permanent."
 auto_inject: true
 applicable_when: "Reasoning about why chains diverge after convergence; touching the committer's admission/`held_decision`/`block_authority` path, the removal of committed registry entries, or `Blockchain` append paths; deciding where a duplicate-commit gate belongs; changing Sentinel selection or anything that makes two Sentinels' views differ"
-confidence: 0.9
+confidence: 0.92
 verified_at: "10/09/2026"
 verified_by: "dsh-agent"
 staleness_signal: "Re-open if `tips.sh` reports DIVERGENCE while hosts report growing chains, and the diverging host has more `COMMIT-OK` lines than distinct transaction ids — that signature is this defect, whatever else has changed. Verify D1 is closed by confirming a Committer that holds decision A refuses an arriving decision B for the same transaction instead of replacing it. Verify D2 by confirming a second block carrying an already-committed transaction id is refused by the chain rather than appended. Also re-verify if `SelectionRecord::same_decision_as` stops being the comparison used, since it is the only thing that can tell 'the same decision, re-delivered' from 'a conflicting decision'."
@@ -34,6 +34,29 @@ source_url: "repo:committer/src/committer/routing.rs (held_decision)"
 ---
 
 # Two decisions, one transaction, two blocks
+
+## D2 closed for the live mesh (10/09/2026, `3076d5d`)
+
+`Committer::committed_txs` — a transaction id → `(epoch, block hash)` record written when a block
+commits, read as the FIRST thing the commit path does, before the registry is touched, and pruned
+by epoch. Measured on the mesh (`pneumatic:stage3`): **AGREEMENT, all four hosts at the same tip
+and sequence, `tips.sh` exit 0** — the first time this mesh has agreed — and the gate fired
+identically on every host against the same rival block (`[dup] refusing tx=ph2-1098
+booked=5fba3f86… incoming=82ee6b2c…`), so the failure mode is real and now caught everywhere.
+
+Why placement was the design: after a commit removes the entry, the registry holds neither a
+booked block hash nor a held decision, so the commit path is the first place that can ask the
+question, and the admission path cannot ask it at all — the re-arriving transaction looks new.
+Two limits are written into the field's doc comment rather than left to be discovered: the set is
+**empty after a restart** (the durable index in the data service is the version that closes that
+window), and **rollback is not reflected, because rollback does not exist yet** — whoever lands
+tip rollback must drop the rolled-back block's transaction in the same step, or a losing block
+becomes a permanently uncommittable transaction. Pruning by epoch also means a duplicate from the
+previous epoch is no longer refused: wider than what it replaces, still a window.
+
+**D1 is untouched.** `LoserDiscarded` still fires three times per host in that same rehearsal —
+two Sentinels still produce rival blocks for one transaction. The chain now refuses the rival
+instead of appending it, which is the difference between a fork and a dropped block.
 
 ## The signature to look for
 
