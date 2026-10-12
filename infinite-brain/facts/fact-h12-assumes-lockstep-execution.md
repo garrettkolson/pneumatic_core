@@ -7,7 +7,7 @@ visibility: namespace
 summary: "10/09/2026, four-container rehearsal, after ADR-004 was actually applied end to end. Routing worked: one finalizer per transaction, no more N blocks per tx (previously committer-1 appended two blocks with different hashes for one transaction). What replaced the divergence is non-convergence: exactly one host committed (executor-1, sequence 2 for 6 txs) and the other three refused every block with `TransactionPayloadMismatch`. Cause: `committer/src/committer/committing.rs:164` compares `transaction.hash()` — SHA-256 over `canonical_bytes()`, and `CanonicalTransaction` **includes `result_hash`** — against the block's transaction. Each host runs its own executor, so a receiver compares the producer's execution result against what IT executed against ITS local token state. That holds only if every host executes every transaction in the same order against the same state — lockstep. It was invisible before because every host built its own block, and each block matched its own producer's local result by construction; routing removed the cover and exposed the assumption. Open design decision: on receipt of a block produced by the assigned finalizer, a committer should INSTALL the block's execution result (after verifying the routing decision and the finalizer signature) instead of requiring its local execution to agree — a different consistency model from the one the audit phases assumed (H12 was written to stop a payload swap on the wire, and it still does that job against the same host's registry)."
 auto_inject: false
 applicable_when: "Touching `handle_commit`/`handle_block_finalized` or the H12 hash compare; reasoning about why fewer than all committers commit; changing what `CanonicalTransaction` includes; designing cross-host execution convergence; reading rehearsal output where one host's sequence moves and the others stay at 0"
-confidence: 0.85
+confidence: 0.9
 verified_at: "10/09/2026"
 verified_by: "dsh-agent"
 staleness_signal: "When a committer that receives a block from the assigned Finalizer installs the block's `result_hash`/`result_data` rather than comparing it to a locally executed copy — then all four hosts' sequences move together and `tips.sh` exits 0. Also re-verify if execution becomes deterministic across hosts by construction (a single executor per transaction with the result gossiped ahead of the block), which would make the compare satisfiable."
@@ -46,6 +46,7 @@ source_url: "repo:committer/src/committer/committing.rs"
 | before ADR-004 enforcement (`pneumatic:phase2n`) | 4 txs submitted → sequence 3 → 7 on the committer host; every host committing its own block for each tx |
 | routing + finalizer/committer gates (`pneumatic:adr004`) | 1 tx submitted → committer-1 appended **two** blocks with two different hashes; the other hosts committed nothing |
 | + decision belongs to the transaction, committer compares against the decision it holds (`pneumatic:adr004c`) | 6 txs → exactly **one** host grows (executor-1, sequence 2), three hosts refuse every block |
+| + signature binds the payload and H12 scoped to identity, result adopted from the block (`pneumatic:stage2`) | 8 txs → **three hosts byte-identical** (sequence 3, tip `d86ed741…`); every host booked the same 3 txs; `executor-1` booked 6 appends for those 3 ids and its tip moved off |
 
 `./tips.sh` (added the same day) is what makes that readable: it reads all four
 hosts' chains through their own data-service sidecars and compares `(sequence, tip)`.
@@ -97,6 +98,28 @@ canonical surface entirely, and only the deploy/upgrade/wasm delta sites re-deri
 `hash(result_data)`. So Stage 1 made the signature bind the payload for real; only then can
 the compare below be narrowed to identity fields. See
 [[fact-finalizer-signature-did-not-bind-payload]].
+
+## Resolved for the lockstep half (10/09/2026, `8e4f86e`)
+
+`Transaction::identity_bytes` / `identity_hash` — the same serialization `hash()` does, with
+`result_hash` and `result_data` normalized away — replaced the full-hash compare, and the
+commit path adopts the block's result before the delta applies. The three legs of the safety
+argument are stated at the call site: identity from this compare, result from the reconstructed
+finalizer digest, authority from the routing decision. Measured above: three hosts now hold
+identical chains, which this mesh has never done.
+
+What the node still asserts, and what it does not. It is NOT resolved that a receiver can be
+indifferent to what a routed Finalizer executes: a Wasm `ContractCall` result is checked only
+for self-consistency (`hash(result_data) == result_hash`), so a byzantine routed Finalizer
+ships a wrong-but-self-consistent Wasm result and it is applied — attribution catches that,
+disagreement does not. `DeployContract`/`UpgradeContract` are exempt because those deltas are a
+pure function of the transaction and are re-derived. The confirmation axis
+(`FinalityStatus::Confirmed`) is where the disagreement half is supposed to live and currently
+gates nothing.
+
+The residual this change exposed is a different defect and now the top blocker: `executor-1`
+appended the same transactions twice (6 `COMMIT-OK` lines, 3 distinct ids) and its tip left the
+majority. That is fork choice and double-append, not lockstep.
 
 ## Why H12 is still right
 
