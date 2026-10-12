@@ -397,3 +397,109 @@ async fn commit_surfaces_token_persist_failure_instead_of_reporting_success() {
         other => panic!("expected TokenPersist, got {other:?}"),
     }
 }
+
+/// Stage 2 of the convergence work: the Committer accepts an execution result it did not
+/// produce, and the boundary at which it still refuses.
+///
+/// Under ADR-005 the routed Finalizer's block is the answer, so a receiver that requires the
+/// block's result to match what IT would have produced is demanding lockstep execution —
+/// which is why one host committed and three refused every block in the four-host rehearsal
+/// (`fact-h12-assumes-lockstep-execution`). The result is therefore removed from the
+/// payload compare, and what backs the acceptance is the routing decision (who was entitled
+/// to build this) plus the Finalizer's signature, reconstructed from the received bytes
+/// (what was signed).
+///
+/// Both halves go through the identical edit path — change a field, re-sign the carrier,
+/// re-hash the block — so the difference in outcome can only be the field that changed. That
+/// is the boundary this change draws: the execution result is the producer's to decide;
+/// everything else is the sender's, and a commit that disagrees with what this node
+/// validated about the *transaction* is still refused and still appends nothing.
+#[tokio::test]
+async fn a_commits_execution_result_may_differ_from_what_this_node_computed() {
+    let fixture = |tx_id: &'static str| {
+        let dp = Arc::new(TestDataProvider::new());
+        dp.insert_user(
+            b"alice".to_vec(),
+            "token".to_string(),
+            User {
+                public_key: b"alice".to_vec(),
+                fuel_balance: 1000,
+                stake: 0,
+                nonce: 0,
+            },
+        );
+        let (committer, registry, _logger) = make_test_committer(dp.clone());
+        let mut token = Token::new();
+        token.id = vec![1];
+        committer.bootstrap_token(token);
+        bootstrap_token_chain(&committer);
+        make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+        (committer, registry)
+    };
+
+    // Edit ONLY the execution result: this node's entry carries whatever the fixture put
+    // there; the block asserts a different one, signed by the routed Finalizer.
+    let (committer, _registry) = fixture("tx_foreign_result");
+    let mut block = make_test_block_for_token(&committer, "tx_foreign_result", b"alice".to_vec());
+    let foreign_result = vec![0xC0u8; 32];
+    block.signed_trans.transaction.result_hash = foreign_result.clone();
+    block.signed_trans.transaction.result_data = b"a-result-another-host-produced".to_vec();
+    sign_like_finalizer(&mut block.signed_trans, &gossip_finalizer());
+    block.current_hash = BlockFactory::create_hash(&block).expect("re-hash after the edit");
+
+    let foreign_block_hash = block.current_hash.clone();
+    let commit = TransactionCommit {
+        trans_id: b"tx_foreign_result".to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block,
+    };
+    committer
+        .check_and_commit_transaction_results(&commit, vec![])
+        .await
+        .expect("a block whose execution result differs from this node's local execution is \
+                 the routed Finalizer's answer, not a mismatch — refusing it is what kept \
+                 every host but one from converging");
+
+    // The block this node refused-before and accepts-now is on its chain: the tip is the
+    // block that carried the foreign result. (That the *applied state* also comes from the
+    // block, rather than from this node's own record, is proven by
+    // `the_commit_applies_the_blocks_result_rather_than_the_local_one` in `deploy.rs` — the
+    // apply reads the adopted result, so that test fails if adoption is removed. Asserting
+    // it here through the registry entry is not possible: a committed transaction is
+    // released and removed at the end of the commit path, which is itself the reason this
+    // assertion changed shape after it was first written.)
+    let tip = committer
+        .tokens
+        .get(&vec![1])
+        .unwrap()
+        .value()
+        .blockchain
+        .get_current_chain_state()
+        .last_hash_in;
+    assert_eq!(
+        tip, foreign_block_hash,
+        "the accepted block must be this node's new tip — the chain is what the node reports"
+    );
+
+    // Control: the same edit path, on a field the SENDER authorized.
+    let (committer, _registry) = fixture("tx_foreign_identity");
+    let mut block = make_test_block_for_token(&committer, "tx_foreign_identity", b"alice".to_vec());
+    block.signed_trans.transaction.amount = Some(999_999);
+    sign_like_finalizer(&mut block.signed_trans, &gossip_finalizer());
+    block.current_hash = BlockFactory::create_hash(&block).expect("re-hash after the edit");
+
+    let commit = TransactionCommit {
+        trans_id: b"tx_foreign_identity".to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block,
+    };
+    let result = committer.check_and_commit_transaction_results(&commit, vec![]).await;
+    assert!(
+        matches!(result, Err(CommitterError::TransactionPayloadMismatch(_))),
+        "the result is the producer's to decide; the transaction itself is the sender's — a \
+         block whose amount differs from what this node validated is still a foreign payload: \
+         {result:?}"
+    );
+}

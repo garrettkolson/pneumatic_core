@@ -156,14 +156,60 @@ impl Committer {
             }
         };
 
-        // AUDIT Phase 3.5 / H12: commit the validated payload, not whatever arrived. The wire
-        // TransactionCommit carries its own `proposed_block`; that block is what actually gets
-        // appended to the chain, yet nothing above verifies its embedded transaction is the one we
-        // validated and pooled. Hash-compare the wire block's transaction against the validated one
-        // (a full-payload hash, so a swap of any field is caught) — fail closed on any mismatch.
-        if transaction.hash()? != commit.proposed_block.signed_trans.transaction.hash()? {
+        // AUDIT Phase 3.5 / H12, scoped to the transaction's IDENTITY (ADR-004 convergence).
+        //
+        // What H12 was for, and what it still does: the wire `TransactionCommit` carries its
+        // own `proposed_block`, and that block is what gets appended — so the embedded
+        // transaction must be the one this node validated and pooled. Compare on identity
+        // (`Transaction::identity_bytes`): the sender's signature and everything it covers,
+        // the routing record the Sentinel attested, the payload, the gas limit, the nonce,
+        // the amount. A swap of any of those is still caught, and still refused with
+        // `TransactionPayloadMismatch`.
+        //
+        // What it no longer compares is the execution result — `result_hash` and
+        // `result_data`. Comparing those asked this node to confirm that the producer's
+        // execution matched what THIS node would have produced, which is only satisfiable if
+        // every host executes every transaction in the same order against the same state.
+        // That assumption (see the measured version in
+        // `fact-h12-assumes-lockstep-execution`) is why a mesh with exactly one producer per
+        // transaction had one host committing and three refusing every block: each had
+        // executed against its own token state, so the producer's result was, correctly, not
+        // equal to theirs. Under optimistic finality (ADR-005) the block the routed Finalizer
+        // produced IS the answer, and the receiver adopts its result.
+        //
+        // That is a real transfer of trust, so here is exactly what backs it:
+        //   - the block's authority — the routing decision names the one Finalizer entitled
+        //     to produce this transaction, and the sender must be that key (`block_authority`);
+        //   - the result's integrity — `result_hash` and `result_data` are inside the
+        //     Finalizer's signed digest, which the Committer RECONSTRUCTS from the received
+        //     bytes rather than accepting a hash the sender carried
+        //     (`fact-finalizer-signature-did-not-bind-payload`, `verify_finalizer_signature`);
+        //   - for `DeployContract` and `UpgradeContract`, an independent re-derivation: those
+        //     deltas are a pure function of the transaction, so the committer recomputes them
+        //     and still refuses if they do not hash to the signed result.
+        // What is NOT independently checked is a Wasm `ContractCall` result: the storage
+        // apply verifies `hash(result_data) == result_hash`, which is self-consistency, not
+        // re-execution. A byzantine routed Finalizer could ship a wrong-but-self-consistent
+        // Wasm result and it would be applied. Attribution catches it, disagreement does not.
+        // That is the price of optimistic finality, named rather than buried — Stage 3 (making
+        // `FinalityStatus::Confirmed` gate anything) is where it gets paid.
+        if transaction.identity_hash()?
+            != commit.proposed_block.signed_trans.transaction.identity_hash()?
+        {
             return Err(CommitterError::TransactionPayloadMismatch(tx_id.clone()));
         }
+
+        // Adopt the producer's execution result for everything downstream — the delta
+        // applies and the `Committed` booking below read from this value, so the state this
+        // node applies is the state in the block, not the state it would have produced.
+        // Identity fields (including `sender_signature` and the routing record) stay as
+        // validated, and are provably identical: they are inside the compare above.
+        let wire_tx = &commit.proposed_block.signed_trans.transaction;
+        let transaction = Transaction {
+            result_hash: wire_tx.result_hash.clone(),
+            result_data: wire_tx.result_data.clone(),
+            ..transaction
+        };
         // S5.3: the shielded extension of H12. The wire block's shielded
         // payload must be the one the (never-evicted, S5.1) parallel map
         // holds for this tx — hash-compare the full canonical payloads, so a

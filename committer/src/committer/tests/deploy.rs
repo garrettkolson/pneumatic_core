@@ -9,6 +9,7 @@
 
 use super::helpers::*;
 use pneumatic_core::contracts::{deploy_contract, DeployParams};
+use pneumatic_core::tokens::Token;
 use pneumatic_core::crypto::HashProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,4 +121,107 @@ fn deploy_delta_rejects_tampered_result_hash() {
         err,
         CommitterError::TransactionPayloadMismatch(_)
     ));
+}
+
+/// Stage 2 of the convergence work: a commit applies **the block's** execution result, not
+/// the one this node computed — and the delta apply is where that becomes observable.
+///
+/// The commit path used to refuse a block whose execution result differed from the result in
+/// its own registry entry. Each host executes against its own token state, so once exactly
+/// one Finalizer produces each transaction, that compare refuses every block on every host
+/// except the producer's (`fact-h12-assumes-lockstep-execution`). It was narrowed to the
+/// transaction's identity — everything the sender authorized, plus the routing record — and
+/// the result is adopted from the block.
+///
+/// The observable is not a field someone remembered to copy. `apply_deploy_delta` re-derives
+/// the delta and checks it against `transaction.result_hash`, so it reads whichever result
+/// the commit path is holding. This fixture makes the two disagree on purpose: the local
+/// entry carries a result this node "computed" that does not match the deploy it contains,
+/// and the block carries the correct one. So the test fails two ways — if the payload
+/// compare is still full-hash, the commit is refused outright; and if the compare is
+/// narrowed but the result is not adopted, the apply reads the stale local value and refuses
+/// with `TransactionPayloadMismatch`. A token in the environment partition is the proof that
+/// neither happened: the state this node applied is the state in the block.
+#[tokio::test]
+async fn the_commit_applies_the_blocks_result_rather_than_the_local_one() {
+    let dp = Arc::new(TestDataProvider::new());
+    dp.insert_user(
+        b"alice".to_vec(),
+        "token".to_string(),
+        User {
+            public_key: b"alice".to_vec(),
+            fuel_balance: 1000,
+            stake: 0,
+            nonce: 0,
+        },
+    );
+    let (committer, registry, _logger) = make_test_committer(dp.clone());
+    let mut token = Token::new();
+    token.id = vec![1];
+    committer.bootstrap_token(token);
+    bootstrap_token_chain(&committer);
+
+    let tx_id = "deploy_foreign_result";
+    let mut block = make_test_block_for_token(&committer, tx_id, b"alice".to_vec());
+    let sender = block.signed_trans.transaction.sender.clone();
+    let nonce = block.signed_trans.transaction.sequence_number;
+    let params = spec_params();
+    let hash = BasicHashProvider::new();
+    let delta = deploy_contract(&sender, nonce as u64, &params, &hash).expect("delta derives");
+    let producer_result = hash
+        .hash(&serialize_to_bytes_rmp(&delta).expect("delta serializes"));
+
+    // The block as the routed Finalizer produced it: a deploy, with the result that deploy
+    // actually yields. Re-signed after the edit, because the result is inside the finalizer's
+    // signed digest — an unsigned edit is tampering, and would be refused for that reason.
+    block.signed_trans.transaction.action = "DeployContract".into();
+    block.signed_trans.transaction.payload =
+        serialize_to_bytes_rmp(&params).expect("params serialize");
+    block.signed_trans.transaction.result_hash = producer_result.clone();
+    sign_like_finalizer(&mut block.signed_trans, &gossip_finalizer());
+    block.current_hash = pneumatic_core::blocks::BlockFactory::create_hash(&block)
+        .expect("the edited block re-hashes");
+
+    // This node's own record of the same transaction: identical in every field the sender
+    // authorized, and carrying a result this node arrived at somewhere else. In the rehearsal
+    // this was not a contrivance — it is what a host that had committed a different set of
+    // blocks before this one produced.
+    let mut local = block.signed_trans.transaction.clone();
+    local.result_hash = vec![0x11; 32];
+    local.result_data = b"what-this-node-computed-instead".to_vec();
+    make_finalizing_entry(&registry, tx_id, b"alice".to_vec());
+    {
+        let mut entry = registry
+            .get_transaction_mut(tx_id)
+            .expect("the fixture entry exists");
+        match &mut entry.state {
+            pneumatic_core::transactions::TransactionState::Finalizing { transaction, .. } => {
+                *transaction = local;
+            }
+            other => panic!("the fixture entry must be Finalizing, got {other:?}"),
+        }
+    }
+
+    let commit = TransactionCommit {
+        trans_id: tx_id.as_bytes().to_vec(),
+        token_id: vec![1],
+        env_id: "test".to_string(),
+        proposed_block: block,
+    };
+    committer
+        .check_and_commit_transaction_results(&commit, vec![])
+        .await
+        .expect("the block's result is the routed Finalizer's answer; this node's differing \
+                 local result is not a reason to refuse the block");
+
+    let applied = dp
+        .get_token(&delta.token_id, PARTITION)
+        .expect("the contract token the BLOCK described must have been created — the apply \
+                 read the block's result, not the stale local one");
+    assert_eq!(applied.id, delta.token_id);
+    assert_eq!(
+        applied.metadata.get("contract_engine").map(|s| s.as_str()),
+        Some("Spec"),
+        "and it is the contract the block's payload describes"
+    );
 }

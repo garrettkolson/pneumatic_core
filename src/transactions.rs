@@ -746,27 +746,6 @@ pub fn finalizer_placeholder_sig(transaction: &Transaction) -> TransactionSignat
     }
 }
 
-/// The digest a Finalizer signs over a `SignedTransaction`, and the digest every verifier
-/// must **reconstruct** from the payload in front of it.
-///
-/// ```text
-/// H( H(rmp(signed_tx with placeholder finalizer_sig))
-///    || H(concat(executor signature bytes, ordered by voter key)) )
-/// ```
-///
-/// The execution result is inside that surface — `signed_tx.transaction` is serialized
-/// whole, `result_hash` and `result_data` included — so the Finalizer's signature is what
-/// binds a block to *the* execution result it accepted. That binding is the only thing
-/// standing between "accept a block from the Finalizer the routing decision names" and
-/// "accept whatever bytes arrived inside a block from a key that happens to match", which
-/// is why this function exists as a single implementation rather than as a few lines in
-/// the Finalizer's block builder.
-///
-/// It is deliberately the *same* function the signer calls. A digest built twice is a
-/// digest that drifts, and drift between signer and verifier fails closed as
-/// "everybody's blocks are invalid" — the loud case. The quiet case is a verifier that
-/// checks a digest the sender supplied instead of one it derived itself, which verifies
-/// perfectly and means nothing. See [`verify_finalizer_signature`].
 /// The carrier as the Finalizer's digest sees it: every field of [`SignedTransaction`],
 /// with the executor signatures collected into a key-ordered map and the signature slot
 /// holding its placeholder.
@@ -1010,6 +989,47 @@ impl Transaction {
     /// round-trip stable (`CanonicalTransaction`), giving a digest that matches across the pipeline
     /// contexts that must agree on the same transaction — e.g. the Committer comparing the validated
     /// transaction it holds against the block it is about to append.
+    /// The transaction's **identity**: the same serialization [`hash`] performs, with the
+    /// two execution outputs — `result_hash` and `result_data` — normalized away.
+    ///
+    /// This is the surface a Committer compares its own record against when it is handed a
+    /// block it did not build. "Is this the transaction I validated?" is a question about
+    /// identity: the sender's authorization (`sender_signature`, and therefore every field
+    /// the sender signed), the routing record the Sentinel attested, the gas limit, the
+    /// payload — all of that must match, and if any of it differs the block is about a
+    /// different transaction and is refused.
+    ///
+    /// The execution result is not part of that question. It is produced *downstream* of
+    /// admission, by the Executor, over state the receiving node may not have in the same
+    /// order. A Committer that requires the block's result to equal the result IT computed
+    /// is requiring every host to execute every transaction in the same order against the
+    /// same state — lockstep — which is exactly why a mesh with one producer per transaction
+    /// fails to converge (`fact-h12-assumes-lockstep-execution`). The result is not left
+    /// unauthenticated: it is inside the Finalizer's signed digest
+    /// ([`finalizer_digest`]), which the Committer now reconstructs rather than trusting.
+    /// So the trust moves from "I would have produced this" to "the Finalizer the routing
+    /// decision named signed this", which is the same thing the rest of the pipeline asserts.
+    ///
+    /// Built from a clone rather than a field-by-field view on purpose: a view struct has to
+    /// list every field, and a field added later would silently fall out of the identity
+    /// compare. Here a new field is compared until someone deliberately normalizes it.
+    ///
+    /// [`hash`]: Transaction::hash
+    pub fn identity_bytes(&self) -> Result<Vec<u8>, PneumaticError> {
+        let mut normalized = self.clone();
+        normalized.result_hash = Vec::new();
+        normalized.result_data = Vec::new();
+        crate::encoding::serialize_to_bytes_rmp(&normalized)
+            .map_err(|e| PneumaticError::Encoding(e.to_string()))
+    }
+
+    /// Hash of [`identity_bytes`](Self::identity_bytes) — see there for what this binds and
+    /// what it deliberately does not.
+    pub fn identity_hash(&self) -> Result<Vec<u8>, PneumaticError> {
+        let bytes = self.identity_bytes()?;
+        Ok(BasicHashProvider::new().hash(&bytes))
+    }
+
     pub fn hash(&self) -> Result<Vec<u8>, PneumaticError> {
         let bytes = crate::encoding::serialize_to_bytes_rmp(self)?;
         Ok(BasicHashProvider::new().hash(&bytes))
